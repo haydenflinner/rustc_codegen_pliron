@@ -1055,6 +1055,32 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    selects because `LTUNDEF` materializes an undefined slice as 0, so the
    phi of the value and the undefined one does not fold (LLVM: undef).
 
+10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
+   2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours
+   (22.0k samples, `mul_pow2` inlined into it) against LLVM's 35.5% +
+   7.4% `mul_pow2` (18.9k); everything else in the kernel is as fast or
+   faster than LLVM's. Our `format_exact` is 9,137 bytes (LLVM 5,081),
+   `mul_pow10` 10,056 (LLVM 1,309, called twice per call, cheap in the
+   profile). A driver over the internals (`#![feature(num_internals,
+   core_private_bignum, flt2dec)]`, `$TMPDIR/bigdrv`): `dragon::format_exact`
+   1.04x LLVM, `Big32x40` compare loop 1.67x, `sub`+`add` 1.61x,
+   `mul_small`/`mul_pow2` 0.95x. In TurboFan the compare loop's equal path
+   is the same 7-8 instructions per limb on both sides (both unroll it
+   4x); what differs is around it: our standalone `add`/`sub` are 596/586
+   bytes (LLVM 358/331) because `PLIRON_PUNROLL_COUNTED_WASM` unrolls
+   their limb loop 4 wide, so V8 (500-byte inline limit) calls them where
+   it inlines LLVM's. Rolled (`PLIRON_PUNROLL_COUNTED_WASM_FNMIN=100`,
+   opt-in: not in functions under 100 instructions) the `sub`+`add` loop
+   is 0.94x LLVM, but `format_exact` itself does not change (its bignum
+   ops are inlined at the IR level and it is past `_FNMAX`), so `strwork`
+   does not move (+2.9% / +3.3%, overlapping ranges), and the rule costs
+   `sieve` (-11.1% -> -3.7% against LLVM: `vec![x; n]`'s fill loop sits
+   in a small function too). Open: the extra 4k bytes and the per-call
+   overhead inside `format_exact` (Ordering materialized as `gt - lt`
+   with a dead `gt + 2 == lt` test on each compare's exit, a duplicate
+   loop-carried pointer param, `& 255` on every carry), and telling a
+   short-loop callee from a long-loop one before skipping the unroll.
+
 Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
 times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,
 `PLIRON_WASM_BRTAB_SHARE`, `PLIRON_WCOAL_EDGE`,

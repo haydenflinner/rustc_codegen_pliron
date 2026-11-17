@@ -531,6 +531,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   1,329 bytes (LLVM 294) and `memcmp` 602 (LLVM 74), with `=120` they are
   340 and 116. A scratch string-search driver goes from 1.33x to 1.14x
   LLVM's time; the kernel module changes in one cold function.
+- `PLIRON_PUNROLL_COUNTED_WASM_FNMIN=<insts>` (opt-in, wasm): the
+  `COUNTED_WASM` 4-wide unroll skips functions under that many
+  instructions, so small counted-loop callees stay under V8's 500-byte
+  inline limit (bignum `add`/`sub` 596/586 -> 439/444 bytes; a
+  `Big32x40` subtraction loop 1.61x -> 0.94x LLVM). Loses `sieve` at 100
+  (its `vec![x; n]` fill is a small function with a long loop): not for
+  default (PARITY queue item 10).
 - `PLIRON_INLINE_V8CAP=<lean ops>` (opt-in, wasm, 2026-11-17): the
   inliner refuses an inline that would take a caller from at most that
   many `lean_cost` ops past it, when the caller has at least
