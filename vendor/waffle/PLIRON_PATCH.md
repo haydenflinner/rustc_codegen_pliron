@@ -180,7 +180,7 @@ directly (plus the wrappers around the table). Read once per function
 from a copy of the crate with an empty `[workspace]` table, since the
 crate is not a workspace member).
 
-## Cut-block aliases in the reducifier's max-SSA (`PLIRON_WASM_MAXSSA_CUTALIAS=1`, opt-in)
+## Cut-block aliases in the reducifier's max-SSA (`PLIRON_WASM_MAXSSA_CUTALIAS`, default on, `=0` off)
 
 `passes/maxssa.rs` gives a cut block (an irreducible loop's side entry
 or exit, `backend/reducify.rs`) a parameter for every value live across

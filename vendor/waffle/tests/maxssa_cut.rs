@@ -88,7 +88,7 @@ fn run(on: bool) -> usize {
     if on {
         std::env::set_var("PLIRON_WASM_MAXSSA_CUTALIAS", "1");
     } else {
-        std::env::remove_var("PLIRON_WASM_MAXSSA_CUTALIAS");
+        std::env::set_var("PLIRON_WASM_MAXSSA_CUTALIAS", "0");
     }
     let bytes = irreducible_module().to_wasm_bytes().expect("compile");
     std::env::remove_var("PLIRON_WASM_MAXSSA_CUTALIAS");

@@ -293,13 +293,13 @@ impl<'a> Reducifier<'a> {
         let mut new_body = self.body.clone();
         let cfg = CFGInfo::new(&new_body);
         crate::passes::resolve_aliases::run(&mut new_body);
-        // PLIRON: `PLIRON_WASM_MAXSSA_CUTALIAS=1` lets the all-same alias
+        // PLIRON: `PLIRON_WASM_MAXSSA_CUTALIAS` (default on, `=0` off) lets the all-same alias
         // rule apply at cut blocks for values defined outside every block
         // that may be duplicated: a block is copied only in a non-empty
         // context, and contexts hold irreducible headers of the block's
         // header set, so a block whose header set meets none is never
         // copied (a superset of the copies, which is what soundness needs).
-        if std::env::var_os("PLIRON_WASM_MAXSSA_CUTALIAS").is_some_and(|v| v == "1") {
+        if !std::env::var_os("PLIRON_WASM_MAXSSA_CUTALIAS").is_some_and(|v| v == "0") {
             let clones: HashSet<Block> = new_body
                 .blocks
                 .iter()
@@ -524,7 +524,7 @@ mod test {
             if on {
                 std::env::set_var("PLIRON_WASM_MAXSSA_CUTALIAS", "1");
             } else {
-                std::env::remove_var("PLIRON_WASM_MAXSSA_CUTALIAS");
+                std::env::set_var("PLIRON_WASM_MAXSSA_CUTALIAS", "0");
             }
             let body = build();
             let out = Reducifier::new(&body).run().into_owned();

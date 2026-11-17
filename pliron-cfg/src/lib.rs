@@ -29,7 +29,7 @@ pub struct PassConfig {
 /// `PLIRON_EDGEDEDUP`, `PLIRON_NARROWEXT`, `PLIRON_EDGEMERGE`,
 /// `PLIRON_EPIMERGE`, `PLIRON_BJALIAS`, `PLIRON_TBNZ_IREDUCE`,
 /// `PLIRON_EDITPAIR`, `PLIRON_MCP`, `PLIRON_MCPBB`, `PLIRON_CCMP` and
-/// `PLIRON_JT_NARROW`
+/// `PLIRON_JT_NARROW`, and the vendored waffle `PLIRON_WASM_MAXSSA_CUTALIAS`,
 /// itself and
 /// defaults them the same way (on unless `=0`; EDGEMERGE/EPIMERGE take
 /// their mode default when unset). Validation: docs/history/2026-10-27-defaults.md,
