@@ -20,6 +20,7 @@ pub mod bittab;
 pub mod brifsel;
 pub mod demand;
 pub mod ivdown;
+pub mod ivmerge;
 pub mod tripfold;
 pub mod ivptr;
 pub mod memcmpk;

@@ -45,22 +45,22 @@ const MAX_DEPTH: usize = 8;
 
 /// `k + sum(coef * leaf)`, leaves sorted by index.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Lin {
-    k: i64,
-    t: Vec<(Value, i64)>,
+pub(crate) struct Lin {
+    pub(crate) k: i64,
+    pub(crate) t: Vec<(Value, i64)>,
 }
 
 impl Lin {
-    fn leaf(v: Value) -> Lin {
+    pub(crate) fn leaf(v: Value) -> Lin {
         Lin {
             k: 0,
             t: vec![(v, 1)],
         }
     }
-    fn konst(k: i64) -> Lin {
+    pub(crate) fn konst(k: i64) -> Lin {
         Lin { k, t: Vec::new() }
     }
-    fn add(&self, o: &Lin, sign: i64) -> Lin {
+    pub(crate) fn add(&self, o: &Lin, sign: i64) -> Lin {
         let mut m: FxHashMap<Value, i64> = self.t.iter().copied().collect();
         for &(v, c) in &o.t {
             let e = m.entry(v).or_default();
@@ -73,7 +73,7 @@ impl Lin {
             t,
         }
     }
-    fn scale(&self, s: i64) -> Lin {
+    pub(crate) fn scale(&self, s: i64) -> Lin {
         let mut t: Vec<(Value, i64)> = self
             .t
             .iter()
@@ -87,14 +87,14 @@ impl Lin {
         }
     }
     /// Equal modulo `bits`-bit wrapping.
-    fn eq_mod(&self, o: &Lin, bits: u32) -> bool {
+    pub(crate) fn eq_mod(&self, o: &Lin, bits: u32) -> bool {
         let m = |x: i64| if bits >= 64 { x } else { x & ((1i64 << bits) - 1) };
         m(self.k) == m(o.k)
             && self.t.len() == o.t.len()
             && self.t.iter().zip(&o.t).all(|(a, b)| a.0 == b.0 && m(a.1) == m(b.1))
     }
     /// The constant this is, modulo `bits`-bit wrapping.
-    fn as_const(&self, bits: u32) -> Option<i64> {
+    pub(crate) fn as_const(&self, bits: u32) -> Option<i64> {
         let m = |x: i64| if bits >= 64 { x } else { x & ((1i64 << bits) - 1) };
         self.t.iter().all(|&(_, c)| m(c) == 0).then_some(self.k)
     }

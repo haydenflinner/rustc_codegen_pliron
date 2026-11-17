@@ -3893,6 +3893,14 @@ fn s_selknown(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 // A branch repeating its only predecessor's test — see `edgeknown::retests`.
+fn s_ivmerge(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::ivmerge::run(&mut p.clctx.func, an, crate::ivmerge::Amode::of(&p.target));
+    if k > 0 && p.dump {
+        p.dump("ivmerge");
+    }
+    k
+}
+
 fn s_retest(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::edgeknown::retests(&mut p.clctx.func);
     if k > 0 {
@@ -5947,6 +5955,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // That GVN is also what shows a rotated loop's guard to be the
         // test the block's only predecessor just made.
         step("retest", "edgeknown", Gate::Env("PLIRON_RETEST"), s_retest).needs(shape::CONDBR),
+        // Loop params in lockstep (`q = p + D`, D invariant: two pointers
+        // of one zip, a duplicate the late GVN made) share one register;
+        // `q`'s end test becomes `p`'s and folds. After the last GVN and
+        // retest, which leave the shape. Opt-in: `PLIRON_IVMERGE=1`.
+        step("ivmerge", "ivmerge", Gate::OptIn("PLIRON_IVMERGE"), s_ivmerge).needs(shape::LOOPS),
         // A cursor that a rotated loop's top block only steps is stepped
         // on the edges instead, next to the load of the same pointer
         // (post-index), so the block carries one cursor. After every
