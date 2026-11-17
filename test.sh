@@ -420,10 +420,12 @@ t_slotpromlt() {
   # (default on since 2026-11-13), which lets LICM promote the fields
   # those reloads fetched (1546 -> 1500 instructions on its own), and
   # `LF_TRIVPHI` (default on since 2026-11-13), which no longer creates
-  # the single-value block params whose edge moves these were.
-  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
-  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
-  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
+  # the single-value block params whose edge moves these were. And
+  # `PLIRON_RA2_POSTOPT` (default 15 since 2026-11-17), whose redundant
+  # spill-store bit removes the same store-backs after allocation.
+  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_POSTOPT=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
+  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_POSTOPT=0 PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
+  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_POSTOPT=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
   local z0 z3 z4
   if [[ -x "$llvmod" ]]; then
     z0=$("$llvmod" -d --no-show-raw-insn $out/spl0.o | grep -E '^ *[0-9a-f]+:' | grep -vcw nop)
