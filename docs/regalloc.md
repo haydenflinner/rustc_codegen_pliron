@@ -195,6 +195,47 @@ Weighted (8^depth) counts; static counts in parentheses.
 csr moved under 0.12% in every row. Static is a ranking aid, not the
 verdict: the dynamic counts and exact instruction totals below decide.
 
+### Knob evaluation (2026-11-17, executed, against the dynamic baseline)
+
+Each knob alone on top of the baseline, all eight programs built with the
+checker on (all checker-clean). Change in executed instructions (whole
+program) and in regalloc overhead (st+ld+mov+csr), pliron side:
+
+| knob | blake3 | blind-sig | pulldown | regex | compression | html | json | protobuf | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| `POSTOPT=15` insts | +4 | -41,476 | -72,602 | -9,694 | -14,412 | -33,436 | -516 | -25,178 | **on** |
+| overhead | 0 | -34 | -2,185 | -705 | -23,092 | -20,242 | -260 | -8,473 | |
+| `SRCVREG=1` insts | 0 | -37,772 | -129,603 | -4,519 | -2,914 | -56,569 | +615 | -54,349 | **on** |
+| overhead | 0 | -4,012 | -144,483 | -11,086 | -246,155 | -113,940 | +13 | -38,793 | |
+| `REMATW=1` insts | +1 | +79,719 | -212,819 | +7,809 | +1,394 | +53,332 | -935 | +298,190 | opt-in |
+| overhead | +1 | -15,663 | -359,667 | -2,390 | +50,160 | -44,065 | -8,369 | +252,340 | |
+| `XBLOCK=1` insts | 0 | -13,310 | +5,097 | +225 | -28 | -38 | +644 | -30,749 | opt-in |
+| overhead | 0 | -1,822 | +44 | -23 | -18 | -10,724 | +20 | +39 | |
+| `MERGEDEPTH=1` insts | -6 | -10,369 | +632,706 | +50,155 | -86,616 | +15,726 | -110,179 | +50,399 | opt-in |
+| overhead | -5 | +6,592 | +594,435 | +17,318 | -82,939 | -18,554 | +8,147 | -1,350 | |
+| `MERGEDEPTH=2` insts | -2 | -23,195 | +1,194,178 | +48,031 | -95,819 | +22,196 | -117,576 | +28,831 | opt-in |
+| overhead | -5 | +4,402 | +1,182,460 | +18,395 | -89,967 | -12,074 | +4,385 | -13,100 | |
+
+- `POSTOPT=15` and `SRCVREG` are default on (commits "regalloc2:
+  PLIRON_RA2_POSTOPT default 15", "... SRCVREG default on"). SRCVREG's
+  rust-json +615 (0.001%) is outside the overhead classes (layout). With
+  SRCVREG on, block-parameter labels name instruction results, so the
+  checker's label check covers them.
+- `REMATW` halves the spill weight of rematerializable bundles: the
+  largest single overhead cut on pulldown (-360k) but protobuf +298k
+  instructions (`mov` +437k: the remat'd values push others into moves).
+  A candidate for a narrower rule (only when the bundle crosses no call,
+  or a smaller weight cut), not as is.
+- `XBLOCK` is too small to matter (largest win html -10.7k moves, which
+  layout eats) and loses 5k on pulldown.
+- `MERGEDEPTH` breaks pulldown-cmark (+0.63M / +1.19M; `mov` +0.17M /
+  +0.76M, `st` +0.29M) though it helps compression and json. The static
+  metric ranked it first (std -14%): std's number is dominated by
+  miniz's `decompress_with_limit`. Read static as a ranking aid only.
+- Native kernel timings (`bench/run.sh`) were not taken: the machine ran
+  at load 30-45 throughout (other agents), so timings would be noise; the
+  exact counts above are the evidence.
+
 ## Knobs
 
 Status: **on** = default on; **opt-in**; **eval** = under evaluation.
@@ -214,9 +255,9 @@ source, not `pliron-cfg`'s `DEFAULT_ON`.
 | `PLIRON_RA2_POSTOPT=<bits>` | regalloc2 `postopt.rs` | post-allocation cleanup: 1 redundant reloads, 2 reload as copy, 4 redundant spill stores, 8 dead spill stores | on (15) since 2026-11-17 |
 | `PLIRON_RA2_SRCVREG` | regalloc2 `moves.rs` | block-param moves carry the argument's vreg (constant args rematerialize) | on since 2026-11-17 |
 | `PLIRON_RA2_REHOME` | regalloc2 `rehome.rs` | a value's register in a join-only block follows the cheaper side | on (2) |
-| `PLIRON_RA2_XBLOCK=1` | regalloc2 `moves.rs` | redundant-move state survives a single-predecessor fallthrough | opt-in, eval |
-| `PLIRON_RA2_MERGEDEPTH=1..3` | regalloc2 `merge.rs` | merge blockparams of the deepest loops first | opt-in, eval |
-| `PLIRON_RA2_REMATW=1` | Cranelift `vcode.rs` | rematerializable bundles get half the spill weight | opt-in, eval |
+| `PLIRON_RA2_XBLOCK=1` | regalloc2 `moves.rs` | redundant-move state survives a single-predecessor fallthrough | opt-in (evaluated: pulldown +5k) |
+| `PLIRON_RA2_MERGEDEPTH=1..3` | regalloc2 `merge.rs` | merge blockparams of the deepest loops first | opt-in (evaluated: pulldown +0.6M..1.2M) |
+| `PLIRON_RA2_REMATW=1` | Cranelift `vcode.rs` | rematerializable bundles get half the spill weight | opt-in (evaluated: protobuf +298k) |
 | `PLIRON_REMAT`, `_STORE` | Cranelift `vcode.rs` | reloads of constants/addresses rematerialize; stores only remat reads die | on |
 | `PLIRON_RELOADPRE` (`_ROUNDS`), `PLIRON_RELOADCSE`, `PLIRON_SPILLCSE` | Cranelift `vcode.rs` | reload PRE into predecessors; per-block and cross-block reload CSE | on |
 | `PLIRON_EDITPAIR` | Cranelift `vcode.rs` | fuse adjacent spill/reload edits into pairs | on |
@@ -233,3 +274,14 @@ source, not `pliron-cfg`'s `DEFAULT_ON`.
   its parameter: not a miscompile (only instruction results
   rematerialize); the check now skips block-parameter labels.
   regalloc2 leg: 0 failures in the first 6,000 seeds under defaults.
+- 2026-11-17: the first held-out builds with `PLIRON_RA_CHECK=1` failed
+  on blake3's `derive_key` with `EditVRegMismatch`: the release dylib
+  predated the block-parameter skip above (only clif-check had been
+  rebuilt). Rebuilt, all eight programs are checker-clean. `clif-check`
+  gained `CLIF_CHECK_TRIPLE` (aarch64-unknown-linux-musl) for replaying
+  the held-out corpora on their own target.
+- 2026-11-17, first loop (12:07-13:44): 455 runs, 0 failures: 6.88M
+  regalloc2 seeds and 114 CLIF corpus runs (std, smoke, clcg, html
+  samples) under defaults, everything on, each knob alone at each value,
+  and random combinations. Restarted on the new defaults (POSTOPT=15,
+  SRCVREG on).
