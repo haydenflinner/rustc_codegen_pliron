@@ -182,6 +182,26 @@ time, memory, code size, stack frames) in ~20 min and writes
   IPC — so one run says whether a change removes work or only moves
   it. `--prof` adds inclusive/self per-function cycle deltas. Start
   here for any "is X faster" question on real programs.
+- `harness/placement.py heldout PROG|all --cand NAME:K=V,..` and
+  `harness/placement.py kernels FILTER|all --cand ...` — is a native
+  delta within what code placement alone does? (the native
+  `--perturb`). Builds K copies (`--copies`, default 4; 8 for a
+  verdict) of the default and of each candidate: copy i sets
+  `PLIRON_PLACE_PHASE=P_i` (vendored Cranelift, measurement aid: every
+  function starts P_i bytes past a 64-byte line, loop pads and constants
+  aligned for that address, the pad ahead of the symbol never runs) and,
+  for timing, is relinked under random function order i. Held-out:
+  callgrind exact counts per copy (aarch64-linux-musl, docker) with every
+  executed instruction classified from its encoding (`nop`, jump,
+  conditional branch, call, ret, load, store, other) and charged to its
+  ELF symbol, so a delta reads `+23.3k, of which nop -8.6k, load +52.9k`,
+  plus macOS cycles. Kernels: ns/op and exact instructions per op
+  (`(I(2N) - I(N))/N` under `/usr/bin/time -l`). A phase moves only
+  `nop`s (pulldown-cmark ±0.5%, `varint` ±5% per op), so the non-`nop`
+  delta is the candidate's real code; timing verdicts call a delta real
+  only when each side's median is outside the other's range. Prints the
+  load average: on a busy machine (other agents) the cycle ranges are
+  mostly noise; `--stat min` helps. Summaries in `target/placement/`.
 - `bench/heldout/run.py --pgo` — the profile loop for all eight
   programs, ours and LLVM's, with build-time totals; `tune.py PROG`
   searches the profile knobs for one program. `harness/pgofuzz.py`
