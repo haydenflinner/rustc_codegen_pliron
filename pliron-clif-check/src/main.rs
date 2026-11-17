@@ -897,6 +897,10 @@ struct CgRow {
     msg: String,
     /// `--vcode`: the allocated vcode with depth labels.
     vtext: String,
+    /// Register-to-register copies (`mov`/`fmov` between registers), plain
+    /// and loop-weighted: what coalescing and move resolution leave.
+    movs: usize,
+    wmov: u64,
 }
 
 /// Labels gain the CLIF loop depth: `block3: ; block7 depth=2` (a split
@@ -924,6 +928,22 @@ fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
         .cloned()
         .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_else(|| "non-string panic".into())
+}
+
+/// A register-to-register copy in aarch64 vcode text.
+fn is_reg_copy(t: &str) -> bool {
+    let (mn, ops) = t.split_once(' ').unwrap_or((t, ""));
+    if mn != "mov" && mn != "fmov" {
+        return false;
+    }
+    let ops: Vec<&str> = ops.split(',').map(str::trim).collect();
+    let reg = |o: &str| {
+        let o = o.split('.').next().unwrap_or(o);
+        let (c, n) = o.split_at(1.min(o.len()));
+        matches!(c, "x" | "w" | "d" | "s" | "q" | "v" | "h") && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+            || o == "fp" || o == "lr"
+    };
+    ops.len() == 2 && reg(ops[0]) && reg(ops[1])
 }
 
 /// The backend's Cranelift flags for aarch64-apple-darwin (`src/lib.rs`).
@@ -976,6 +996,10 @@ fn score_vcode(v: &str, row: &mut CgRow, spill_from: i64, depth_of: &dyn Fn(&str
         for t in insts {
             row.insts += 1;
             row.winsts += w;
+            if is_reg_copy(t) {
+                row.movs += 1;
+                row.wmov += w;
+            }
             if t.contains("[sp") && !t.contains("]!") && !t.contains("], #") {
                 row.stack += 1;
                 row.wstack += w;
@@ -1092,10 +1116,12 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
         "corpus": dir.display().to_string(),
         "insts": sum(|r| r.insts as u64), "stack": sum(|r| r.stack as u64),
         "winsts": sum(|r| r.winsts), "wstack": sum(|r| r.wstack), "wspill": sum(|r| r.wspill),
+        "movs": sum(|r| r.movs as u64), "wmov": sum(|r| r.wmov),
         "functions": rows.iter().map(|r| {
             let mut j = serde_json::json!({
                 "file": r.file, "status": r.status, "insts": r.insts, "stack": r.stack,
                 "winsts": r.winsts, "wstack": r.wstack, "slots": r.slots, "spills": r.spills, "wspill": r.wspill,
+                "movs": r.movs, "wmov": r.wmov,
             });
             if !r.msg.is_empty() {
                 j["msg"] = r.msg.chars().take(4000).collect::<String>().into();
@@ -1113,9 +1139,9 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
     }
     let bad = rows.iter().filter(|r| r.status != "ok").count();
     println!(
-        "codegen: {} fns ({bad} failed): insts {} stack {} | weighted insts {} stack {} -> {}",
+        "codegen: {} fns ({bad} failed): insts {} stack {} movs {} | weighted insts {} stack {} spill {} movs {} -> {}",
         rows.len(),
-        json["insts"], json["stack"], json["winsts"], json["wstack"],
+        json["insts"], json["stack"], json["movs"], json["winsts"], json["wstack"], json["wspill"], json["wmov"],
         out.display()
     );
     bad == 0

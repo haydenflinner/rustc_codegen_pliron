@@ -4430,6 +4430,14 @@
         (if-let (imm12_from_u64 imm12) (i64_cast_unsigned y))
         (add_imm $I64 x imm12))
 (rule 2 (amode_add x 0) x)
+;; PLIRON (`PLIRON_AMODENEG=1`): a negative offset whose negation fits
+;; 12 bits is a `sub` of the immediate, not `mov` of the constant + `add`
+;; (`base - 4 + index` byte loads in pulldown-cmark's escape loops).
+(rule 3 (amode_add x y)
+        (if-let imm12 (amode_neg_imm12 y))
+        (sub_imm $I64 x imm12))
+(decl pure partial amode_neg_imm12 (i32) Imm12)
+(extern constructor amode_neg_imm12 amode_neg_imm12)
 
 ;; Creates a `PairAMode` for the `Value` provided plus the `i32` constant
 ;; offset provided.

@@ -1472,6 +1472,16 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         SImm9::maybe_from_i64(off).is_some() || UImm12Scaled::maybe_from_i64(off, ty).is_some()
     }
 
+    /// PLIRON (`PLIRON_AMODENEG=1`): `-off` as an `Imm12` for a negative
+    /// `off`, so `amode_add` subtracts it instead of materializing it.
+    fn amode_neg_imm12(&mut self, off: i32) -> Option<Imm12> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if off >= 0 || !*ON.get_or_init(|| std::env::var("PLIRON_AMODENEG").as_deref() == Ok("1")) {
+            return None;
+        }
+        Imm12::maybe_from_u64(i64::from(off).unsigned_abs())
+    }
+
     fn uimm12_scaled_from_i64(&mut self, val: i64, ty: Type) -> Option<UImm12Scaled> {
         UImm12Scaled::maybe_from_i64(val, ty)
     }

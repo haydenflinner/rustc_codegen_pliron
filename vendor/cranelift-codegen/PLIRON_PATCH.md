@@ -2014,3 +2014,13 @@ on `offset + phase`), and `vendor/cranelift-object`'s
 default's laid out as if `phase` bytes preceded it: loop pads and line
 crossings change, nothing else. `harness/placement.py` builds copies
 under several phases to measure what placement alone moves.
+
+## `PLIRON_AMODENEG=1` (opt-in): negative amode offsets as `sub` (2026-11-17)
+
+`src/isa/aarch64/inst.isle` (`amode_add` rule 3, `amode_neg_imm12`),
+`src/isa/aarch64/lower/isle.rs` (`amode_neg_imm12`): a reg+reg access
+with a constant offset adds the offset to the base first. A positive
+offset was `add x, x, #imm`; a negative one was `mov xK, #-imm` + `add`,
+two instructions where `sub x, x, #imm` is one (pulldown-cmark's
+escape loops `ldr w1, [x26 - 4 + x25]`: about 330k executed `mov`s).
+Static, html corpus: -531 instructions, loop-weighted -8.6k.
