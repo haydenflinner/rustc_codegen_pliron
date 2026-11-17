@@ -353,6 +353,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // kernels: `k_sieve` loses two dead stores, timings unchanged
     // (PARITY item 7). Stanza `sretnosync`. `=0` off.
     "PLIRON_SROA_SRETNOSYNC",
+    // 2026-11-17 (PARITY item 9): `unroll2`, `unroll` again after the
+    // first `loadfwd`/`egraph`. Exact counts: html-rewriter -179k
+    // (-0.18%), pulldown-cmark -11.9k, regex and compression within noise,
+    // the others unchanged; native kernel `varint_postcard` -0.25%; the
+    // wasm kernel module is byte-identical. `=0` off.
+    "PLIRON_UNROLL2",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
