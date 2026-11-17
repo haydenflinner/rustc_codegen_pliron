@@ -826,19 +826,35 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    the top functions by self time and what our code does worse there
    (V8 machine code via `harness/v8/mcode.sh`-style listings), fix the
    largest cause.
-3. **`dims_page` 1.2x** (diffuse in the profile): same method; the
+3. **Inline nalgebra's small products by their simplified size.** After
+   item 2's knobs, rapier2d's `Matrix<2,3> * Matrix<3,2>` (`Mul::mul`)
+   compiles to 33 CLIF instructions (12 loads, 8 `fmul`, 4 `fadd`), but
+   the IR inliner scores its unsimplified body: `reject (score) n=2294
+   t=512` (`PLIRON_REMARKS`; the IR is 765 `br`, 431 lifetime markers,
+   225 allocas, 163 loads, 160 stores, 12 `fmul`). LLVM inlines the
+   simplified body, then unrolls the `for p`/`for q` loops of
+   `SoftFemSystem::assemble_operator` around the four products and keeps
+   everything in registers. Ours stays four calls in loops (waffle
+   inlines them afterwards, too late for the caller's passes):
+   `assemble_operator` self time 328 ms against LLVM's 173 on the
+   rapier2d driver (`$TMPDIR/astdrv`, 1.37x with item 2's knobs).
+   `PLIRON_INLINE=2400` globally is slower (assemble 430 ms). Ideas: a
+   cost that does not count free ops (`inline_cost::spec_cost` is
+   native-only), allocas whose loads/stores SROA removes, or constant-trip
+   loops at their unrolled size; check hmget/tokenize (no kernel may lose).
+4. **`dims_page` 1.2x** (in progress 2026-11-17; diffuse in the profile): same method; the
    self-time join first.
-4. **`contains_rng` +9.5% on wasm** (an honest gap since the `black_box`
+5. **`contains_rng` +9.5% on wasm** (an honest gap since the `black_box`
    fix: its bounds are no longer constants). Compare with LLVM's wasm and
    TurboFan code for the loop.
-5. **N7, the default hmget +5% / 102 vs 96 TurboFan instructions per
+6. **N7, the default hmget +5% / 102 vs 96 TurboFan instructions per
    lookup**: `invparam` splits the lookup loop into two headers (the
    memory base reloads at both), the hash expression has two extra
    xor/rotate pairs, `k + (round & 1)` is recomputed per lookup.
-6. **N9 #3 and #4**, constant rematerialization (up to 824 KB on dsa)
+7. **N9 #3 and #4**, constant rematerialization (up to 824 KB on dsa)
    and values parked in locals across block openers (0.3-0.6 MB):
    waffle `treeify.rs::is_remat`, `stackify.rs`.
-7. **vm_loop / vm_mandelbrot +5-10%** (the Mimas interpreter's dispatch
+8. **vm_loop / vm_mandelbrot +5-10%** (the Mimas interpreter's dispatch
    loop): profile `step_one`. Looked at 2026-11-17 on the fad51e94
    packages (dsa HEAD does not build, so there is no dsa cross-check
    yet). Retired instructions per call (`--loop=N` minus `--loop=2`):
@@ -859,7 +875,7 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `--perturb=4`), and on std 60 of 4,925 functions (`xcorpus`: no
    mismatch on wasm or std). Open: what makes `step_one`'s frame
    larger, and the byte tag loads.
-8. **Native**: the held-out programs (`bench/heldout/run.py`, 1.08x
+9. **Native**: the held-out programs (`bench/heldout/run.py`, 1.08x
    on 2026-11-09) with tonight's wasm-only defaults tried on native one
    at a time (`PLIRON_LICM_GTE=1`, `PLIRON_LICM_SLOTPROV=1`,
    `PLIRON_INLINE_RECX=1`): exact instruction counts with
