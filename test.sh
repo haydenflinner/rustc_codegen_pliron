@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std mcrdwrap sretnosync shrinkwrap
+#   o0std mcrdwrap sretnosync shrinkwrap regionsplit
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -928,6 +928,22 @@ t_shrinkwrap() {
   PLIRON_SHRINKWRAP=1 PLIRON_SHRINKWRAP_LEAF=1 rustc $BE --edition 2021 -O tests/shrinkwrap/main.rs -o $out/shrinkwrap$exe && [[ "$($out/shrinkwrap$exe)" == $want ]]
 }
 
+t_regionsplit() {
+  # PLIRON_RA2_REGION (opt-in, vendored regalloc2): min-cut region
+  # splitting. Values live through a function and used in one loop, live
+  # across a call-heavy loop elsewhere (brotli's BrotliHistogramCombine),
+  # and entry-to-exit values across calls (html-rewriter's build_state).
+  # Output must match stock rustc in every mode, and the regalloc2 checker
+  # must accept every function.
+  rustc --edition 2021 -O tests/regionsplit/main.rs -o $out/regionsplit-stock$exe || return 1
+  local want m
+  want=$($out/regionsplit-stock$exe) || return 1
+  for m in 0 1 2; do
+    PLIRON_RA2_REGION=$m PLIRON_RA_CHECK=1 rustc $BE --edition 2021 -O tests/regionsplit/main.rs -o $out/regionsplit$m$exe || return 1
+    [[ "$($out/regionsplit$m$exe)" == "$want" ]] || { echo "regionsplit: output differs (PLIRON_RA2_REGION=$m)" >&2; return 1; }
+  done
+}
+
 # r[verify clif.vendor.noret]
 t_noret() {
   # PLIRON_NORETTRAP (default on): no trap after a call that cannot return
@@ -1539,6 +1555,7 @@ want narrowext && t_narrowext
 want cmp3 && t_cmp3
 want sretnosync && t_sretnosync
 want shrinkwrap && t_shrinkwrap
+want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern

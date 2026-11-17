@@ -170,6 +170,18 @@ pub(crate) fn region_on() -> bool {
     false
 }
 
+/// PLIRON: the `PLIRON_RA2_REGION` mode: 1 block-local stack pieces, 2
+/// stack components of several blocks requeued whole.
+pub(crate) fn region_mode() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_REGION", &C, 0.0) as u32
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
 /// PLIRON: `PLIRON_RA2_REGION_MAX` (default 4): region splits per
 /// spillset (each must shrink the register part; this bounds the work).
 pub(crate) fn region_max() -> u8 {

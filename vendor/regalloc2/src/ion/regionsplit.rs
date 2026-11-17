@@ -384,7 +384,34 @@ impl<'a, F: Function> Env<'a, F> {
             explain!("  region {:?}: best {cost} not below {} x all-stack {total_s}", bundle, crate::region_ratio());
             return false;
         }
-        self.apply_region_split(bundle, preg, &infos, &in_r);
+        // Stack components: S blocks joined by edges the bundle is live
+        // across (mode 2). A component of several blocks with uses is
+        // requeued as one bundle, so it can still take another register
+        // as a whole (a loop the chosen register is busy in).
+        let n = infos.len();
+        let mut comp: Vec<u32> = (0..n as u32).collect();
+        if crate::region_mode() >= 2 {
+            fn root(c: &mut [u32], mut x: u32) -> u32 {
+                while c[x as usize] != x {
+                    let p = c[c[x as usize] as usize];
+                    c[x as usize] = p;
+                    x = p;
+                }
+                x
+            }
+            for &(i, j, _) in &edges {
+                if !in_r[i as usize] && !in_r[j as usize] {
+                    let (a, b) = (root(&mut comp, i), root(&mut comp, j));
+                    if a != b {
+                        comp[a.max(b) as usize] = a.min(b);
+                    }
+                }
+            }
+            for k in 0..n as u32 {
+                comp[k as usize] = root(&mut comp, k);
+            }
+        }
+        self.apply_region_split(bundle, preg, &infos, &in_r, &comp);
         true
     }
 
@@ -394,6 +421,7 @@ impl<'a, F: Function> Env<'a, F> {
         preg: PReg,
         infos: &[BlockInfo],
         in_r: &[bool],
+        comp: &[u32],
     ) {
         let spillset = self.ctx.bundles[bundle].spillset;
         self.ctx.spillsets[spillset].region_count += 1;
@@ -469,7 +497,38 @@ impl<'a, F: Function> Env<'a, F> {
             .get_or_create_spill_bundle(bundle, /* create_if_absent = */ true)
             .unwrap();
         let mut locals: Vec<LiveBundleIndex> = Vec::new();
+        // Per component root: blocks, register uses, and its bundle.
+        let n = infos.len();
+        let mut csize = vec![0u32; n];
+        let mut cuses = vec![0u32; n];
+        for k in 0..n {
+            if !in_r[k] {
+                csize[comp[k] as usize] += 1;
+                cuses[comp[k] as usize] += infos[k].reg_uses;
+            }
+        }
+        let mut cbundle: Vec<LiveBundleIndex> = vec![LiveBundleIndex::invalid(); n];
+        let block_of = |this: &Self, e: &LiveRangeListEntry| -> usize {
+            let b = this.ctx.cfginfo.insn_block[e.range.from.inst().index()].index() as u32;
+            infos.binary_search_by_key(&b, |i| i.block).unwrap()
+        };
         for entry in stack_part {
+            let k = block_of(self, &entry);
+            let c = comp[k] as usize;
+            if csize[c] > 1 && cuses[c] > 0 {
+                if cbundle[c].is_invalid() {
+                    let piece = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
+                    self.ctx.bundles[piece].spillset = spillset;
+                    self.ctx.bundles[piece].cold_split = self.ctx.bundles[bundle].cold_split;
+                    self.ctx.bundles[piece].region_blocks = infos.len() as u32;
+                    cbundle[c] = piece;
+                    locals.push(piece);
+                }
+                let piece = cbundle[c];
+                self.ctx.ranges[entry.index].bundle = piece;
+                self.ctx.bundles[piece].ranges.push(entry);
+                continue;
+            }
             let lr = entry.index;
             let uses = &self.ctx.ranges[lr].uses;
             let first = uses
