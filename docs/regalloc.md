@@ -134,6 +134,39 @@ One classifier (aarch64) for both compilers and both modes:
 recorded from the held-out build); copy it from another checkout or
 record it with `PLIRON_CORPUS`.
 
+### Dynamic baseline (main at d74c3554 + the harness, 2026-11-17)
+
+Executed instructions, callgrind, aarch64-unknown-linux-musl, both sides
+built with `PLIRON_RA_CHECK=1 PLIRON_RELOADPRE_CHECK=1` (all eight
+checker-clean). Class cells: ours/LLVM. "Share of gap" is our excess
+overhead as a share of the whole executed-instruction gap.
+`target/rastat/dyn-base.json` in the agent's worktree holds the
+per-function numbers.
+
+| program | insts LLVM | insts ours | overhead LLVM | overhead ours | ours/LLVM | share of gap | st | ld | mov | csr |
+|---|---|---|---|---|---|---|---|---|---|---|
+| blake3-scalar | 46.6M | 49.0M | 3.98M | 5.03M | 1.265 | 44% | 0.64/0.59M | 3.31/1.81M | 0.46/1.11M | 0.62/0.47M |
+| blind-sig | 31.5M | 34.7M | 0.81M | 1.29M | 1.594 | 15% | 0.06/0.04M | 0.22/0.09M | 0.75/0.46M | 0.25/0.22M |
+| pulldown-cmark | 45.3M | 51.9M | 6.84M | 9.80M | 1.434 | 45% | 1.58/0.98M | 1.86/1.64M | 3.40/1.82M | 2.96/2.40M |
+| regex | 46.0M | 50.5M | 3.59M | 4.54M | 1.265 | 21% | 1.09/0.98M | 0.98/0.76M | 1.90/1.27M | 0.57/0.58M |
+| rust-compression | 39.7M | 44.1M | 2.21M | 4.42M | 1.999 | 51% | 0.68/0.15M | 2.03/1.31M | 1.58/0.60M | 0.13/0.15M |
+| rust-html-rewriter | 85.8M | 101.5M | 12.16M | 16.87M | 1.388 | 30% | 2.59/1.47M | 1.93/1.21M | 6.40/4.14M | 5.96/5.34M |
+| rust-json | 45.6M | 51.5M | 3.20M | 4.13M | 1.291 | 16% | 0.23/0.17M | 0.58/0.48M | 1.82/1.04M | 1.50/1.51M |
+| rust-protobuf | 60.8M | 65.3M | 7.28M | 8.94M | 1.228 | 37% | 1.18/0.61M | 0.87/0.40M | 3.60/3.06M | 3.29/3.21M |
+
+Register moves are the largest excess class in five programs. The
+largest excess function per program (where, not why: inlining differs,
+so a 0 on LLVM's side often means LLVM inlined it):
+
+- blake3: `portable::compress_in_place` +0.82M (ld 3.19M/1.80M; LLVM uses more moves, 0.93M/0.21M)
+- blind-sig: `monty::montgomery` +0.15M (ld 0.11M/0)
+- pulldown-cmark: `FirstPass::parse_block` +2.45M (inlined by LLVM)
+- regex: `dfa::Fsm::follow_epsilons` +0.66M (st 0.22M/3k, mov 0.45M/3k)
+- rust-compression: `BrotliCreateHqZopfliBackwardReferences` +1.04M (st 0.39M/28k, mov 0.55M/0.11M)
+- html-rewriter: a `transform_stream::dispatcher` closure +0.50M (mov + csr, inlined by LLVM)
+- rust-json: a serde `Deserialize` for `Post` +0.41M (inlined by LLVM)
+- rust-protobuf: `prost::encoding::string::encode` +1.02M (csr 0.42M, mov 0.38M; inlined by LLVM)
+
 ### Static baseline (main at d74c3554 + the harness, 2026-11-17)
 
 Weighted (8^depth) counts; static counts in parentheses.
