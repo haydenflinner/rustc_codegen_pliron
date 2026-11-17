@@ -214,7 +214,13 @@ Open on this program:
   times (memchr, memcmp, `CharSearcher`: `PLIRON_WASM_SMALLFN=120`,
   opt-in, keeps them rolled: 340 and 116 bytes, a string-search driver
   1.33x -> 1.14x), and inlining into small callers (the drop glue,
-  `Parser::at`): open. `harness/dsa/v8inl.py LLVM.wasm OURS.wasm
+  `Parser::at`: `PLIRON_INLINE_V8CAP=90`, opt-in, refuses an inline that
+  takes a small caller with several call sites and few calls of its own
+  past about 115 lean ops, V8's 500 bytes; the driver with both knobs
+  1.109 -> 1.042, V8CAP alone 1.324 -> 1.343; kernels geomean 0.927 both
+  ways; rapier2d's object: 15 functions drop under 500 bytes, 19 cross
+  over, +2.5% bytes, so the rule trades as well as it fixes).
+  `harness/dsa/v8inl.py LLVM.wasm OURS.wasm
   [profiles]` lists the class. The dsa row is
   pending (the dsa tree did not build on 11-17).
 - Compile memory: the default feature set with polars and typst needs
