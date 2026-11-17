@@ -23,7 +23,8 @@ after the IR passes.
 
 A corpus under a `wasm-*` name is replayed as wasm32 (`PLIRON_CLIF_WASM=1`),
 as the gate does. Defaults: the std corpus of the main checkout, every 4th
-function. Uses target/debug/clif-check (`PLIRON_PROFILE=fast`: target/fast).
+function. Uses target/debug/clif-check (`PLIRON_PROFILE=fast`: target/fast;
+`CLIF_CHECK=<path>` names another binary).
 """
 import argparse
 import json
@@ -116,6 +117,8 @@ def main():
         return 2
     prof = os.environ.get("PLIRON_PROFILE", "debug")
     clif_check = ROOT / "target" / ("fast" if prof == "fast" else "debug") / "clif-check"
+    # `CLIF_CHECK=<path>`: a copy, so a rebuild can run while a sweep does.
+    clif_check = Path(os.environ.get("CLIF_CHECK", clif_check))
     if not clif_check.exists():
         print(f"offswitch: build clif-check first ({clif_check})", file=sys.stderr)
         return 2
