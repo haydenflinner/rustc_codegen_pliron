@@ -868,6 +868,20 @@ pub struct Adj {
     pub callers_of: FxHashMap<String, Vec<String>>,
     /// Symbols whose address is referenced outside calls.
     taken: FxHashSet<String>,
+    /// `PLIRON_INLINE_XCGU_SOLO=1` (default off): how many of
+    /// `callers_of[c]`'s entries are cross-CGU copies (`xcgu_made`),
+    /// which `callers` leaves out. A copy is speculative: it is inlined
+    /// somewhere (its calls then count in that caller, `Adj::inlined`),
+    /// dies, or goes back to its home definition (`home_copies`). Counted,
+    /// it takes the single-caller inline and the `fanin` room from the
+    /// CGU's own functions: regex with `PLIRON_XCGU_SIZE=100` copied
+    /// `HashMap<State, u32>::insert` into the CGU of `Fsm::cached_state`;
+    /// `hash_one` had two callers there, was not inlined into
+    /// `HashMap::get` and `StateMap::get_ptr` called it, and
+    /// `drop_glue::<State>` went from 2 callers to 19 and hit `fanin`.
+    /// `callers_of` itself stays exact (`PLIRON_DEADFREE` erases a body
+    /// only when it is empty).
+    solo: Option<FxHashMap<String, usize>>,
 }
 
 impl Adj {
@@ -888,9 +902,39 @@ impl Adj {
                 }
             }
         }
+        let solo = crate::env_is("PLIRON_INLINE_XCGU_SOLO", "1").then(|| {
+            let mut m: FxHashMap<String, usize> = FxHashMap::default();
+            for (c, v) in &callers_of {
+                let k = v.iter().filter(|x| st.xcgu_made.contains(x.as_str())).count();
+                if k > 0 {
+                    m.insert(c.clone(), k);
+                }
+            }
+            m
+        });
         Adj {
             callers_of,
             taken: crate::address_taken(ctx, st),
+            solo,
+        }
+    }
+
+    /// Callers of `c` that count for the single-caller and `fanin` rules:
+    /// every call site, less those in cross-CGU copies under `solo`.
+    pub fn callers(&self, c: &str) -> Option<usize> {
+        let v = self.callers_of.get(c)?;
+        let k = self.solo.as_ref().and_then(|m| m.get(c)).copied().unwrap_or(0);
+        Some(v.len().saturating_sub(k))
+    }
+
+    /// Bookkeeping for `solo`: `caller`'s entry under `c` was added (`add`)
+    /// or removed.
+    fn solo_note(&mut self, st: &State, caller: &str, c: &str, add: bool) {
+        if let Some(m) = self.solo.as_mut()
+            && st.xcgu_made.contains(caller)
+        {
+            let e = m.entry(c.to_string()).or_default();
+            *e = if add { *e + 1 } else { e.saturating_sub(1) };
         }
     }
 
@@ -898,15 +942,41 @@ impl Adj {
     /// calls now live in `sym` (its out-of-line copy still exists — its
     /// calls stay).
     fn inlined(&mut self, ctx: &Context, st: &State, sym: &str, cs: &str) {
+        let mut removed = false;
         if let Some(v) = self.callers_of.get_mut(cs) {
             if let Some(p) = v.iter().position(|x| x == sym) {
                 v.swap_remove(p);
+                removed = true;
             }
         }
+        if removed {
+            self.solo_note(st, sym, cs, false);
+        }
         for m in callees(ctx, st, cs) {
+            self.solo_note(st, sym, &m, true);
             self.callers_of.entry(m).or_default().push(sym.to_string());
         }
     }
+}
+
+/// `PLIRON_INLINE_XCGU_LATE=1`: the cross-CGU copies the first round left
+/// alone that something still calls, for the second round.
+pub fn late_copies(ctx: &Context, st: &State, adj: &Option<Adj>) -> FxHashSet<String> {
+    if !crate::env_is("PLIRON_INLINE_XCGU_LATE", "1") {
+        return FxHashSet::default();
+    }
+    st.xcgu_made
+        .iter()
+        .filter(|s| {
+            st.funcs.get(s.as_str()).is_some_and(|f| has_body(ctx, f.op))
+                && !st.dead_fns.contains(s.as_str())
+                && !st.dead_unopt.contains(s.as_str())
+                && adj
+                    .as_ref()
+                    .is_none_or(|a| a.taken.contains(s.as_str()) || a.callers_of.get(s.as_str()).is_some_and(|v| !v.is_empty()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// What a `run` changed, for driving the next round's caller filter.
@@ -1316,7 +1386,7 @@ pub fn run(
             .filter(|(n, f)| {
                 f.linkage == Linkage::Local
                     && !adj.taken.contains(n.as_str())
-                    && adj.callers_of.get(n.as_str()).is_some_and(|v| v.len() == 1)
+                    && adj.callers(n.as_str()) == Some(1)
             })
             .map(|(n, _)| n.clone())
             .collect()
@@ -1647,9 +1717,21 @@ pub fn run(
     let mut tagcache: FxHashMap<Ptr<Operation>, CalleeTags> = FxHashMap::default();
     // `PLIRON_DEADFREE`: ops freed since the last side-table purge, and in all.
     let (mut freed_ops, mut freed_total) = (0usize, 0usize);
+    // `PLIRON_INLINE_XCGU_LATE=1` (default off): the first full round leaves
+    // cross-CGU copies (`xcgu_made`) as they arrived, so a caller here takes
+    // a copy small and then decides on the copy's callees with its own
+    // budget; `late_copies` hands the copies still called to the second
+    // round. Bottom-up, a copy first takes its own callees and then is too
+    // big for its callers: blind-sig with `PLIRON_XCGU_SIZE=100` copied
+    // `SmallVec::extend` next to `from_iter`, `from_iter` grew from 57 to
+    // 974 ops by inlining it and stayed a call in `clone`, `add`, `div_rem`.
+    let late = !always_only
+        && only.is_none()
+        && callers.is_none()
+        && crate::env_is("PLIRON_INLINE_XCGU_LATE", "1");
     for sym in order {
         let caller = st.funcs[&sym].op;
-        if st.opt_skip.contains(&caller) {
+        if st.opt_skip.contains(&caller) || (late && st.xcgu_made.contains(sym.as_str())) {
             continue;
         }
         let mut size: usize = blocks_iter(ctx, caller)
@@ -1996,9 +2078,9 @@ pub fn run(
                             && fanin > 0
                             && adj
                                 .as_ref()
-                                .and_then(|a| a.callers_of.get(cs.as_str()))
-                                .is_some_and(|v| {
-                                    sn.saturating_mul(v.len()) <= t.saturating_mul(fanin)
+                                .and_then(|a| a.callers(cs.as_str()))
+                                .is_some_and(|n| {
+                                    sn.saturating_mul(n) <= t.saturating_mul(fanin)
                                 });
                         if (leafish || warm_leaf)
                             && loops
@@ -2199,8 +2281,8 @@ pub fn run(
                         && !f.always_inline
                         && adj
                             .as_ref()
-                            .and_then(|a| a.callers_of.get(cs.as_str()))
-                            .is_some_and(|v| sn.saturating_mul(v.len()) > t.saturating_mul(fanin))
+                            .and_then(|a| a.callers(cs.as_str()))
+                            .is_some_and(|n| sn.saturating_mul(n) > t.saturating_mul(fanin))
                         && !loops
                             .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                             .contains(&b)
@@ -2270,7 +2352,7 @@ pub fn run(
                                 if lean_n == usize::MAX { -1 } else { lean_n as i64 },
                                 single.contains(cs), f.linkage == Linkage::Local,
                                 adj.as_ref().is_some_and(|a| a.taken.contains(cs.as_str())),
-                                adj.as_ref().and_then(|a| a.callers_of.get(cs.as_str())).map_or(0, |v| v.len()),
+                                adj.as_ref().and_then(|a| a.callers(cs.as_str())).unwrap_or(0),
                                 rec_caller, free_used.contains(cs.as_str())
                             )
                         };
@@ -2334,6 +2416,7 @@ pub fn run(
                                 && let Some(p) = v.iter().position(|x| *x == c)
                             {
                                 v.swap_remove(p);
+                                a.solo_note(st, &c, &m, false);
                             }
                             work.push(m);
                         }

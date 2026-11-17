@@ -553,6 +553,11 @@ pub struct State {
     /// `predefine_fn` uses this set to promote only a home definition,
     /// never a duplicate (`xcgu::promoted`).
     pub xcgu_extra: SymSet,
+    /// The `xcgu_extra` entries that are copies of another CGU's body
+    /// (`xcgu::copies`), without this CGU's own non-owner mono items:
+    /// the speculative bodies `PLIRON_INLINE_XCGU_SOLO` and
+    /// `PLIRON_INLINE_XCGU_LATE` treat apart.
+    pub xcgu_made: SymSet,
     /// `PLIRON_XCGUFN_KILL=1`: `dead_fns` may strip `xcgu_copies` entries —
     /// the default exemption exists because copy-to-copy refs can evade
     /// `direct_callee`.

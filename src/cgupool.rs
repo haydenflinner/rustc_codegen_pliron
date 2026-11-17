@@ -1160,8 +1160,10 @@ pub(crate) fn iropt_head(
     // Incremental: rescore only the callers round 1 inlined into, plus
     // callers of callees that lost a callsite (a now-single callee can
     // newly inline free there).
-    if pass_enabled("PLIRON_INLINE_ITER") && !d1.callers.is_empty() {
+    let late = inline::late_copies(ctx, st, &adj);
+    if pass_enabled("PLIRON_INLINE_ITER") && !(d1.callers.is_empty() && late.is_empty()) {
         let mut touched = d1.callers;
+        touched.extend(late);
         if let Some(a) = &adj {
             for c in &d1.callees {
                 if let Some(v) = a.callers_of.get(c) {

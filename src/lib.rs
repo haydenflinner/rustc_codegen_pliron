@@ -1612,6 +1612,10 @@ fn module_codegen(
             .borrow_mut()
             .xcgu_extra
             .insert(tcx.symbol_name(inst).name.to_string());
+        cx.st
+            .borrow_mut()
+            .xcgu_made
+            .insert(tcx.symbol_name(inst).name.to_string());
         rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(
             &mut cx,
             cgu_name.as_str(),
