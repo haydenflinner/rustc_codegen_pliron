@@ -36,6 +36,13 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-17, PARITY item 8: an integer load whose every use reads only
+    // its low bytes loads that width (`i32.load8_u` instead of `i32.load` +
+    // mask on wasm, `ldrb` on native). Native held-out exact counts:
+    // pulldown-cmark -149.0k (-0.28%), rust-html-rewriter -144.8k, rust-
+    // protobuf -61.2k, regex -13.0k, none worse; wasm kernels 4 functions,
+    // nbody unchanged under --perturb=4. `PLIRON_LDNARROW=0` off.
+    "PLIRON_LDNARROW",
     // 2026-11-17: memcpyopt redirects writers spread over branch arms that
     // together write every byte on every route into the copy. Quiet-machine
     // wasm kernels geomean 0.929 -> 0.917 against LLVM, no kernel worse than
