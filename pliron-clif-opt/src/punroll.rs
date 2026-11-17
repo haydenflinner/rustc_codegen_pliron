@@ -1568,6 +1568,15 @@ fn counted_wasm_fnmax() -> Option<usize> {
     *M
 }
 
+/// `PLIRON_PUNROLL_COUNTED_WASM_FNMIN=N`: the `COUNTED_WASM` rule not in
+/// functions of fewer than N instructions (see `run_loop`).
+fn counted_wasm_fnmin() -> Option<usize> {
+    static M: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        pliron_cfg::env_get("PLIRON_PUNROLL_COUNTED_WASM_FNMIN").and_then(|s| s.parse().ok()).filter(|&m| m > 0)
+    });
+    *M
+}
+
 /// `PLIRON_PUNROLL_COUNTED_WASM_NOSTORE=1`: the `COUNTED_WASM` rule only
 /// for loops without stores (see `run_loop`).
 fn nostore_on() -> bool {
@@ -2623,6 +2632,18 @@ fn run_loop(
             }
             if counted_wasm_fnmax().is_some_and(|m| ni > m) {
                 bail!("counted loop of unknown length in a big function");
+            }
+            // `PLIRON_PUNROLL_COUNTED_WASM_FNMIN=N` (opt-in): nor in
+            // functions of fewer than N laid-out instructions. A small
+            // leaf is a callee V8 inlines only up to 500 body bytes: the
+            // unrolled bignum `add`/`sub` (596/586 bytes, rolled 213/193,
+            // LLVM's 358/331) stay calls, 1.6x LLVM's time on a loop of
+            // `Big32x40` subtractions, 0.94x rolled.
+            if let Some(m) = counted_wasm_fnmin() {
+                let laid: usize = func.layout.blocks().map(|b| func.layout.block_insts(b).count()).sum();
+                if laid < m {
+                    bail!("counted loop of unknown length in a small function");
+                }
             }
             // `PLIRON_PUNROLL_PEELFIRST=1`: short trips keep the peel the
             // rolled loop would have had (`run` peels, then unrolls what
