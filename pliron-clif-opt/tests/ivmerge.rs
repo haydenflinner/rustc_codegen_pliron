@@ -26,11 +26,13 @@ const AARCH64: Amode = Amode {
     reg_reg: true,
     reg_reg_disp: false,
     neg_off: true,
+    post_index: true,
 };
 const WASM: Amode = Amode {
     reg_reg: false,
     reg_reg_disp: false,
     neg_off: false,
+    post_index: false,
 };
 
 fn count(f: &Function, op: Opcode) -> usize {
@@ -328,4 +330,44 @@ fn wasm_keeps_offsets_nonnegative() {
     run(&mut g, &mut Analysis::default(), AARCH64);
     assert!(mem_offsets(&g).contains(&-4), "{}", g.display());
     same(&before, &f);
+}
+
+/// `dst[i] = f(src[i])` after `punroll`'s scalar tail: `dst` steps by one
+/// next to a counter that steps by one. On aarch64 the store at `[dst]`
+/// steps `dst` for free (post-index), so rebasing `dst` onto the counter
+/// saves nothing (html-rewriter's `to_ascii_lowercase` copy lost 7%); on
+/// wasm the dropped step is a real `i32.add`.
+const COPY: &str = "function %copy(i64, i64, i64) {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = iconst.i64 0
+    v4 = iadd v1, v3
+    jump block1(v0, v3, v4)
+
+block1(v10: i64, v11: i64, v12: i64):
+    v13 = uload8.i32 notrap v10
+    v14 = iconst.i32 32
+    v15 = bor v13, v14
+    istore8 notrap v15, v12
+    v16 = iconst.i64 1
+    v17 = iadd v10, v16
+    v18 = iadd v11, v16
+    v19 = iadd v12, v16
+    v20 = icmp ult v18, v2
+    brif v20, block1(v17, v18, v19), block2
+
+block2:
+    return
+}";
+
+#[test]
+fn post_indexed_pointer_stays_on_aarch64() {
+    knob();
+    let before = parse(COPY);
+    let mut f = before.clone();
+    run(&mut f, &mut Analysis::default(), AARCH64);
+    assert_eq!(params_of(&f, "block1"), 3, "{}", f.display());
+    let mut g = before.clone();
+    run(&mut g, &mut Analysis::default(), WASM);
+    assert!(params_of(&g, "block1") < 3, "{}", g.display());
+    same(&before, &g);
 }

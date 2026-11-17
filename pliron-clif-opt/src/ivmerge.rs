@@ -91,6 +91,8 @@ pub struct Amode {
     pub reg_reg_disp: bool,
     /// A load/store offset may be negative (not wasm).
     pub neg_off: bool,
+    /// `[p]` with a post-indexed step of `p` is one instruction (aarch64).
+    pub post_index: bool,
 }
 
 impl Amode {
@@ -99,6 +101,7 @@ impl Amode {
             reg_reg: t.amode_scale(),
             reg_reg_disp: t.is_x64(),
             neg_off: t.neg_mem_offset(),
+            post_index: t.post_index(),
         }
     }
 }
@@ -488,6 +491,49 @@ impl Ctx<'_, '_> {
         Some((out, cost))
     }
 
+    /// Dying steps `p + c` (|c| small) of members accessed at `[p]`, which
+    /// a post-indexed access performs for free.
+    fn free_steps(&self, members: &[Member], params: &[Value], dead: &FxHashSet<Inst>) -> usize {
+        if !self.am.post_index {
+            return 0;
+        }
+        let func = self.func;
+        let mut n = 0;
+        for m in members {
+            let p = params[m.idx];
+            let at_p = m.uses.iter().any(|u| {
+                matches!(*u, Use::Mem(ui, _) if matches!(
+                    func.dfg.insts[ui],
+                    InstructionData::Load { offset, .. } | InstructionData::Store { offset, .. }
+                        if i32::from(offset) == 0
+                ))
+            });
+            if !at_p {
+                continue;
+            }
+            n += dead
+                .iter()
+                .filter(|&&i| match func.dfg.insts[i] {
+                    InstructionData::Binary {
+                        opcode: Opcode::Iadd,
+                        args,
+                    } => {
+                        let (a, b) = (
+                            func.dfg.resolve_aliases(args[0]),
+                            func.dfg.resolve_aliases(args[1]),
+                        );
+                        let small = |v: Value| {
+                            self.cx.iconst(func, v).is_some_and(|k| (-256..256).contains(&k))
+                        };
+                        (a == p && small(b)) || (b == p && small(a))
+                    }
+                    _ => false,
+                })
+                .count();
+        }
+        n
+    }
+
     /// In-loop instructions a rewritten address costs.
     fn mem_cost(&self, leaves: bool, sub_only: bool, off: i32) -> usize {
         if !leaves || (!sub_only && (self.am.reg_reg_disp || (self.am.reg_reg && off == 0))) {
@@ -689,7 +735,13 @@ impl Ctx<'_, '_> {
                     cost += c;
                     members.push(Member { idx: m, d, uses });
                 }
-                (cost <= removed)
+                // With post-indexing, a dropped pointer's small constant
+                // step rides on its `[p]` access for free: no saving, and
+                // then a tie loses (the rebased access costs a copy where
+                // the post-indexed one did not), so it must be a win.
+                let free = self.free_steps(&members, &params, &dead);
+                let removed = removed.saturating_sub(free);
+                (cost < removed || (cost == removed && free == 0))
                     .then(|| (removed as isize - cost as isize, ClassPlan { root: rho, members }))
             };
             let mut best: Option<(isize, ClassPlan)> = None;

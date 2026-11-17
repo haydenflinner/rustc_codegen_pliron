@@ -154,6 +154,14 @@ impl Target {
         !self.is_wasm()
     }
 
+    /// A load or store at `[p]` can step `p` by a small constant in the
+    /// same instruction (aarch64 post-index `ldrb w, [x], #1`), so that
+    /// step costs nothing. Uses: `ivmerge` (dropping such a pointer saves
+    /// no instruction).
+    pub const fn post_index(&self) -> bool {
+        self.is_aarch64()
+    }
+
     /// (allocatable, callee-saved) integer registers, for register
     /// pressure estimates (licm's `PLIRON_LICM_INNERPRESS=2`). `None` on
     /// wasm32, which has no register file of ours.
