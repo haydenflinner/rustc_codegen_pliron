@@ -45,7 +45,7 @@ fn load_side(text: &str) -> Option<Side> {
     }
     let func = fs.remove(0);
     let facts = parse_facts(text, &func);
-    let syms = anon_by_content(facts.syms_of(&func));
+    let syms = facts.syms_of(&func);
     Some(Side { func, facts, syms })
 }
 
@@ -55,13 +55,19 @@ fn load_side(text: &str) -> Option<Side> {
 /// (`TryFromIntError`'s `Debug`: its vtable). Such a symbol whose image is
 /// recorded goes by its content instead: bytes, and the relocations with
 /// their targets renamed the same way (to a fixed depth).
-fn anon_by_content(mut s: Syms) -> Syms {
+///
+/// A symbol the other function names or points at without an image stays
+/// as it is: content says nothing there, and the two builds may well agree on
+/// the number (hashbrown's empty control group, `fallible_with_capacity`).
+fn anon_by_content(mut s: Syms, other: &Syms) -> Syms {
     const ANON: &str = "__rcg_alloc.";
     let mut rename: FxHashMap<String, String> = FxHashMap::default();
     for _ in 0..3 {
         let mut next: FxHashMap<String, String> = FxHashMap::default();
         for (sym, img) in &s.data {
-            if !sym.starts_with(ANON) {
+            if !sym.starts_with(ANON) || (!other.data.contains_key(sym)
+                    && (other.names.values().any(|n| n == sym)
+                        || other.data.values().any(|i| i.relocs.iter().any(|r| r.sym == *sym)))) {
                 continue;
             }
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -236,10 +242,13 @@ fn check_pair(isa: &dyn TargetIsa, text_a: &str, text_b: &str, o: &Opts, row: &m
         row.status = "identical".into();
         return None;
     }
-    let (Some(mut a), Some(b)) = (load_side(text_a), load_side(text_b)) else {
+    let (Some(mut a), Some(mut b)) = (load_side(text_a), load_side(text_b)) else {
         row.status = "parse".into();
         return None;
     };
+    let (ra, rb) = (a.syms.clone(), b.syms.clone());
+    a.syms = anon_by_content(std::mem::take(&mut a.syms), &rb);
+    b.syms = anon_by_content(std::mem::take(&mut b.syms), &ra);
     if a.func.signature != b.func.signature {
         row.status = "skipped: signature differs".into();
         return None;
