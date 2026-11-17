@@ -150,7 +150,8 @@ fn run(on: bool, shape: Shape) -> usize {
     if on {
         std::env::set_var("PLIRON_WASM_BLKHOIST", "1");
     } else {
-        std::env::remove_var("PLIRON_WASM_BLKHOIST");
+        // Default on since 2026-11-17: off has to be asked for.
+        std::env::set_var("PLIRON_WASM_BLKHOIST", "0");
     }
     let mut module = Module::empty();
     let (sig, body) = (shape.0)(&mut module);

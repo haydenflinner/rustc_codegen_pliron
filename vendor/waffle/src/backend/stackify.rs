@@ -278,7 +278,8 @@ impl<'a, 'b> Context<'a, 'b> {
             promote_if_results(&mut out);
         }
         // PLIRON: `PLIRON_WASM_BLKHOIST=1` (opt-in), see `hoist_into_blocks`.
-        if std::env::var_os("PLIRON_WASM_BLKHOIST").is_some_and(|v| v == "1") {
+        // PLIRON: default on since 2026-11-17 (`=0` off).
+        if !std::env::var_os("PLIRON_WASM_BLKHOIST").is_some_and(|v| v == "0") {
             hoist_into_blocks(&mut out);
         }
         out

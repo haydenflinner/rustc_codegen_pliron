@@ -863,7 +863,8 @@ impl<'a> Context<'a> {
     fn coalesce_edge_copies(&self, inter: &mut [Bitset], n_params: usize) -> Vec<usize> {
         let n = inter.len();
         let mut rep: Vec<usize> = (0..n).collect();
-        if !std::env::var_os("PLIRON_WCOAL_EDGE").is_some_and(|v| v == "1") {
+        // PLIRON: default on since 2026-11-17 (`=0` off).
+        if std::env::var_os("PLIRON_WCOAL_EDGE").is_some_and(|v| v == "0") {
             return rep;
         }
         fn find(rep: &mut [usize], mut x: usize) -> usize {

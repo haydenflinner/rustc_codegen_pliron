@@ -212,7 +212,7 @@ upstream `.gitignore`, is committed (`git add -f`) and the tests run
 and in `harness/quick.py` for `vendor/waffle/` changes. The backend still
 builds the crate as a path dependency from the repo's `Cargo.lock`.
 
-## `src/backend/localify.rs` — edge-copy coalescing (`PLIRON_WCOAL_EDGE=1`, opt-in)
+## `src/backend/localify.rs` — edge-copy coalescing (`PLIRON_WCOAL_EDGE (default on since 2026-11-17, `=0` off)`, opt-in)
 
 `coalesce_edge_copies`, called by `coalesce_holes` on its precise local
 interference graph before the greedy recolor: for each edge transfer
@@ -254,7 +254,7 @@ unchanged under `--perturb=4`. Test: `tests/const_local.rs` (long
 and an edge argument; knob on and off through the interpreter; the body
 must shrink; dropping one prologue `local.set` fails it).
 
-## `src/backend/stackify.rs` — straight-line code into a following `block` (`PLIRON_WASM_BLKHOIST=1`, opt-in)
+## `src/backend/stackify.rs` — straight-line code into a following `block` (`PLIRON_WASM_BLKHOIST (default on since 2026-11-17, `=0` off)`, opt-in)
 
 `hoist_into_blocks`, the last step of `Context::compute`: the run of
 leaves and local-only parameter transfers right before a `block` moves
