@@ -12,6 +12,7 @@
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync shrinkwrap regionsplit
 #   o0std mcrdwrap sretnosync shrinkwrap bigtmp
+#   o0std mcrdwrap sretnosync shrinkwrap bigtmp fragcopyout
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -932,6 +933,21 @@ t_bigtmp() {
   PLIRON_MEMCPYOPT_BIGTMP=0 rustc $BE --edition 2021 -O tests/bigtmp/main.rs -o $out/bigtmp$exe && [[ "$($out/bigtmp$exe)" == "$want" ]]
 }
 
+t_fragcopyout() {
+  # PLIRON_SROA_FRAGCOPY_OUT=<min bytes>: an 80-byte struct of words, u32s
+  # and bools (FRAGCOPY's sub-word pieces) that stores build and one copy
+  # moves into a new Box is split, so the copy becomes the stores into the
+  # box and `make` keeps no stack slot (regex-syntax Properties::empty).
+  # Output pinned from stock. Legs: defaults, the rule at 64 (no slots in
+  # `make`), the rule off.
+  local want=14794945474585521765 s
+  rustc $BE --edition 2021 -O tests/fragcopyout/main.rs -o $out/fragcopyout$exe && [[ "$($out/fragcopyout$exe)" == "$want" ]] || return 1
+  PLIRON_SROA_FRAGCOPY_OUT=64 PLIRON_FRAME_INFO=4main4make rustc $BE --edition 2021 -O tests/fragcopyout/main.rs -o $out/fragcopyout$exe 2> $out/fragcopyout.fi && [[ "$($out/fragcopyout$exe)" == "$want" ]] || return 1
+  s=$(sed -nE 's/^frame-info .*4main4make: slots=([0-9]+).*/\1/p' $out/fragcopyout.fi | head -1)
+  [[ "$s" == 0 ]] || { echo "fragcopyout: make has stack slots '${s}' (want 0)" >&2; return 1; }
+  PLIRON_SROA_FRAGCOPY_OUT=0 rustc $BE --edition 2021 -O tests/fragcopyout/main.rs -o $out/fragcopyout$exe && [[ "$($out/fragcopyout$exe)" == "$want" ]]
+}
+
 t_shrinkwrap() {
   # PLIRON_SHRINKWRAP=1 (opt-in, aarch64): the save block must keep its
   # callee saves through emission (EDGEHOIST retargeted a branch past it,
@@ -1571,6 +1587,7 @@ want narrowext && t_narrowext
 want cmp3 && t_cmp3
 want sretnosync && t_sretnosync
 want bigtmp && t_bigtmp
+want fragcopyout && t_fragcopyout
 want shrinkwrap && t_shrinkwrap
 want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge
