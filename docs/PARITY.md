@@ -1134,6 +1134,22 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    corpus every 8th): identical verdicts; 26/122/44 functions change.
    Tests `pliron-clif-opt/tests/slotconst.rs` (a byte-order bug fails
    them). Next for this class: the spills in those hot functions.
+   **Spills, first look (no fix yet):** the static loop-depth weights
+   mislead. `exec_hereditary_jumps_with_attrs` (`SelectorMatchingVm`,
+   9.4k weighted) spills values live across the `dyn Fn` matcher calls
+   (`blr`) in its loops beyond the ten callee-saved registers (regalloc2:
+   fixed-register conflicts at every call); LLVM spills there too (20
+   stack accesses to our 42 on the paired lines), and the function has
+   a handful of samples. By samples, spill loads and stores are 84 of
+   html-rewriter's 561-sample gap, spread over 518 source lines, none
+   above 6: foldhash's `write_num` inlined into `Stack::build_state`
+   (hasher state reloaded on a loop back edge, 10), encoding_rs
+   `lib.rs:3104-3107` (11), `local_name.rs:35` (5). In `build_state`
+   regalloc2 evicts and splits function-wide values (entry to exit,
+   depth 0) repeatedly at one program point while loop values compete
+   for registers; next: why those long ranges are not split around the
+   loop once (`PLIRON_RA_EXPLAIN=11build_stateCshc`; note the substring
+   must be contiguous in the mangled name).
 
 10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
    2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours
