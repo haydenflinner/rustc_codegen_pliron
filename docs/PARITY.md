@@ -1114,7 +1114,10 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    copy of A) reproduces: the checker's sandbox leaves a `nonnull` call
    result unbacked and the pipeline's hoisted `notrap` load traps there.
    Still opt-in: html-rewriter's -228k came from in-loop joins.
-   **`PLIRON_SLOTCONST=1` (opt-in, ready):** the stack-slot class. A
+   It stays off until `varint` (+3% cycles, a loop that lost its
+   alignment pad) is shown placement-neutral: no benchmark may lose to
+   win elsewhere.
+   **`PLIRON_SLOTCONST` (default on since 2026-11-17):** the stack-slot class. A
    per-function count of explicit slot traffic over html-rewriter's
    15,352 functions (`clif-check codegen` on a recorded corpus,
    weighted by loop depth): explicit slots 254k against spills 410k, and
