@@ -94,11 +94,67 @@ fn copyable_as<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize, prof
         }
     }
     size <= limit
+        || leaf_copyable(tcx, inst, size)
         || (crate::env_is("PLIRON_XCGU_ALWAYS", "1")
             && matches!(
                 a.inline,
                 rustc_attr_ir::InlineAttr::Always | rustc_attr_ir::InlineAttr::Force { .. }
             ))
+}
+
+/// `PLIRON_XCGU_LEAF=<size>` (default off, not ready): a leaf callee, one
+/// whose calls go only to `#[cold]` functions, intrinsics or (transitively)
+/// other small leaves, is copyable up to `<size>` instead of the plain
+/// limit. pulldown-cmark's scanners (`scan_closing_code_fence`, 50k calls
+/// from `parse_block` in another CGU) are past the native limit of 50 and
+/// stay calls; LLVM's thin-local LTO inlines them. Exact counts at 200
+/// (2026-11-17): rust-json -1.7%, html-rewriter -0.8%, pulldown-cmark
+/// -0.3%, but rust-protobuf +3.3% and regex +0.5%; the plain
+/// `PLIRON_XCGU_SIZE=200` gives pulldown-cmark -1.9% and rust-protobuf
+/// +1.8% (PARITY queue).
+fn leaf_copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, size: usize) -> bool {
+    static LEAF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let leaf = *LEAF.get_or_init(|| crate::env_get("PLIRON_XCGU_LEAF").and_then(|s| s.parse().ok()).unwrap_or(0));
+    if leaf == 0 || size > leaf {
+        return false;
+    }
+    let mut budget = 64usize;
+    is_leaf(tcx, inst, leaf, 8, &mut budget)
+}
+
+/// Every function `inst` calls is `#[cold]`, or itself a leaf of at most
+/// `leaf` size (`depth` levels down: the scanners reach their byte loop
+/// through `scan_ch_repeat` -> `scan_while` -> `take_while`/`count` and the
+/// predicate closure). At most `budget` functions are visited per query.
+fn is_leaf<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, leaf: usize, depth: u32, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let Some(items) = used(tcx, inst) else {
+        return false;
+    };
+    items.iter().all(|m| match m.node {
+        MonoItem::Fn(c) => {
+            let ok = !needs_body(tcx, &m.node)
+                || tcx.codegen_instance_attrs(c.def).flags.contains(F::COLD)
+                || matches!(c.def, InstanceKind::Item(d) if tcx.intrinsic(d).is_some())
+                || (depth > 0
+                    && c != inst
+                    && matches!(c.def, InstanceKind::Item(_) | InstanceKind::Shim(_))
+                    && tcx.size_estimate(c) <= leaf
+                    && is_leaf(tcx, c, leaf, depth - 1, budget));
+            if !ok
+                && pliron_cfg::tracing_on()
+                && crate::env_get("PLIRON_STATS_XCGU").is_some_and(|w| with_no_trimmed_paths!(inst.to_string()).contains(&*w))
+            {
+                tracing::info!(target: "pliron::stats", "xcgu notleaf {} calls {} (size {})",
+                    with_no_trimmed_paths!(inst.to_string()), with_no_trimmed_paths!(c.to_string()), tcx.size_estimate(c));
+            }
+            ok
+        }
+        _ => true,
+    })
 }
 
 fn used<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>) -> Option<&'tcx [Spanned<MonoItem<'tcx>>]> {
