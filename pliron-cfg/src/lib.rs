@@ -72,6 +72,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // 16-aligned at entry (`strip_realign`). Kernel module -204 B (68
     // frames), every kernel returns LLVM's value, smoke + peepdiff clean.
     "PLIRON_WASM_NOREALIGN",
+    // wpeep (N9 #5): unreachable code goes ahead of block elision, so a
+    // block only dead code branched to is elided too
+    // (`wpeep_elide::dead_exact`). dsa: untargeted blocks 78k -> 14k in
+    // non-SIMD bodies; kernels -2.8 KB, parse_only unchanged.
+    "PLIRON_WASM_DEADTAIL",
     // wasm only (each is read behind an `is_like_wasm` / `Pipe::wasm`
     // test; native was not timed). 2026-11-16, `--layouts=3` against
     // the same llvm.wasm: chars_mixed +19.9% -> -1.4%, nbody +5.4% ->
