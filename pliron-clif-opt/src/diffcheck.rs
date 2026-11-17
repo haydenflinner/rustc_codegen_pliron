@@ -76,6 +76,16 @@ pub struct Facts<'a> {
     /// in registers across the call, so the stub's fill stops there too.
     /// An operand not listed is unbounded.
     pub stub_extent: FxHashMap<(String, u32), u64>,
+    /// Values of the original that stand for `undef` ([`Syms::undef`]).
+    /// They are 0 in a run, like the bytes of a fresh frame, and like
+    /// those they take the other fill when a mismatch runs the original
+    /// again: a byte of the output that moves with them is one the
+    /// source program never determined, and the rewritten function may
+    /// show anything there. Without this a pass that stops copying
+    /// `undef` (memcpyopt forwarding a temporary's writes: the unwritten
+    /// part of the destination keeps its old bytes where the original
+    /// copied the temporary's zeros) is reported.
+    pub undef: Option<&'a FxHashSet<Value>>,
 }
 
 /// [`Facts::stub_extent`] for `func`: per direct callee and argument, the
@@ -104,6 +114,90 @@ pub fn stub_extents(
     }
     out.retain(|_, e| *e != u64::MAX);
     out
+}
+
+/// The bytes of an immutable data object, as a corpus records them
+/// (`; diffcheck-data:`): what a load from the symbol yields. The IR
+/// passes fold such loads (`constload`), so a function recorded with the
+/// pass on holds the constant where the other build's loads the symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DataImage {
+    pub bytes: Vec<u8>,
+    pub relocs: Vec<Reloc>,
+}
+
+/// A pointer inside a [`DataImage`]: `off` holds the address of `sym`
+/// (a function when `func`) plus `addend`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reloc {
+    pub off: u32,
+    pub func: bool,
+    pub sym: String,
+    pub addend: i64,
+}
+
+/// How one recorded function spells the symbols it names. A callee is
+/// `u0:<FuncId>` and a data object `u1:<DataId>` in the text, and the ids
+/// are a build's own: two builds of one program number them differently.
+#[derive(Debug, Clone, Default)]
+pub struct Syms {
+    /// External name as displayed (`u0:12`, `u1:65`) -> linker symbol.
+    pub names: FxHashMap<String, String>,
+    /// Linker symbol -> the object's image, where the recorder knew it.
+    pub data: FxHashMap<String, DataImage>,
+    /// Values that stand for `undef` (`; diffcheck-undef:`): the lowering
+    /// writes a 0 for a value the program does not determine (an `undef`
+    /// constant, a promoted variable read before it is written), and the
+    /// function as recorded cannot be told from one that means the 0.
+    /// See [`Facts::undef`].
+    pub undef: Vec<Value>,
+}
+
+/// A pair recorded from two builds of the same program ([`check_cross`]):
+/// everything the checker keys by a callee's or a data object's name goes
+/// by the symbol, so the two functions' stubs, function addresses and
+/// data regions agree.
+pub struct Cross<'a> {
+    pub before: &'a Syms,
+    pub after: &'a Syms,
+    /// The function's own symbol (self-recursion runs for real).
+    pub self_symbol: Option<&'a str>,
+    /// Callees, by symbol, that `after`'s build knows to write no memory.
+    /// A fact about the callee holds for both builds, and `after`'s
+    /// pipeline may have used it.
+    pub nowrite: &'a FxHashSet<String>,
+    /// `(callee symbol, argument) -> extent` known to `after`'s build
+    /// ([`Facts::stub_extent`]); the smaller of the two builds' bounds
+    /// is used.
+    pub extent: &'a FxHashMap<(String, u32), u64>,
+}
+
+/// What a stub did with one call's arguments. In a cross-build pair the
+/// second function's stubs repeat it: a stub stands for one callee with
+/// one behavior, and how many bytes it writes through a pointer must not
+/// depend on which of the caller's objects the pointer names. An IR pass
+/// changes that (`memcpyopt`: `call f(sret tmp); memcpy(dst, tmp)` becomes
+/// `call f(sret dst)`, a parameter's memory where the original passed a
+/// stack slot).
+#[derive(Debug, Clone, Default)]
+pub struct CallRec {
+    name: String,
+    args: Vec<ArgRec>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArgRec {
+    /// The argument pointed into the caller's frame: its value is the
+    /// caller's to choose, so the other function may pass any pointer.
+    frame: bool,
+    /// Bytes the stub wrote through it.
+    fill: u32,
+    /// The window the stub read through it: its length, and which of its
+    /// bytes had been written (bit `j`: byte `j`).
+    seen: u32,
+    mask: u64,
+    /// The bytes it read there (unwritten ones 0).
+    bytes: [u8; 64],
 }
 
 pub struct Config {
@@ -158,6 +252,8 @@ pub struct Mismatch {
     /// `before` run again under the other stack fill: a byte the two
     /// original runs agree on is one the source program determines.
     pub rerun: Option<Outcome>,
+    /// Cross-build pair: the function's own return area ([`sret_area`]).
+    pub sret: Option<(u64, u64)>,
 }
 
 impl std::fmt::Display for Mismatch {
@@ -187,7 +283,9 @@ impl std::fmt::Display for Mismatch {
             let bad: Vec<u64> = keys
                 .into_iter()
                 .filter(|k| {
-                    m1.as_ref().is_none_or(|m1| m0.get(k) == m1.get(k)) && ma.get(k) != m0.get(k)
+                    !unwritten_sret(self.sret, &m0, *k)
+                        && m1.as_ref().is_none_or(|m1| m0.get(k) == m1.get(k))
+                        && ma.get(k) != m0.get(k)
                 })
                 .collect();
             if !bad.is_empty() {
@@ -240,6 +338,20 @@ pub fn check(
     facts: &Facts,
     cfg: &Config,
 ) -> Result<Summary, Mismatch> {
+    check_cross(before, after, facts, None, cfg)
+}
+
+/// [`check`] for two functions that need not come from one build: with
+/// `cross`, `before` and `after` are one source function as two builds
+/// lowered it (one of them with an IR pass off), each naming its callees
+/// and data by its own ids. `facts` are `before`'s.
+pub fn check_cross(
+    before: &Function,
+    after: &Function,
+    facts: &Facts,
+    cross: Option<&Cross>,
+    cfg: &Config,
+) -> Result<Summary, Mismatch> {
     let mut sum = Summary::default();
     if before.signature != after.signature {
         sum.inconclusive = cfg.trials;
@@ -258,29 +370,66 @@ pub fn check(
             }
         }
     }
-    let nowrite_names = nowrite_by_name(before, facts);
+    let (xb, xa) = (cross.map(|c| c.before), cross.map(|c| c.after));
+    let mut nowrite_names = nowrite_by_name(before, facts, xb);
+    // The return area is the function's to fill (cross-build pairs).
+    let sret = cross.and_then(|_| sret_area(before));
     let layout = slot_layout(&[before, after]);
+    let pair_syms = match cross.map(|c| pair_symbols(before, after, c)) {
+        Some(Err(sym)) => {
+            sum.inconclusive = cfg.trials;
+            sum.why = Some(format!("data symbol {sym} has a different image in each build"));
+            return Ok(sum);
+        }
+        Some(Ok(t)) => Some(t),
+        None => None,
+    };
+    if let Some(c) = cross {
+        nowrite_names.extend(c.nowrite.iter().cloned());
+    }
     for trial in 0..cfg.trials {
         let seed = mix(cfg.seed, trial as u64);
-        let world = World::new(
+        let mut world = World::new(
             before,
             if trial % 2 == 1 { &all_ptrs } else { &ptrs },
             facts,
             seed,
             &layout,
+            xb,
         );
-        let self_name = facts
-            .self_name
-            .clone()
-            .unwrap_or_else(|| before.name.to_string());
-        let b = run(before, &world, &nowrite_names, &self_name, cfg.fuel, true);
+        if let (Some(c), Some((names, images))) = (cross, &pair_syms) {
+            for (key, n) in c.extent {
+                let x = world.extent.entry(key.clone()).or_insert(*n);
+                *x = (*x).min(*n);
+            }
+            world.add_symbols(names, images);
+        }
+        let self_name = match cross {
+            // No symbol: a name no callee has.
+            Some(c) => c.self_symbol.unwrap_or("\0").to_string(),
+            None => facts
+                .self_name
+                .clone()
+                .unwrap_or_else(|| before.name.to_string()),
+        };
+        let (b, btrace) = run(before, &world, &nowrite_names, &self_name, cfg.fuel, true, xb, None);
+        let blog = &btrace.log;
+        if cross.is_some() && let Some(m) = prefix_mismatch(&b, &btrace, trial, &world, &|w| {
+            // The run that pins the arguments down, as below.
+            let w1 = World { stack_fill: 0xa5, slot_pad: 0x25, ..w.clone() };
+            run(before, &w1, &nowrite_names, &self_name, cfg.fuel, true, xb, None)
+        }, &|| run(after, &world, &nowrite_names, &self_name, cfg.fuel, false, xa, Some(blog.as_slice()))) {
+            return Err(m);
+        }
         if !matches!(b, Outcome::Returned { .. }) {
             sum.inconclusive += 1;
             sum.why
                 .get_or_insert_with(|| format!("before {}", describe(&b)));
             continue;
         }
-        let a = run(after, &world, &nowrite_names, &self_name, cfg.fuel, false);
+        // A cross-build `after` repeats what `before`'s stubs did.
+        let replay = cross.map(|_| blog.as_slice());
+        let (a, _) = run(after, &world, &nowrite_names, &self_name, cfg.fuel, false, xa, replay);
         match &a {
             Outcome::Inconclusive(r) if !r.starts_with("out of fuel") => {
                 sum.inconclusive += 1;
@@ -306,8 +455,8 @@ pub fn check(
                     slot_pad: 0x25,
                     ..world.clone()
                 };
-                let b1 = run(before, &world1, &nowrite_names, &self_name, cfg.fuel, true);
-                if underdetermined(&a, &b, &b1) {
+                let (b1, _) = run(before, &world1, &nowrite_names, &self_name, cfg.fuel, true, xb, None);
+                if underdetermined(&a, &b, &b1, sret) {
                     sum.inconclusive += 1;
                     sum.why.get_or_insert_with(|| match &b1 {
                         Outcome::Returned { .. } => {
@@ -325,12 +474,146 @@ pub fn check(
                         before: b,
                         after: a,
                         rerun: Some(b1),
+                        sret,
                     });
                 }
             }
         }
     }
     Ok(sum)
+}
+
+impl Default for ArgRec {
+    fn default() -> Self {
+        Self { frame: false, fill: 0, seen: 0, mask: 0, bytes: [0; 64] }
+    }
+}
+
+/// What a run did besides its [`Outcome`].
+#[derive(Default)]
+struct Trace {
+    /// What its stubs did, one entry per call.
+    log: Vec<CallRec>,
+    /// The calls made, when the run did not return (a returned run has
+    /// them in its `Outcome`).
+    calls: Vec<(String, Vec<DataValue>)>,
+}
+
+/// Did the sandbox, not the program, stop this run? An operation it
+/// does not model (a copy whose length or address is a seeded word that
+/// points nowhere) or the fuel: the calls made up to there are what the
+/// program does. A trap, a panic of the interpreter (a `notrap` access
+/// through a wild pointer) or a broken fact is undefined behavior or may
+/// be, and says nothing about what came before.
+fn sandbox_stop(o: &Outcome) -> bool {
+    matches!(o, Outcome::Inconclusive(r)
+        if r.starts_with("out of fuel") || r.ends_with("out of sandbox"))
+}
+
+/// Cross-build pairs: the calls are observable in order. When the
+/// original stops for a reason of the sandbox's own ([`sandbox_stop`])
+/// after `n` calls, the rewritten function must still make those `n`
+/// calls with the same arguments, wherever it stops. Without this a
+/// trial is compared only when the original returns, and an IR pass whose
+/// wrong value first shows in a later loop iteration is seen only by a
+/// trial whose random words carry it through every iteration
+/// (`tests/mcrdwrap`: a `String` the second iteration starts from a copy
+/// of another; no trial in 1,024 got there and returned). `rerun` runs
+/// the original under the other fill, so arguments it does not determine
+/// are not compared; `after` runs the rewritten function.
+fn prefix_mismatch(
+    b: &Outcome,
+    bt: &Trace,
+    trial: u32,
+    world: &World,
+    rerun: &dyn Fn(&World) -> (Outcome, Trace),
+    after: &dyn Fn() -> (Outcome, Trace),
+) -> Option<Mismatch> {
+    if !sandbox_stop(b) || bt.calls.is_empty() {
+        return None;
+    }
+    let (a, at) = after();
+    let ac: &[(String, Vec<DataValue>)] = match &a {
+        Outcome::Returned { calls, .. } => calls,
+        o if sandbox_stop(o) => &at.calls,
+        // A trap or a panic: the rewritten function is wrong, or it did
+        // something the original left for later. Not this check's call.
+        _ => return None,
+    };
+    let n = bt.calls.len().min(ac.len());
+    let differ = |x: &(String, Vec<DataValue>), y: &(String, Vec<DataValue>)| {
+        x.0 != y.0 || x.1.len() != y.1.len() || x.1.iter().map(norm).ne(y.1.iter().map(norm))
+    };
+    // A returned rewritten function that made fewer calls dropped some.
+    let short = matches!(a, Outcome::Returned { .. }) && ac.len() < bt.calls.len();
+    let first = (0..n).find(|&k| differ(&bt.calls[k], &ac[k]));
+    if first.is_none() && !short {
+        return None;
+    }
+    // Pinned down by the original under the other fill: the same calls
+    // up to the difference, each argument byte the same in both runs.
+    let (b1, b1t) = rerun(world);
+    let c1: &[(String, Vec<DataValue>)] = match &b1 {
+        Outcome::Returned { calls, .. } => calls,
+        o if sandbox_stop(o) => &b1t.calls,
+        _ => return None,
+    };
+    let upto = first.map_or(bt.calls.len(), |k| k + 1);
+    if c1.len() < upto {
+        return None;
+    }
+    for k in 0..upto {
+        let (x0, x1) = (&bt.calls[k], &c1[k]);
+        if x0.0 != x1.0 || x0.1.len() != x1.1.len() {
+            return None;
+        }
+        if k + 1 < upto && x0.1.iter().map(norm).ne(x1.1.iter().map(norm)) {
+            // An earlier call was handed an undetermined value: what the
+            // stubs did from there on is a hash of it.
+            return None;
+        }
+    }
+    if let Some(k) = first {
+        let (x0, x1, y) = (&bt.calls[k], &c1[k], &ac[k]);
+        if x0.0 == y.0 && x0.1.len() == y.1.len() {
+            // Only bytes both original runs agree on count.
+            let det = x0.1.iter().zip(&x1.1).zip(&y.1).any(|((p, q), r)| {
+                let (_, np) = norm(p);
+                let (_, nq) = norm(q);
+                let (_, nr) = norm(r);
+                (0..p.ty().bytes() as usize).any(|j| np[j] == nq[j] && nr[j] != np[j])
+            });
+            if !det {
+                return None;
+            }
+        }
+    }
+    // The report names the first call that differs and its differing
+    // arguments (a stub's pointer arguments are followed by what it read
+    // through them: a byte mask, then the bytes, a word at a time).
+    let stop = |o: &Outcome| match o {
+        Outcome::Inconclusive(r) => format!("stopped by the sandbox ({r})"),
+        Outcome::Returned { .. } => "returned".to_string(),
+        o => describe(o),
+    };
+    let (bs, as_) = match first {
+        Some(k) => {
+            let (x, y) = (&bt.calls[k], &ac[k]);
+            let idx: Vec<usize> = (0..x.1.len().max(y.1.len()))
+                .filter(|&j| x.1.get(j).map(norm) != y.1.get(j).map(norm))
+                .collect();
+            let pick = |c: &(String, Vec<DataValue>)| -> String {
+                let vs: Vec<String> =
+                    idx.iter().take(8).map(|&j| format!("{j}: {:?}", c.1.get(j))).collect();
+                format!("call {k} `{}`, arguments {}", c.0, vs.join(", "))
+            };
+            (pick(x), pick(y))
+        }
+        None => (String::new(), String::new()),
+    };
+    let before = Outcome::Inconclusive(format!("{} after {} calls; {bs}", stop(b), bt.calls.len()));
+    let after_o = Outcome::Inconclusive(format!("{} after {} calls; {as_}", stop(&a), ac.len()));
+    Some(Mismatch { trial, args: world.args.clone(), before, after: after_o, rerun: None, sret: None })
 }
 
 /// By type and bytes: `DataValue`'s float `==` says NaN != NaN.
@@ -383,7 +666,7 @@ fn same(a: &Outcome, b: &Outcome) -> bool {
 /// True when `a` differs from `b0` only on such bytes (or the original's
 /// whole behavior is fill-dependent, which leaves nothing to check).
 // r[impl clif.diffcheck.sound]
-fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
+fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome, sret: Option<(u64, u64)>) -> bool {
     let (
         Outcome::Returned {
             rets: r0,
@@ -455,6 +738,9 @@ fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
         if x0.0 != x1.0 {
             return true; // the original's call sequence is fill-dependent
         }
+        if x0.1.len() != x1.1.len() {
+            return true; // and so is what this call was handed
+        }
         if ya.0 != x0.0 || ya.1.len() != x0.1.len() || x0.1.len() != x1.1.len() {
             return false;
         }
@@ -488,7 +774,33 @@ fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome) -> bool {
     m0.keys()
         .chain(m1.keys())
         .chain(ma.keys())
-        .all(|k| m0.get(k) != m1.get(k) || ma.get(k) == m0.get(k))
+        .all(|k| unwritten_sret(sret, &m0, *k) || m0.get(k) != m1.get(k) || ma.get(k) == m0.get(k))
+}
+
+/// The sandbox addresses of `f`'s return area: the memory behind its
+/// `sret` parameter.
+fn sret_area(f: &Function) -> Option<(u64, u64)> {
+    let k = f
+        .signature
+        .params
+        .iter()
+        .position(|p| p.purpose == ir::ArgumentPurpose::StructReturn)?;
+    let base = param_base() + k as u64 * REGION_STRIDE;
+    Some((base, base + REGION_STRIDE))
+}
+
+/// Is `k` a byte of the return area that the original left as it found
+/// it? The return area holds nothing when the function is entered and
+/// its caller reads the returned value only, so such a byte is not part
+/// of what the function returns on this path (`None`'s payload) and the
+/// other function may leave anything there. An IR pass does: memcpyopt
+/// sends a callee's result straight to the return area where the
+/// original called into a temporary and copied it on one arm only
+/// (`parse_number`: `let (n, len) = parse_partial_number(s)?; if len ==
+/// s.len() { Some(n) } else { None }`). `m0` holds the bytes the original
+/// changed.
+fn unwritten_sret(sret: Option<(u64, u64)>, m0: &BTreeMap<u64, u8>, k: u64) -> bool {
+    sret.is_some_and(|(lo, hi)| (lo..hi).contains(&k)) && !m0.contains_key(&k)
 }
 
 fn mix(a: u64, b: u64) -> u64 {
@@ -583,6 +895,11 @@ struct Region {
     init: Vec<u8>,
     /// Calls may write here (not frozen / read-only).
     stub_writable: bool,
+    /// Frames of a cross-build pair: which bytes were written since the
+    /// frame was made (1), so a stub can tell what its callee may read
+    /// from what the caller never set. Empty: not tracked, every byte
+    /// counts as written (memory that exists before the call).
+    set: Vec<u8>,
 }
 
 /// The seeded sandbox one trial runs in; cloned per run.
@@ -611,17 +928,177 @@ struct World {
     derived: FxHashMap<Value, Value>,
     /// `Facts::memcmp` callees as call names spell them.
     memcmp: FxHashSet<String>,
+    /// `Facts::undef`.
+    undef: FxHashSet<Value>,
     /// `Facts::stub_extent`.
     extent: FxHashMap<(String, u32), u64>,
+    /// Data symbols placed ahead of the runs ([`World::add_symbols`]).
+    syms: FxHashMap<String, u64>,
+}
+
+/// A displayed external name as the checker keys it: the linker symbol
+/// in a cross-build pair, the text's own spelling otherwise.
+fn key_of(d: String, x: Option<&Syms>) -> String {
+    match x.and_then(|x| x.names.get(&d)) {
+        Some(s) => s.clone(),
+        None => d,
+    }
+}
+
+fn ext_key(f: &Function, name: &ExternalName, x: Option<&Syms>) -> String {
+    key_of(name.display(Some(&f.params)).to_string(), x)
+}
+
+/// The data symbols of a cross-build pair, sorted, and their images:
+/// those either function names, and those their images point at. Both
+/// functions run with every one of them at the same address, whichever of
+/// the two names it (a pass folds the last load of a constant away, and
+/// the symbol leaves that function). `Err`: a symbol the two builds
+/// recorded different bytes for.
+#[allow(clippy::type_complexity)]
+fn pair_symbols<'c>(
+    before: &Function,
+    after: &Function,
+    c: &'c Cross,
+) -> Result<(Vec<String>, FxHashMap<String, &'c DataImage>), String> {
+    let mut names: std::collections::BTreeSet<String> = Default::default();
+    let mut images: FxHashMap<String, &DataImage> = FxHashMap::default();
+    for (f, x) in [(before, c.before), (after, c.after)] {
+        for gv in f.global_values.keys() {
+            if let Some(n) = gv_name(f, gv, Some(x)) {
+                names.insert(n);
+            }
+        }
+        for (sym, img) in &x.data {
+            match images.get(sym) {
+                Some(old) if *old != img => return Err(sym.clone()),
+                _ => {}
+            }
+            images.insert(sym.clone(), img);
+        }
+    }
+    // Only what a function names, or what such an image points at, gets
+    // a region: a header may describe more.
+    let mut targets = Vec::new();
+    for n in &names {
+        if let Some(img) = images.get(n) {
+            targets.extend(img.relocs.iter().filter(|r| !r.func).map(|r| r.sym.clone()));
+        }
+    }
+    names.extend(targets);
+    Ok((names.into_iter().collect(), images))
+}
+
+/// The value `func_addr` yields for the function keyed `key`.
+fn func_addr_value(key: &str) -> Option<DataValue> {
+    let size = if p32() { AddressSize::_32 } else { AddressSize::_64 };
+    let a = Address::from_parts(
+        size,
+        AddressRegion::Function,
+        AddressFunctionEntry::UserFunction as u64,
+        hash_str(key) & 0xff_ffff,
+    )
+    .ok()?;
+    DataValue::try_from(a).ok()
+}
+
+/// Give data symbol `name` a region and return the symbol's address. The
+/// region is seeded from the name, so it is the same in every run and in
+/// both functions of a cross-build pair; `image`'s bytes go over the
+/// seed (its relocations are applied by the caller, once every symbol
+/// has an address).
+fn place_symbol(
+    regions: &mut BTreeMap<u64, Region>,
+    syms: &mut FxHashMap<String, u64>,
+    seed: u64,
+    name: &str,
+    image: Option<&DataImage>,
+) -> u64 {
+    if let Some(&a) = syms.get(name) {
+        return a;
+    }
+    if p32() && syms.len() as u64 >= AREA_REGIONS {
+        // The 32-bit symbol area is full: an address with nothing
+        // mapped, so a read through it ends the trial inconclusive
+        // instead of landing in the stack area.
+        let a = 0x3f00_0000 + syms.len() as u64 * 16;
+        syms.insert(name.to_string(), a);
+        return a;
+    }
+    let base = sym_base() + syms.len() as u64 * REGION_STRIDE;
+    let mut rng = Rng(mix(seed, hash_str(name)));
+    let targets: Vec<u64> = (0..HEAPS)
+        .map(|h| heap_base() + h * REGION_STRIDE + PTR_SLACK)
+        .collect();
+    let len = image
+        .map_or(0, |i| i.bytes.len() + 2 * PTR_SLACK as usize)
+        .clamp(1024, (REGION_STRIDE - 16) as usize)
+        .next_multiple_of(8);
+    let mut data = vec![0u8; len];
+    fill(&mut data, &targets, &mut rng);
+    if let Some(img) = image {
+        let o = PTR_SLACK as usize;
+        let n = img.bytes.len().min(len - o);
+        data[o..o + n].copy_from_slice(&img.bytes[..n]);
+    }
+    regions.insert(
+        base,
+        Region {
+            init: data.clone(),
+            data,
+            stub_writable: false,
+            set: Vec::new(),
+        },
+    );
+    syms.insert(name.to_string(), base + PTR_SLACK);
+    base + PTR_SLACK
 }
 
 impl World {
+    /// Place `names` (sorted) with their `images`, and write the
+    /// addresses the images' relocations name.
+    fn add_symbols(&mut self, names: &[String], images: &FxHashMap<String, &DataImage>) {
+        for n in names {
+            place_symbol(&mut self.regions, &mut self.syms, self.seed, n, images.get(n).copied());
+        }
+        let w = if p32() { 4usize } else { 8 };
+        for n in names {
+            let (Some(img), Some(&at)) = (images.get(n), self.syms.get(n)) else { continue };
+            for r in &img.relocs {
+                let v = if r.func {
+                    // A function's address plus an offset is not a
+                    // callable value; leave the seeded bytes.
+                    if r.addend != 0 {
+                        continue;
+                    }
+                    match func_addr_value(&r.sym).as_ref().and_then(as_ptr) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                } else {
+                    match self.syms.get(&r.sym) {
+                        Some(&a) => a.wrapping_add(r.addend as u64),
+                        None => continue,
+                    }
+                };
+                let a = at + u64::from(r.off);
+                let Some((&base, reg)) = self.regions.range_mut(..=a).next_back() else { continue };
+                let o = (a - base) as usize;
+                if o + w <= reg.data.len() {
+                    reg.data[o..o + w].copy_from_slice(&v.to_le_bytes()[..w]);
+                    reg.init[o..o + w].copy_from_slice(&v.to_le_bytes()[..w]);
+                }
+            }
+        }
+    }
+
     fn new(
         f: &Function,
         ptrs: &FxHashMap<Value, PtrInfo>,
         facts: &Facts,
         seed: u64,
         layout: &(Vec<u64>, u64),
+        x: Option<&Syms>,
     ) -> Self {
         let mut rng = Rng(seed);
         let mut regions = BTreeMap::new();
@@ -641,6 +1118,7 @@ impl World {
                         data: vec![0; (size + 2 * PTR_SLACK) as usize],
                         init: Vec::new(),
                         stub_writable: !pi.frozen,
+                        set: Vec::new(),
                     },
                 );
                 // A noalias param's memory is reachable only through the
@@ -657,6 +1135,7 @@ impl World {
                     data: vec![0; (HEAP_SIZE + 2 * PTR_SLACK) as usize],
                     init: Vec::new(),
                     stub_writable: true,
+                    set: Vec::new(),
                 },
             );
         }
@@ -672,7 +1151,15 @@ impl World {
                 ptr(param_base() + i as u64 * REGION_STRIDE + PTR_SLACK)
             } else {
                 let nonnull = facts.nonnull.is_some_and(|s| s.contains(p));
-                random_value(ty, &mut rng, nonnull)
+                let v = random_value(ty, &mut rng, nonnull);
+                // Cross-build pairs: a byte parameter is 0 or 1, a value
+                // every `bool` and `u8` may hold. A `bool` of -1 is not one
+                // two functions have to treat alike (`vec![b; n]`: sroa off
+                // tested `b == 0` for `alloc_zeroed`, on it tested `b & 1`).
+                match v {
+                    DataValue::I8(b) if x.is_some() => DataValue::I8(b & 1),
+                    v => v,
+                }
             };
             args.push(v);
         }
@@ -699,8 +1186,10 @@ impl World {
                 .memcmp
                 .iter()
                 .filter_map(|fr| f.dfg.ext_funcs.get(*fr))
-                .map(|d| d.name.display(Some(&f.params)).to_string())
+                .map(|d| ext_key(f, &d.name, x))
                 .collect(),
+            undef: facts.undef.cloned().unwrap_or_default(),
+            syms: FxHashMap::default(),
             extent: {
                 // A callee handed the address of a slot reaches that slot
                 // and no further, so the slot's size bounds its operand
@@ -712,10 +1201,10 @@ impl World {
                 // (jiff's `Database::from_dir` and two more in the dsa
                 // corpus). `f` is the original: both runs share its table.
                 let slots = stub_extents(f, |i, k| slot_extent(f, f.dfg.inst_args(i)[k as usize]));
-                let mut e = facts.stub_extent.clone();
-                for (key, n) in slots {
-                    let x = e.entry(key).or_insert(n);
-                    *x = (*x).min(n);
+                let mut e: FxHashMap<(String, u32), u64> = FxHashMap::default();
+                for ((name, k), n) in facts.stub_extent.iter().map(|(k, n)| (k.clone(), *n)).chain(slots) {
+                    let bound = e.entry((key_of(name, x), k)).or_insert(n);
+                    *bound = (*bound).min(n);
                 }
                 e
             },
@@ -968,12 +1457,12 @@ fn address_operand(d: &InstructionData) -> Option<Value> {
     }
 }
 
-fn nowrite_by_name(f: &Function, facts: &Facts) -> FxHashSet<String> {
+fn nowrite_by_name(f: &Function, facts: &Facts, x: Option<&Syms>) -> FxHashSet<String> {
     let mut out = FxHashSet::default();
     if let Some(m) = facts.nowrite {
         for (fr, _) in m {
             if let Some(d) = f.dfg.ext_funcs.get(*fr) {
-                out.insert(d.name.display(Some(&f.params)).to_string());
+                out.insert(ext_key(f, &d.name, x));
             }
         }
     }
@@ -1002,6 +1491,9 @@ struct Sandbox<'a> {
     derived: &'a FxHashMap<Value, Value>,
     memcmp: &'a FxHashSet<String>,
     extent: &'a FxHashMap<(String, u32), u64>,
+    /// `Facts::undef`, when this run is the original under the other
+    /// stack fill; empty otherwise.
+    undef: &'a FxHashSet<Value>,
     seed: u64,
     stack_fill: u8,
     pinned: DataValue,
@@ -1016,6 +1508,12 @@ struct Sandbox<'a> {
     /// `PLIRON_DIFFCHECK_PATH=1`: log every block entered, to diff the
     /// two runs' paths (a pass that keeps block numbers: slotmerge).
     path: Option<&'static str>,
+    /// Cross-build pair: how this function spells symbols.
+    xsyms: Option<&'a Syms>,
+    /// Cross-build pair, second function: what the first one's stubs did.
+    replay: Option<&'a [CallRec]>,
+    /// What this run's stubs did, one entry per `calls` entry.
+    log: Vec<CallRec>,
 }
 
 impl<'a> Sandbox<'a> {
@@ -1035,7 +1533,28 @@ impl<'a> Sandbox<'a> {
         let base = self.find(addr, len)?.0;
         let r = self.regions.get_mut(&base)?;
         let o = (addr - base) as usize;
+        if !r.set.is_empty() {
+            r.set[o..o + len as usize].fill(1);
+        }
         Some(&mut r.data[o..o + len as usize])
+    }
+
+    /// Which of the `len` bytes at `addr` have been written (1), for a
+    /// region that tracks it; all of them otherwise.
+    fn written(&self, addr: u64, len: u64) -> Option<Vec<u8>> {
+        let (base, r) = self.find(addr, len)?;
+        let o = (addr - base) as usize;
+        Some(if r.set.is_empty() { vec![1; len as usize] } else { r.set[o..o + len as usize].to_vec() })
+    }
+
+    /// A copy carries its source's written-ness with it.
+    fn set_written(&mut self, addr: u64, set: &[u8]) {
+        let Some(base) = self.find(addr, set.len() as u64).map(|f| f.0) else { return };
+        let r = self.regions.get_mut(&base).unwrap();
+        if !r.set.is_empty() {
+            let o = (addr - base) as usize;
+            r.set[o..o + set.len()].copy_from_slice(set);
+        }
     }
 
     /// Log a write of `len` bytes at `addr` when it covers the watched
@@ -1058,34 +1577,7 @@ impl<'a> Sandbox<'a> {
     }
 
     fn symbol_addr(&mut self, name: &str) -> u64 {
-        if let Some(&a) = self.syms.get(name) {
-            return a;
-        }
-        if p32() && self.syms.len() as u64 >= AREA_REGIONS {
-            // The 32-bit symbol area is full: an address with nothing
-            // mapped, so a read through it ends the trial inconclusive
-            // instead of landing in the stack area.
-            let a = 0x3f00_0000 + self.syms.len() as u64 * 16;
-            self.syms.insert(name.to_string(), a);
-            return a;
-        }
-        let base = sym_base() + self.syms.len() as u64 * REGION_STRIDE;
-        let mut rng = Rng(mix(self.seed, hash_str(name)));
-        let targets: Vec<u64> = (0..HEAPS)
-            .map(|h| heap_base() + h * REGION_STRIDE + PTR_SLACK)
-            .collect();
-        let mut data = vec![0u8; 1024];
-        fill(&mut data, &targets, &mut rng);
-        self.regions.insert(
-            base,
-            Region {
-                init: data.clone(),
-                data,
-                stub_writable: false,
-            },
-        );
-        self.syms.insert(name.to_string(), base + PTR_SLACK);
-        base + PTR_SLACK
+        place_symbol(&mut self.regions, &mut self.syms, self.seed, name, None)
     }
 
     fn writes(&self) -> Vec<(u64, u8)> {
@@ -1134,6 +1626,7 @@ impl<'a> State<'a> for Sandbox<'a> {
                 data: vec![self.stack_fill; self.frame_size as usize],
                 init: Vec::new(),
                 stub_writable: false,
+                set: if self.xsyms.is_some() { vec![0; self.frame_size as usize] } else { Vec::new() },
             },
         );
         self.frames.push((Frame::new(function), base));
@@ -1216,7 +1709,7 @@ impl<'a> State<'a> for Sandbox<'a> {
     ) -> Result<Address, MemoryError> {
         // Callees are stubs keyed by name; the address only needs to be
         // stable and recognizable when it comes back to `call_indirect`.
-        let key = name.display(Some(&self.func.params)).to_string();
+        let key = ext_key(self.func, name, self.xsyms);
         let idx = hash_str(&key) & 0xff_ffff;
         Address::from_parts(
             size,
@@ -1241,9 +1734,9 @@ impl<'a> State<'a> for Sandbox<'a> {
     }
 }
 
-fn gv_name(f: &Function, gv: GlobalValue) -> Option<String> {
+fn gv_name(f: &Function, gv: GlobalValue, x: Option<&Syms>) -> Option<String> {
     match &f.global_values[gv] {
-        GlobalValueData::Symbol { name, .. } => Some(name.display(Some(&f.params)).to_string()),
+        GlobalValueData::Symbol { name, .. } => Some(ext_key(f, name, x)),
         _ => None,
     }
 }
@@ -1252,7 +1745,7 @@ fn resolve_gv(s: &Sandbox, gv: GlobalValue) -> Result<DataValue, MemoryError> {
     let f = s.func;
     match &f.global_values[gv] {
         GlobalValueData::Symbol { offset, .. } => {
-            let name = gv_name(f, gv).unwrap();
+            let name = gv_name(f, gv, s.xsyms).unwrap();
             let base = *s
                 .syms
                 .get(&name)
@@ -1313,6 +1806,7 @@ fn install_quiet_hook() {
 /// `check_nonnull`: stop as undefined behavior when a load known nonnull
 /// yields 0. Only for the original: an optimized function may hoist such a
 /// load to where its value goes unused, which is fine (it is poison, not UB).
+#[allow(clippy::too_many_arguments)]
 fn run(
     f: &Function,
     world: &World,
@@ -1320,15 +1814,17 @@ fn run(
     self_name: &str,
     fuel: u64,
     check_nonnull: bool,
-) -> Outcome {
+    xsyms: Option<&Syms>,
+    replay: Option<&[CallRec]>,
+) -> (Outcome, Trace) {
     install_quiet_hook();
     QUIET.with(|q| q.set(true));
     let r = catch_unwind(AssertUnwindSafe(|| {
-        run_inner(f, world, nowrite, self_name, fuel, check_nonnull)
+        run_inner(f, world, nowrite, self_name, fuel, check_nonnull, xsyms, replay)
     }));
     QUIET.with(|q| q.set(false));
-    match r {
-        Ok(o) => o,
+    let o = match r {
+        Ok(o) => return o,
         Err(e) => {
             let msg = e
                 .downcast_ref::<String>()
@@ -1343,7 +1839,8 @@ fn run(
                 .unwrap_or_default();
             Outcome::Inconclusive(format!("interpreter panic: {msg}{at}{inst}"))
         }
-    }
+    };
+    (o, Trace::default())
 }
 
 enum Stop {
@@ -1351,6 +1848,7 @@ enum Stop {
     Unsupported(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     f: &Function,
     world: &World,
@@ -1358,7 +1856,9 @@ fn run_inner(
     self_name: &str,
     fuel: u64,
     check_nonnull: bool,
-) -> Outcome {
+    xsyms: Option<&Syms>,
+    replay: Option<&[CallRec]>,
+) -> (Outcome, Trace) {
     let no_facts = FxHashSet::default();
     let no_derived = FxHashMap::default();
     // Stack frame: the pair's layout (`slot_layout`), the same for
@@ -1378,7 +1878,7 @@ fn run_inner(
         self_name: self_name.to_string(),
         regions: world.regions.clone(),
         slot_at,
-        syms: FxHashMap::default(),
+        syms: world.syms.clone(),
         calls: Vec::new(),
         nowrite,
         nonnull: if check_nonnull {
@@ -1393,6 +1893,7 @@ fn run_inner(
         },
         memcmp: &world.memcmp,
         extent: &world.extent,
+        undef: if check_nonnull && world.stack_fill != 0 { &world.undef } else { &no_facts },
         seed: world.seed,
         stack_fill: world.stack_fill,
         pinned: DataValue::I64(0),
@@ -1402,19 +1903,23 @@ fn run_inner(
             .map(|w| (w, if check_nonnull { "before" } else { "after" })),
         path: crate::config::env_is("PLIRON_DIFFCHECK_PATH", "1")
             .then_some(if check_nonnull { "before" } else { "after" }),
+        xsyms,
+        replay,
+        log: Vec::new(),
     };
     // Data symbols: same name, same address and contents in every run.
+    // (A cross-build pair's are placed already: `World::add_symbols`.)
     let mut names: Vec<String> = f
         .global_values
         .keys()
-        .filter_map(|gv| gv_name(f, gv))
+        .filter_map(|gv| gv_name(f, gv, xsyms))
         .collect();
     names.sort();
     for n in names {
         s.symbol_addr(&n);
     }
     let mut left = fuel;
-    match exec(&mut s, world.args.clone(), &mut left) {
+    let o = match exec(&mut s, world.args.clone(), &mut left) {
         Ok(rets) => Outcome::Returned {
             rets,
             writes: s.writes(),
@@ -1425,7 +1930,8 @@ fn run_inner(
             None => t,
         }),
         Err(Stop::Unsupported(r)) => Outcome::Inconclusive(r),
-    }
+    };
+    (o, Trace { log: s.log, calls: s.calls })
 }
 
 /// Deepest self-recursion interpreted before giving up.
@@ -1543,6 +2049,17 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
                         }
                     }
                 }
+                // A value that stands for `undef` is the frame's fill
+                // (`Facts::undef`; the set is empty unless this is the
+                // original's run under the other fill).
+                if !s.undef.is_empty() {
+                    for (v, r) in vals.iter_mut().zip(f.dfg.inst_results(i)) {
+                        if s.undef.contains(r) {
+                            let ty = v.ty();
+                            *v = DataValue::read_from_slice_le(&[s.stack_fill; 16][..ty.bytes() as usize], ty);
+                        }
+                    }
+                }
                 if data.opcode().can_load()
                     && let Some(&r) = f.dfg.inst_results(i).first()
                     && s.nonnull.contains(&r)
@@ -1615,7 +2132,7 @@ fn do_call(s: &mut Sandbox, i: ir::Inst, left: &mut u64) -> Result<Vec<DataValue
                     .collect();
                 return libcall(s, lc, &all, &rets);
             }
-            let name = ext.name.display(Some(&f.params)).to_string();
+            let name = ext_key(f, &ext.name, s.xsyms);
             if s.memcmp.contains(&name) {
                 let rets: Vec<Type> = f.dfg.signatures[ext.signature].returns.iter().map(|r| r.value_type).collect();
                 return libcall(s, LibCall::Memcmp, &all, &rets);
@@ -1657,13 +2174,134 @@ fn stub(
     // behind whichever layout it lands in — a merge that lets a folded
     // slot's stub fill clobber a live neighbor diverges and reports.
     let orig_args = args.clone();
+    let in_frames = |p: u64| (stack_base()..stack_base() + stack_span()).contains(&p);
+    // Cross-build pair, second function: the first one's stub at this
+    // point of the call sequence, when it is the same call. (When it is
+    // not, the two call lists differ and the trial reports that.)
+    let rec: Option<&CallRec> = s
+        .replay
+        .and_then(|log| log.get(s.calls.len()))
+        .filter(|r| r.name == name && r.args.len() == args.len());
+    // Where the first function passed the address of a slot of its own,
+    // the argument's value was that function's to choose: whatever
+    // pointer this one passes there is the same argument. What the callee
+    // writes through it still lands where this function's pointer points.
     let args: Vec<DataValue> = args
         .into_iter()
-        .map(|a| match as_ptr(&a) {
-            Some(p) if (stack_base()..stack_base() + stack_span()).contains(&p) => ptr(stack_base()),
+        .enumerate()
+        .map(|(k, a)| match as_ptr(&a) {
+            Some(p) if in_frames(p) || rec.is_some_and(|r| r.args[k].frame) => ptr(stack_base()),
             _ => a,
         })
         .collect();
+    // Bytes from a frame address to the end of its stack slot. Each
+    // frame holds the slots at `slot_at` (outer frames count too — a
+    // callee can out-param into a caller's slot).
+    let room_at = |s: &Sandbox, p: u64| -> Option<u64> {
+        let d = p - stack_base();
+        let fidx = d / s.frame_size;
+        if fidx as usize >= s.frames.len() {
+            return None;
+        }
+        // The slot whose room holds the address: the last one that
+        // starts at or before it.
+        let rel = d % s.frame_size;
+        let slot = s.slot_at.partition_point(|&o| o <= rel).checked_sub(1)?;
+        let in_off = rel - s.slot_at[slot];
+        let sz = s.func.sized_stack_slots.get(StackSlot::from_u32(slot as u32))?.size as u64;
+        (in_off < sz).then(|| sz - in_off)
+    };
+    let mut arec: Vec<ArgRec> = orig_args
+        .iter()
+        .map(|a| ArgRec { frame: as_ptr(a).is_some_and(in_frames), ..ArgRec::default() })
+        .collect();
+    // Cross-build pair: what the callee can read through each pointer is
+    // part of the call. A callee reads the memory it is handed, and an IR
+    // pass moves the writes that fill it (memcpyopt sends a temporary's
+    // writers to the copy's destination; with the copy gone, a later
+    // reader of the temporary reads the destination, which a loop may
+    // have changed since: two `String`s owning one block, `tests/mcrdwrap`).
+    // The first function's stub takes the bytes written so far in the
+    // window its pointer opens (to the end of the slot or region, the
+    // operand's extent, 64 bytes); the second one's takes the same bytes
+    // of the same window behind its own pointer. Bytes of a frame that
+    // were never written are not the callee's to read and are left out:
+    // an out-slot shows nothing.
+    let mut args = args;
+    if s.xsyms.is_some() {
+        for (k, a) in orig_args.iter().enumerate() {
+            let Some(p) = as_ptr(a) else { continue };
+            // The callee writes an `sret` area and may not read it: what
+            // it held before is dead, and the pipeline need not keep it
+            // (`tokenize::setup`: the slot of a `format!` result, reused).
+            if f.dfg.signatures[sig].params.get(k).is_some_and(|p| p.purpose == ir::ArgumentPurpose::StructReturn) {
+                continue;
+            }
+            // The window this function's pointer opens: to the end of its
+            // slot or region, the operand's extent, 64 bytes.
+            let ext = s.extent.get(&(name.clone(), k as u32)).copied().unwrap_or(u64::MAX);
+            let room = if in_frames(p) {
+                room_at(s, p)
+            } else {
+                s.find(p, 1).map(|(base, reg)| base + reg.data.len() as u64 - p)
+            };
+            let own = room.unwrap_or(0).min(64).min(ext);
+            // The second function reads the first one's window, as far as
+            // its own reaches; beyond that the first one's bytes stand.
+            // The callee reads one object, and a window ends at the end of
+            // the slot that holds it: where one build keeps more in that
+            // slot (sroa off: the whole aggregate around the field passed),
+            // the bytes past the object are not the callee's to read.
+            let (len, mask, theirs) = match rec {
+                Some(r) => (u64::from(r.args[k].seen), Some(r.args[k].mask), Some(r.args[k].bytes)),
+                None => (own, None, None),
+            };
+            if len == 0 {
+                continue;
+            }
+            let mine = len.min(own);
+            let mut bytes = s.bytes(p, mine).map(<[u8]>::to_vec).unwrap_or_else(|| vec![0; mine as usize]);
+            if let Some(t) = theirs {
+                bytes.extend_from_slice(&t[mine as usize..len as usize]);
+            }
+            let mask = mask.unwrap_or_else(|| {
+                let set = s.written(p, len).unwrap_or_else(|| vec![0; len as usize]);
+                set.iter().enumerate().fold(0u64, |m, (j, &w)| m | (u64::from(w != 0) << j))
+            });
+            if mask == 0 {
+                continue;
+            }
+            arec[k].seen = len as u32;
+            arec[k].mask = mask;
+            let mut seen = [0u8; 64];
+            for (j, b) in bytes.iter().enumerate() {
+                if mask >> j & 1 != 0 {
+                    seen[j] = *b;
+                }
+            }
+            // A frame address in the window (an argument array of
+            // `&local`s) is the function's to choose, like one passed
+            // directly: the same canonical value.
+            let w = if p32() { 4usize } else { 8 };
+            let mut j = (p as usize).next_multiple_of(w) - p as usize;
+            while j + w <= len as usize {
+                let mut cell = [0u8; 8];
+                cell[..w].copy_from_slice(&seen[j..j + w]);
+                if (mask >> j) & ((1u64 << w) - 1) == (1u64 << w) - 1
+                    && in_frames(u64::from_le_bytes(cell))
+                {
+                    seen[j..j + w].copy_from_slice(&stack_base().to_le_bytes()[..w]);
+                }
+                j += w;
+            }
+            arec[k].bytes = seen;
+            // Which bytes, then the bytes, a word at a time.
+            args.push(DataValue::I64(mask as i64));
+            for w in seen[..(len as usize).next_multiple_of(8)].chunks(8) {
+                args.push(DataValue::I64(i64::from_le_bytes(w.try_into().unwrap())));
+            }
+        }
+    }
     let mut h = mix(s.seed, hash_str(&name));
     h = mix(h, s.calls.len() as u64);
     for a in &args {
@@ -1672,7 +2310,59 @@ fn stub(
         h = mix(h, u64::from_le_bytes(b[..8].try_into().unwrap()));
         h = mix(h, u64::from_le_bytes(b[8..].try_into().unwrap()));
     }
-    if !s.nowrite.contains(&name) {
+    // The two fills: up to 64 bytes for a slot of the caller's frame, one
+    // word for other memory.
+    // In a cross-build pair both are words a function can go on with
+    // (small integers, zero, pointers into the heap regions, as seeded
+    // memory holds them): the IR passes move code around calls, and a
+    // run that dies at the first use of what a callee returned through
+    // memory (a `Vec` header that is 24 random bytes) sees none of it.
+    let xmode = s.xsyms.is_some();
+    let words = |k: usize, n: usize| -> Vec<u8> {
+        let targets: Vec<u64> = (0..HEAPS).map(|h| heap_base() + h * REGION_STRIDE + PTR_SLACK).collect();
+        let mut v = vec![0u8; n.next_multiple_of(8)];
+        fill(&mut v, &targets, &mut Rng(mix(h, k as u64)));
+        v.truncate(n);
+        v
+    };
+    let frame_fill = |k: usize, n: usize| -> Vec<u8> {
+        if xmode {
+            return words(k, n);
+        }
+        (0..n).map(|j| (mix(h, k as u64) >> ((j % 8) * 8)) as u8 ^ j as u8).collect()
+    };
+    let word_fill = |k: usize| -> Vec<u8> {
+        if xmode { words(k, 8) } else { mix(h, k as u64).to_le_bytes().to_vec() }
+    };
+    if let Some(rec) = rec {
+        // The same bytes the first function's stub wrote, as far as the
+        // object this pointer names has room for them.
+        for (k, a) in orig_args.iter().enumerate() {
+            let (Some(p), r) = (as_ptr(a), rec.args[k]) else { continue };
+            if r.fill == 0 {
+                continue;
+            }
+            let room = if in_frames(p) {
+                room_at(s, p)
+            } else {
+                s.find(p, 1)
+                    .filter(|(base, reg)| reg.stub_writable && *base < stack_base())
+                    .map(|(base, reg)| base + reg.data.len() as u64 - p)
+            };
+            let Some(room) = room else { continue };
+            // The same bytes, wherever this pointer points: a callee that
+            // fills its `sret` area fills all of it, in the caller's frame
+            // or (memcpyopt forwarded `call f(sret tmp); memcpy(dst, tmp)`)
+            // in the heap. Both fills are the same words in cross mode.
+            let v = frame_fill(k, (r.fill as u64).min(room) as usize);
+            let n = v.len() as u64;
+            s.note_write(p, n, |_| format!("stub fill of {n} bytes at {p:#x} (argument {k}, as in the other build)"));
+            if let Some(b) = s.bytes_mut(p, n) {
+                b.copy_from_slice(&v);
+                arec[k].fill = n as u32;
+            }
+        }
+    } else if !s.nowrite.contains(&name) {
         for (k, a) in orig_args.iter().enumerate() {
             if let Some(p) = as_ptr(a) {
                 // The callee reaches at most this many bytes through the
@@ -1680,38 +2370,16 @@ fn stub(
                 // of its 24; the `len` beyond is the caller's to keep in
                 // a register).
                 let ext = s.extent.get(&(name.clone(), k as u32)).copied().unwrap_or(u64::MAX);
-                if (stack_base()..stack_base() + stack_span()).contains(&p) {
+                if in_frames(p) {
                     // Frame pointer: bound the fill to the containing
                     // slot's extent so it can't spill into a neighbor.
-                    // Each frame holds the slots at `slot_at` (outer
-                    // frames count too — a callee can out-param into a
-                    // caller's slot).
-                    let d = p - stack_base();
-                    let fidx = d / s.frame_size;
-                    if fidx as usize >= s.frames.len() {
-                        continue;
-                    }
-                    // The slot whose room holds the address: the last
-                    // one that starts at or before it.
-                    let rel = d % s.frame_size;
-                    let Some(slot) = s.slot_at.partition_point(|&o| o <= rel).checked_sub(1) else {
-                        continue;
-                    };
-                    let in_off = rel - s.slot_at[slot];
-                    let Some(sd) = s.func.sized_stack_slots.get(StackSlot::from_u32(slot as u32)) else {
-                        continue;
-                    };
-                    let sz = sd.size as u64;
-                    if in_off >= sz {
-                        continue;
-                    }
-                    let n = (sz - in_off).min(64).min(ext) as usize;
-                    let v: Vec<u8> = (0..n)
-                        .map(|j| (mix(h, k as u64) >> ((j % 8) * 8)) as u8 ^ j as u8)
-                        .collect();
+                    let Some(room) = room_at(s, p) else { continue };
+                    let n = room.min(64).min(ext) as usize;
+                    let v = frame_fill(k, n);
                     s.note_write(p, n as u64, |_| format!("stub fill of {n} bytes at {p:#x} (argument {k})"));
                     if let Some(b) = s.bytes_mut(p, n as u64) {
                         b.copy_from_slice(&v[..n]);
+                        arec[k].fill = n as u32;
                     }
                     continue;
                 }
@@ -1719,19 +2387,34 @@ fn stub(
                     .find(p, 8)
                     .is_some_and(|(base, r)| r.stub_writable && base < stack_base());
                 if writable && ext >= 8 {
-                    let v = mix(h, k as u64).to_le_bytes();
+                    let v = word_fill(k);
                     s.note_write(p, 8, |_| format!("stub fill of 8 bytes at {p:#x} (argument {k})"));
                     s.bytes_mut(p, 8).unwrap().copy_from_slice(&v);
+                    arec[k].fill = 8;
                 }
             }
         }
     }
+    // `PLIRON_DIFFCHECK_PATH=1` logs the calls with the blocks.
+    if let Some(run) = s.path {
+        tracing::info!(target: "pliron::diffcheck", "call [{run}, fill {:#x}] {}: {name} {args:x?} (as passed: {orig_args:x?})", s.stack_fill, s.calls.len());
+    }
+    s.log.push(CallRec { name: name.clone(), args: arec });
     s.calls.push((name, args));
     let mut rets = Vec::new();
     for (k, r) in f.dfg.signatures[sig].returns.iter().enumerate() {
         let mut rng = Rng(mix(h, 1000 + k as u64));
         let v = if r.value_type == ptr_ty() && rng.below(2) == 0 {
             ptr(heap_base() + rng.below(HEAPS) * REGION_STRIDE + PTR_SLACK + rng.below(8) * 8)
+        } else if xmode && r.value_type == types::I8 {
+            // A byte result is mostly a `bool` or the tag of a
+            // `Result<(), E>`: 0 or 1, mostly 0. `random_value` never
+            // makes it 0, so every `write!(..)?` failed and a loop around
+            // one never came round a second time (`tests/mcrdwrap`); and a
+            // `bool` of 46 is one no function has to treat alike (sroa off
+            // returned it as is, on it came back as `46 & 1`: rustc
+            // demangle's `in_binder`).
+            DataValue::I8(i8::from(rng.below(4) == 0))
         } else {
             random_value(r.value_type, &mut rng, true)
         };
@@ -1760,10 +2443,14 @@ fn libcall(
             let (d, src, n) = (int(&a[0]), int(&a[1]), int(&a[2]));
             if n > 0 {
                 let tmp = s.bytes(src, n).ok_or_else(oob)?.to_vec();
+                let set = s.written(src, n);
                 s.note_write(d, n, |k| {
                     format!("copy of {n} bytes to {d:#x}: byte {:#x} from {:#x}", tmp[k as usize], src + k)
                 });
                 s.bytes_mut(d, n).ok_or_else(oob)?.copy_from_slice(&tmp);
+                if let Some(set) = set {
+                    s.set_written(d, &set);
+                }
             }
             Ok(rets.iter().map(|_| ptr(d)).collect())
         }
@@ -1991,9 +2678,115 @@ pub struct OwnedFacts {
     pub block_region: Vec<(u32, u32)>,
     pub region_parent: Vec<(u32, u32)>,
     pub region_nn: Vec<(Value, Vec<u32>)>,
+    /// `; diffcheck-undef:` ([`Facts::undef`]).
+    pub undef: FxHashSet<Value>,
+    /// `; diffcheck-syms:` and `; diffcheck-data:`: every external name of
+    /// the function by symbol, and the images of the constant data among
+    /// them ([`Self::syms_of`] adds what the `names` header knows).
+    pub syms: Syms,
+}
+
+impl Syms {
+    /// May `s` stand in a `; diffcheck-syms:`/`; diffcheck-data:` item?
+    fn plain(s: &str) -> bool {
+        !s.is_empty() && !s.contains([',', '=', '/', '+', ' ', '\n'])
+    }
+
+    /// The two header lines a corpus dump records these as (empty when
+    /// there is nothing to say):
+    /// `; diffcheck-syms: u0:12=<symbol>,u1:65=<symbol>` and
+    /// `; diffcheck-data: <symbol>=<hex bytes>[/<offset>+<f|d>+<symbol>+<addend>]..,..`.
+    pub fn header(&self) -> String {
+        let mut names: Vec<String> = self
+            .names
+            .iter()
+            .filter(|(_, s)| Self::plain(s))
+            .map(|(d, s)| format!("{d}={s}"))
+            .collect();
+        names.sort();
+        let mut data: Vec<String> = self
+            .data
+            .iter()
+            .filter(|(s, img)| Self::plain(s) && img.relocs.iter().all(|r| Self::plain(&r.sym)))
+            .map(|(s, img)| {
+                let mut t = format!("{s}=");
+                for b in &img.bytes {
+                    let _ = write!(t, "{b:02x}");
+                }
+                for r in &img.relocs {
+                    let _ = write!(t, "/{}+{}+{}+{}", r.off, if r.func { 'f' } else { 'd' }, r.sym, r.addend);
+                }
+                t
+            })
+            .collect();
+        data.sort();
+        let mut out = String::new();
+        if !self.undef.is_empty() {
+            let mut vs: Vec<u32> = self.undef.iter().map(|v| v.as_u32()).collect();
+            vs.sort_unstable();
+            vs.dedup();
+            let vs: Vec<String> = vs.iter().map(|v| format!("v{v}")).collect();
+            let _ = writeln!(out, "; diffcheck-undef: {}", vs.join(","));
+        }
+        if !names.is_empty() {
+            let _ = writeln!(out, "; diffcheck-syms: {}", names.join(","));
+        }
+        if !data.is_empty() {
+            let _ = writeln!(out, "; diffcheck-data: {}", data.join(","));
+        }
+        out
+    }
+
+    fn parse_line(&mut self, line: &str) {
+        if let Some(list) = line.strip_prefix("; diffcheck-syms:") {
+            for item in list.split(',') {
+                if let Some((d, s)) = item.trim().split_once('=') {
+                    self.names.insert(d.to_string(), s.to_string());
+                }
+            }
+        } else if let Some(list) = line.strip_prefix("; diffcheck-data:") {
+            for item in list.split(',') {
+                let Some((sym, rest)) = item.trim().split_once('=') else { continue };
+                let mut parts = rest.split('/');
+                let hex = parts.next().unwrap_or("");
+                let bytes: Option<Vec<u8>> = (0..hex.len() / 2)
+                    .map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
+                    .collect();
+                let relocs: Option<Vec<Reloc>> = parts
+                    .map(|r| {
+                        let f: Vec<&str> = r.split('+').collect();
+                        (f.len() == 4).then_some(())?;
+                        Some(Reloc {
+                            off: f[0].parse().ok()?,
+                            func: f[1] == "f",
+                            sym: f[2].to_string(),
+                            addend: f[3].parse().ok()?,
+                        })
+                    })
+                    .collect();
+                if let (Some(bytes), Some(relocs), true) = (bytes, relocs, hex.len() % 2 == 0) {
+                    self.data.insert(sym.to_string(), DataImage { bytes, relocs });
+                }
+            }
+        }
+    }
 }
 
 impl OwnedFacts {
+    /// How `func` spells its symbols: the `syms` header, and for a corpus
+    /// recorded before it existed the callees of the `names` header.
+    pub fn syms_of(&self, func: &Function) -> Syms {
+        let mut out = self.syms.clone();
+        for (fr, sym) in &self.names {
+            if let Some(d) = func.dfg.ext_funcs.get(*fr) {
+                out.names
+                    .entry(d.name.display(Some(&func.params)).to_string())
+                    .or_insert_with(|| sym.clone());
+            }
+        }
+        out
+    }
+
     /// A corpus dump records `self=<symbol>`, a diffcheck repro
     /// `self=u0:<FuncId>`; callees are spelled `u0:<FuncId>` in both. Turn
     /// the symbol into that spelling through the `names` header, so a
@@ -2045,6 +2838,7 @@ impl OwnedFacts {
                 .map(|(r, _)| *r)
                 .collect(),
             stub_extent: self.stub_extent.clone(),
+            undef: Some(&self.undef),
         }
     }
 
@@ -2084,6 +2878,14 @@ impl OwnedFacts {
         };
         let num = |s: &str, c: char| -> Option<u32> { s.trim().strip_prefix(c)?.parse().ok() };
         for line in text.lines() {
+            out.syms.parse_line(line);
+            if let Some(list) = line.strip_prefix("; diffcheck-undef:") {
+                out.undef.extend(
+                    list.split(',')
+                        .filter_map(|v| v.trim().strip_prefix('v')?.parse().ok())
+                        .map(Value::from_u32),
+                );
+            }
             if let Some(list) = line.strip_prefix("; diffcheck-nocap:") {
                 for item in list.split(',').filter(|x| !x.is_empty()) {
                     // `fn{funcref}:{arg}` or `fn{funcref}:{arg}:{extent}`;

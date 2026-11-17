@@ -357,6 +357,75 @@ fn uen_syms_of(m: &dyn Module, func: &ir::Function) -> FxHashMap<u32, String> {
         .collect()
 }
 
+/// `PLIRON_CORPUS` (`Pipe::corpus_syms`): the symbol behind every
+/// external name of `func`, callees and data, and the bytes of the
+/// immutable data among them with a known initializer of at most
+/// `CORPUS_IMAGE_MAX` bytes (what `constload` folds loads from),
+/// relocations included. `None` when no corpus is recorded.
+fn corpus_syms_of(
+    m: &dyn Module,
+    ctx: &Context,
+    st: &State,
+    func: &ir::Function,
+    undef: Vec<ir::Value>,
+) -> Option<Box<pliron_clif_opt::diffcheck::Syms>> {
+    use pliron_clif_opt::diffcheck::{DataImage, Reloc, Syms};
+    const CORPUS_IMAGE_MAX: u64 = 4096;
+    if !crate::env_set("PLIRON_CORPUS") {
+        return None;
+    }
+    let decls = m.declarations();
+    let (n_fn, n_data) = (
+        decls.get_functions().count() as u32,
+        decls.get_data_objects().count() as u32,
+    );
+    // `st`'s names keep LLVM's `\x01` marker, the module's do not.
+    let global = |sym: &str| st.globals.get(sym).or_else(|| st.globals.get(&format!("\u{1}{sym}")));
+    let mut out = Syms { undef, ..Syms::default() };
+    for n in func.params.user_named_funcs().values() {
+        let text = format!("u{}:{}", n.namespace, n.index);
+        match n.namespace {
+            0 if n.index < n_fn => {
+                if let Some(s) = decls.get_function_decl(FuncId::from_u32(n.index)).name.clone() {
+                    out.names.insert(text, s);
+                }
+            }
+            1 if n.index < n_data => {
+                let Some(sym) = decls.get_data_decl(DataId::from_u32(n.index)).name.clone() else {
+                    continue;
+                };
+                if let Some(g) = global(&sym)
+                    && let (Some(init), false, false) = (g.init, g.mutable, g.tls)
+                {
+                    let (size, _) = size_align(ctx, init.get_type(ctx));
+                    if size <= CORPUS_IMAGE_MAX {
+                        let mut bytes = vec![0u8; size as usize];
+                        let mut relocs = Vec::new();
+                        write_const(ctx, st, init, 0, &mut bytes, &mut relocs);
+                        let relocs = relocs
+                            .into_iter()
+                            .map(|(off, s, addend)| Reloc {
+                                off: off as u32,
+                                func: st.funcs.get(&s).is_some(),
+                                sym: crate::obj_sym(&s).to_string(),
+                                addend,
+                            })
+                            .collect();
+                        out.data.insert(sym.clone(), DataImage { bytes, relocs });
+                    }
+                } else if let Some(b) = st.extern_bytes.get(&sym)
+                    && b.len() as u64 <= CORPUS_IMAGE_MAX
+                {
+                    out.data.insert(sym.clone(), DataImage { bytes: b.to_vec(), relocs: Vec::new() });
+                }
+                out.names.insert(text, sym);
+            }
+            _ => {}
+        }
+    }
+    Some(Box::new(out))
+}
+
 /// The pliron `Context` handed to [`lower_to_object`]: borrowed, or owned
 /// through a slot so `PLIRON_LOWERFREE` can drop it once phase (A) has
 /// lowered every function (see [`lowerfree`]).
@@ -595,6 +664,8 @@ struct FnJob {
     /// `user_named_funcs` — the step cache keys those indices by
     /// symbol and remaps replayed variants across CGUs.
     uen_syms: FxHashMap<u32, String>,
+    /// `PLIRON_CORPUS`: see `Pipe::corpus_syms`.
+    corpus_syms: Option<Box<pliron_clif_opt::diffcheck::Syms>>,
     /// The CGU's read-only inputs, Arc'd so a job can ride the global
     /// pool without borrowing anything off the producer thread.
     sh: Arc<JobShared>,
@@ -650,6 +721,7 @@ impl FnJob {
         self.lifetimes = Default::default();
         self.nocap = Default::default();
         self.uen_syms = Default::default();
+        self.corpus_syms = None;
     }
 
     /// A job carrying a prebuilt body and no lowering facts.
@@ -680,6 +752,7 @@ impl FnJob {
             nocap: FxHashMap::default(),
             stubs: rustc_hash::FxHashSet::default(),
             uen_syms: FxHashMap::default(),
+            corpus_syms: None,
             sh,
             stats: crate::pipeline::Stats::default(),
             err: None,
@@ -1046,6 +1119,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 carry_log: Vec::new(),
                 prof_hook: Some(&prof_hook),
                 fn_names: &sh.fn_names,
+                corpus_syms: j.corpus_syms.as_deref(),
             };
             // Debug bisection: same `PLIRON_PIPEFN[X]` filter as the
             // wasm path — the pipeline runs only on matching fns.
@@ -2165,6 +2239,7 @@ pub fn lower_module<'a>(
             };
             let id = hot_bodies.get(n).copied().unwrap_or(id);
             clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
+            let undef: Vec<ir::Value>;
             let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
             let derived: pliron_clif_opt::vmap::VMap<cranelift_codegen::ir::Value>;
             let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
@@ -2238,6 +2313,7 @@ pub fn lower_module<'a>(
                     lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
                     ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                     ltzero: FxHashSet::default(),
+                    undef: Vec::new(),
                     ltloops: FxHashSet::default(),
                 cycles: FxHashSet::default(),
                     ltdom: None,
@@ -2321,6 +2397,7 @@ pub fn lower_module<'a>(
                 block_region = std::mem::take(&mut fl.block_region);
                 nocap = std::mem::take(&mut fl.nocap);
                 dbg_slots = std::mem::take(&mut fl.dbg_slots);
+                undef = std::mem::take(&mut fl.undef);
                 // Caller-side operands of `noalias readonly` clone params, in
                 // CLIF values (`State::region_frozen_op`): `*v` is immutable
                 // while the binding clone runs — loadfwd's scoped immunity.
@@ -2348,6 +2425,7 @@ pub fn lower_module<'a>(
                 );
             }
             let uen_syms = uen_syms_of(m, &clctx.func);
+            let corpus_syms = corpus_syms_of(m, ctx, st, &clctx.func, undef);
             emit(
                 idx,
                 FnJob {
@@ -2376,6 +2454,7 @@ pub fn lower_module<'a>(
                     nocap,
                     stubs,
                     uen_syms,
+                    corpus_syms,
                     sh: shared.clone(),
                     stats: crate::pipeline::Stats::default(),
                     err: None,
@@ -3311,6 +3390,7 @@ pub fn lower_clif_wasm(
             prof,
             lifetimes,
             nocap,
+            undef,
         ) = {
             let b = FunctionBuilder::new(&mut clctx.func, &mut fbc);
             let mut fl = FnLower {
@@ -3362,6 +3442,7 @@ pub fn lower_clif_wasm(
                 lowerfold: crate::pass_enabled("PLIRON_LOWERFOLD"),
                 ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                 ltzero: FxHashSet::default(),
+                undef: Vec::new(),
                 ltloops: FxHashSet::default(),
                 cycles: FxHashSet::default(),
                 ltdom: None,
@@ -3414,9 +3495,11 @@ pub fn lower_clif_wasm(
                 prof,
                 lifetimes,
                 fl.nocap,
+                fl.undef,
             )
         };
         let uen_syms = uen_syms_of(&m, &clctx.func);
+        let corpus_syms = corpus_syms_of(&m, ctx, st, &clctx.func, undef);
         emit(
             idx,
             FnJob {
@@ -3445,6 +3528,7 @@ pub fn lower_clif_wasm(
                 nocap,
                 stubs: rustc_hash::FxHashSet::default(),
                 uen_syms,
+                corpus_syms,
                 sh: shared.clone(),
                 stats: crate::pipeline::Stats::default(),
                 err: None,
@@ -3977,6 +4061,13 @@ struct FnLower<'a, 'b> {
     /// blurring slotmerge's lifetimes (NestLimiter's error-kind temps
     /// stopped sharing a slot).
     ltzero: FxHashSet<ir::Inst>,
+    /// `PLIRON_CORPUS`: the values that stand for `undef`: the zero a
+    /// promoted variable restarts at (`ltundef`), the zero the SSA builder
+    /// gives a variable read before any write, and `undef`/`poison`
+    /// constants. The lowered function holds a plain 0 for each; the
+    /// differential checker must not pin a byte made of one
+    /// (`diffcheck::Syms::undef`).
+    undef: Vec<ir::Value>,
     /// Lazily-built domtree for `sroa::lt_marker_bounded`'s marker/read
     /// ordering check.
     ltdom: Option<pliron_ir_opt::domcheck::Dom>,
@@ -4229,7 +4320,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
             self.b.ins().return_(&rets);
         }
         self.dbg_value_labels();
+        // Sealing creates instructions for one thing only: the zero of a
+        // variable that is read on a path with no write.
+        let n0 = self.b.func.dfg.num_insts();
         self.b.seal_all_blocks();
+        for k in n0..self.b.func.dfg.num_insts() {
+            let i = ir::Inst::new(k);
+            self.undef.extend(self.b.func.dfg.inst_results(i).iter().copied());
+        }
     }
 
     /// `-g` when optimizing: the pieces of keyed variable slot `k` (alloca
@@ -5494,11 +5592,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         .collect()
                 }
             }
-            ConstVal::Zero | ConstVal::Undef => self
+            ConstVal::Zero => self
                 .ty_leaves(ty)
                 .iter()
                 .map(|&(_, t)| self.iconst_any(t, 0))
                 .collect(),
+            ConstVal::Undef => {
+                let r: Vals = self
+                    .ty_leaves(ty)
+                    .iter()
+                    .map(|&(_, t)| self.iconst_any(t, 0))
+                    .collect();
+                self.undef.extend(r.iter().copied());
+                r
+            }
             ConstVal::Bytes(bs) => bs
                 .iter()
                 .map(|b| self.b.ins().iconst(clt::I8, *b as i64))
@@ -7110,11 +7217,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 "pliron->cranelift: unsupported inline asm {t:?}"
             );
         } else if is!(UndefOp) || is!(PoisonOp) || is!(ZeroOp) {
-            let r = self
+            let r: Vals = self
                 .ty_leaves(self.res_ty(op))
                 .iter()
                 .map(|&(_, t)| self.iconst_any(t, 0))
                 .collect();
+            if !is!(ZeroOp) {
+                self.undef.extend(r.iter().copied());
+            }
             self.set(op, r);
         } else {
             panic!("pliron->cranelift: unsupported op {id}");
@@ -8616,6 +8726,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         None => {
                             let z = self.iconst_any(t, 0);
                             zeros.push((t, z));
+                            self.undef.push(z);
                             if let Some(i) = self.b.func.dfg.value_def(z).inst() {
                                 // `iconcat` for i128: its two iconsts too.
                                 self.ltzero.insert(i);

@@ -331,6 +331,12 @@ pub struct Pipe<'a> {
     /// Module-wide FuncId-indexed symbol table, for `PLIRON_CORPUS` name
     /// maps. Empty outside the real backend.
     pub fn_names: &'a [String],
+    /// `PLIRON_CORPUS` only: every symbol the function names (callees and
+    /// data, by the ids its text uses) and the bytes of the constant
+    /// data among them, for the dump's `diffcheck-syms`/`diffcheck-data`
+    /// headers. With them two builds' dumps of one function can be
+    /// compared (`clif-check xcorpus`).
+    pub corpus_syms: Option<&'a crate::diffcheck::Syms>,
 }
 
 impl Pipe<'_> {
@@ -1310,6 +1316,7 @@ fn corpus_dump(p: &mut Pipe) {
         memcmp: Default::default(),
         // Rebuilt from the nocap header on replay.
         stub_extent: Default::default(),
+        undef: None,
     };
     // Extra replay facts `diffcheck-facts` can't express: the per-callee
     // nocapture arg positions (a `(Inst, arg)` set on `Pipe`) re-keyed by
@@ -1413,8 +1420,9 @@ fn corpus_dump(p: &mut Pipe) {
             rnn.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join(",")
         )
     };
+    let syms = p.corpus_syms.map_or(String::new(), |s| s.header());
     let text = format!(
-        "{}; diffcheck-nocap: {}\n; diffcheck-names: {}\n; diffcheck-lifetimes: {}\n{regions}{}",
+        "{}; diffcheck-nocap: {}\n; diffcheck-names: {}\n; diffcheck-lifetimes: {}\n{regions}{syms}{}",
         crate::diffcheck::facts_header(&p.clctx.func, &facts),
         nc.join(","),
         names.join(","),
@@ -1700,6 +1708,7 @@ fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
         derived: Some(&*p.derived),
         memcmp: memcmp_refs(&p.clctx.func, p.fn_names),
         stub_extent: crate::diffcheck::stub_extents(&p.clctx.func, |i, k| p.nocap.get(&(i, k)).copied()),
+        undef: None,
     }
 }
 
@@ -5846,6 +5855,7 @@ mod tests {
         stats: &mut stats,
         carry_log: Vec::new(),
         fn_names: &[],
+        corpus_syms: None,
         cur_step: "",
     };
         p.seed_fact_bits();

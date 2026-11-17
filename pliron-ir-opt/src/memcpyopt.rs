@@ -1020,7 +1020,10 @@ fn try_forward(
     // every consumer, cutting at writers; a marker on the way (or a scan
     // over budget) drops all of `dst`'s markers, which leaves the slot
     // live wherever its bytes are used.
-    if st.allocas.get(dbase).is_some() {
+    // `PLIRON_MEMCPYOPT_DSTMARK=0` skips this: a miscompile, kept (like
+    // `PLIRON_MEMCPYOPT_RDWRAP=0`) for bisecting and to show the IR-pass
+    // differential check (`harness/xcorpus.py`) finding it.
+    if st.allocas.get(dbase).is_some() && pliron_cfg::pass_enabled("PLIRON_MEMCPYOPT_DSTMARK") {
         let dmarks: FxHashSet<Ptr<Operation>> = dbase
             .uses_iter(ctx)
             .map(|u| u.user_op())

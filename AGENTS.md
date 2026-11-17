@@ -364,6 +364,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   to follow a differing byte back, never-written bytes, lifetime markers
   an IR pass left stale, a corpus older than a fix):
   `docs/miscompile-triage.md` "Reading a corpus mismatch".
+- **Did an IR pass change behaviour?** `harness/xcorpus.py --off
+  PLIRON_<PASS>=0 [--on K=V] [wasm|std|rs FILE|cargo DIR]` records two
+  corpora of one build, the pass off and on, and `clif-check xcorpus`
+  compares every function by symbol: A against B and A against the CLIF
+  pipeline's output for B (stale lifetime markers show only there).
+  Functions whose call sets differ (inlining, devirt) are skipped.
+  Names `mcrdwrap::build` with `PLIRON_MEMCPYOPT_RDWRAP=0`; no false
+  positive on the wasm kernels + std for `PLIRON_MEMCPYOPT=0`, so it is
+  the check for memcpyopt work. How it works, what it cannot see:
+  `docs/miscompile-triage.md` "IR passes".
 - **wasm-only stages** (after CLIF): the waffle inliner
   (`PLIRON_WASM_INLINE=0`), byte peepholes (`PLIRON_WASM_PEEP=0`,
   `PLIRON_WASM_PEEP_LIMIT=N` peepholes only the first N bodies — bisect

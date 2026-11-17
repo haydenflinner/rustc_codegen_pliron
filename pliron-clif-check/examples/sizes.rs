@@ -127,6 +127,7 @@ fn main() {
         prof: &e8,
         prof_hook: None,
         fn_names: &[],
+        corpus_syms: None,
         region_parent: &e6,
         lifetimes: &mut lifetimes,
         renames: Vec::new(),

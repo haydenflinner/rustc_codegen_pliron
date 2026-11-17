@@ -136,6 +136,85 @@ clone-entry block params that are `PLIRON_SCOPED_NOALIAS` candidates, and
 for `block_region`/`region_parent`; the other map-valued tables need a
 value/inst-keyed encoding).
 
+## 3b. IR passes: ablation across two corpora (`clif-check xcorpus`)
+
+Everything above checks the CLIF pipeline. A corpus file is a function
+as lowered, after the pliron-IR passes, so two corpora of one build, one
+with an IR pass switched off, differ by what that pass did, and the CLIF
+interpreter can compare them:
+
+```sh
+harness/xcorpus.py --off PLIRON_MEMCPYOPT=0              # wasm kernels + std, ~2 min
+harness/xcorpus.py --off PLIRON_SROA=0 std               # natively
+harness/xcorpus.py --off PLIRON_MEMCPYOPT=0 rs tests/mcrdwrap/main.rs
+harness/xcorpus.py --off PLIRON_MEMCPYOPT=0 --on PLIRON_MEMCPYOPT_RDWRAP=0 rs tests/mcrdwrap/main.rs
+# by hand, any two corpora (PLIRON_CLIF_WASM=1 for wasm ones):
+clif-check xcorpus <dirA> <dirB> out.json --pipeline [--fn SUBSTR] [--trials N] [--every N]
+clif-check xpair a.clif b.clif --pipeline [--print]       # one pair, the replay line of a report
+```
+
+A is the reference (pass off), B the build under test. Functions pair by
+the symbol in `self=`; one recorded in several CGUs pairs when the
+copies match byte for byte but one. Each pair is checked A against B and
+(`--pipeline`) A against the CLIF pipeline's output for B: a fact the IR
+pass left stale (a lifetime marker) does harm only once `slotmerge`
+trusts it. A mismatch says which, and `B against pipeline(B)` says
+whether `report --check` on B alone would have shown it (then it is a
+CLIF step, not the IR pass).
+
+Statuses: `identical` (the pass did nothing), `ok`, `inconclusive`,
+`mismatch`, `skipped: calls differ` (the two call different callees, or
+a different number of indirect call sites: an inliner or devirt decision,
+not comparable), `skipped: signature differs`, `only in A|B`,
+`ambiguous`.
+
+What the cross-build mode adds to the checker (`diffcheck::check_cross`):
+
+- **Names by symbol.** Callees (`u0:N`) and data (`u1:N`) are a build's
+  own ids. The corpus records `; diffcheck-syms:` (every external name's
+  symbol) and stubs, function addresses and data regions are keyed by
+  symbol.
+- **Constant data.** `; diffcheck-data:` holds the bytes (and pointer
+  relocations) of the immutable data a function names, at most 4 KiB
+  each: `constload` folds a load in one build that the other performs.
+- **`undef`.** `; diffcheck-undef:` lists the values the lowering wrote
+  as 0 for `undef` (an `undef` constant, a promoted variable read before
+  a write). Under the other stack fill they take that fill, so a byte
+  made of one is not pinned.
+- **What a callee reads.** A stub hashes, with its arguments, the bytes
+  written so far behind each pointer argument (to the end of its slot or
+  region, its `nocap` extent, 64 bytes; never an `sret` area). The second
+  function's stubs read the first one's window and do what the first
+  one's did (same fill lengths). Without it a value that only a callee
+  reads is invisible (`tests/mcrdwrap`).
+- **Calls before a sandbox stop.** When the original stops because the
+  sandbox cannot follow (a copy out of the sandbox, fuel), the calls it
+  made up to there must be made by B too. Most loop iterations end that
+  way; without it a bug in a loop's second iteration is seen only by a
+  trial that also returns.
+- **Return area.** Bytes of the `sret` area the original left untouched
+  are not compared.
+- Byte-sized stub results and arguments are 0 or 1 (a `bool` of 46 is not
+  one two functions must treat alike), and the stub's fills are words a
+  program can go on with (pointers into the heap regions, small integers).
+
+Default 64 trials (`report` uses 16). Acceptance, 2026-11-16: with
+`PLIRON_MEMCPYOPT_RDWRAP=0` it names `mcrdwrap::build` (call 5,
+`core::fmt::write`, reads `{cap 0, ptr 1, len 0}` in A and `body`'s
+header in B: the second iteration's `String` starts as a copy of
+another) and is clean on the fixed tree; `docs/history/2026-11-16-xcorpus.md`
+has the numbers.
+
+What it cannot see: functions the inliner treated differently (skipped,
+by design: on the wasm kernels + std that is 15 of ~800 changed functions
+for memcpyopt, ~130 for sroa, ~250 for constload, which turns devirt off
+with it); interprocedural facts (a pass that changes a *callee's*
+behaviour shows only in the callee); stub behaviour (a callee is a hash,
+not the real function); what the sandbox stops on. Known false positives,
+all in ablations other than memcpyopt: values the program never makes
+(a `bool` or an enum tag of 0x80 in seeded memory that sroa's or
+constload's code treats differently from the original).
+
 ## 4. Prefix-bisect `PLIRON_PIPELINE` — rebuild-per-probe, last resort
 
 `PLIRON_PIPELINE=a,b,c` selects steps by name in listed order; bisect the

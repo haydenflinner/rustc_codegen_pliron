@@ -24,6 +24,16 @@
 //!                                          after every step, a failure is a
 //!                                          `panic` row naming the step)
 //!   clif-check steps                       list step names
+//!   clif-check xcorpus <dirA> <dirB> <out.json>
+//!                                          the IR passes, by ablation: A is a
+//!                                          corpus recorded with an IR pass off,
+//!                                          B the same build with it on; every
+//!                                          function in both is checked A against
+//!                                          B (--pipeline: and A against the
+//!                                          pipeline's output for B; --fn SUBSTR:
+//!                                          matching symbols only; --jobs, --every,
+//!                                          --limit as for report). See xcorpus.rs.
+//!   clif-check xpair a.clif b.clif         one such pair (--pipeline, --print)
 //!
 //! Options (after the subcommand args): --trials N, --seed N, --fuel N, --print.
 
@@ -39,6 +49,8 @@ use cranelift_module::FuncId;
 use pliron_clif_opt::diffcheck::{self, Config, OwnedFacts};
 use pliron_clif_opt::pipeline::{self, FnFlags, Pipe, Stats};
 
+mod xcorpus;
+
 struct Opts {
     cfg: Config,
     print: bool,
@@ -47,6 +59,12 @@ struct Opts {
     limit: usize,
     /// `report`/`codegen`: every Nth file (a deterministic sample of a big corpus).
     every: usize,
+    /// `xcorpus`/`xpair`: also compare A with the pipeline's output for B.
+    pipeline: bool,
+    /// `xcorpus`: only symbols containing this.
+    only: Option<String>,
+    /// `--trials` or `PLIRON_DIFFCHECK_TRIALS` was given.
+    trials_given: bool,
 }
 
 #[global_allocator]
@@ -81,6 +99,9 @@ fn main() -> ExitCode {
         jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
         limit: usize::MAX,
         every: 1,
+        pipeline: false,
+        only: None,
+        trials_given: std::env::var_os("PLIRON_DIFFCHECK_TRIALS").is_some(),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -90,7 +111,10 @@ fn main() -> ExitCode {
                 .expect("number after flag")
         };
         match a.as_str() {
-            "--trials" => opts.cfg.trials = num() as u32,
+            "--trials" => {
+                opts.cfg.trials = num() as u32;
+                opts.trials_given = true;
+            }
             "--seed" => opts.cfg.seed = num(),
             "--fuel" => opts.cfg.fuel = num(),
             "--print" => opts.print = true,
@@ -98,6 +122,8 @@ fn main() -> ExitCode {
             "--jobs" => opts.jobs = num().max(1) as usize,
             "--limit" => opts.limit = num() as usize,
             "--every" => opts.every = num().max(1) as usize,
+            "--pipeline" => opts.pipeline = true,
+            "--fn" => opts.only = Some(it.next().expect("substring after --fn").clone()),
             _ => pos.push(a.clone()),
         }
     }
@@ -148,6 +174,8 @@ fn main() -> ExitCode {
         }
         ["report", dir, out] => report_corpus(&isa, Path::new(dir), Path::new(out), &opts),
         ["codegen", dir, out] => codegen_corpus(Path::new(dir), Path::new(out), &opts),
+        ["xcorpus", a, b, out] => xcorpus::xcorpus(&isa, Path::new(a), Path::new(b), Path::new(out), &opts),
+        ["xpair", a, b] => xcorpus::xpair(&*isa, Path::new(a), Path::new(b), &opts),
         ["vcode", file] => {
             // One corpus file through the pipeline and Cranelift; print the
             // allocated vcode (what `codegen` scores).
@@ -197,7 +225,7 @@ fn main() -> ExitCode {
                 "{}",
                 include_str!("main.rs")
                     .lines()
-                    .take(12)
+                    .take(28)
                     .collect::<Vec<_>>()
                     .join("\n")
             );
@@ -453,6 +481,7 @@ fn with_pipe_lts<R>(
         dbg_slots: &Default::default(),
         fn_names: &fn_names,
         target: if wasm_mode { pliron_clif_opt::target::Target::wasm32() } else { pliron_clif_opt::target::of_isa(isa) },
+        corpus_syms: None,
         tcfg: isa.frontend_config(),
         // The wasm backend runs the pipeline with `simd` (no simd128 by
         // default), `x64` and `cmp64` off.
