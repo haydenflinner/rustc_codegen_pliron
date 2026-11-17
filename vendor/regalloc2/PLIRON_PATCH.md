@@ -361,3 +361,58 @@ moves such a reload two edges ahead of it; only instruction results are
 rematerializable. `PLIRON_RA_CHECK_LABELS=0` turns the check off. It runs
 wherever the checker runs (`PLIRON_RA_CHECK=1`, `PLIRON_RELOADPRE_CHECK=1`,
 the fuzzer).
+## `PLIRON_RA2_REGION=1|2` (runtime, opt-in): min-cut region splitting
+
+`src/ion/regionsplit.rs` (new), the hook in `process_bundle`
+(`src/ion/process.rs`, ahead of the conflict-point split),
+`LiveBundle::region_blocks` and `SpillSet::region_count`
+(`src/ion/data_structures.rs`), knobs in `src/lib.rs` (`region_on`,
+`region_mode`, `region_k`, `region_use_cap`, `region_max_blocks`,
+`region_ratio`, `region_max`); `cold_split_range` is now `pub(crate)`.
+
+LLVM's `RAGreedy::tryRegionSplit` with `SpillPlacement`, solved exactly.
+When a bundle must split, every block it is live in is a node labelled R
+(in one physical register) or S (on the stack). For a candidate register,
+blocks where the register is not free over the bundle's part of the block
+must be S. An S block costs `hot_bonus x min(register uses, CAP)` (CAP =
+`PLIRON_RA2_REGION_CAP`, default 2: a block-local piece reloads once per
+stretch); an edge the bundle is live across costs `min(hot(pred),
+hot(succ))` when its ends differ. The cheapest labelling is a minimum s-t
+cut (symmetric pairwise costs: submodular), found by Dinic's max-flow with
+a budget linear in the graph. The `K` registers with the largest possible
+gain (sum of S costs of their free blocks; `PLIRON_RA2_REGION_K`, default
+4) are cut; the cheapest wins if it costs less than `RATIO` (1.0) x all
+blocks S. The ranges are cut at block boundaries only: the R blocks become
+one bundle with holes, assigned the register at once; mode 1 gives each S
+block with register uses a block-local piece from its first to its last
+use (requeued: it may still take a register or split locally), mode 2
+requeues an S component of several blocks (S blocks joined by live edges)
+whole; the rest goes to the spill bundle. Moves come from the ordinary
+edge/range insertion in `moves.rs`, so the checker sees ordinary splits.
+
+The register part keeps its parent's block count and is region-split
+again (after an eviction) only while it has fewer blocks (LLVM's
+`RS_Split2` guard); at most `PLIRON_RA2_REGION_MAX` (4) region splits per
+spillset; bundles in more than `PLIRON_RA2_REGION_MAXB` (2048) blocks are
+left to the ordinary split. Explain lines: `region ...` (each cut) and
+`region split -> preg` (`PLIRON_RA_EXPLAIN`; `clif-check vcode` honours it
+too). Unit tests for the max-flow in the module; stanza `regionsplit`
+(stock output, modes 0/1/2 under `PLIRON_RA_CHECK=1`).
+
+Exact executed instructions (2026-11-17, aarch64-linux-musl, callgrind),
+default -> `PLIRON_RA2_REGION=1` (built with `PLIRON_RA_CHECK=1`):
+rust-compression 44,095,655 -> 42,728,743 (-3.10%: Zopfli -772k,
+`BrotliEstimateBitCostsForLiterals` -298k, `compress_inner` -125k),
+rust-html-rewriter 101,452,418 -> 100,774,931 (-0.67%), pulldown-cmark
+51,914,147 -> 51,544,931 (-0.71%), regex 50,528,248 -> 50,067,237
+(-0.91%), rust-protobuf 65,262,081 -> 64,938,104 (-0.50%), rust-json
+51,478,425 -> 51,372,540 (-0.21%), blake3-scalar 49,040,376 -> 49,046,430
+(+6k), blind-sig 34,687,507 -> 34,724,239 (+37k; this program is not
+deterministic: two default builds differ by 10k). Mode 2: compression
++112k against mode 1, the others within +-20k (blake3 -9k, below the
+default). With `PLIRON_XCGU_SIZE=100 PLIRON_XCGU_LASTCALL=20` (the copy
+limit that inlines `HistogramSelfAddHistogram`): compression 44,196,946
+-> 42,740,891; `BrotliHistogramCombine<HistogramLiteral>` 1,914,946 ->
+1,777,062, so the copy change costs +12k with the region split instead of
++101k. Compile time: html-rewriter corpus `clif-check codegen` 17.4-17.9 s
+user either way.
