@@ -925,6 +925,21 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `PLIRON_XORCANCEL` default on (it is target-independent; native was
    not timed). Remaining difference: our wasm keeps more values in locals
    (`local.get`/`set` 98/37 against LLVM's 64/6 in the loop), N9 #4.
+   **Locals, later 2026-11-17:** unchanged by `BLKHOIST`/`WCOAL_EDGE`.
+   No `local.set x; local.get x` pair is left for `wpeep`; the sets come
+   from order: a value used twice is computed early and read back after
+   unrelated work (SipHash's `v0 += v1` before `rotl(v1, 13)`, read by
+   `bxor rot, sum`). New wasm-only CLIF step `stkorder`
+   (`PLIRON_WASM_STKORDER=1`, opt-in, last before `brhint`): such a value
+   moves next to its first use, and a commutative first use takes it as
+   its first operand. Lookup loop 343 -> 328 ops (`local.get` 98 -> 83,
+   `set` 37 -> 22, `tee` 22 -> 37), module -234 B, step diffcheck and
+   corpus replays clean; quiet machine, `--perturb=4`: no kernel moves
+   (`hmget` -3.8% both, geomean 0.892 both): TurboFan allocates
+   registers from the locals itself, so the traffic is bytes, not time.
+   Of the 22 sets left in the loop, 7 are loop-carried values written at
+   the back edges (`invparam`'s two headers duplicate them), 9 are read
+   more than once, 5 once but not next to the set.
 7. **N9 #3 and #4**, constant rematerialization (up to 824 KB on dsa)
    and values parked in locals across block openers (0.3-0.6 MB):
    waffle `treeify.rs::is_remat`, `stackify.rs`. Done 2026-11-17 as
