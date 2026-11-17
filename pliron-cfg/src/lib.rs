@@ -359,6 +359,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // the others unchanged; native kernel `varint_postcard` -0.25%; the
     // wasm kernel module is byte-identical. `=0` off.
     "PLIRON_UNROLL2",
+    // 2026-11-17 (PARITY item 9): `PLIRON_LICM_GTE` on native too (it was
+    // on for wasm as `PLIRON_LICM_GTE_WASM`, which still works). Exact
+    // counts: regex -57.2k (-0.11%), rust-json and blind-sig within noise,
+    // the other five and the native kernels unchanged. `=0` off everywhere.
+    "PLIRON_LICM_GTE",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
