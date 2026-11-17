@@ -331,7 +331,7 @@ pub fn analyze(func: &Function) -> Option<Demanded> {
     Some(Demanded { mask: s.mask })
 }
 
-/// Per-target extension/mask counts (`Cost`): what a narrow-tree rewrite
+/// Per-target extension/mask counts: what rebuilding a narrow web wide
 /// adds and removes.
 struct Cost {
     /// `Target::narrow_masked`.
@@ -340,8 +340,22 @@ struct Cost {
     word: u32,
 }
 
+/// `v` is a constant, a compare, a narrow load, an extension or an
+/// `ireduce` (which aarch64 materializes as `uxtb`/`uxth`): its register
+/// holds the zero-extended value on aarch64, and wasm's `norm` sees it as
+/// canonical.
+fn clean_leaf(func: &Function, v: Value) -> bool {
+    match func.dfg.value_def(func.dfg.resolve_aliases(v)).inst().map(|d| &func.dfg.insts[d]) {
+        Some(InstructionData::Load { opcode, .. }) => !matches!(opcode, Opcode::Sload8 | Opcode::Sload16),
+        Some(InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. }) => true,
+        Some(InstructionData::UnaryImm { opcode: Opcode::Iconst, .. }) => true,
+        Some(InstructionData::Unary { opcode: Opcode::Uextend | Opcode::Ireduce, .. }) => true,
+        _ => false,
+    }
+}
+
 impl Cost {
-    /// An `ireduce.N` leaf used only by the tree: aarch64 materializes a
+    /// An `ireduce.N` leaf the web alone reads: aarch64 materializes a
     /// `uxtb`/`uxth` unless the source is already clean; wasm masks (and
     /// wraps an i64 first).
     fn ireduce_leaf(&self, func: &Function, src: Value, n: Type) -> u32 {
@@ -367,26 +381,27 @@ impl Cost {
         u32::from(!clean) + wrap
     }
 
-    /// The new conversion of a leaf the tree used to take narrow.
-    fn other_leaf(&self, func: &Function, l: Value) -> u32 {
+    /// The conversion of a leaf the web used to take narrow and now takes
+    /// at `w`.
+    fn leaf(&self, func: &Function, l: Value, w: Type) -> u32 {
         let l = func.dfg.resolve_aliases(l);
-        match func.dfg.value_def(l) {
-            ValueDef::Param(..) => 1,
-            ValueDef::Result(d, _) => match &func.dfg.insts[d] {
-                InstructionData::Load { opcode, .. } => {
-                    u32::from(matches!(opcode, Opcode::Sload8 | Opcode::Sload16))
+        match func.dfg.value_def(l).inst().map(|d| &func.dfg.insts[d]) {
+            Some(InstructionData::Unary { opcode: Opcode::Ireduce, arg }) => {
+                let st = func.dfg.value_type(*arg);
+                if st.bits() < w.bits() {
+                    // `ireduce.i8` of an i16 widens with `uextend`.
+                    u32::from(!clean_leaf(func, *arg))
+                } else {
+                    u32::from(self.masked && st.bits() > w.bits())
                 }
-                InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. } => 0,
-                // wasm keeps every narrow arithmetic result masked.
-                InstructionData::Binary { opcode, .. }
-                    if self.masked && !matches!(opcode, Opcode::Sshr) =>
-                {
-                    0
-                }
-                InstructionData::Unary { opcode: Opcode::Bnot | Opcode::Ineg, .. } if self.masked => 0,
-                _ => 1,
-            },
-            _ => 1,
+            }
+            Some(InstructionData::UnaryImm { opcode: Opcode::Iconst, .. }) => 0,
+            // Re-extended from the narrower source: the same cost as before.
+            Some(InstructionData::Unary { opcode: Opcode::Uextend | Opcode::Sextend, .. }) => 0,
+            // wasm keeps every narrow arithmetic result masked.
+            Some(InstructionData::Binary { opcode, .. }) if self.masked && *opcode != Opcode::Sshr => 0,
+            Some(InstructionData::Unary { opcode: Opcode::Bnot | Opcode::Ineg, .. }) if self.masked => 0,
+            _ => u32::from(!clean_leaf(func, l)),
         }
     }
 
@@ -396,86 +411,41 @@ impl Cost {
     }
 }
 
-/// One narrow tree: its nodes in post-order (children first), with the
-/// counts of what rebuilding it removes and adds.
-#[derive(Default)]
-struct Tree {
-    /// Inner nodes, children before parents.
-    nodes: Vec<Inst>,
-    old: u32,
-    new: u32,
-}
-
-const MAX_NODES: usize = 24;
-
-struct Ctx<'a> {
-    func: &'a Function,
-    uses: &'a SecondaryMap<Value, u32>,
-    cost: Cost,
-}
-
-impl Ctx<'_> {
-    fn widenable(&self, i: Inst) -> bool {
-        match self.func.dfg.insts[i] {
-            InstructionData::Binary { opcode, args } => match opcode {
-                Opcode::Iadd | Opcode::Isub | Opcode::Imul | Opcode::Band | Opcode::Bor | Opcode::Bxor => true,
-                Opcode::Ishl => iconst(self.func, args[1]).is_some(),
-                _ => false,
-            },
-            InstructionData::Unary { opcode: Opcode::Bnot | Opcode::Ineg, .. } => true,
-            InstructionData::Ternary { opcode: Opcode::Select, .. } => true,
+/// A narrow op whose low bits depend only on its operands' low bits.
+fn widenable(func: &Function, i: Inst) -> bool {
+    match func.dfg.insts[i] {
+        InstructionData::Binary { opcode, args } => match opcode {
+            Opcode::Iadd | Opcode::Isub | Opcode::Imul | Opcode::Band | Opcode::Bor | Opcode::Bxor => true,
+            Opcode::Ishl => iconst(func, args[1]).is_some(),
             _ => false,
-        }
+        },
+        InstructionData::Unary { opcode: Opcode::Bnot | Opcode::Ineg, .. } => true,
+        InstructionData::Ternary { opcode: Opcode::Select, .. } => true,
+        _ => false,
     }
+}
 
-    /// Collect the tree under `v` (type `n`): inner nodes are widenable
-    /// and used once (by their parent, or by the root); the rest are
-    /// leaves. `false` when the tree is too big.
-    fn collect(&self, v: Value, n: Type, w: Type, t: &mut Tree) -> bool {
-        let v = self.func.dfg.resolve_aliases(v);
-        let def = self.func.dfg.value_def(v);
-        if let ValueDef::Result(i, _) = def
-            && self.uses[v] == 1
-            && self.widenable(i)
-        {
-            if t.nodes.len() >= MAX_NODES {
-                return false;
-            }
-            t.old += self.cost.node(self.func.dfg.insts[i].opcode());
-            let args: Vec<Value> = match self.func.dfg.insts[i] {
-                InstructionData::Ternary { args: [_, x, y], .. } => vec![x, y],
-                InstructionData::Binary { opcode: Opcode::Ishl, args: [x, _] } => vec![x],
-                _ => self.func.dfg.inst_args(i).to_vec(),
-            };
-            for a in args {
-                if !self.collect(a, n, w, t) {
-                    return false;
-                }
-            }
-            t.nodes.push(i);
-            return true;
-        }
-        // A leaf.
-        match def.inst().map(|d| &self.func.dfg.insts[d]) {
-            Some(InstructionData::Unary { opcode: Opcode::Ireduce, arg }) => {
-                if self.uses[v] == 1 {
-                    t.old += self.cost.ireduce_leaf(self.func, *arg, n);
-                }
-                let st = self.func.dfg.value_type(*arg);
-                // A narrower source (`ireduce.i8` of an i16) widens with
-                // `uextend`.
-                if st.bits() < w.bits() {
-                    t.new += self.cost.other_leaf(self.func, *arg);
-                } else if self.cost.masked && st.bits() > w.bits() {
-                    t.new += 1;
-                }
-            }
-            Some(InstructionData::UnaryImm { opcode: Opcode::Iconst, .. }) => {}
-            Some(InstructionData::Unary { opcode: Opcode::Uextend | Opcode::Sextend, .. }) => {}
-            _ => t.new += self.cost.other_leaf(self.func, v),
-        }
-        true
+/// The operands of a widenable op that carry its value (not a `select`'s
+/// condition, not a shift amount).
+fn value_operands(func: &Function, i: Inst) -> smallvec::SmallVec<[Value; 2]> {
+    match func.dfg.insts[i] {
+        InstructionData::Ternary { args: [_, x, y], .. } => smallvec::smallvec![x, y],
+        InstructionData::Binary { opcode: Opcode::Ishl, args: [x, _] } => smallvec::smallvec![x],
+        _ => func.dfg.inst_args(i).iter().copied().collect(),
     }
+}
+
+/// How a web member is used.
+#[derive(Clone, Copy)]
+enum Use {
+    /// `uextend`/`sextend` to 32 bits or more, or a narrow `store`.
+    Root(Inst),
+    /// A value operand of this widenable op (its result).
+    Web(Value),
+    /// An argument of an edge into this block parameter.
+    Edge(Value),
+    /// Anything else: the value stays narrow.
+    Hard,
 }
 
 /// `v` (of a narrow type) as a value of type `w` whose low bits are `v`'s,
@@ -512,63 +482,19 @@ fn widen_leaf(func: &mut Function, v: Value, w: Type, at: Inst) -> Value {
     }
 }
 
-/// Rebuild the tree rooted at `top` at type `w`; returns the wide value.
-/// Each wide node goes right before its narrow original.
-fn rebuild(func: &mut Function, top: Value, w: Type, nodes: &[Inst]) -> Value {
-    let mut wide: rustc_hash::FxHashMap<Value, Value> = Default::default();
-    for &i in nodes {
-        let data = func.dfg.insts[i];
-        let n = func.dfg.value_type(func.dfg.first_result(i));
-        let get = |func: &mut Function, v: Value| -> Value {
-            let v = func.dfg.resolve_aliases(v);
-            match wide.get(&v) {
-                Some(&x) => x,
-                None => widen_leaf(func, v, w, i),
-            }
-        };
-        let r = match data {
-            InstructionData::Binary { opcode: Opcode::Ishl, args: [x, k] } => {
-                let x = get(func, x);
-                let kk = iconst(func, k).unwrap() & u64::from(n.bits() - 1);
-                let mut cur = FuncCursor::new(func).at_inst(i);
-                let kc = cur.ins().iconst(w, kk as i64);
-                cur.ins().ishl(x, kc)
-            }
-            InstructionData::Binary { opcode, args: [a, b] } => {
-                let a = get(func, a);
-                let b = get(func, b);
-                let mut cur = FuncCursor::new(func).at_inst(i);
-                let (ni, dfg) = cur.ins().Binary(opcode, w, a, b);
-                dfg.first_result(ni)
-            }
-            InstructionData::Unary { opcode, arg } => {
-                let a = get(func, arg);
-                let mut cur = FuncCursor::new(func).at_inst(i);
-                let (ni, dfg) = cur.ins().Unary(opcode, w, a);
-                dfg.first_result(ni)
-            }
-            InstructionData::Ternary { opcode, args: [c, x, y] } => {
-                let x = get(func, x);
-                let y = get(func, y);
-                let mut cur = FuncCursor::new(func).at_inst(i);
-                let (ni, dfg) = cur.ins().Ternary(opcode, w, c, x, y);
-                dfg.first_result(ni)
-            }
-            _ => unreachable!("not a widenable node"),
-        };
-        let res = func.dfg.first_result(i);
-        wide.insert(res, r);
+/// Union-find root.
+fn find(up: &mut SecondaryMap<Value, Value>, v: Value) -> Value {
+    let mut r = v;
+    while up[r] != r {
+        r = up[r];
     }
-    // The last node is the top (post-order); a leaf top never gets here.
-    wide[&func.dfg.resolve_aliases(top)]
-}
-
-enum Root {
-    /// `uextend`/`sextend` result `r`; `mask`: the extended bits are
-    /// demanded, so a zero extension keeps a `band`.
-    Extend { r: Value, mask: bool },
-    /// A narrow `store` of the tree.
-    Store,
+    let mut x = v;
+    while up[x] != r {
+        let n = up[x];
+        up[x] = r;
+        x = n;
+    }
+    r
 }
 
 /// Run the analysis and its rewrites on `func`.
@@ -579,113 +505,59 @@ pub fn run(func: &mut Function, target: &Target) -> usize {
         return 0;
     }
     let Some(dm) = analyze(func) else { return 0 };
-    let mut uses: SecondaryMap<Value, u32> = SecondaryMap::with_default(0);
+    let mut k = drop_masks(func, &dm);
+    k += widen(func, &dm, target);
+    k
+}
+
+/// Constant `band`/`bor`/`bxor` on bits nobody demands.
+fn drop_masks(func: &mut Function, dm: &Demanded) -> usize {
+    let mut drops: Vec<(Inst, Value, Value)> = Vec::new();
+    // `uextend`/`sextend` of `ireduce y` whose extended bits nobody reads,
+    // `y` wider than the result: `ireduce y` to the result type.
+    let mut rereduce: Vec<(Inst, Type, Value)> = Vec::new();
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
-            for v in func.dfg.inst_values(i) {
-                uses[func.dfg.resolve_aliases(v)] += 1;
-            }
-        }
-    }
-    let masked = target.narrow_masked();
-    let word = Type::int((target.word_bytes() * 8) as u16).expect("word is an integer type");
-    // (root inst, root kind, narrow operand, wide type, tree)
-    let mut trees: Vec<(Inst, Root, Value, Type, Tree)> = Vec::new();
-    // (inst, result, replacement) for useless masks.
-    let mut drops: Vec<(Inst, Value, Value)> = Vec::new();
-    {
-        let cx = Ctx { func, uses: &uses, cost: Cost { masked, word: word.bits() } };
-        for b in func.layout.blocks() {
-            for i in func.layout.block_insts(b) {
-                match func.dfg.insts[i] {
-                    InstructionData::Binary { opcode: opcode @ (Opcode::Band | Opcode::Bor | Opcode::Bxor), args: [a, b] } => {
-                        let r = func.dfg.first_result(i);
-                        if !tracked(func.dfg.value_type(r)) {
-                            continue;
-                        }
-                        let (x, c) = match (iconst(func, a), iconst(func, b)) {
-                            (_, Some(c)) => (a, c),
-                            (Some(c), None) => (b, c),
-                            _ => continue,
-                        };
-                        let d = dm.of(func, r);
-                        let tm = tymask(func.dfg.value_type(r));
-                        let c = c & tm;
-                        let useless = match opcode {
-                            Opcode::Band => d & !c == 0 && c != tm,
-                            _ => d & c == 0 && c != 0,
-                        };
-                        if useless {
-                            drops.push((i, r, func.dfg.resolve_aliases(x)));
-                        }
+            if let InstructionData::Unary { opcode: Opcode::Uextend | Opcode::Sextend, arg } = func.dfg.insts[i]
+                && let Some(InstructionData::Unary { opcode: Opcode::Ireduce, arg: y }) =
+                    func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst().map(|d| func.dfg.insts[d])
+            {
+                let r = func.dfg.first_result(i);
+                let (m, n) = (func.dfg.value_type(r), func.dfg.value_type(arg));
+                let y = func.dfg.resolve_aliases(y);
+                let yt = func.dfg.value_type(y);
+                if tracked(m) && dm.of(func, r) & !tymask(n) == 0 {
+                    if yt == m {
+                        drops.push((i, r, y));
+                    } else if yt.bits() > m.bits() {
+                        rereduce.push((i, m, y));
                     }
-                    InstructionData::Unary { opcode: opcode @ (Opcode::Uextend | Opcode::Sextend), arg } => {
-                        let r = func.dfg.first_result(i);
-                        let m = func.dfg.value_type(r);
-                        let n = func.dfg.value_type(arg);
-                        if !matches!(n, types::I8 | types::I16) || !tracked(m) || m.bits() < 32 {
-                            continue;
-                        }
-                        let undemanded = dm.of(func, r) & !tymask(n) == 0;
-                        if opcode == Opcode::Sextend && !undemanded {
-                            continue;
-                        }
-                        // Where narrow arithmetic is masked, the chain is
-                        // rebuilt at the word and extended once.
-                        let w = if masked && m.bits() > word.bits() { word } else { m };
-                        let mut t = Tree::default();
-                        let arg = func.dfg.resolve_aliases(arg);
-                        if !cx.collect(arg, n, w, &mut t) {
-                            continue;
-                        }
-                        // The root: its extend goes when nothing demands
-                        // the bits it defines; a demanded zero extension
-                        // becomes a mask. On aarch64 a zero extension used
-                        // once by an add/sub/compare rides that use's
-                        // extended-register operand for free.
-                        let fused = !masked
-                            && opcode == Opcode::Uextend
-                            && uses[r] == 1
-                            && single_use_fuses(func, r);
-                        let root_old = if masked { u32::from(m.bits() > w.bits()) + u32::from(opcode == Opcode::Sextend) } else { u32::from(!fused) };
-                        let root_new = u32::from(!undemanded) + u32::from(m.bits() > w.bits());
-                        t.old += root_old;
-                        t.new += root_new;
-                        if t.nodes.is_empty() {
-                            // A leaf operand: only `uextend (ireduce y)` /
-                            // constants, and only when the extension is
-                            // not demanded.
-                            if !undemanded {
-                                continue;
-                            }
-                            let ok = matches!(
-                                func.dfg.value_def(arg).inst().map(|d| &func.dfg.insts[d]),
-                                Some(InstructionData::Unary { opcode: Opcode::Ireduce, arg: y })
-                                    if func.dfg.value_type(*y).bits() >= w.bits()
-                            );
-                            if !ok {
-                                continue;
-                            }
-                        } else if t.new >= t.old {
-                            continue;
-                        }
-                        trees.push((i, Root::Extend { r, mask: !undemanded }, arg, w, t));
-                    }
-                    InstructionData::Store { opcode: Opcode::Store, args: [x, _], .. } => {
-                        let x = func.dfg.resolve_aliases(x);
-                        let n = func.dfg.value_type(x);
-                        if !matches!(n, types::I8 | types::I16) {
-                            continue;
-                        }
-                        let mut t = Tree::default();
-                        // i32: the narrowest whole register on every target.
-                        if !cx.collect(x, n, types::I32, &mut t) || t.nodes.is_empty() || t.new >= t.old {
-                            continue;
-                        }
-                        trees.push((i, Root::Store, x, types::I32, t));
-                    }
-                    _ => {}
                 }
+                continue;
+            }
+            let InstructionData::Binary { opcode: opcode @ (Opcode::Band | Opcode::Bor | Opcode::Bxor), args: [a, b] } =
+                func.dfg.insts[i]
+            else {
+                continue;
+            };
+            let r = func.dfg.first_result(i);
+            if !tracked(func.dfg.value_type(r)) {
+                continue;
+            }
+            let (x, c) = match (iconst(func, a), iconst(func, b)) {
+                (_, Some(c)) => (a, c),
+                (Some(c), None) => (b, c),
+                _ => continue,
+            };
+            let d = dm.of(func, r);
+            let tm = tymask(func.dfg.value_type(r));
+            let c = c & tm;
+            let useless = match opcode {
+                Opcode::Band => d & !c == 0 && c != tm,
+                _ => d & c == 0 && c != 0,
+            };
+            if useless {
+                drops.push((i, r, func.dfg.resolve_aliases(x)));
             }
         }
     }
@@ -699,46 +571,291 @@ pub fn run(func: &mut Function, target: &Target) -> usize {
         func.dfg.change_to_alias(r, x);
         k += 1;
     }
-    let mut dead = false;
-    for (i, root, x, w, t) in trees {
+    for (i, m, y) in rereduce {
         if !pliron_cfg::bisect("demanded") {
             continue;
         }
-        // A drop above may have aliased a node away; a stale tree is
-        // skipped (the next run sees it again).
-        if t.nodes.iter().any(|&n| func.layout.inst_block(n).is_none()) || func.layout.inst_block(i).is_none() {
+        func.replace(i).ireduce(m, y);
+        k += 1;
+    }
+    k
+}
+
+/// Narrow webs rebuilt wide. A web is a set of `i8`/`i16` values — results
+/// of widenable ops and block parameters — whose every use is another
+/// member (a value operand of a member op, an edge argument of a member
+/// parameter) or a root: a `uextend`/`sextend` to 32 bits or more, or a
+/// narrow `store`. A greatest fixpoint drops any candidate with another
+/// use. Each connected web is rebuilt at one type `w` when the counts say
+/// it pays: member parameters change type, member ops get wide twins,
+/// leaves (operands from outside) convert, and the roots read the wide
+/// value (a zero extension whose bits are demanded keeps a mask).
+fn widen(func: &mut Function, dm: &Demanded, target: &Target) -> usize {
+    let masked = target.narrow_masked();
+    let word = Type::int((target.word_bytes() * 8) as u16).expect("word is an integer type");
+    let cost = Cost { masked, word: word.bits() };
+    let narrow = |t: Type| matches!(t, types::I8 | types::I16);
+    let entry = func.layout.entry_block();
+
+    // Candidates and their uses, in one scan.
+    let mut cand: SecondaryMap<Value, bool> = SecondaryMap::with_default(false);
+    let mut uses: SecondaryMap<Value, smallvec::SmallVec<[Use; 2]>> = SecondaryMap::default();
+    let mut nuses: SecondaryMap<Value, u32> = SecondaryMap::with_default(0);
+    let mut preds: Preds = SecondaryMap::default();
+    let mut any = false;
+    for b in func.layout.blocks() {
+        if Some(b) != entry {
+            for &p in func.dfg.block_params(b) {
+                if narrow(func.dfg.value_type(p)) {
+                    cand[p] = true;
+                    any = true;
+                }
+            }
+        }
+        for i in func.layout.block_insts(b) {
+            if let [r] = func.dfg.inst_results(i)
+                && narrow(func.dfg.value_type(*r))
+                && widenable(func, i)
+            {
+                cand[*r] = true;
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return 0;
+    }
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let data = &func.dfg.insts[i];
+            let dests = data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for v in func.dfg.inst_values(i) {
+                nuses[func.dfg.resolve_aliases(v)] += 1;
+            }
+            if !dests.is_empty() {
+                for &a in func.dfg.inst_args(i) {
+                    uses[func.dfg.resolve_aliases(a)].push(Use::Hard);
+                }
+                for bc in dests {
+                    let t = bc.block(&func.dfg.value_lists);
+                    if preds[t].last() != Some(&i) {
+                        preds[t].push(i);
+                    }
+                    for (k, arg) in bc.args(&func.dfg.value_lists).enumerate() {
+                        let p = func.dfg.block_params(t).get(k).copied();
+                        match (arg, p) {
+                            (BlockArg::Value(v), Some(p)) => uses[func.dfg.resolve_aliases(v)].push(Use::Edge(p)),
+                            // An argument the branch makes itself (a
+                            // `try_call` result): its parameter stays.
+                            (_, Some(p)) => uses[p].push(Use::Hard),
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
+            let root = match *data {
+                InstructionData::Unary { opcode: opcode @ (Opcode::Uextend | Opcode::Sextend), arg } => {
+                    let r = func.dfg.first_result(i);
+                    let m = func.dfg.value_type(r);
+                    let n = func.dfg.value_type(arg);
+                    let sign_ok = opcode == Opcode::Uextend || dm.of(func, r) & !tymask(n) == 0;
+                    tracked(m) && m.bits() >= 32 && sign_ok
+                }
+                InstructionData::Store { opcode: Opcode::Store, .. } => true,
+                _ => false,
+            };
+            if root {
+                // A store's address is never narrow; its value is operand 0.
+                let a = func.dfg.resolve_aliases(func.dfg.inst_args(i)[0]);
+                uses[a].push(Use::Root(i));
+                for &x in &func.dfg.inst_args(i)[1..] {
+                    uses[func.dfg.resolve_aliases(x)].push(Use::Hard);
+                }
+                continue;
+            }
+            let member = matches!(func.dfg.inst_results(i), [r] if cand[*r]);
+            if member {
+                let r = func.dfg.first_result(i);
+                for (k, &a) in func.dfg.inst_args(i).iter().enumerate() {
+                    let a = func.dfg.resolve_aliases(a);
+                    // The slots `value_operands` names carry the value.
+                    let is_val = match func.dfg.insts[i] {
+                        InstructionData::Ternary { .. } => k > 0,
+                        InstructionData::Binary { opcode: Opcode::Ishl, .. } => k == 0,
+                        _ => true,
+                    };
+                    uses[a].push(if is_val { Use::Web(r) } else { Use::Hard });
+                }
+            } else {
+                for &a in func.dfg.inst_args(i) {
+                    uses[func.dfg.resolve_aliases(a)].push(Use::Hard);
+                }
+            }
+        }
+    }
+
+    // Greatest fixpoint: drop candidates with a hard use, then anything
+    // feeding a dropped value.
+    let mut feeds: SecondaryMap<Value, smallvec::SmallVec<[Value; 2]>> = SecondaryMap::default();
+    let mut members: Vec<Value> = Vec::new();
+    let mut work: Vec<Value> = Vec::new();
+    for b in func.layout.blocks() {
+        let params = func.dfg.block_params(b).to_vec();
+        let results = func.layout.block_insts(b).flat_map(|i| func.dfg.inst_results(i).to_vec());
+        for v in params.into_iter().chain(results) {
+            if !cand[v] {
+                continue;
+            }
+            members.push(v);
+            let mut hard = uses[v].is_empty();
+            for &u in &uses[v] {
+                match u {
+                    Use::Root(_) => {}
+                    Use::Web(x) | Use::Edge(x) => {
+                        if cand[x] {
+                            feeds[x].push(v);
+                        } else {
+                            hard = true;
+                        }
+                    }
+                    Use::Hard => hard = true,
+                }
+            }
+            if hard {
+                work.push(v);
+            }
+        }
+    }
+    while let Some(v) = work.pop() {
+        if !cand[v] {
             continue;
         }
-        let wide = if t.nodes.is_empty() {
-            widen_leaf(func, x, w, i)
-        } else {
-            rebuild(func, x, w, &t.nodes)
-        };
-        match root {
-            Root::Extend { r, mask } => {
-                let m = func.dfg.value_type(r);
-                let n = func.dfg.value_type(x);
-                let mut cur = FuncCursor::new(func).at_inst(i);
-                let mut v = wide;
-                if mask {
-                    let c = cur.ins().iconst(w, tymask(n) as i64);
-                    v = cur.ins().band(v, c);
-                }
-                if m.bits() > w.bits() {
-                    v = cur.ins().uextend(m, v);
-                }
-                func.layout.remove_inst(i);
-                func.dfg.clear_results(i);
-                func.dfg.change_to_alias(r, v);
+        cand[v] = false;
+        for k in 0..feeds[v].len() {
+            let d = feeds[v][k];
+            if cand[d] {
+                work.push(d);
             }
-            Root::Store => {
-                let n = func.dfg.value_type(x);
-                if let InstructionData::Store { opcode, args, .. } = &mut func.dfg.insts[i] {
-                    *opcode = if n == types::I8 { Opcode::Istore8 } else { Opcode::Istore16 };
-                    args[0] = wide;
+        }
+    }
+    members.retain(|&v| cand[v]);
+    if members.is_empty() {
+        return 0;
+    }
+
+    // Webs: connected through web and edge uses.
+    let mut up: SecondaryMap<Value, Value> = SecondaryMap::with_default(Value::from_u32(0));
+    for &v in &members {
+        up[v] = v;
+    }
+    for &v in &members {
+        for k in 0..uses[v].len() {
+            if let Use::Web(x) | Use::Edge(x) = uses[v][k] {
+                let (a, b) = (find(&mut up, v), find(&mut up, x));
+                if a != b {
+                    up[a] = b;
                 }
             }
         }
+    }
+    struct Web {
+        old: u32,
+        new: u32,
+        /// Widest extension root (0: stores only).
+        widest: u32,
+        members: Vec<Value>,
+    }
+    let mut webs: rustc_hash::FxHashMap<Value, Web> = Default::default();
+    // Occurrences of each `ireduce` leaf per web, to tell whether the web
+    // is its only reader.
+    let mut red: rustc_hash::FxHashMap<(Value, Value), u32> = Default::default();
+    for &v in &members {
+        let root = find(&mut up, v);
+        let n = func.dfg.value_type(v);
+        let w = webs.entry(root).or_insert(Web { old: 0, new: 0, widest: 0, members: Vec::new() });
+        w.members.push(v);
+        // The member's own cost, and its leaves.
+        let leaves: smallvec::SmallVec<[Value; 4]> = match func.dfg.value_def(v) {
+            ValueDef::Result(i, _) => {
+                w.old += cost.node(func.dfg.insts[i].opcode());
+                value_operands(func, i).into_iter().map(|a| func.dfg.resolve_aliases(a)).filter(|&a| !cand[a]).collect()
+            }
+            ValueDef::Param(b, k) => {
+                let mut ls = smallvec::SmallVec::new();
+                for &t in &preds[b] {
+                    for bc in func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                        if bc.block(&func.dfg.value_lists) != b {
+                            continue;
+                        }
+                        if let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(k) {
+                            let a = func.dfg.resolve_aliases(a);
+                            if !cand[a] {
+                                ls.push(a);
+                            }
+                        }
+                    }
+                }
+                ls
+            }
+            _ => smallvec::SmallVec::new(),
+        };
+        for l in leaves {
+            if let Some(InstructionData::Unary { opcode: Opcode::Ireduce, arg }) =
+                func.dfg.value_def(l).inst().map(|d| &func.dfg.insts[d])
+            {
+                let c = red.entry((root, l)).or_insert(0);
+                *c += 1;
+                if *c == nuses[l] {
+                    w.old += cost.ireduce_leaf(func, *arg, n);
+                }
+            }
+            // The leaf's new conversion; its type is not known until every
+            // root is seen, so count it at the word (a narrower `w` only
+            // makes `ireduce` leaves cheaper).
+            w.new += cost.leaf(func, l, if masked { word } else { types::I32 });
+        }
+        // Roots.
+        for &u in &uses[v] {
+            let Use::Root(i) = u else { continue };
+            match func.dfg.insts[i] {
+                InstructionData::Unary { opcode, .. } => {
+                    let r = func.dfg.first_result(i);
+                    let m = func.dfg.value_type(r);
+                    let undemanded = dm.of(func, r) & !tymask(n) == 0;
+                    w.widest = w.widest.max(m.bits());
+                    let clean = member_clean(func, v);
+                    let old = if masked {
+                        u32::from(!clean) + u32::from(m.bits() > word.bits()) + u32::from(opcode == Opcode::Sextend)
+                    } else {
+                        let fused = opcode == Opcode::Uextend && nuses[r] == 1 && single_use_fuses(func, r);
+                        u32::from(!fused && !(opcode == Opcode::Uextend && clean))
+                    };
+                    let new = u32::from(!undemanded) + u32::from(masked && m.bits() > word.bits());
+                    w.old += old;
+                    w.new += new;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut k = 0;
+    let mut dead = false;
+    // Deterministic order (the map is keyed by value).
+    let mut webs: Vec<(Value, Web)> = webs.into_iter().collect();
+    webs.sort_by_key(|(r, _)| *r);
+    for (_, web) in webs {
+        if web.new >= web.old {
+            continue;
+        }
+        if !pliron_cfg::bisect("demanded") {
+            continue;
+        }
+        // The widest root's type (32 bits for stores alone); where narrow
+        // arithmetic is masked, the word, extended once at wider roots.
+        let w = if masked { word } else { Type::int(web.widest.max(32) as u16).expect("int type") };
+        rewrite(func, &web.members, &uses, &preds, w, dm);
         dead = true;
         k += 1;
     }
@@ -766,13 +883,201 @@ pub fn run(func: &mut Function, target: &Target) -> usize {
     k
 }
 
+/// A member whose register aarch64 already holds zero-extended (a `band`
+/// with a clean operand, `bor`/`bxor` of two clean ones, a parameter: all
+/// as `narrow_uext_clean` sees them, the parameter optimistically) — its
+/// root extension costs nothing today. On wasm: `norm` sees it as
+/// canonical (a narrow add, subtract, multiply or shift masked itself).
+fn member_clean(func: &Function, v: Value) -> bool {
+    match func.dfg.value_def(v) {
+        ValueDef::Param(..) => true,
+        ValueDef::Result(i, _) => match func.dfg.insts[i] {
+            InstructionData::Binary { opcode: Opcode::Band, args: [a, b] } => clean_leaf(func, a) || clean_leaf(func, b),
+            InstructionData::Binary { opcode: Opcode::Bor | Opcode::Bxor, args: [a, b] } => {
+                clean_leaf(func, a) && clean_leaf(func, b)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+type Preds = SecondaryMap<cranelift_codegen::ir::Block, Vec<Inst>>;
+
+/// Rebuild one web at `w`.
+fn rewrite(
+    func: &mut Function,
+    members: &[Value],
+    uses: &SecondaryMap<Value, smallvec::SmallVec<[Use; 2]>>,
+    preds: &Preds,
+    w: Type,
+    dm: &Demanded,
+) {
+    let mut wide: rustc_hash::FxHashMap<Value, Value> = Default::default();
+    let is_member: rustc_hash::FxHashSet<Value> = members.iter().copied().collect();
+    let n = func.dfg.value_type(members[0]);
+    // Parameters first: member ops may read them, and every cycle in the
+    // web passes through one.
+    let mut params: Vec<(cranelift_codegen::ir::Block, usize)> = Vec::new();
+    for &v in members {
+        if let ValueDef::Param(b, k) = func.dfg.value_def(v) {
+            let p2 = func.dfg.replace_block_param(v, w);
+            wide.insert(v, p2);
+            params.push((b, k));
+        }
+    }
+    // Member ops, operands first (an explicit DFS: chains can be long).
+    // Each wide twin goes right before its original, where every operand
+    // is already defined.
+    let mut order: Vec<Inst> = Vec::new();
+    {
+        let mut done: rustc_hash::FxHashSet<Inst> = Default::default();
+        for &v in members {
+            let ValueDef::Result(i0, _) = func.dfg.value_def(v) else { continue };
+            let mut stack: Vec<(Inst, bool)> = vec![(i0, false)];
+            while let Some((i, expanded)) = stack.pop() {
+                if done.contains(&i) {
+                    continue;
+                }
+                if expanded {
+                    done.insert(i);
+                    order.push(i);
+                    continue;
+                }
+                stack.push((i, true));
+                for a in value_operands(func, i) {
+                    let a = func.dfg.resolve_aliases(a);
+                    if is_member.contains(&a)
+                        && let ValueDef::Result(d, _) = func.dfg.value_def(a)
+                        && !done.contains(&d)
+                    {
+                        stack.push((d, false));
+                    }
+                }
+            }
+        }
+    }
+    for i in order {
+        let r = func.dfg.first_result(i);
+        let data = func.dfg.insts[i];
+        let get = |func: &mut Function, v: Value| -> Value {
+            let v = func.dfg.resolve_aliases(v);
+            match wide.get(&v) {
+                Some(&x) => x,
+                None => widen_leaf(func, v, w, i),
+            }
+        };
+        let nv = match data {
+            InstructionData::Binary { opcode: Opcode::Ishl, args: [x, kk] } => {
+                let x = get(func, x);
+                let amt = iconst(func, kk).unwrap() & u64::from(n.bits() - 1);
+                let mut cur = FuncCursor::new(func).at_inst(i);
+                let kc = cur.ins().iconst(w, amt as i64);
+                cur.ins().ishl(x, kc)
+            }
+            InstructionData::Binary { opcode, args: [a, b] } => {
+                let a = get(func, a);
+                let b = get(func, b);
+                let mut cur = FuncCursor::new(func).at_inst(i);
+                let (ni, dfg) = cur.ins().Binary(opcode, w, a, b);
+                dfg.first_result(ni)
+            }
+            InstructionData::Unary { opcode, arg } => {
+                let a = get(func, arg);
+                let mut cur = FuncCursor::new(func).at_inst(i);
+                let (ni, dfg) = cur.ins().Unary(opcode, w, a);
+                dfg.first_result(ni)
+            }
+            InstructionData::Ternary { opcode, args: [c, x, y] } => {
+                let x = get(func, x);
+                let y = get(func, y);
+                let mut cur = FuncCursor::new(func).at_inst(i);
+                let (ni, dfg) = cur.ins().Ternary(opcode, w, c, x, y);
+                dfg.first_result(ni)
+            }
+            _ => unreachable!("not a widenable op"),
+        };
+        wide.insert(r, nv);
+    }
+    // Edges into member parameters.
+    for &(b, k) in &params {
+        for &t in &preds[b] {
+            // The new arguments first (conversions go before the branch).
+            let mut news: Vec<Value> = Vec::new();
+            for bc in func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                if bc.block(&func.dfg.value_lists) != b {
+                    continue;
+                }
+                if let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(k) {
+                    news.push(func.dfg.resolve_aliases(a));
+                }
+            }
+            let news: Vec<Value> = news
+                .into_iter()
+                .map(|a| match wide.get(&a) {
+                    Some(&x) => x,
+                    None => widen_leaf(func, a, w, t),
+                })
+                .collect();
+            let dfg = &mut func.dfg;
+            let mut it = news.into_iter();
+            for bc in dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
+                if bc.block(&dfg.value_lists) != b {
+                    continue;
+                }
+                let nv = it.next().expect("one new argument per edge");
+                let mut ix = 0;
+                bc.update_args(&mut dfg.value_lists, |arg| {
+                    ix += 1;
+                    if ix - 1 == k { nv.into() } else { arg }
+                });
+            }
+        }
+    }
+    // Roots.
+    for &v in members {
+        let wv = wide[&v];
+        for &u in &uses[v] {
+            let Use::Root(i) = u else { continue };
+            if func.layout.inst_block(i).is_none() {
+                continue;
+            }
+            match func.dfg.insts[i] {
+                InstructionData::Unary { .. } => {
+                    let r = func.dfg.first_result(i);
+                    let m = func.dfg.value_type(r);
+                    let mut cur = FuncCursor::new(func).at_inst(i);
+                    let mut x = wv;
+                    if cur.func.dfg.insts[i].opcode() == Opcode::Uextend && dm.of(cur.func, r) & !tymask(n) != 0 {
+                        let c = cur.ins().iconst(w, tymask(n) as i64);
+                        x = cur.ins().band(x, c);
+                    }
+                    if m.bits() > w.bits() {
+                        x = cur.ins().uextend(m, x);
+                    } else if m.bits() < w.bits() {
+                        x = cur.ins().ireduce(m, x);
+                    }
+                    func.layout.remove_inst(i);
+                    func.dfg.clear_results(i);
+                    func.dfg.change_to_alias(r, x);
+                }
+                InstructionData::Store { .. } => {
+                    if let InstructionData::Store { opcode, args, .. } = &mut func.dfg.insts[i] {
+                        *opcode = if n == types::I8 { Opcode::Istore8 } else { Opcode::Istore16 };
+                        args[0] = wv;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// `r`'s one use reads it as an aarch64 extended-register operand: a
 /// 32/64-bit `iadd`/`isub` or `icmp`.
 fn single_use_fuses(func: &Function, r: Value) -> bool {
-    // The use is found by a scan of `r`'s block's successors' worth of
-    // code in the worst case; callers ask only for single-use roots, and
-    // the answer only changes a cost, so a bounded look at the next few
-    // instructions of the root's block is enough.
+    // The answer only changes a cost: a bounded look at the next few
+    // instructions of the root's block.
     let Some(def) = func.dfg.value_def(r).inst() else { return false };
     let mut cur = func.layout.next_inst(def);
     for _ in 0..8 {
