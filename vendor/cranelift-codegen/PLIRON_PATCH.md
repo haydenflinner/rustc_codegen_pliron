@@ -1146,7 +1146,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     lowers (`block7: ; block158`), so `clif-check codegen` can weight code
     by CLIF loop depth.
 
-84. Opt-in shrink-wrapping (`PLIRON_SHRINKWRAP=1`, aarch64):
+84. Shrink-wrapping (`PLIRON_SHRINKWRAP`, aarch64; default on since 2026-11-17, `=0` off):
     `VCode::pliron_shrink_wrap` picks the save block (nearest common
     dominator of blocks that need the frame, climbed off cycles until every
     block reachable from it is dominated by it); the frame record stays at

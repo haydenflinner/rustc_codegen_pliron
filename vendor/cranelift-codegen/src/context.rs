@@ -1427,7 +1427,7 @@ impl Context {
         use crate::cursor::{Cursor, FuncCursor};
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         crate::machinst::vcode::PLIRON_SPLIT_BLOCK.with(|c| c.set(None));
-        if !*ON.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP").as_deref() == Ok("1")) {
+        if !*ON.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP").as_deref() != Ok("0")) {
             return;
         }
         // `PLIRON_SHRINKWRAP_FNS=lo..hi`: only functions whose content

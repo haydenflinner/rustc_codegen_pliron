@@ -670,7 +670,7 @@ impl<I: VCodeInst> VCode<I> {
     /// there gets the full epilogue.
     fn pliron_shrink_wrap(&self, ra: &regalloc2::Output, order: &[BlockIndex]) -> Option<(BlockIndex, Vec<bool>)> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP").as_deref() == Ok("1")) {
+        if !*ON.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP").as_deref() != Ok("0")) {
             return None;
         }
         if PLIRON_SW_OFF.with(|c| c.get()) {
