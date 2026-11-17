@@ -1449,6 +1449,12 @@ pub fn run(
     // function), while the kernels' `hash_one` sites are at most 2 per
     // caller (`hashmap::run`).
     let hot_cap: usize = crate::env_get("PLIRON_INLINE_HOTCAP").and_then(|s| s.parse().ok()).unwrap_or(0);
+    // `PLIRON_INLINE_HOTCAP_MIN=<ops>`: the cap applies only to callees
+    // whose cost is above this (default 0, every bonus callee). Two copies
+    // of `hash_one` (926) in `hashmap::run` and four of `Big32x40::cmp`
+    // (574) in `format_exact` are what `hashmap` and `strwork` run: a cap
+    // on them costs those kernels 1.5 and 1.4 points (2026-11-17).
+    let hot_cap_min: usize = crate::env_get("PLIRON_INLINE_HOTCAP_MIN").and_then(|s| s.parse().ok()).unwrap_or(0);
     let glue_warm = crate::env_is("PLIRON_INLINE_GLUEWARM", "1");
     // `PLIRON_INLINE_FREEMAX=<n>` (opt-in): a single-site callee over n ops
     // gets no "free" threshold. memchr's 809-op search closure, inlined
@@ -1985,6 +1991,7 @@ pub fn run(
                     } else if hot > 1
                         && ci.ncalls <= 2
                         && (hot_cap == 0
+                            || cost <= hot_cap_min
                             || st.inline_hot_copies.get(&(sym.to_string(), cs.to_string())).copied().unwrap_or(0)
                                 + hot_add.get(cs.as_str()).copied().unwrap_or(0)
                                 < hot_cap)
