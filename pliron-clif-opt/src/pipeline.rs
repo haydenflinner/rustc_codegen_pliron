@@ -4031,6 +4031,17 @@ fn s_dem64(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// `ireduce`-only integer loads narrowed to the reduced width
+// (`clifpeep::ldnarrow`): after dem64, whose i64 -> i32 demotion leaves
+// `ireduce.i8 (load.i32)` tag reads.
+fn s_ldnarrow(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::ldnarrow(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("ldnarrow");
+    }
+    k
+}
+
 fn s_postinc(p: &mut Pipe, an: &mut Analysis) -> usize {
     let mut k = indvars::postinc(&mut p.clctx.func, an, 1024);
     if k > 0 {
@@ -5714,6 +5725,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Last, once sameargs/edge folds left the loop-entry arg a plain 0.
         step("mulcarry", "", Gate::OptIn("PLIRON_MULCARRY"), s_mulcarry).needs(shape::LOOPS),
         step("dem64", "dem64", Gate::Env("PLIRON_DEM64"), s_dem64),
+        // Byte reads forwarded out of a wider copy word load the byte.
+        step("ldnarrow", "ldnarrow", Gate::OptIn("PLIRON_LDNARROW"), s_ldnarrow)
+            .needs(shape::LOAD),
         // Fold a loop latch's few pure instructions into its predecessor's
         // `brif` so the back edge is one branch (pulldown's escape scan).
         step("latchspec", "latchspec", Gate::Env("PLIRON_LATCHSPEC"), s_latchspec).needs(shape::LOOPS),

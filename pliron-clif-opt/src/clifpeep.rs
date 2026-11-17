@@ -679,6 +679,102 @@ pub fn uloads32(func: &mut Function) -> usize {
     n
 }
 
+/// `PLIRON_LDNARROW=1` (opt-in): a `notrap` integer load whose every use
+/// is an `ireduce` reads only its low bytes, so it becomes a load of the
+/// widest reduced type at the same address (every supported target is
+/// little-endian: the low bytes are at the lowest address). The reduces
+/// to that type become the new load; narrower ones reduce it. The shape
+/// comes from `loadfwd` forwarding a byte read of a copied aggregate
+/// (an enum's tag) out of a wider copy word, `ireduce.i8 (load.i64)`,
+/// which `dem64` turns into `load.i32`: wasm then emits `i32.load` plus
+/// `i32.const 255; i32.and` where LLVM loads the byte (`i32.load8_u`),
+/// and TurboFan keeps the `ldr` + `and`. One pass over the
+/// instructions to classify the loads' uses, one over the candidates.
+pub fn ldnarrow(func: &mut Function) -> usize {
+    // load result -> widest reduced type so far; `None` = a use that is
+    // not an `ireduce` (or a load that cannot narrow).
+    let mut want: FxHashMap<Value, Option<Type>> = FxHashMap::default();
+    let is_cand = |func: &Function, v: Value| -> bool {
+        let Some(d) = func.dfg.value_def(v).inst() else { return false };
+        let InstructionData::Load { opcode: Opcode::Load, flags, .. } = func.dfg.insts[d] else {
+            return false;
+        };
+        let ty = func.dfg.value_type(v);
+        ty.is_int() && ty.bits() > 8 && ty.bits() <= 64 && func.dfg.mem_flags[flags].notrap()
+    };
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let reduce_to = match func.dfg.insts[i] {
+                InstructionData::Unary { opcode: Opcode::Ireduce, .. } => {
+                    Some(func.dfg.value_type(func.dfg.first_result(i)))
+                }
+                _ => None,
+            };
+            for v in func.dfg.inst_values(i) {
+                let v = func.dfg.resolve_aliases(v);
+                if !is_cand(func, v) {
+                    continue;
+                }
+                let e = want.entry(v).or_insert(reduce_to);
+                *e = match (*e, reduce_to) {
+                    (Some(a), Some(r)) => Some(if r.bits() > a.bits() { r } else { a }),
+                    _ => None,
+                };
+            }
+        }
+    }
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    let mut cands: Vec<(Value, Type)> =
+        want.into_iter().filter_map(|(v, t)| t.map(|t| (v, t))).collect();
+    // Deterministic order (the map is hashed).
+    cands.sort_by_key(|&(v, _)| v.index());
+    let mut retarget: FxHashMap<Value, (Value, Type)> = FxHashMap::default();
+    for (v, nt) in cands {
+        let l = pos.func.dfg.value_def(v).inst().unwrap();
+        let InstructionData::Load { flags, arg, offset, .. } = pos.func.dfg.insts[l] else {
+            unreachable!()
+        };
+        let flags = pos.func.dfg.mem_flags[flags].clone();
+        pos.goto_inst(l);
+        let nl = pos.ins().load(nt, flags, arg, offset);
+        retarget.insert(v, (nl, nt));
+        n += 1;
+    }
+    if n == 0 {
+        return 0;
+    }
+    // Rewrite the reduces, then drop the wide loads (no uses left).
+    let mut dead = Vec::new();
+    for b in pos.func.layout.blocks().collect::<Vec<_>>() {
+        let mut cur = pos.func.layout.first_inst(b);
+        while let Some(i) = cur {
+            cur = pos.func.layout.next_inst(i);
+            let InstructionData::Unary { opcode: Opcode::Ireduce, arg } = pos.func.dfg.insts[i] else {
+                continue;
+            };
+            let a = pos.func.dfg.resolve_aliases(arg);
+            let Some(&(nl, nt)) = retarget.get(&a) else { continue };
+            let res = pos.func.dfg.first_result(i);
+            if pos.func.dfg.value_type(res) == nt {
+                pos.func.dfg.clear_results(i);
+                pos.func.layout.remove_inst(i);
+                pos.func.dfg.change_to_alias(res, nl);
+            } else {
+                pos.func.dfg.inst_args_mut(i)[0] = nl;
+            }
+        }
+    }
+    for (v, _) in retarget.iter() {
+        if let Some(l) = pos.func.dfg.value_def(*v).inst() {
+            dead.push(l);
+        }
+    }
+    dead.sort_by_key(|i| i.index());
+    reap_dead(pos.func, &dead);
+    n
+}
+
 /// One i64 value's use in `dem64`'s web.
 #[derive(Clone, Copy)]
 enum Dem64Use {
