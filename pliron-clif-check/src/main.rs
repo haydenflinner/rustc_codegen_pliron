@@ -921,7 +921,10 @@ fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
     fb.set("opt_level", "speed").unwrap();
     fb.set("preserve_frame_pointers", "true").unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
-    fb.set("tls_model", "macho").unwrap();
+    // `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`: another target's ISA
+    // and ABI (Linux frees x18), as the held-out builds use.
+    let triple = std::env::var("CLIF_CHECK_TRIPLE").unwrap_or_else(|_| "aarch64-apple-darwin".into());
+    fb.set("tls_model", if triple.contains("apple") { "macho" } else { "elf_gd" }).unwrap();
     // `PLIRON_RA_ALGO=single_pass`: Cranelift's other allocator, to compare.
     if let Ok(a) = std::env::var("PLIRON_RA_ALGO") {
         fb.set("regalloc_algorithm", &a).unwrap();
@@ -932,8 +935,8 @@ fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
         fb.set("regalloc_checker", "true").unwrap();
     }
     let flags = cranelift_codegen::settings::Flags::new(fb);
-    cranelift_codegen::isa::lookup_by_name("aarch64-apple-darwin")
-        .expect("aarch64 ISA")
+    cranelift_codegen::isa::lookup_by_name(&triple)
+        .expect("ISA for CLIF_CHECK_TRIPLE")
         .finish(flags)
         .expect("ISA flags")
 }
