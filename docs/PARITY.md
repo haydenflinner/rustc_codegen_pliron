@@ -839,7 +839,7 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    and values parked in locals across block openers (0.3-0.6 MB):
    waffle `treeify.rs::is_remat`, `stackify.rs`.
 7. **vm_loop / vm_mandelbrot +5-10%** (the Mimas interpreter's dispatch
-   loop): profile `step_one`.
+   loop): profile `step_one`. (In progress 2026-11-17.)
 8. **Native**: the held-out programs (`bench/heldout/run.py`, 1.08x
    on 2026-11-09) with tonight's wasm-only defaults tried on native one
    at a time (`PLIRON_LICM_GTE=1`, `PLIRON_LICM_SLOTPROV=1`,
