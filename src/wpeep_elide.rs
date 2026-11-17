@@ -526,6 +526,264 @@ pub(super) fn dead_exact(
     Some((del.len() as u32, must))
 }
 
+/// (pops, pushes) of one straight-line instruction, `None` for control
+/// flow and anything this table does not size.
+fn straight_eff(
+    b: &[u8],
+    k: WPeek,
+    s: usize,
+    fsig: &[(u32, u32)],
+    tsig: &[(u32, u32)],
+) -> Option<(u32, u32)> {
+    Some(match k {
+        WPeek::Del | WPeek::Nop(_) => (0, 0),
+        WPeek::Get(_) => (0, 1),
+        WPeek::Set(_) | WPeek::Drop => (1, 0),
+        WPeek::Tee(_) | WPeek::Eqz => (1, 1),
+        WPeek::Op1(_) => (2, 1),
+        WPeek::Br(_) | WPeek::BrIf(_) => return None,
+        WPeek::Ctl => match *b.get(s)? {
+            0x10 => {
+                let mut p = s + 1;
+                *fsig.get(super::urd(b, &mut p)? as usize)?
+            }
+            0x11 => {
+                let mut p = s + 1;
+                let (np, nr) = *tsig.get(super::urd(b, &mut p)? as usize)?;
+                (np + 1, nr)
+            }
+            _ => return None,
+        },
+        WPeek::Other => match *b.get(s)? {
+            0x01 => (0, 0),
+            0x1a => (1, 0),
+            0x1b | 0x1c => (3, 1),
+            0x23 => (0, 1),
+            0x24 => (1, 0),
+            0x25 => (1, 1),
+            0x26 => (2, 0),
+            0x28..=0x35 => (1, 1),
+            0x36..=0x3e => (2, 0),
+            0x3f => (0, 1),
+            0x40 => (1, 1),
+            0x41..=0x44 => (0, 1),
+            0x45 | 0x50 => (1, 1),
+            0x46..=0x4f | 0x51..=0x66 => (2, 1),
+            0x67..=0x69 | 0x79..=0x7b | 0x8b..=0x91 | 0x99..=0x9f => (1, 1),
+            0x6a..=0x78 | 0x7c..=0x8a | 0x92..=0x98 | 0xa0..=0xa6 => (2, 1),
+            0xa7..=0xc4 => (1, 1),
+            0xd0 | 0xd2 => (0, 1),
+            0xd1 => (1, 1),
+            0xfc => match *b.get(s + 1)? {
+                0..=7 => (1, 1),
+                8 | 10 | 11 | 12 | 14 | 17 => (3, 0),
+                9 | 13 => (0, 0),
+                15 => (2, 1),
+                16 => (0, 1),
+                _ => return None,
+            },
+            _ => return None,
+        },
+    })
+}
+
+/// The integer compare with the opposite result (`eq`/`ne`, `lt`/`ge`,
+/// `gt`/`le`, signed and unsigned, i32 and i64). Float compares have none
+/// (NaN), and `eqz` is handled by its caller.
+fn invert_icmp(op: u8) -> Option<u8> {
+    Some(match op {
+        0x46 => 0x47,
+        0x47 => 0x46,
+        0x48 => 0x4e,
+        0x4e => 0x48,
+        0x49 => 0x4f,
+        0x4f => 0x49,
+        0x4a => 0x4c,
+        0x4c => 0x4a,
+        0x4b => 0x4d,
+        0x4d => 0x4b,
+        0x51 => 0x52,
+        0x52 => 0x51,
+        0x53 => 0x59,
+        0x59 => 0x53,
+        0x54 => 0x5a,
+        0x5a => 0x54,
+        0x55 => 0x57,
+        0x57 => 0x55,
+        0x56 => 0x58,
+        0x58 => 0x56,
+        _ => return None,
+    })
+}
+
+/// Branch over branch (N9 #2, `PLIRON_WASM_BOB=1`):
+/// `block; S; br_if 0; br K; end` with `S` straight-line becomes
+/// `S'; br_if K-1`, where `S'` ends in the inverted test: an integer
+/// compare flips (`lt_u` to `ge_u`), an `i32.eqz` goes, anything else
+/// gets an `i32.eqz`. Saves the block (3 bytes), the `br` (2) and, for the
+/// compare and `eqz` cases, nothing is added.
+///
+/// Conditions: the empty blocktype; `S` sized by `straight_eff` with the
+/// operand depth (relative to the block) never below zero and exactly 1
+/// (the condition) at the `br_if`, so `br K` passes no values and
+/// `S'` runs in the outer frame with the same net effect; `K >= 1`
+/// (`br 0` would name the block itself); no `local.get` prelude anchored
+/// on an instruction this deletes. `S` holds no branch, so no label
+/// inside needs a fixup. Returns the number of folds.
+pub(super) fn bob_round(
+    b: &[u8],
+    ins: &mut Vec<(WPeek, usize, usize, usize)>,
+    fsig: &[(u32, u32)],
+    tsig: &[(u32, u32)],
+    is_anchor: impl Fn(usize) -> bool,
+) -> u32 {
+    let live = |k: WPeek| !matches!(k, WPeek::Del | WPeek::Nop(_));
+    let label = |k: WPeek, s: usize, want: u8| -> Option<u32> {
+        match (k, want) {
+            (WPeek::BrIf(d), 0x0d) | (WPeek::Br(d), 0x0c) => Some(d),
+            (WPeek::Ctl, _) if b.get(s) == Some(&want) => {
+                let mut p = s + 1;
+                super::urd(b, &mut p)
+            }
+            _ => None,
+        }
+    };
+    // Each fold: (block opener, br_if, br, end, the condition's producer,
+    // what happens to it).
+    enum Cond {
+        Flip(u8),
+        DropEqz,
+        AddEqz,
+        /// `{i32,i64}.const 0; {eq,ne}` (the emitter would fuse it to
+        /// `eqz`): the const goes and the test becomes the value itself,
+        /// `i32.eqz`, `i64.eqz` or `i64.eqz; i32.eqz`.
+        Zero(u8, usize),
+    }
+    let mut folds: Vec<(usize, usize, usize, usize, usize, Cond)> = Vec::new();
+    let mut i = 0;
+    'scan: while i < ins.len() {
+        let (k, s, e, _) = ins[i];
+        if !(matches!(k, WPeek::Ctl) && empty_blocktype(b, s, e)) || b[s] != 0x02 {
+            i += 1;
+            continue;
+        }
+        let mut d: i64 = 0;
+        let mut last: Option<usize> = None;
+        let mut j = i + 1;
+        while j < ins.len() {
+            let (k2, s2, ..) = ins[j];
+            if label(k2, s2, 0x0d).is_some() {
+                break;
+            }
+            let Some((p, u)) = straight_eff(b, k2, s2, fsig, tsig) else {
+                i = j.max(i + 1);
+                continue 'scan;
+            };
+            d -= p as i64;
+            if d < 0 {
+                i = j;
+                continue 'scan;
+            }
+            d += u as i64;
+            if live(k2) {
+                last = Some(j);
+            }
+            j += 1;
+        }
+        let jb = j;
+        let next_live = |from: usize| (from..ins.len()).find(|&x| live(ins[x].0));
+        let (Some(jr), true) = (next_live(jb + 1), d == 1) else {
+            i += 1;
+            continue;
+        };
+        let Some(je) = next_live(jr + 1) else { break };
+        let ok = jb < ins.len()
+            && label(ins[jb].0, ins[jb].1, 0x0d) == Some(0)
+            && label(ins[jr].0, ins[jr].1, 0x0c).is_some_and(|kk| kk >= 1)
+            && matches!(ins[je].0, WPeek::Ctl)
+            && b[ins[je].1] == 0x0b;
+        let Some(c) = last.filter(|_| ok) else {
+            i += 1;
+            continue;
+        };
+        let prev = (i + 1..c).rev().find(|&x| live(ins[x].0));
+        let zero_before = |want: u8| {
+            prev.filter(|&x| {
+                let (k3, s3, e3, _) = ins[x];
+                matches!(k3, WPeek::Other) && e3 == s3 + 2 && b[s3] == want && b[s3 + 1] == 0
+            })
+        };
+        let cond = match ins[c].0 {
+            WPeek::Other => match b[ins[c].1] {
+                0x45 => Cond::DropEqz,
+                op @ (0x46 | 0x47) if zero_before(0x41).is_some() => {
+                    Cond::Zero(op, zero_before(0x41).unwrap())
+                }
+                op @ (0x51 | 0x52) if zero_before(0x42).is_some() => {
+                    Cond::Zero(op, zero_before(0x42).unwrap())
+                }
+                op => invert_icmp(op).map_or(Cond::AddEqz, Cond::Flip),
+            },
+            WPeek::Eqz => Cond::DropEqz,
+            _ => Cond::AddEqz,
+        };
+        let mut gone = vec![i, jb, jr, je];
+        match cond {
+            Cond::DropEqz => gone.push(c),
+            Cond::Zero(_, pc) => gone.extend([c, pc]),
+            _ => {}
+        }
+        if gone.iter().any(|&x| is_anchor(ins[x].1)) {
+            i = je + 1;
+            continue;
+        }
+        folds.push((i, jb, jr, je, c, cond));
+        i = je + 1;
+    }
+    if folds.is_empty() {
+        return 0;
+    }
+    let n = folds.len() as u32;
+    let mut add_eqz: Vec<usize> = Vec::new();
+    for (bi, jb, jr, je, c, cond) in folds {
+        let kk = label(ins[jr].0, ins[jr].1, 0x0c).unwrap_or(1);
+        ins[bi].0 = WPeek::Del;
+        ins[jr].0 = WPeek::Del;
+        ins[je].0 = WPeek::Del;
+        ins[jb].0 = WPeek::BrIf(kk - 1);
+        match cond {
+            Cond::Flip(op) => ins[c].0 = WPeek::Op1(op),
+            Cond::DropEqz => ins[c].0 = WPeek::Del,
+            Cond::AddEqz => add_eqz.push(jb),
+            Cond::Zero(op, pc) => {
+                ins[pc].0 = WPeek::Del;
+                match op {
+                    0x46 => ins[c].0 = WPeek::Del,
+                    0x47 => ins[c].0 = WPeek::Eqz,
+                    0x51 => {
+                        ins[c].0 = WPeek::Op1(0x50);
+                        add_eqz.push(jb);
+                    }
+                    _ => ins[c].0 = WPeek::Op1(0x50),
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(ins.len() + add_eqz.len());
+    let mut a = 0;
+    for (x, &it) in ins.iter().enumerate() {
+        if a < add_eqz.len() && add_eqz[a] == x {
+            out.push((WPeek::Eqz, it.1, it.1, it.3));
+            a += 1;
+        }
+        if !matches!(it.0, WPeek::Del) {
+            out.push(it);
+        }
+    }
+    *ins = out;
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

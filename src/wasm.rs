@@ -703,6 +703,10 @@ enum WPeek {
     /// real byte range; passes that byte-decode `Other`/`Ctl` must
     /// never see it reach those arms.
     Eqz,
+    /// A synthesized one-byte opcode without immediates: the inverted
+    /// integer compare of the branch-over-branch fold (`bob`), which runs
+    /// last, so only the emitter sees it.
+    Op1(u8),
     Other,
 }
 
@@ -769,6 +773,8 @@ struct PeepOpts {
     deadtail: bool,
     /// `btr` again after elision (`PLIRON_WASM_BTR2=1`).
     btr2: bool,
+    /// Branch-over-branch fold (`PLIRON_WASM_BOB=1`; `wpeep_elide::bob_round`).
+    bob: bool,
 }
 
 impl PeepOpts {
@@ -793,6 +799,7 @@ impl PeepOpts {
             elideblk: crate::env_get("PLIRON_WASM_ELIDEBLK") != Some("0"),
             deadtail: pliron_cfg::env_is("PLIRON_WASM_DEADTAIL", "1"),
             btr2: pliron_cfg::env_is("PLIRON_WASM_BTR2", "1"),
+            bob: pliron_cfg::env_is("PLIRON_WASM_BOB", "1"),
         }
     }
 }
@@ -809,6 +816,7 @@ fn wpeek_name(k: WPeek) -> String {
         WPeek::BrIf(d) => format!("br_if {d}"),
         WPeek::Ctl => "ctl".into(),
         WPeek::Eqz => "eqz".into(),
+        WPeek::Op1(o) => format!("op1 {o:02x}"),
         WPeek::Other => "other".into(),
     }
 }
@@ -913,6 +921,7 @@ fn btr_pass(
             WPeek::Tee(_) => {}
             // pop-1/push-1: depth unchanged, underflows to unknown
             WPeek::Eqz => d = d.and_then(|x| x.checked_sub(1)).map(|x| x + 1),
+            WPeek::Op1(_) => d = d.and_then(|x| x.checked_sub(2)).map(|x| x + 1),
             WPeek::Br(dd) => {
                 d = None;
                 if dead_at.is_none() {
@@ -3706,6 +3715,15 @@ fn peep_body_opts(
                     vstack.push(OTHER);
                     continue;
                 }
+                WPeek::Op1(_) => {
+                    for _ in 0..2 {
+                        if vstack.pop().is_none() {
+                            pend.clear();
+                        }
+                    }
+                    vstack.push(OTHER);
+                    continue;
+                }
                 WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
                     // Merge `copymap`/`last_write` per ctl kind — a
                     // `set T(get U)` on every incoming arm leaves
@@ -4282,6 +4300,12 @@ fn peep_body_opts(
                             st.push(i as u32);
                             vec![v]
                         }
+                        WPeek::Op1(_) => {
+                            let v = st.pop().unwrap_or(u32::MAX);
+                            let w = st.pop().unwrap_or(u32::MAX);
+                            st.push(i as u32);
+                            vec![v, w]
+                        }
                         WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => {
                             st.clear();
                             lo.clear();
@@ -4355,6 +4379,7 @@ fn peep_body_opts(
                     WPeek::Tee(_) => (1, 1),
                     WPeek::Drop => (1, 0),
                     WPeek::Eqz => (1, 1),
+                    WPeek::Op1(_) => (2, 1),
                     WPeek::Ctl | WPeek::BrIf(_) | WPeek::Br(_) => (0, 0),
                     WPeek::Other => eff(s).unwrap_or((0, 0)),
                 };
@@ -4818,6 +4843,7 @@ fn peep_body_opts(
                 // `Nop(l)`/`Drop`/`Del`/`Eqz` leave locals and memory alone;
                 // `Get` is a plain read.
                 WPeek::Nop(_) | WPeek::Drop | WPeek::Del | WPeek::Get(_) | WPeek::Eqz => {}
+                WPeek::Op1(_) => {}
                 WPeek::Other => match b[ins[i].1] {
                     // calls decode as Ctl; `memory.*`/`0xfb`-`0xfe` are
                     // opaque — atomics/SIMD/GC bail at decode anyway.
@@ -5361,6 +5387,23 @@ fn peep_body_opts(
         wtrace!("btr2", ins);
         elide_loop(&mut ins);
     }
+    // `PLIRON_WASM_BOB=1`: `block; S; br_if 0; br K; end` -> `S'; br_if
+    // K-1` with the test inverted (N9 #2). Last, so no analysis sees its
+    // synthesized compares (`WPeek::Op1`).
+    if opts.bob {
+        let anchor = |s: usize| prel.iter().any(|&(pp, _)| pp == s);
+        let before = ins.clone();
+        if wpeep_elide::bob_round(b, &mut ins, fsig, tsig, anchor) > 0 {
+            if let Err(e) = wpeep_elide::wellformed(b, &ins) {
+                if opts.audit_panic {
+                    panic!("wpeep bob: rejected in {}: {e}", opts.tag);
+                }
+                tracing::debug!(target: "pliron::wasm", "wpeep bob: reverted in {}: {e}", opts.tag);
+                ins = before;
+            }
+        }
+        wtrace!("bob", ins);
+    }
     let mut nb = Vec::with_capacity(p);
     leb(&mut nb, groups.len() as u32);
     for &(c, t) in &groups {
@@ -5474,6 +5517,7 @@ fn peep_body_opts(
             WPeek::Del | WPeek::Nop(_) => {}
             WPeek::Drop => nb.push(0x1a),
             WPeek::Eqz => nb.push(0x45),
+            WPeek::Op1(o) => nb.push(o),
         }
         wi += 1;
     }
@@ -5941,6 +5985,7 @@ mod wpeep_tests {
             elideblk: false,
             deadtail: false,
             btr2: false,
+            bob: false,
         }
     }
 
