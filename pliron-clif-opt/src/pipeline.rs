@@ -2510,7 +2510,37 @@ fn unroll_round(p: &mut Pipe, an: &mut Analysis, pure_only: bool) -> usize {
 // `dse` and the `egraph`.
 fn s_unroll2(p: &mut Pipe, an: &mut Analysis) -> usize {
     // Loops with a call or a `black_box` stay (`unroll::run_opts`).
-    let k = unroll_round(p, an, true);
+    let mut k = unroll_round(p, an, true);
+    // `PLIRON_UNROLL2_BUNROLL=<body>` (opt-in): then `bunroll` with nested
+    // loops allowed (`bunroll::run_late`) for the constant-bound loops whose
+    // body branches on data, and `unroll` again for the inner loops the
+    // copies' constant IVs decide.
+    static LB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        pliron_cfg::env_get("PLIRON_UNROLL2_BUNROLL").and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if *LB > 0 {
+        if k > 0 {
+            an.bump(&p.clctx.func, shape::CREATED);
+        }
+        // Outer loops first: a copy's inner loops have constant bounds
+        // for the next round (three rounds: a nest of three).
+        for _ in 0..3 {
+            let b = bunroll::run_late(&mut p.clctx.func, an, *LB, 32);
+            if b == 0 {
+                break;
+            }
+            an.invalidate(&mut p.clctx.func);
+            an.bump(&p.clctx.func, shape::CREATED);
+            // The tails the last copies no longer continue into.
+            jumpthread::fold_const_branches(&mut p.clctx.func);
+            jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
+            an.bump(&p.clctx.func, shape::CREATED);
+            k += b;
+        }
+        if k > 0 {
+            k += unroll_round(p, an, true);
+        }
+    }
     if k == 0 {
         return 0;
     }

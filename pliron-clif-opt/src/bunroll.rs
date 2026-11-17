@@ -31,11 +31,34 @@ const MAX_BODY: usize = 48;
 
 fn max_body() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some((body, _)) = LATE.with(|c| c.get()) {
+        return body;
+    }
     *V.get_or_init(|| {
         crate::env_get("PLIRON_BUNROLL_BODY")
             .and_then(|v| v.parse().ok())
             .unwrap_or(MAX_BODY)
     })
+}
+
+thread_local! {
+    /// `(body cap, block cap)` of a late round (`run_late`): loops that
+    /// contain loops are taken too.
+    static LATE: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The late round of `PLIRON_UNROLL2`: [`run`], but a loop may contain
+/// loops (they are cloned whole: each copy keeps its inner loops, whose
+/// bounds then read the copy's constant IV), with the given body and
+/// block caps. rapier2d's `for q in 0..3 { for p in 0..=q { if
+/// blocks[..] == u32::MAX { continue } .. } }` is that shape: the
+/// trip walk of `unroll` cannot take the data-dependent `continue`,
+/// and the outer loop's bound is the only constant one.
+pub fn run_late(func: &mut Function, an: &mut crate::pipeline::Analysis, body: usize, blocks: usize) -> usize {
+    LATE.with(|c| c.set(Some((body, blocks))));
+    let n = run_inner(func, an);
+    LATE.with(|c| c.set(None));
+    n
 }
 
 struct Vm<'a> {
@@ -121,7 +144,132 @@ fn iconst(func: &Function, v: Value) -> Option<i64> {
 /// through a param of another in-loop block whose every in-loop in-edge
 /// supplies the same affine arg (the rotated-loop latch: `h[p]` flows
 /// in, `p+s` comes back out).
+/// `cond` on two constants of width `w`.
+fn icmp_const(cond: IntCC, a: i64, b: i64, w: u32) -> bool {
+    let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let (ua, ub) = (a as u64 & m, b as u64 & m);
+    let sh = 64 - w.min(64);
+    let (sa, sb) = (((ua << sh) as i64) >> sh, ((ub << sh) as i64) >> sh);
+    match cond {
+        IntCC::Equal => ua == ub,
+        IntCC::NotEqual => ua != ub,
+        IntCC::UnsignedLessThan => ua < ub,
+        IntCC::UnsignedLessThanOrEqual => ua <= ub,
+        IntCC::UnsignedGreaterThan => ua > ub,
+        IntCC::UnsignedGreaterThanOrEqual => ua >= ub,
+        IntCC::SignedLessThan => sa < sb,
+        IntCC::SignedLessThanOrEqual => sa <= sb,
+        IntCC::SignedGreaterThan => sa > sb,
+        IntCC::SignedGreaterThanOrEqual => sa >= sb,
+    }
+}
+
 fn rec_expr(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    h: Block,
+    inset: &FxHashSet<Block>,
+    v: Value,
+    depth: usize,
+) -> Option<(usize, i64)> {
+    if LATE.with(|c| c.get()).is_some() {
+        let mut stack = Vec::new();
+        return match rec_expr_cyc(func, cfg, h, inset, v, depth.max(16), &mut stack) {
+            Some(Rec::Expr(k, d)) => Some((k, d)),
+            _ => None,
+        };
+    }
+    rec_expr_flat(func, cfg, h, inset, v, depth)
+}
+
+/// [`rec_expr`]'s result in a late round: an expression, or "the relay
+/// param being resolved" (a cycle through an inner loop's header).
+#[derive(Clone, Copy, PartialEq)]
+enum Rec {
+    Expr(usize, i64),
+    Cycle,
+}
+
+/// [`rec_expr`] with nested loops: an inner loop's header param that
+/// carries an outer value unchanged around the inner loop (`q + 1` riding
+/// through `for p in 0..=q`) is a relay whose in-loop incoming values are
+/// that value and itself. Incoming edges that lead back to a param on the
+/// resolution stack are ignored; arithmetic on a cycle is not a relay.
+fn rec_expr_cyc(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    h: Block,
+    inset: &FxHashSet<Block>,
+    v: Value,
+    depth: usize,
+    stack: &mut Vec<Value>,
+) -> Option<Rec> {
+    if depth == 0 {
+        return None;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    match func.dfg.value_def(v) {
+        cranelift_codegen::ir::ValueDef::Param(b, pi) if b == h => Some(Rec::Expr(pi, 0)),
+        cranelift_codegen::ir::ValueDef::Param(b, m) if inset.contains(&b) => {
+            if stack.contains(&v) {
+                return Some(Rec::Cycle);
+            }
+            stack.push(v);
+            let mut out: Option<Rec> = None;
+            let mut ok = true;
+            'preds: for p in cfg.pred_iter(b) {
+                if !inset.contains(&p.block) {
+                    continue;
+                }
+                for bc in func.dfg.insts[p.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    if bc.block(&func.dfg.value_lists) != b {
+                        continue;
+                    }
+                    let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(m) else {
+                        ok = false;
+                        break 'preds;
+                    };
+                    match rec_expr_cyc(func, cfg, h, inset, a, depth - 1, stack) {
+                        None => {
+                            ok = false;
+                            break 'preds;
+                        }
+                        Some(Rec::Cycle) => {}
+                        Some(e) => {
+                            if out.is_some_and(|o| o != e) {
+                                ok = false;
+                                break 'preds;
+                            }
+                            out = Some(e);
+                        }
+                    }
+                }
+            }
+            stack.pop();
+            if !ok {
+                return None;
+            }
+            Some(out.unwrap_or(Rec::Cycle))
+        }
+        cranelift_codegen::ir::ValueDef::Result(i, _) => {
+            if let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i] {
+                for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
+                    if let Some(s) = iconst(func, c) {
+                        if let Some(Rec::Expr(k, d)) = rec_expr_cyc(func, cfg, h, inset, x, depth - 1, stack) {
+                            return Some(Rec::Expr(k, d + s));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn rec_expr_flat(
     func: &Function,
     cfg: &ControlFlowGraph,
     h: Block,
@@ -153,7 +301,7 @@ fn rec_expr(
                     let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(m) else {
                         return None;
                     };
-                    let e = rec_expr(func, cfg, h, inset, a, depth - 1)?;
+                    let e = rec_expr_flat(func, cfg, h, inset, a, depth - 1)?;
                     if out.is_some_and(|o| o != e) {
                         return None;
                     }
@@ -170,7 +318,7 @@ fn rec_expr(
             {
                 for (x, c) in [(args[0], args[1]), (args[1], args[0])] {
                     if let Some(s) = iconst(func, c) {
-                        if let Some((k, d)) = rec_expr(func, cfg, h, inset, x, depth - 1) {
+                        if let Some((k, d)) = rec_expr_flat(func, cfg, h, inset, x, depth - 1) {
                             return Some((k, d + s));
                         }
                     }
@@ -211,10 +359,12 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
     // Loop blocks = blocks whose *innermost* loop is `lp` (no nested).
     // Bail on nested loops: blocks in a child loop aren't cloned but
     // outer uses of their values would leak original defs into clones.
-    if func
-        .layout
-        .blocks()
-        .any(|b| la.is_in_loop(b, lp) && la.innermost_loop(b) != Some(lp))
+    let late = LATE.with(|c| c.get());
+    if late.is_none()
+        && func
+            .layout
+            .blocks()
+            .any(|b| la.is_in_loop(b, lp) && la.innermost_loop(b) != Some(lp))
     {
         dbg("nested");
         return None;
@@ -222,9 +372,10 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
     let mut blocks: Vec<Block> = func
         .layout
         .blocks()
-        .filter(|&b| la.innermost_loop(b) == Some(lp))
+        .filter(|&b| if late.is_some() { la.is_in_loop(b, lp) } else { la.innermost_loop(b) == Some(lp) })
         .collect();
-    if blocks.len() > MAX_BLOCKS || !blocks.contains(&h) {
+    let max_blocks = late.map_or(MAX_BLOCKS, |(_, b)| b);
+    if blocks.len() > max_blocks || !blocks.contains(&h) {
         dbg("blocks");
         return None;
     }
@@ -355,6 +506,10 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
     // copies; the tail covers any shape that iterates further.
     let mut iters = None;
     for &b in &blocks {
+        // An inner loop's test is not this loop's bound.
+        if la.innermost_loop(b) != Some(lp) {
+            continue;
+        }
         for i in func.layout.block_insts(b) {
             let InstructionData::IntCompare { args, cond, .. } = func.dfg.insts[i] else {
                 continue;
@@ -365,11 +520,14 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
             // `iv(+d)` side vs a small constant — the iv may reach the
             // test through a relay latch param, so use `rec_expr`.
             let mut bound = None;
-            for (a, c) in [(args[0], args[1]), (args[1], args[0])] {
-                if let Some((k, _d)) = rec_expr(func, cfg, h, &inset, a, 6) {
+            // (iv param, offset, iv on the left) of the bound test.
+            let mut side = None;
+            for (left, (a, c)) in [(true, (args[0], args[1])), (false, (args[1], args[0]))] {
+                if let Some((k, d)) = rec_expr(func, cfg, h, &inset, a, 6) {
                     if ivs.iter().any(|&(pi, _, _)| pi == k) {
                         if let Some(kb) = iconst(func, c) {
                             bound = Some(kb);
+                            side = Some((k, d, left));
                         }
                     }
                 }
@@ -377,7 +535,7 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
             let Some(k) = bound else {
                 continue;
             };
-            if !(2..=MAX_ITERS as i64).contains(&k) {
+            if late.is_none() && !(2..=MAX_ITERS as i64).contains(&k) {
                 continue;
             }
             // Its user brif must split in-loop/out-of-loop.
@@ -395,6 +553,32 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
             let in0 = inset.contains(&d0.block(&func.dfg.value_lists));
             let in1 = inset.contains(&d1.block(&func.dfg.value_lists));
             if in0 == in1 {
+                continue;
+            }
+            if late.is_some() {
+                // The trips the test allows from the IV's start, plus the
+                // copy whose test leaves (so the last copy never continues
+                // into the tail, and the tail folds away). `p <= q` with
+                // `q` a copy's constant is `q + 1` trips, where the `K`
+                // copies of the plain rule left one trip to the tail.
+                let Some((pk, d, left)) = side else { continue };
+                let Some(&(_, v0, st)) = ivs.iter().find(|&&(pi, _, _)| pi == pk) else { continue };
+                let w = func.dfg.value_type(args[0]).bits();
+                let mut n = 0usize;
+                while n <= MAX_ITERS {
+                    let x = v0 + d + n as i64 * st;
+                    let (l, r) = if left { (x, k) } else { (k, x) };
+                    let c = icmp_const(cond, l, r, w);
+                    let cont = if c { in0 } else { in1 };
+                    if !cont {
+                        break;
+                    }
+                    n += 1;
+                }
+                if n > MAX_ITERS {
+                    continue;
+                }
+                iters = Some(n + 1);
                 continue;
             }
             iters = Some(k as usize);
@@ -564,6 +748,12 @@ fn detect(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, la: &Loop
             repair.push((x, ns));
         }
     }
+    // A late round caps the copies' total, not only one body: its loops
+    // are bigger (`max_body` is the whole budget there).
+    if late.is_some() && body.saturating_mul(iters) > max_body() {
+        dbg("late total");
+        return None;
+    }
     dbg(&format!("plan iters={iters}"));
     Some(Plan {
         h,
@@ -708,12 +898,25 @@ pub fn run(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     if !pliron_cfg::env_is("PLIRON_BUNROLL", "1") {
         return 0;
     }
+    run_inner(func, an)
+}
+
+fn run_inner(func: &mut Function, an: &mut crate::pipeline::Analysis) -> usize {
     let mut plans = Vec::new();
     {
         let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
         tracing::debug!(target: "pliron::bunroll", "run {}: {} loops", func.name, la.loops().count());
+        // Late rounds take nested loops, so a plan's blocks can hold
+        // another plan's: applying one would leave the other's block list
+        // stale. Keep the plans disjoint (the first one in loop order
+        // wins; the next round sees the rest).
+        let mut taken: FxHashSet<Block> = FxHashSet::default();
         for lp in la.loops().take(16) {
             if let Some(p) = detect(func, cfg, dt, la, lp) {
+                if p.blocks.iter().any(|b| taken.contains(b)) {
+                    continue;
+                }
+                taken.extend(p.blocks.iter().copied());
                 plans.push(p);
             }
         }
