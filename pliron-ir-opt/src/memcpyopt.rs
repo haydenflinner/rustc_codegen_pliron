@@ -1389,10 +1389,16 @@ fn sibarms_on() -> bool {
 
 /// May `op` unwind out of the function (or into a landing pad, whose
 /// path the caller then sees through `resume`)? Invokes and calls not
-/// proven `nounwind` may; intrinsics only when they throw.
+/// proven `nounwind` may; intrinsics only when they throw. Under
+/// `panic=abort` (`State::panic_abort`) no call does: rustc already marks
+/// the declared callees `nounwind`, and the rest (indirect calls) cannot
+/// unwind past a Rust frame either.
 fn may_unwind(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
     if st.invokes.contains(op) {
         return true;
+    }
+    if st.panic_abort {
+        return false;
     }
     if let Some(name) = st.intrinsics.get(op) {
         return name.contains("throw") || name.contains("rethrow") || name.starts_with("pliron.eh.rethrow");
@@ -2781,9 +2787,14 @@ mod tests {
     /// Parse a `NA_HEAD` body, mark `p` `noalias` (`deref` bytes,
     /// `writable`) and try the forward with the knob on or off.
     fn na_forward(body: &str, on: bool, deref: u64, writable: bool) -> bool {
+        na_forward_in(body, on, deref, writable, false)
+    }
+
+    /// `na_forward` with `State::panic_abort` set as given.
+    fn na_forward_in(body: &str, on: bool, deref: u64, writable: bool, panic_abort: bool) -> bool {
         let input = format!("{NA_HEAD}{body}{NA_TAIL}");
         let ctx = &mut Context::new();
-        let st = &mut State::default();
+        let st = &mut State { panic_abort, ..State::default() };
         let (f, m) = fixture(&input, st, ctx);
         let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head().unwrap();
         let p = entry.deref(ctx).get_argument(ctx, 0);
@@ -2814,6 +2825,8 @@ mod tests {
             "            llvm.store *tmp <- v;\n            c = llvm.call @g () : llvm.func <llvm.void () variadic = false>;\n{NA_MC}            llvm.return\n"
         );
         assert!(!na_forward(&body, true, 8, true));
+        // Under `panic=abort` the call cannot unwind: forwarded.
+        assert!(na_forward_in(&body, true, 8, true, true));
     }
 
     /// A path from the writer that returns without reaching the copy: the

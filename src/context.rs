@@ -93,6 +93,7 @@ impl<'tcx> CodegenCx<'tcx> {
             module,
             st: RefCell::new(State {
                 target: crate::target::of(tcx.sess),
+                panic_abort: tcx.sess.panic_strategy() != rustc_target::spec::PanicStrategy::Unwind,
                 eh_personality: rustc_symbol_mangling::eh_personality_symbol(tcx),
                 dbg: crate::debuginfo::cu_info(tcx, name),
                 ..State::default()

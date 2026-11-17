@@ -358,6 +358,11 @@ pub struct State {
     /// `State` is created (`src/target.rs`), `Target::host()` in unit
     /// tests. The lowering hands it on to the CLIF pipeline.
     pub target: pliron_cfg::target::Target,
+    /// The session's panic strategy is not `unwind`: a panic aborts where
+    /// it is raised, and an unwind from foreign code aborts at the first
+    /// Rust frame, so nothing unwinds out of a function of this crate.
+    /// `false` (may unwind) in unit tests.
+    pub panic_abort: bool,
     pub consts: ColMap<Value, ConstVal>,
     pub funcs: SymMap<FuncInfo>,
     pub globals: SymMap<GlobalInfo>,
