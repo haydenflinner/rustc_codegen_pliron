@@ -206,7 +206,15 @@ fn main() -> ExitCode {
             }
             let mut ctx = Context::for_function(after);
             ctx.set_disasm(true);
+            // `PLIRON_RA_EXPLAIN` (any value): regalloc2's `ra2x:` decision log.
+            let explain = std::env::var_os("PLIRON_RA_EXPLAIN").is_some();
+            if explain {
+                cranelift_codegen::ra_set_explain(true);
+            }
             let c = ctx.compile(&*isa, &mut cranelift_codegen::control::ControlPlane::default()).expect("compile");
+            if explain {
+                cranelift_codegen::ra_set_explain(false);
+            }
             let v = c.vcode.clone().unwrap_or_default();
             if std::env::var_os("CLIF_CHECK_POST_EGRAPH").is_some() {
                 // The function as Cranelift lowered it (after its egraph).

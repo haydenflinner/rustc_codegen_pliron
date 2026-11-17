@@ -1419,6 +1419,16 @@ impl<'a, F: Function> Env<'a, F> {
                         conf
                     );
                 }
+                // PLIRON `PLIRON_RA2_REGION=1`: decide per block where the
+                // bundle lives in one register and where on the stack
+                // (`ion/regionsplit.rs`) instead of splitting at the first
+                // conflict.
+                if crate::region_on()
+                    && fixed_preg.is_none()
+                    && self.try_region_split(bundle, hint)
+                {
+                    break 'outer;
+                }
                 let bundle_start = self.ctx.bundles[bundle].ranges[0].range.from;
                 let mut split_at_point =
                     core::cmp::max(lowest_cost_split_conflict_point, bundle_start);
@@ -2099,7 +2109,7 @@ impl<'a, F: Function> Env<'a, F> {
     /// gets `[at, to)` with the uses from `at` on and is appended to the
     /// vreg's range list (sorted after allocation, as for any split). The
     /// caller puts both into bundles.
-    fn cold_split_range(&mut self, orig: LiveRangeIndex, at: ProgPoint) -> LiveRangeIndex {
+    pub(crate) fn cold_split_range(&mut self, orig: LiveRangeIndex, at: ProgPoint) -> LiveRangeIndex {
         debug_assert!(self.ctx.ranges[orig].range.from < at && at < self.ctx.ranges[orig].range.to);
         debug_assert!(at.pos() == InstPosition::Before);
         let to = self.ctx.ranges[orig].range.to;

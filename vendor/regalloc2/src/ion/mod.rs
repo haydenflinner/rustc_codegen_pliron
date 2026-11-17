@@ -36,6 +36,7 @@ pub(crate) mod moves;
 pub(crate) mod spill;
 pub(crate) mod postopt;
 pub(crate) mod rehome;
+pub(crate) mod regionsplit;
 
 impl<'a, F: Function> Env<'a, F> {
     pub(crate) fn new(func: &'a F, env: &'a MachineEnv, ctx: &'a mut Ctx) -> Self {

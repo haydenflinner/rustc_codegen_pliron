@@ -146,6 +146,90 @@ pub(crate) fn coldsplit_ratio() -> f32 {
     16.0
 }
 
+/// PLIRON: a numeric `PLIRON_RA2_*` knob read once.
+#[cfg(feature = "std")]
+fn env_f32(name: &str, cell: &'static std::sync::OnceLock<f32>, default: f32) -> f32 {
+    *cell.get_or_init(|| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|k| k.is_finite())
+            .unwrap_or(default)
+    })
+}
+
+/// PLIRON: `PLIRON_RA2_REGION=1` (opt-in): min-cut region splitting
+/// (`ion/regionsplit.rs`) before the split at the first conflict.
+pub(crate) fn region_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_REGION", &C, 0.0) != 0.0
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON: `PLIRON_RA2_REGION_MAX` (default 4): region splits per
+/// spillset (each must shrink the register part; this bounds the work).
+pub(crate) fn region_max() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_REGION_MAX", &C, 4.0).clamp(1.0, 200.0) as u8
+    }
+    #[cfg(not(feature = "std"))]
+    4
+}
+
+/// PLIRON: `PLIRON_RA2_REGION_K` (default 4): registers whose cut is
+/// solved, the ones with the largest possible gain.
+pub(crate) fn region_k() -> usize {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_REGION_K", &C, 4.0).max(1.0) as usize
+    }
+    #[cfg(not(feature = "std"))]
+    4
+}
+
+/// PLIRON: `PLIRON_RA2_REGION_CAP` (default 2): uses an S block is
+/// charged for at most (a block-local piece reloads once per stretch).
+pub(crate) fn region_use_cap() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_REGION_CAP", &C, 2.0).max(1.0) as u32
+    }
+    #[cfg(not(feature = "std"))]
+    2
+}
+
+/// PLIRON: `PLIRON_RA2_REGION_MAXB` (default 2048): bundles live in more
+/// blocks are left to the ordinary split.
+pub(crate) fn region_max_blocks() -> usize {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_REGION_MAXB", &C, 2048.0).max(2.0) as usize
+    }
+    #[cfg(not(feature = "std"))]
+    2048
+}
+
+/// PLIRON: `PLIRON_RA2_REGION_RATIO` (default 1.0): the cut must cost
+/// less than this times putting the whole bundle on the stack.
+pub(crate) fn region_ratio() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_REGION_RATIO", &C, 1.0)
+    }
+    #[cfg(not(feature = "std"))]
+    1.0
+}
+
 /// PLIRON: `PLIRON_RA2_COLDSPLIT_BIAS=<f>` (default 1.0): multiplier on
 /// the cold split's cost when it is compared with the cost of opening a
 /// callee-saved register (see `Env::try_cold_split`); below 1 splits

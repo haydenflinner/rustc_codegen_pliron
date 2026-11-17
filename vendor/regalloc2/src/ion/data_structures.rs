@@ -208,6 +208,11 @@ pub struct LiveBundle {
     /// remainder or cold region) of a cold-region split, or was split off
     /// one; the rule does not apply to it again.
     pub cold_split: bool,
+    /// PLIRON (`PLIRON_RA2_REGION`): the register part of a region split
+    /// records the block count of the bundle it was cut from; it is
+    /// region-split again only while it has fewer blocks (LLVM's
+    /// `RS_Split2` guard). 0: not from a region split.
+    pub region_blocks: u32,
 }
 
 pub const BUNDLE_MAX_SPILL_WEIGHT: u32 = (1 << 28) - 1;
@@ -310,6 +315,9 @@ pub struct SpillSet {
     /// cold split put on the stack; its second-chance register must not
     /// be a callee-saved one nobody else uses (`spill.rs`).
     pub cold_spill: bool,
+    /// PLIRON (`PLIRON_RA2_REGION`): region splits done on bundles of this
+    /// spillset (capped by `PLIRON_RA2_REGION_MAX`).
+    pub region_count: u8,
 
     /// The aggregate [`CodeRange`] of all involved [`LiveRange`]s. The effect of this abstraction
     /// is that we attempt to allocate one spill slot for the extent of a bundle. For fragmented
@@ -425,6 +433,7 @@ impl LiveBundles {
             spill_weight_and_props: 0,
             limit: None,
             cold_split: false,
+            region_blocks: 0,
         })
     }
 }

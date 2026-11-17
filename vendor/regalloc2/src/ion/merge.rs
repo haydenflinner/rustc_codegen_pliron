@@ -381,6 +381,7 @@ impl<'a, F: Function> Env<'a, F> {
                 spill_bundle: LiveBundleIndex::invalid(),
                 splits: 0,
                 cold_spill: false,
+                region_count: 0,
                 range,
             });
             self.bundles[bundle].spillset = ssidx;
