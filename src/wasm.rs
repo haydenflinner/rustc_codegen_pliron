@@ -680,6 +680,38 @@ fn nskip(b: &[u8], p: &mut usize, n: usize) -> Option<()> {
     Some(())
 }
 
+/// (pops, pushes) of the SIMD instruction at `s` (`0xfd` prefix), for
+/// the passes that only count operand depth (`btr`, `bob`); the
+/// forwarding passes keep SIMD opaque. Relaxed SIMD and unassigned
+/// opcodes are `None`.
+fn simd_eff(b: &[u8], s: usize) -> Option<(u32, u32)> {
+    let mut p = s + 1;
+    let op = urd(b, &mut p)?;
+    Some(match op {
+        0x00..=0x0a | 0x5c | 0x5d => (1, 1), // loads
+        0x0b => (2, 0),                      // v128.store
+        0x0c => (0, 1),                      // v128.const
+        0x0d | 0x0e => (2, 1),               // shuffle, swizzle
+        0x0f..=0x14 => (1, 1),               // splats
+        0x15 | 0x16 | 0x18 | 0x19 | 0x1b | 0x1d | 0x1f | 0x21 => (1, 1), // extract_lane
+        0x17 | 0x1a | 0x1c | 0x1e | 0x20 | 0x22 => (2, 1), // replace_lane
+        0x23..=0x4c => (2, 1),               // compares
+        0x4d | 0x53 => (1, 1),               // not, any_true
+        0x4e..=0x51 => (2, 1),               // and, andnot, or, xor
+        0x52 => (3, 1),                      // bitselect
+        0x54..=0x57 => (2, 1),               // load lane
+        0x58..=0x5b => (2, 0),               // store lane
+        0x5e..=0x64 | 0x67..=0x6a | 0x74 | 0x75 | 0x7a | 0x7c..=0x81 | 0x83 | 0x84
+        | 0x87..=0x8a | 0x94 | 0xa0 | 0xa1 | 0xa3 | 0xa4 | 0xa7..=0xaa | 0xc0 | 0xc1
+        | 0xc3 | 0xc4 | 0xc7..=0xca | 0xe0 | 0xe1 | 0xe3 | 0xec | 0xed | 0xef
+        | 0xf8..=0xff => (1, 1),             // unary, extends, conversions
+        0x65 | 0x66 | 0x6b..=0x73 | 0x76..=0x79 | 0x7b | 0x82 | 0x85 | 0x86 | 0x8b..=0x93
+        | 0x95..=0x99 | 0x9b..=0x9f | 0xab..=0xae | 0xb1 | 0xb5..=0xba | 0xbc..=0xbf
+        | 0xcb..=0xce | 0xd1 | 0xd5..=0xdf | 0xe4..=0xeb | 0xf0..=0xf7 => (2, 1), // binary, shifts
+        _ => return None,
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 enum WPeek {
     Get(u32),
@@ -979,6 +1011,13 @@ fn btr_pass(
                         15 => (2, 1),
                         16 => (0, 1),
                         _ => {
+                            ok = false;
+                            break 'model;
+                        }
+                    },
+                    0xfd => match simd_eff(b, s) {
+                        Some(e) => e,
+                        None => {
                             ok = false;
                             break 'model;
                         }
@@ -7576,6 +7615,27 @@ mod wpeep_tests {
     fn simd_scalar_local_forwards() {
         let out = peep_body_opts(&fwd_body(false), &[], &[], 0, &opts_simd(true)).unwrap();
         assert!(!has_seq(&out, &[0x21, 0x01]), "scalar control kept the set: {out:02x?}");
+    }
+
+    // `btr` sizes SIMD instructions (`simd_eff`): the `br 0` after a
+    // v128 copy folds; with a v128 value left on the stack it stays.
+    #[test]
+    fn simd_btr_counts_depth() {
+        let mk = |extra: &[u8]| {
+            let mut ins = vec![0x02, 0x40, 0x20, 0x00, 0x20, 0x00, 0xfd, 0x00, 0x04, 0x00];
+            ins.extend_from_slice(&[0xfd, 0x0b, 0x04, 0x10]); // v128.store
+            ins.extend_from_slice(extra);
+            ins.extend_from_slice(&[0x0c, 0x00, 0x0b]); // br 0; end
+            body_typed(&[(1, 0x7f)], &ins)
+        };
+        let mut o = opts_simd(true);
+        o.btr = true;
+        o.elideblk = false;
+        let out = peep_body_opts(&mk(&[]), &[], &[], 0, &o).unwrap();
+        assert!(!has_seq(&out, &[0x0c, 0x00]), "br kept: {out:02x?}");
+        let left = [0x20, 0x00, 0xfd, 0x00, 0x04, 0x00]; // get 0; v128.load (left over)
+        let out = peep_body_opts(&mk(&left), &[], &[], 0, &o).unwrap();
+        assert!(has_seq(&out, &[0x0c, 0x00, 0x0b]), "br folded over a live v128: {out:02x?}");
     }
 
     // Near miss: the same shape on a v128 local is not rewritten.

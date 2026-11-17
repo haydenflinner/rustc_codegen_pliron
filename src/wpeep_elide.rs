@@ -582,6 +582,7 @@ fn straight_eff(
                 16 => (0, 1),
                 _ => return None,
             },
+            0xfd => super::simd_eff(b, s)?,
             _ => return None,
         },
     })
