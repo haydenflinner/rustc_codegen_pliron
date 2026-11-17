@@ -7530,6 +7530,64 @@ mod wpeep_tests {
         assert_eq!(count_seq(&out, &[0x0c, 0x01]), 1, "{out:02x?}");
     }
 
+    fn opts_simd(on: bool) -> PeepOpts {
+        let mut o = opts(false, false);
+        o.simd = on;
+        o.elideblk = true;
+        o
+    }
+
+    /// N3: a body with a SIMD instruction is peepholed under `simd`
+    /// (the untargeted `block` goes) and left alone without it.
+    #[test]
+    fn simd_body_decoded() {
+        let b = body_typed(
+            &[(1, 0x7f)],
+            &[
+                0x02, 0x40, 0x01, 0x0b, // block; nop; end (untargeted)
+                0x20, 0x00, 0x20, 0x00, // get 0; get 0
+                0xfd, 0x00, 0x04, 0x00, // v128.load align=16
+                0xfd, 0x0b, 0x04, 0x10, // v128.store offset=16
+            ],
+        );
+        assert!(peep_body_opts(&b, &[], &[], 0, &opts_simd(false)).is_none());
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_simd(true)).unwrap();
+        assert_eq!(count_seq(&out, &[0x02, 0x40]), 0, "{out:02x?}");
+        assert!(has_seq(&out, &[0xfd, 0x00, 0x04, 0x00, 0xfd, 0x0b, 0x04, 0x10]), "{out:02x?}");
+    }
+
+    /// `get 2; set 1; get 0; get 1; <store>`: a scalar `1` forwards
+    /// (`get 0; get 2; store`), a v128 `1` must stay a local.
+    fn fwd_body(v128: bool) -> Vec<u8> {
+        let (t, store): (u8, &[u8]) = if v128 {
+            (0x7b, &[0xfd, 0x0b, 0x04, 0x00])
+        } else {
+            (0x7f, &[0x36, 0x02, 0x00])
+        };
+        let mut ins = vec![
+            0x20, 0x02, 0x21, 0x01, // get 2; set 1
+            0x20, 0x00, 0x20, 0x01, // get 0; get 1
+        ];
+        ins.extend_from_slice(store);
+        body_typed(&[(1, 0x7f), (2, t)], &ins)
+    }
+
+    #[test]
+    fn simd_scalar_local_forwards() {
+        let out = peep_body_opts(&fwd_body(false), &[], &[], 0, &opts_simd(true)).unwrap();
+        assert!(!has_seq(&out, &[0x21, 0x01]), "scalar control kept the set: {out:02x?}");
+    }
+
+    // Near miss: the same shape on a v128 local is not rewritten.
+    #[test]
+    fn simd_v128_local_not_forwarded() {
+        let out = peep_body_opts(&fwd_body(true), &[], &[], 0, &opts_simd(true)).unwrap();
+        assert!(
+            has_seq(&out, &[0x20, 0x02, 0x21, 0x01, 0x20, 0x00, 0x20, 0x01, 0xfd, 0x0b]),
+            "{out:02x?}"
+        );
+    }
+
     fn opts_bob() -> PeepOpts {
         let mut o = opts(false, false);
         o.bob = true;
