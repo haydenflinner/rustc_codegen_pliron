@@ -1332,7 +1332,11 @@ fn split(
         // stores themselves into the destination, and no slot is left.
         // Whole, the stores go to a stack slot the copy then reads back.
         // regex-syntax's `Box::new(PropertiesI { .. })` (80 bytes, copied
-        // into the new box) and `Parser::new` kept such slots (STK).
+        // into the new box) and `Parser::new` kept such slots (STK). The
+        // value is the smallest aggregate (bytes) the rule takes: small
+        // structs of byte fields (regex's `EmptyFlags`) are cheaper as one
+        // wide copy than as a store per field (`=1`: regex +0.36%).
+        let out_min: u64 = crate::env_get("PLIRON_SROA_FRAGCOPY_OUT").and_then(|v| v.parse().ok()).unwrap_or(0);
         let built_in_place = || {
             let mut outs = 0;
             for x in &acc {
@@ -1346,7 +1350,7 @@ fn split(
         };
         if whole_copy
             && frag_copy_stays_whole(size, &pieces, direct, per, word)
-            && !(crate::env_is("PLIRON_SROA_FRAGCOPY_OUT", "1") && built_in_place())
+            && !(out_min > 0 && size >= out_min && built_in_place())
         {
             return false;
         }
