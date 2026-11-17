@@ -536,20 +536,37 @@ fn try_forward(
     } else {
         let Some((base, off)) = alloca_base(ctx, st, inc_of(ctx, f, pin), dst) else {
             if pliron_cfg::tracing_on() {
-                let kind = match dst.defining_op() {
-                    None => "block-arg",
-                    Some(d) if Operation::is_op::<LoadOp>(d, ctx) => "load",
-                    Some(d) if st.calls.get(d).is_some() => "call",
-                    Some(d) => {
-                        tracing::debug!(
-                            target: "pliron::memcpyopt",
-                            "dst base is {}",
-                            Operation::get_opid(d, ctx)
-                        );
-                        "other"
+                // What `dst` is, after the GEPs above it (constant or not):
+                // the census of 2026-11-17 for `PLIRON_MEMCPYOPT_NOALIASDST`.
+                let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head();
+                let mut r = dst;
+                let mut via = "";
+                for _ in 0..16 {
+                    match r.defining_op() {
+                        Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
+                            via = if gep_offset(ctx, st, d).is_some() && via != " via var gep" { " via gep" } else { " via var gep" };
+                            r = d.deref(ctx).get_operand(ctx, 0);
+                        }
+                        _ => break,
                     }
+                }
+                let kind: String = match r.defining_op() {
+                    None if r.defining_block().is_some_and(|b| Some(b) == entry) => {
+                        match st.noalias.get(r) {
+                            Some(&(_, true)) => "entry-param noalias".to_string(),
+                            Some(_) => "entry-param noalias readonly".to_string(),
+                            None if sret_args.contains(&r) => "entry-param sret".to_string(),
+                            None => "entry-param".to_string(),
+                        }
+                    }
+                    None if st.region_noalias.contains(r) => "clone-arg noalias (scoped)".to_string(),
+                    None => "block-arg".to_string(),
+                    Some(d) if Operation::is_op::<AllocaOp>(d, ctx) => "alloca".to_string(),
+                    Some(d) if Operation::is_op::<LoadOp>(d, ctx) => "load".to_string(),
+                    Some(d) if st.calls.get(d).is_some() => "call".to_string(),
+                    Some(d) => Operation::get_opid(d, ctx).to_string(),
                 };
-                tracing::debug!(target: "pliron::memcpyopt", "dst unbased: {kind}");
+                tracing::debug!(target: "pliron::memcpyopt", "dst unbased: {kind}{via}");
             }
             why!("dst has no provable base");
         };
