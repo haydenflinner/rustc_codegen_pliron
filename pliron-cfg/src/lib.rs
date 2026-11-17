@@ -36,6 +36,16 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-17, wasm only, with `PLIRON_INLINE_ONCE_WASM=3` below
+    // (docs/history/2026-11-16-licm-gte.md, -wasm-night.md): licm
+    // hoists a load that runs on every iteration without a
+    // dereferenceability proof, and a stack slot indexed by a loop
+    // counter stays an object of its own. Alone they leave the wasm
+    // kernel module byte-identical; they are what lets single-caller
+    // inlining stop costing hmget. `PLIRON_LICM_GTE=0` /
+    // `PLIRON_LICM_SLOTPROV=0` turn them off everywhere.
+    "PLIRON_LICM_GTE_WASM",
+    "PLIRON_LICM_SLOTPROV_WASM",
     // 2026-11-16 afternoon, wasm only (read in the inliner's small mode;
     // `PLIRON_INLINE_RECX=0` turns it off, `=1` turns it on for native
     // too): a site cloned out of an inlined body does not inline a member
@@ -334,6 +344,18 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // 2026-11-17: wasm's single-caller inlining mode `3`, one loop nest
+    // per function (a callee with a loop only into a loop-free caller
+    // that has taken no such callee). With the two licm rules above, on
+    // a quiet machine: wasm kernels geomean 0.931 -> 0.929 against LLVM,
+    // hmget +5.7% -> +1.9%, hashmap +1.2% -> -0.1%, strwork +4.4% ->
+    // +2.9%, tokenize and parse_only unchanged over two 5-layout reruns
+    // (-14.4/-15.6 vs -14.5/-15.9, -10.6/-11.0 vs -10.7/-10.8), every
+    // other kernel within its range; dsa module 44.09 -> 42.36 MB, all
+    // 19 workloads return LLVM's results, the 14 like-for-like rows
+    // 1.030 -> 0.999 against LLVM. `PLIRON_INLINE_ONCE_WASM=0` restores
+    // the old wasm behaviour (no single-caller bonus); native keeps `1`.
+    ("PLIRON_INLINE_ONCE_WASM", "3"),
     // Outer-only loads stay out of nested-loop preheaders (`1`: geomean
     // 0.997 / 0.998 in two layout-averaged runs) unless every inner loop
     // has register room for them (`2`, docs/loop-unswitch-pressure.md
