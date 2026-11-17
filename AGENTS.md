@@ -619,6 +619,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   `PLIRON_SHRINKWRAP_FNS=lo..hi` limits it to functions whose content
   hash is in range (bisecting; `PLIRON_SHRINKWRAP_DEBUG` prints hashes).
   Stanza `shrinkwrap`; PARITY item 10.
+- `PLIRON_UNDEFPHI=1` (opt-in, not ready; PARITY item 10) — a block
+  parameter whose inputs are one dominating value or the lowering's
+  undefined zeros becomes that value (`pliron_clif_opt::undefphi`, run
+  on the lowered function). Mixed: html-rewriter -0.22%, regex +0.6%,
+  blind-sig +26%.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

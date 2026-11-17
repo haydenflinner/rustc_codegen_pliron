@@ -1069,6 +1069,32 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    .unwrap_unchecked()` (memchr's `distance`) leaves `x >= 0 ? x : 0`
    selects because `LTUNDEF` materializes an undefined slice as 0, so the
    phi of the value and the undefined one does not fold (LLVM: undef).
+   **2026-11-17, `PLIRON_XORCANCEL` on native** (default on everywhere,
+   timed on wasm only): exact counts against `=0`: protobuf -24.3k,
+   pulldown-cmark -13.0k, rust-json -6.9k, regex -2.8k, html-rewriter,
+   compression and blake3 equal, blind-sig within its noise; native
+   kernels `hmget` -6.2% and `hashmap` -3.0% retired instructions. No
+   program worse: keep it on for native.
+   **`PLIRON_UNDEFPHI=1` (opt-in, not ready)**: `pliron_clif_opt::undefphi`,
+   run on the lowered function before the pipeline, takes the lowering's
+   list of undefined zeros and solves `undef > one value > many` per
+   block parameter; a parameter equal to one dominating value `v` (the
+   undefined inputs choosing `v`) becomes `v`. It removes memchr's
+   `x >= 0 ? x : 0` selects (14 -> 7 `csel` in a scratch `memchr` loop).
+   Exact counts against the default: html-rewriter -228k, rust-json
+   -32.9k, compression -9.6k; but regex +307k, pulldown-cmark +16k and
+   blind-sig +26% (`montgomery`'s `add_mul_vvw`: bounds checks come back
+   in the zip loop, `monty.rs:87` 2.8M -> 6.3M); native kernels: `sieve`
+   -11.7% and `varint` -5.8% retired instructions but `strwork` +1.9%
+   (its outer loop keeps two latches, so `looprot` bails). The zero a
+   lowering picked for `undef` is sometimes the useful choice (a loop
+   start, a known index); choosing `v` everywhere loses those. Next: pick
+   per parameter (keep the zero where it is a loop-carried start, or
+   where a compare against it folds), then re-measure. Two miscompiles of
+   the first version were caught before any default use and have tests
+   (`pliron-clif-opt/tests/undefphi.rs`): a value computed in the
+   parameter's own block, and a loop header parameter treated as equal to
+   the current iteration's value.
 
 10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
    2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours
