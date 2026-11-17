@@ -364,6 +364,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // counts: regex -57.2k (-0.11%), rust-json and blind-sig within noise,
     // the other five and the native kernels unchanged. `=0` off everywhere.
     "PLIRON_LICM_GTE",
+    // 2026-11-17 (PARITY item 9): `punroll` does not keep a do-while's
+    // counting latch test in every copy. Exact counts: regex -1.2k,
+    // compression -1.7k, the others and the native kernels unchanged; the
+    // wasm kernel module is byte-identical (PARITY item 5). `=0` off.
+    "PLIRON_PUNROLL_DWLATCH",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
