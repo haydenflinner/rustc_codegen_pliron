@@ -9876,48 +9876,23 @@ fn elide_sp_frame(b: &mut FunctionBody, sp: Global, roots: [WV; 4]) {
     }
 }
 
-/// N9 #9: drop the frame realignment `fp = (sp0 - SZ) & -A` when `A <= 16`
-/// and `SZ` is a multiple of 16. The stack pointer is 16-aligned on entry
-/// to every function: `pliron-wasm-ld` places it at `1024 + stack`
-/// (a multiple of 16), our frames and `winline`'s folded reservations move
-/// it by multiples of 16, and LLVM-built wasm keeps the same rule. So the
-/// `and` is the identity there: 3 bytes (`i32.const -16; i32.and`) per
-/// frame. Runs after `winline`, which matches the `and` to find and grow
-/// frame chains, so its patterns stay as they were. Returns the number of
-/// `and`s removed. Off switch: `PLIRON_WASM_NOREALIGN=0`.
-fn strip_realign(b: &mut FunctionBody, sp: Global) -> usize {
-    let mut repl: FxHashMap<WV, WV> = FxHashMap::default();
-    let mut masks: Vec<WV> = Vec::new();
-    for blk in b.blocks.iter() {
-        for &v in &b.blocks[blk].insts {
-            let ValueDef::Operator(O::I32And, aa, _) = &b.values[v] else {
-                continue;
-            };
-            let (x, m) = (b.arg_pool[*aa][0], b.arg_pool[*aa][1]);
-            let Some(mask) = wconst(b, m) else { continue };
-            let align = mask.wrapping_neg();
-            if !(1..=16).contains(&align) || (align & (align - 1)) != 0 {
-                continue;
+/// Replace every use of each key of `repl` with its value (chains are
+/// followed), drop the keys from the instruction lists, and drop each
+/// value of `maybe_dead` nothing uses any more.
+fn subst_values(b: &mut FunctionBody, repl: &FxHashMap<WV, WV>, maybe_dead: &[WV]) {
+    let fin = |mut v: WV| {
+        let mut n = 0;
+        while let Some(&x) = repl.get(&v) {
+            v = x;
+            n += 1;
+            if n > repl.len() {
+                break;
             }
-            let x = b.resolve_alias(x);
-            let ValueDef::Operator(O::I32Sub, sa, _) = &b.values[x] else {
-                continue;
-            };
-            let (g, k) = (b.arg_pool[*sa][0], b.arg_pool[*sa][1]);
-            let is_sp = matches!(
-                b.values[b.resolve_alias(g)],
-                ValueDef::Operator(O::GlobalGet { global_index }, ..) if global_index == sp
-            );
-            if !is_sp || wconst(b, k).is_none_or(|k| k % 16 != 0) {
-                continue;
-            }
-            repl.insert(v, x);
-            masks.push(b.resolve_alias(m));
         }
-    }
-    if repl.is_empty() {
-        return 0;
-    }
+        v
+    };
+    let repl: FxHashMap<WV, WV> = repl.keys().map(|&k| (k, fin(k))).collect();
+    let masks = maybe_dead;
     let mut uses: FxHashMap<WV, u32> = masks.iter().map(|&m| (m, 0)).collect();
     for blk in b.blocks.iter() {
         for i in 0..b.blocks[blk].insts.len() {
@@ -9960,6 +9935,51 @@ fn strip_realign(b: &mut FunctionBody, sp: Global) -> usize {
             .insts
             .retain(|v| !repl.contains_key(v) && uses.get(v).is_none_or(|&c| c > 0));
     }
+}
+
+/// N9 #9: drop the frame realignment `fp = (sp0 - SZ) & -A` when `A <= 16`
+/// and `SZ` is a multiple of 16. The stack pointer is 16-aligned on entry
+/// to every function: `pliron-wasm-ld` places it at `1024 + stack`
+/// (a multiple of 16), our frames and `winline`'s folded reservations move
+/// it by multiples of 16, and LLVM-built wasm keeps the same rule. So the
+/// `and` is the identity there: 3 bytes (`i32.const -16; i32.and`) per
+/// frame. Runs after `winline`, which matches the `and` to find and grow
+/// frame chains, so its patterns stay as they were. Returns the number of
+/// `and`s removed. Off switch: `PLIRON_WASM_NOREALIGN=0`.
+fn strip_realign(b: &mut FunctionBody, sp: Global) -> usize {
+    let mut repl: FxHashMap<WV, WV> = FxHashMap::default();
+    let mut masks: Vec<WV> = Vec::new();
+    for blk in b.blocks.iter() {
+        for &v in &b.blocks[blk].insts {
+            let ValueDef::Operator(O::I32And, aa, _) = &b.values[v] else {
+                continue;
+            };
+            let (x, m) = (b.arg_pool[*aa][0], b.arg_pool[*aa][1]);
+            let Some(mask) = wconst(b, m) else { continue };
+            let align = mask.wrapping_neg();
+            if !(1..=16).contains(&align) || (align & (align - 1)) != 0 {
+                continue;
+            }
+            let x = b.resolve_alias(x);
+            let ValueDef::Operator(O::I32Sub, sa, _) = &b.values[x] else {
+                continue;
+            };
+            let (g, k) = (b.arg_pool[*sa][0], b.arg_pool[*sa][1]);
+            let is_sp = matches!(
+                b.values[b.resolve_alias(g)],
+                ValueDef::Operator(O::GlobalGet { global_index }, ..) if global_index == sp
+            );
+            if !is_sp || wconst(b, k).is_none_or(|k| k % 16 != 0) {
+                continue;
+            }
+            repl.insert(v, x);
+            masks.push(b.resolve_alias(m));
+        }
+    }
+    if repl.is_empty() {
+        return 0;
+    }
+    subst_values(b, &repl, &masks);
     repl.len()
 }
 
@@ -10019,6 +10039,154 @@ fn one_exit(b: &mut FunctionBody, sp: Global, void_only: bool) -> bool {
     }
     fixup_edges(b);
     true
+}
+
+/// N9 #6: drop `x & (2^w - 1)` when `x` already fits in `w` bits. `CX::norm`
+/// asks the same of a value's defining operator (`normed`), but a block
+/// parameter is opaque to it while the body is being emitted (its incoming
+/// arguments come later), so a narrow value carried in a block param is
+/// masked again at each use. Here, after emission, an optimistic fixpoint
+/// gives every i32 value an upper bound on its significant bits: compares
+/// 1, constants their width, `load8_u`/`load16_u` 8/16, `and` the min, `or`,
+/// `xor` and `select` the max, `shr_u` by a constant shrinks it, a block
+/// param of a non-entry block the max over its incoming arguments; function
+/// params, call results and everything else 32. Bails (no change) if the
+/// fixpoint does not settle within its round budget. Returns the number of
+/// masks removed. Opt-in: `PLIRON_WASM_MASKELIM=1`.
+fn mask_elim(b: &mut FunctionBody) -> usize {
+    // Incoming arguments per (block, param index).
+    let mut incoming: FxHashMap<(WBlock, usize), Vec<WV>> = FxHashMap::default();
+    let mut any_mask = false;
+    for blk in b.blocks.iter() {
+        b.blocks[blk].terminator.visit_targets(|t| {
+            for (i, &a) in t.args.iter().enumerate() {
+                incoming.entry((t.block, i)).or_default().push(a);
+            }
+        });
+        any_mask |= b.blocks[blk].insts.iter().any(|&v| {
+            matches!(&b.values[v], ValueDef::Operator(O::I32And, ..))
+        });
+    }
+    if !any_mask {
+        return 0;
+    }
+    let entry = b.entry;
+    let mut bits: FxHashMap<WV, u32> = FxHashMap::default();
+    // Optimistic start: non-entry i32 block params fit in 0 bits.
+    for blk in b.blocks.iter() {
+        if blk == entry {
+            continue;
+        }
+        for &(t, p) in &b.blocks[blk].params {
+            if t == WT::I32 {
+                bits.insert(p, 0);
+            }
+        }
+    }
+    let get = |bits: &FxHashMap<WV, u32>, b: &FunctionBody, v: WV| -> u32 {
+        *bits.get(&b.resolve_alias(v)).unwrap_or(&32)
+    };
+    let mut settled = false;
+    for _round in 0..12 {
+        let mut changed = false;
+        for blk in b.blocks.iter() {
+            if blk != entry {
+                for (i, &(t, p)) in b.blocks[blk].params.iter().enumerate() {
+                    if t != WT::I32 {
+                        continue;
+                    }
+                    let nb = incoming
+                        .get(&(blk, i))
+                        .map(|args| args.iter().map(|&a| get(&bits, b, a)).max().unwrap_or(32))
+                        .unwrap_or(32);
+                    let cur = bits.get(&p).copied().unwrap_or(32);
+                    if nb > cur {
+                        bits.insert(p, nb);
+                        changed = true;
+                    }
+                }
+            }
+            for &v in &b.blocks[blk].insts {
+                let ValueDef::Operator(op, args, tys) = &b.values[v] else {
+                    continue;
+                };
+                if b.type_pool[*tys].len() != 1 || b.type_pool[*tys][0] != WT::I32 {
+                    continue;
+                }
+                let a = |i: usize| b.arg_pool[*args][i];
+                let nb = match op {
+                    O::I32Eq | O::I32Ne | O::I32LtS | O::I32LtU | O::I32GtS | O::I32GtU
+                    | O::I32LeS | O::I32LeU | O::I32GeS | O::I32GeU | O::I32Eqz | O::I64Eq
+                    | O::I64Ne | O::I64LtS | O::I64LtU | O::I64GtS | O::I64GtU | O::I64LeS
+                    | O::I64LeU | O::I64GeS | O::I64GeU | O::I64Eqz | O::F32Eq | O::F32Ne
+                    | O::F32Lt | O::F32Le | O::F32Gt | O::F32Ge | O::F64Eq | O::F64Ne
+                    | O::F64Lt | O::F64Le | O::F64Gt | O::F64Ge => 1,
+                    O::I32Const { value } => 32 - value.leading_zeros(),
+                    O::I32Load8U { .. } => 8,
+                    O::I32Load16U { .. } => 16,
+                    O::I32And => get(&bits, b, a(0)).min(get(&bits, b, a(1))),
+                    O::I32Or | O::I32Xor => get(&bits, b, a(0)).max(get(&bits, b, a(1))),
+                    O::Select | O::TypedSelect { .. } => {
+                        get(&bits, b, a(0)).max(get(&bits, b, a(1)))
+                    }
+                    O::I32ShrU => match wconst(b, a(1)) {
+                        Some(s) => {
+                            let s = (s as u32) & 31;
+                            get(&bits, b, a(0)).saturating_sub(s).min(32 - s)
+                        }
+                        None => 32,
+                    },
+                    _ => 32,
+                };
+                let cur = bits.get(&v).copied();
+                if cur != Some(nb) {
+                    // Monotone except for the first visit of an operator.
+                    if cur.is_some_and(|c| nb < c) {
+                        continue;
+                    }
+                    bits.insert(v, nb);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        return 0;
+    }
+    let mut repl: FxHashMap<WV, WV> = FxHashMap::default();
+    let mut consts: Vec<WV> = Vec::new();
+    for blk in b.blocks.iter() {
+        for &v in &b.blocks[blk].insts {
+            let ValueDef::Operator(O::I32And, args, _) = &b.values[v] else {
+                continue;
+            };
+            let (x, m) = (b.arg_pool[*args][0], b.arg_pool[*args][1]);
+            let (x, m) = match (wconst(b, m), wconst(b, x)) {
+                (Some(c), _) => (x, (c, m)),
+                (None, Some(c)) => (m, (c, x)),
+                _ => continue,
+            };
+            let (c, mv) = m;
+            let c = c as u32;
+            if c == u32::MAX || (c & c.wrapping_add(1)) != 0 {
+                continue; // not 2^w - 1
+            }
+            let w = 32 - c.leading_zeros();
+            if get(&bits, b, x) <= w {
+                repl.insert(v, b.resolve_alias(x));
+                consts.push(b.resolve_alias(mv));
+            }
+        }
+    }
+    let n = repl.len();
+    if n > 0 {
+        subst_values(b, &repl, &consts);
+    }
+    n
 }
 
 // ---------- CLIF -> waffle emit ----
@@ -11048,6 +11216,9 @@ mod clif_emit {
                     self.o.sp,
                     [self.sp0, self.fp, self.frame_c, self.mask_c],
                 );
+            }
+            if pliron_cfg::env_is("PLIRON_WASM_MASKELIM", "1") {
+                mask_elim(&mut self.b);
             }
             wrange(&mut self.b);
             waddr(&mut self.b);
