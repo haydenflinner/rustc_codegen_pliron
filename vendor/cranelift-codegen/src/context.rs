@@ -357,6 +357,31 @@ impl Context {
         let nocallx =
             *NOCALLX.get_or_init(|| std::env::var("PLIRON_LUCALLX").as_deref() != Ok("0"));
         let mut call_pre: Vec<u32> = Vec::new();
+        // PLIRON_LUCARRY=1 (opt-in): a move that would compute a block
+        // parameter's next value (an edge argument into that parameter)
+        // ahead of the parameter's own last read makes the two overlap,
+        // and the back edge needs a copy — the in-place op the move was
+        // for saves less than that (regex's varint loop: `lsr` hoisted
+        // above `orr x, #0x80` cost a `mov` and a `b` per byte). Such
+        // moves are refused. `carried[p]`: the arguments of every edge
+        // into parameter `p`.
+        static LUCARRY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lucarry = *LUCARRY.get_or_init(|| std::env::var("PLIRON_LUCARRY").as_deref() == Ok("1"));
+        let mut carried: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+        if lucarry {
+            for b in self.func.layout.blocks() {
+                let Some(t) = self.func.layout.last_inst(b) else { continue };
+                let dfg = &self.func.dfg;
+                for bc in dfg.insts[t].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                    let d = bc.block(&dfg.value_lists);
+                    for (k, a) in bc.args(&dfg.value_lists).enumerate() {
+                        if let (crate::ir::BlockArg::Value(a), Some(&p)) = (a, dfg.block_params(d).get(k)) {
+                            carried.entry(p).or_default().push(a);
+                        }
+                    }
+                }
+            }
+        }
         // Insts that have already been placed (as moved uses or as the
         // inst a move anchored on). A frozen inst is never relocated
         // again — this guarantees termination even when two insts share
@@ -455,6 +480,20 @@ impl Context {
                         }
                     }
                     stack.clear();
+                    // Any parameter `r` reads (not only `v`: the chain
+                    // dragged along for a constant operand can hold it).
+                    if ok
+                        && lucarry
+                        && r_args.iter().any(|p| {
+                            carried.get(p).is_some_and(|next| {
+                                move_set.iter().any(|&u| {
+                                    self.func.dfg.inst_results(u).iter().any(|res| next.contains(res))
+                                })
+                            })
+                        })
+                    {
+                        ok = false;
+                    }
                     if !ok {
                         continue;
                     }

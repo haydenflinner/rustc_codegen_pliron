@@ -2080,3 +2080,16 @@ parallel move (6 moves; the constant's `movz` is an instruction ahead of
 it). Static: `=1` html corpus -571 instructions, std -267, loop-weighted
 about even; `=2` html +1.2k (weighted +25k), std weighted -28k.
 `pliron-clif-opt/tests/edge_consts.rs` `forwarded_params_one_parallel_move`.
+
+## `PLIRON_LUCARRY=1` (opt-in): last-use scheduling keeps loop-carried updates late (2026-11-17)
+
+`Context::lastuse_schedule` (`context.rs`) moves later uses of an RMW
+op's operand, with their pure producers, ahead of the op so it is the
+operand's last use. With the knob it refuses a move whose set computes
+an edge argument into a block parameter the op itself reads: the
+parameter and its next value would overlap at the op and the back edge
+needs a copy (the in-place form is worth nothing on aarch64's
+three-address ops anyway). regex's varint writer with the byte computed
+wide (`PLIRON_DEMANDED=1`): the `lsr` was hoisted above `orr x, #0x80` to
+make the `orr` the last use of the shared constant 128, costing a `mov`
+and a `b` per byte. Test `pliron-clif-opt/tests/lucarry.rs`.
