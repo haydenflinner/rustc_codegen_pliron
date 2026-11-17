@@ -311,6 +311,17 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
 /// `iropt_tail` may still supply. The structural `nonretaining` gates
 /// that adopted facts can't change (no next op, invoke) are rechecked
 /// here so a defer only lands on a call a retry could actually sync.
+/// Operand `idx` of call `op` is the callee's `sret` argument.
+fn sret_arg(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bool {
+    let Some(ci) = st.calls.get(op) else {
+        return false;
+    };
+    let nopd = op.deref(ctx).get_num_operands();
+    let first_arg = nopd - ci.exts.params.len().min(nopd);
+    idx.checked_sub(first_arg)
+        .is_some_and(|ai| ci.exts.params.get(ai) == Some(&crate::state::ArgExt::SRet))
+}
+
 fn bodiless_pin(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
     let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
         return false;
@@ -1176,6 +1187,11 @@ fn split(
     // a pointer where any later call could pick it up, or a retaining pin —
     // keep their slices memory-only.
     let mut pin_rngs: FxHashMap<Ptr<Operation>, Vec<(u64, u64)>> = FxHashMap::default();
+    // `PLIRON_SROA_SRETNOSYNC=1`: calls whose every pin on this alloca is
+    // their `sret` argument covering the whole alloca (the call fills the
+    // alloca as its return place). See the sync loop below.
+    let sret_nosync = crate::env_is("PLIRON_SROA_SRETNOSYNC", "1");
+    let mut sret_only: FxHashMap<Ptr<Operation>, bool> = FxHashMap::default();
     let mut covered = vec![false; sl.len()];
     let mut bad = vec![false; sl.len()];
     // A `Pin` a retry could still sync: its operand is a bodiless-callee
@@ -1210,10 +1226,14 @@ fn split(
                 }
             }
         }
-        if let Kind::Pin { .. } = x.kind
+        if let Kind::Pin { idx, .. } = x.kind
             && ok
         {
             pin_rngs.entry(x.op).or_default().push((x.off, x.off + n));
+            if sret_nosync {
+                let whole = x.off == 0 && n >= size && sret_arg(ctx, st, x.op, idx);
+                *sret_only.entry(x.op).or_insert(true) &= whole;
+            }
         }
     }
     // `store *q <- p` (a non-flow Flow access) parks a pointer into this
@@ -1691,7 +1711,17 @@ fn split(
             if ss.is_empty() {
                 break;
             }
-            for &i in &ss {
+            // The call's `sret` argument is the whole alloca: it is the
+            // call's return place, whose bytes are uninitialized when the
+            // call starts (MIR assigns a call's destination wholesale), so
+            // nothing the callee may read is in them, and every byte the
+            // caller reads back afterwards (the reloads below) is one the
+            // callee wrote. The writeback is dead stores. Not for invokes:
+            // their unwind edge reloads too, and a cleanup could read the
+            // destination's old value there. The mimas interpreter wrote
+            // 136 bytes of `Flow` before every `step_one` call.
+            let skip_wb = sret_only.get(cop).copied().unwrap_or(false) && !st.invokes.contains(*cop);
+            for &i in ss.iter().filter(|_| !skip_wb) {
                 let l = LoadOp::new(ctx, new[i], sl[i].ty).get_operation();
                 l.insert_before(ctx, *cop);
                 let lv = l.deref(ctx).get_result(ctx, 0);
