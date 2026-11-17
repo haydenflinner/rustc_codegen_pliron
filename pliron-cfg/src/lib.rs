@@ -36,6 +36,12 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-17: wpeep also runs on bodies with SIMD instructions (it
+    // decodes the 0xfd opcodes and treats SIMD values as opaque). Quiet
+    // kernels with --perturb=4 (load 5.6): geomean 0.934 -> 0.934, no
+    // kernel outside the default's range; dsa -483 KB with all 19 workloads
+    // equal (fad51e94). `PLIRON_WASM_PEEP_SIMD=0` off.
+    "PLIRON_WASM_PEEP_SIMD",
     // 2026-11-17, PARITY item 8: an integer load whose every use reads only
     // its low bytes loads that width (`i32.load8_u` instead of `i32.load` +
     // mask on wasm, `ldrb` on native). Native held-out exact counts:
