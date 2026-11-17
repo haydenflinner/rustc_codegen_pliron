@@ -191,7 +191,7 @@ def main():
         exe = build(a.prog, binary, side, a.backend, env, a.skip_build, a.tag)
         sides[side] = parse(callgrind(a.prog, exe, side if side == "llvm" or not a.tag else f"{side}-{a.tag}"))
     (lt, lf, ll, lb), (pt, pf, pl, pb) = sides["llvm"], sides["pliron"]
-    print(f"{a.prog}: instructions llvm {lt / 1e6:.2f}M  pliron {pt / 1e6:.2f}M  x{pt / lt:.3f}  (+{(pt - lt) / 1e6:.2f}M)")
+    print(f"{a.prog}: instructions llvm {lt / 1e6:.2f}M  pliron {pt / 1e6:.2f}M  x{pt / lt:.3f}  (+{(pt - lt) / 1e6:.2f}M)  exact {lt} {pt}")
     dm = demangle(set(lf) | set(pf))
     lfn, pfn = collections.Counter(), collections.Counter()
     for k, v in lf.items():
