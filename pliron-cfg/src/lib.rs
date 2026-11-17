@@ -390,6 +390,17 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // 2026-11-17, codegen queue (contains_rng): on wasm, counted loops of
+    // unknown length unroll 4 wide (one counting test per group, with
+    // `PLIRON_PUNROLL_DWLATCH`), but only in functions of at most 800
+    // instructions: in dragon's format_exact (1,270-6,146) the few-limb
+    // bignum loops cost strwork when unrolled. Quiet kernels with
+    // --perturb=4 against LLVM: contains_rng +10.2% -> -0.6%, matmul -26.0%
+    // -> -53.9%, sieve -3.9% -> -9.6%, parse_only -4.8% -> -6.1%, strwork
+    // +4.2% -> +4.5% (ranges overlap), geomean 0.942 -> 0.897; every other
+    // kernel inside its range. `PLIRON_PUNROLL_COUNTED_WASM=0` off.
+    ("PLIRON_PUNROLL_COUNTED_WASM", "4"),
+    ("PLIRON_PUNROLL_COUNTED_WASM_FNMAX", "800"),
     // 2026-11-17: wasm functions restore the shadow stack pointer once, in
     // a single exit block, instead of before every `return` (2.45
     // restores per function against LLVM's ~1). Quiet-machine kernels
