@@ -1121,6 +1121,31 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    with a dead `gt + 2 == lt` test on each compare's exit, a duplicate
    loop-carried pointer param, `& 255` on every carry), and telling a
    short-loop callee from a long-loop one before skipping the unroll.
+   **The three per-call costs, 2026-11-17:** (1) the dead test is
+   `icmp eq (isub gt, lt), -2` (`ControlFlow::Continue`'s niche) until
+   the egraph rewrites it to `iadd gt, 2 == lt`; `vrp2` sees the first
+   form but `ranges::decide` only compared unsigned intervals, and
+   `gt - lt` is signed [-1, 1], unsigned everything. `PLIRON_VRP_SIGNEDEQ=1`
+   (opt-in) lets disjoint signed intervals decide: the wasm kernel module
+   changes in `format_exact` (-92 B), `format_shortest` (-42) and
+   `Big32x40::cmp` (-23) only; std corpus 1 function, wasm-dsa 144
+   (-763 instructions); bignum compare driver 1.69x -> 1.54x LLVM (load
+   27), `strwork` +3.3% -> +2.0% (ranges overlap). `cmp3` is not the
+   step: the shape is a test against a constant outside the range, not a
+   three-way compare. (2) the duplicate pointer param appears after the
+   last `sameargs` (the late egraph/GVN make two params equal); a
+   `sameargs` after `dgvn3` merges it but grows code elsewhere (std
+   corpus +502 instructions over 151 functions, kernels change in
+   `parse_only`, `sortw`, `contains_rng`): not landed. (3) `& 255`:
+   `PLIRON_WASM_MASKELIM`'s fixpoint read a loop header's parameter as 32
+   bits when its back-edge argument (`or` of two compares) came later in
+   the body, so the carry kept its mask; operators now start at 0 bits
+   (`PLIRON_WASM_MASKELIM_OPT=0` the old fixpoint, stanza
+   `maskelimloop`): `big_sub` 5 -> 0 masks, kernel module -75 B over six
+   flt2dec/fmt functions, `strwork` within noise. What is left is the
+   loop shape: `Iterator::cmp_by` over two `Rev` iterators tests both
+   ends every limb (two pointer IVs of equal length), where LLVM keeps
+   one index.
 
 Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
 times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,
