@@ -205,3 +205,32 @@ fn sret_fill_stops_at_the_returned_value() {
     s.sret.insert("foo".into(), 8);
     cross_check(&a, &b, &s, &s, &Facts::default()).unwrap_or_else(|m| panic!("{m}"));
 }
+
+const READ_OLD_LIFE: &str = "function %f(i64) -> i64 {
+    ss0 = explicit_slot 8
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    v2 = iconst.i64 5
+    store v2, v1
+    v3 = load.i64 v1
+    return v3
+}";
+
+/// A slot's bytes from before its `lifetime.start` mean nothing after
+/// it: the reference reads them (a loop's `Option<Expr>` temporary whose
+/// `None` arm leaves the payload as the last iteration's clone wrote it,
+/// copied whole: `<[(FieldKey, Expr)]>::to_vec` in dsa), the build under
+/// test does not. With the reference's start marker the bytes take the
+/// fill and are not compared.
+#[test]
+fn bytes_from_a_slots_previous_life_pin_nothing() {
+    use cranelift_codegen::ir::{Block, Inst, StackSlot};
+    let a = parse(READ_OLD_LIFE);
+    let b = parse(&READ_OLD_LIFE.replace("v3 = load.i64 v1", "v3 = iconst.i64 0"));
+    let s = Syms::default();
+    assert!(cross_check(&a, &b, &s, &s, &Facts::default()).is_err());
+    // `lifetime.start(ss0)` after the store (the third instruction).
+    let lts = vec![(vec![StackSlot::from_u32(0)], Some(Inst::from_u32(2)), Block::from_u32(0), true)];
+    let facts = Facts { lifetime_starts: Some(&lts), ..Facts::default() };
+    cross_check(&a, &b, &s, &s, &facts).unwrap_or_else(|m| panic!("{m}"));
+}

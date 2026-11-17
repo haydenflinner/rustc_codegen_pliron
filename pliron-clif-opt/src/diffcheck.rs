@@ -86,6 +86,16 @@ pub struct Facts<'a> {
     /// part of the destination keeps its old bytes where the original
     /// copied the temporary's zeros) is reported.
     pub undef: Option<&'a FxHashSet<Value>>,
+    /// The original's `lifetime.start` markers (`OwnedFacts::lifetimes`,
+    /// starts only): where a slot's bytes become undefined again. Given
+    /// by `xcorpus` for the reference function only. In a run of the
+    /// original the slot takes the frame's fill there, so a byte read
+    /// from the previous life of a slot (an `Option<Expr>` temporary of a
+    /// loop whose `None` arm leaves the payload alone, copied whole) is
+    /// one the rerun under the other fill changes, not a determined one.
+    /// Not used for one build's steps: a stale marker there is what
+    /// slotmerge must not trust, and the check must keep reporting it.
+    pub lifetime_starts: Option<&'a [(Vec<StackSlot>, Option<Inst>, Block, bool)]>,
 }
 
 /// [`Facts::stub_extent`] for `func`: per direct callee and argument, the
@@ -970,6 +980,10 @@ struct World {
     memcmp: FxHashSet<String>,
     /// `Facts::undef`.
     undef: FxHashSet<Value>,
+    /// `Facts::lifetime_starts`, by anchor: after an instruction, at a
+    /// block's head.
+    lt_inst: FxHashMap<Inst, Vec<StackSlot>>,
+    lt_block: FxHashMap<Block, Vec<StackSlot>>,
     /// `Facts::stub_extent`.
     extent: FxHashMap<(String, u32), u64>,
     /// Data symbols placed ahead of the runs ([`World::add_symbols`]).
@@ -1229,6 +1243,25 @@ impl World {
                 .map(|d| ext_key(f, &d.name, x))
                 .collect(),
             undef: facts.undef.cloned().unwrap_or_default(),
+            lt_inst: facts
+                .lifetime_starts
+                .into_iter()
+                .flatten()
+                .filter(|m| m.3)
+                .filter_map(|(ss, a, _, _)| a.map(|a| (a, ss.clone())))
+                .fold(FxHashMap::default(), |mut m: FxHashMap<Inst, Vec<StackSlot>>, (a, ss)| {
+                    m.entry(a).or_default().extend(ss);
+                    m
+                }),
+            lt_block: facts
+                .lifetime_starts
+                .into_iter()
+                .flatten()
+                .filter(|m| m.3 && m.1.is_none())
+                .fold(FxHashMap::default(), |mut m: FxHashMap<Block, Vec<StackSlot>>, (ss, _, b, _)| {
+                    m.entry(*b).or_default().extend(ss.iter().copied());
+                    m
+                }),
             syms: FxHashMap::default(),
             extent: {
                 // A callee handed the address of a slot reaches that slot
@@ -1534,6 +1567,9 @@ struct Sandbox<'a> {
     /// `Facts::undef`, when this run is the original under the other
     /// stack fill; empty otherwise.
     undef: &'a FxHashSet<Value>,
+    /// `World::lt_inst`/`lt_block`, in runs of the original; empty otherwise.
+    lt_inst: &'a FxHashMap<Inst, Vec<StackSlot>>,
+    lt_block: &'a FxHashMap<Block, Vec<StackSlot>>,
     seed: u64,
     stack_fill: u8,
     pinned: DataValue,
@@ -1567,6 +1603,21 @@ impl<'a> Sandbox<'a> {
         let (base, r) = self.find(addr, len)?;
         let o = (addr - base) as usize;
         Some(&r.data[o..o + len as usize])
+    }
+
+    /// A `lifetime.start` of `sl` in the current frame: its bytes are
+    /// undefined again, the frame's fill and unwritten.
+    fn restart_slot(&mut self, sl: StackSlot) {
+        let Some(&(_, base)) = self.frames.last() else { return };
+        let (Some(&at), Some(d)) = (self.slot_at.get(sl.index()), self.func.sized_stack_slots.get(sl)) else {
+            return;
+        };
+        let (addr, n) = (base + at, u64::from(d.size));
+        let fill = self.stack_fill;
+        if let Some(b) = self.bytes_mut(addr, n) {
+            b.fill(fill);
+        }
+        self.set_written(addr, &vec![0; n as usize]);
     }
 
     fn bytes_mut(&mut self, addr: u64, len: u64) -> Option<&mut [u8]> {
@@ -1901,6 +1952,7 @@ fn run_inner(
 ) -> (Outcome, Trace) {
     let no_facts = FxHashSet::default();
     let no_derived = FxHashMap::default();
+    let (no_lt_inst, no_lt_block) = (FxHashMap::default(), FxHashMap::default());
     // Stack frame: the pair's layout (`slot_layout`), the same for
     // every run of the trial, behind the rerun's pad. A slot the layout
     // does not know (a function outside the pair) goes after the rest.
@@ -1934,6 +1986,8 @@ fn run_inner(
         memcmp: &world.memcmp,
         extent: &world.extent,
         undef: if check_nonnull && world.stack_fill != 0 { &world.undef } else { &no_facts },
+        lt_inst: if check_nonnull { &world.lt_inst } else { &no_lt_inst },
+        lt_block: if check_nonnull { &world.lt_block } else { &no_lt_block },
         seed: world.seed,
         stack_fill: world.stack_fill,
         pinned: DataValue::I64(0),
@@ -1993,6 +2047,19 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
     let f = s.func;
     let mut inst = f.layout.first_inst(entry);
     while let Some(i) = inst {
+        if !s.lt_inst.is_empty() || !s.lt_block.is_empty() {
+            // The markers before `i`: after the instruction ahead of it in
+            // its block, or at the block's head.
+            let ss = match f.layout.prev_inst(i) {
+                Some(p) => s.lt_inst.get(&p),
+                None => f.layout.inst_block(i).and_then(|b| s.lt_block.get(&b)),
+            };
+            if let Some(ss) = ss {
+                for &sl in ss.clone().iter() {
+                    s.restart_slot(sl);
+                }
+            }
+        }
         if *left == 0 {
             return Err(Stop::Unsupported("out of fuel".into()));
         }
@@ -2899,6 +2966,7 @@ impl OwnedFacts {
                 .collect(),
             stub_extent: self.stub_extent.clone(),
             undef: Some(&self.undef),
+            lifetime_starts: None,
         }
     }
 

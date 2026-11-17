@@ -1317,6 +1317,7 @@ fn corpus_dump(p: &mut Pipe) {
         // Rebuilt from the nocap header on replay.
         stub_extent: Default::default(),
         undef: None,
+        lifetime_starts: None,
     };
     // Extra replay facts `diffcheck-facts` can't express: the per-callee
     // nocapture arg positions (a `(Inst, arg)` set on `Pipe`) re-keyed by
@@ -1709,6 +1710,7 @@ fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
         memcmp: memcmp_refs(&p.clctx.func, p.fn_names),
         stub_extent: crate::diffcheck::stub_extents(&p.clctx.func, |i, k| p.nocap.get(&(i, k)).copied()),
         undef: None,
+        lifetime_starts: None,
     }
 }
 

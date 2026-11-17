@@ -288,7 +288,11 @@ fn check_pair(isa: &dyn TargetIsa, text_a: &str, text_b: &str, o: &Opts, row: &m
         nowrite: &nowrite,
         extent: &extent,
     };
-    let facts = a.facts.facts();
+    // The reference's lifetime markers say where a slot's old bytes stop
+    // meaning anything (`Facts::lifetime_starts`).
+    let lts = a.facts.lifetimes(&a.func);
+    let mut facts = a.facts.facts();
+    facts.lifetime_starts = Some(&lts);
     let run = |after: &Function| {
         verdict(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             diffcheck::check_cross(&a.func, after, &facts, Some(&cross), &cfg).map_err(|m| m.to_string())
