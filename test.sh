@@ -11,6 +11,7 @@
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync shrinkwrap regionsplit
+#   o0std mcrdwrap sretnosync shrinkwrap bigtmp
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -916,6 +917,21 @@ t_sretnosync() {
   PLIRON_SROA_SRETNOSYNC=0 rustc $BE --edition 2021 -O tests/sretnosync/main.rs -o $out/sretnosync$exe && [[ "$($out/sretnosync$exe)" == $want ]]
 }
 
+t_bigtmp() {
+  # PLIRON_MEMCPYOPT_BIGTMP: driftsort_main's 4 KiB scratch, filled by an
+  # inlined memset in a temporary and copied whole into the slot drift::sort
+  # receives, is one slot (frame 4 KiB like LLVM's, not 8). memcpyopt's
+  # "tmp could promote" guard must not protect a temporary larger than
+  # sroa's MAX_SIZE. Output pinned from stock. Legs: defaults, the knob on
+  # (stack slots under 8 KiB), the knob off.
+  local want="300 8020576894555092059" s
+  rustc $BE --edition 2021 -O tests/bigtmp/main.rs -o $out/bigtmp$exe && [[ "$($out/bigtmp$exe)" == "$want" ]] || return 1
+  PLIRON_MEMCPYOPT_BIGTMP=1 PLIRON_FRAME_INFO=driftsort_main rustc $BE --edition 2021 -O tests/bigtmp/main.rs -o $out/bigtmp$exe 2> $out/bigtmp.fi && [[ "$($out/bigtmp$exe)" == "$want" ]] || return 1
+  s=$(sed -nE 's/^frame-info .*driftsort_main.*: slots=([0-9]+).*/\1/p' $out/bigtmp.fi | head -1)
+  [[ -n "$s" && "$s" -lt 8192 ]] || { echo "bigtmp: driftsort_main stack slots '${s}' (want < 8192)" >&2; return 1; }
+  PLIRON_MEMCPYOPT_BIGTMP=0 rustc $BE --edition 2021 -O tests/bigtmp/main.rs -o $out/bigtmp$exe && [[ "$($out/bigtmp$exe)" == "$want" ]]
+}
+
 t_shrinkwrap() {
   # PLIRON_SHRINKWRAP=1 (opt-in, aarch64): the save block must keep its
   # callee saves through emission (EDGEHOIST retargeted a branch past it,
@@ -1554,6 +1570,7 @@ want narrowlsr && t_narrowlsr
 want narrowext && t_narrowext
 want cmp3 && t_cmp3
 want sretnosync && t_sretnosync
+want bigtmp && t_bigtmp
 want shrinkwrap && t_shrinkwrap
 want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge

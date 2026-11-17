@@ -770,9 +770,18 @@ fn try_forward(
         // and hardened `memcpy`s (byvalhome's `x = f(x)` shape). A
         // call-written `tmp` already escapes, so nothing is lost by
         // moving the write into `dst`.
+        //
+        // `PLIRON_MEMCPYOPT_BIGTMP=1`: a `tmp` larger than sroa's
+        // `MAX_SIZE` never promotes, so it is not protected either:
+        // `driftsort_main`'s 4 KiB `AlignedStorage` scratch, filled by an
+        // inlined `memset` and copied whole into the slot that
+        // `drift::sort` receives, kept both 4 KiB slots (frame 8 KiB
+        // against LLVM's 4 KiB; stanza `bigtmp`).
+        let bigtmp = pliron_cfg::env_is("PLIRON_MEMCPYOPT_BIGTMP", "1");
         let tmp_esc = writers
             .iter()
-            .any(|&(w, _, _)| st.calls.get(w).is_some() || st.invokes.contains(w));
+            .any(|&(w, _, _)| st.calls.get(w).is_some() || st.invokes.contains(w))
+            || (bigtmp && st.allocas.get(src).is_some_and(|x| x.0 > crate::sroa::MAX_SIZE));
         if !tmp_esc {
             let t = match all_touch {
                 Some(t) => t,

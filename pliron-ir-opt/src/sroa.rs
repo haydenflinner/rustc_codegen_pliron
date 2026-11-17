@@ -31,7 +31,8 @@ use crate::has_body;
 use crate::state::{ConstVal, State, mask};
 use crate::types::{TyK, classify, leaves, size_align, struct_offsets};
 
-const MAX_SIZE: u64 = 512;
+/// The largest alloca sroa scalarizes (memcpyopt's `BIGTMP` rule reads it).
+pub(crate) const MAX_SIZE: u64 = 512;
 const MAX_SLICES: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
