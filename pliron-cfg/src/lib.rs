@@ -77,6 +77,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // (`wpeep_elide::dead_exact`). dsa: untargeted blocks 78k -> 14k in
     // non-SIMD bodies; kernels -2.8 KB, parse_only unchanged.
     "PLIRON_WASM_DEADTAIL",
+    // wpeep (N9 #7): the branch-tail fold again after block elision.
+    // dsa: fallthrough `br`s 37k -> 7.8k in non-SIMD bodies.
+    "PLIRON_WASM_BTR2",
     // wasm only (each is read behind an `is_like_wasm` / `Pipe::wasm`
     // test; native was not timed). 2026-11-16, `--layouts=3` against
     // the same llvm.wasm: chars_mixed +19.9% -> -1.4%, nbody +5.4% ->
