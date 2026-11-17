@@ -36,6 +36,15 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-17, STK: memcpyopt's "tmp could promote" guard skips temps
+    // larger than sroa's MAX_SIZE (512 B), which never promote:
+    // driftsort_main's 4 KiB scratch is one slot again (regex-syntax both
+    // monomorphs 8272 -> 4160 B, LLVM 4176; STK 1.264 -> 1.097). Held-out
+    // exact counts: regex -8.9k, compression -1.8k, the rest unchanged
+    // (blind-sig and rust-json vary run to run: random keys). Native
+    // kernels and the wasm kernel module byte-identical. Stanza bigtmp.
+    // `PLIRON_MEMCPYOPT_BIGTMP=0` off.
+    "PLIRON_MEMCPYOPT_BIGTMP",
     // 2026-11-17, N7: repeated leaves of an xor tree cancel (SipHash's last
     // round: `v0` drops out of `v0 ^ v1 ^ v2 ^ (rotl(v3,21) ^ v0)`, and its
     // last `rotl`/`iadd` die). Quiet wasm kernels with --perturb=4 against
