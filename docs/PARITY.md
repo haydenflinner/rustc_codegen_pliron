@@ -1014,9 +1014,14 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   kept in 12 rounds, raw module 189.6 MB -> 167.2 MB (-11.8%), package
   203.7 -> 178.8 MB; ICF itself 1.5 s of a 3-7 s relink; all 19
   workloads return LLVM's results. Wasm kernels: 6 of 164 folded,
-  -1,536 B. `fib` runs 2x slower with ICF, and as fast again with three
-  unused functions appended to the folded module: V8 places code by
-  function count, a layout artifact, not the fold.
+  -1,536 B. `fib` runs 2x slower with ICF: not placement but TurboFan's
+  wasm inlining budget, which follows the module's small functions
+  (144 instead of 146 nodes, so `fib` stops inlining its own recursive
+  call; two unused functions appended restore it). Over
+  `run.mjs --perturb=8` fib is -7.5% (base) vs -4.5% (ICF), and
+  NOREALIGN's `parse_only` loss (an odd 4-byte loop shift; even shifts
+  are fast) is -4.6% vs -4.9%: both neutral once placement is averaged
+  (`history/2026-11-17-v8-placement.md`).
 - **N9. Code density: the same function is 1.42x LLVM's bytes, and the
   excess is in small functions** (13,089 functions present in both:
   under 256 B 2.45x, 256 B-1 KB 2.00x, 1-4 KB 1.42x, 4-16 KB 1.29x,

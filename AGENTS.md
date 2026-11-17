@@ -166,6 +166,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   Medians append to `bench/history.tsv` (commit it when a number moves).
   ~8 min for all; `BENCHTIME`/`COUNT` env vars tune it.
 - `bench/wasm/run.sh [filter]` — same kernels on wasm32 in node.
+  `node bench/wasm/run.mjs LLVM A [B] [filter] --perturb=4|8` judges a
+  change that only moves code (ICF, a dropped instruction): V8's wasm
+  inlining budget follows the module's small functions (`fib` 6.0 vs
+  12.8 ms) and Apple cores care about a loop's address mod 8
+  (`parse_only` 243 vs 259 ms), and `--layouts` covers neither; the
+  copies append unused functions and shift every loop by 4 bytes
+  (`docs/history/2026-11-17-v8-placement.md`).
 - `bench/heldout/ab.py PROG SIDE...` — the fast A/B for one held-out
   program. Sides: `llvm`, `llvm-pgo`, `llvm:FLAGS` (ablate LLVM's own
   passes), `pliron`, `NAME:K=V,..`, `pgo`, `pgo-NAME:K=V,..`
