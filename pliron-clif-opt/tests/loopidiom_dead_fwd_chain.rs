@@ -178,3 +178,47 @@ fn dead_loop_merge_forwarders_reached_from_an_outer_loop() {
     verify(&after);
     check(&before, &after, &Facts::default(), &Config::default()).unwrap();
 }
+
+/// The forwarder `block10` leads into `block20`, the header of a second
+/// loop that reads the forwarder's param `v10` in its body. `v10`
+/// escapes: `block20` gains a param, the old edge from `block10` binds
+/// `v10`, and the fast edge binds the closed form. The second loop's
+/// latch is an edge into `block20` too, and it must pass the new param:
+/// `v10` no longer dominates it once the fast edge skips `block10`
+/// (yaml-rust's `Scanner`, wasm32, verifier error on main 2026-11-16).
+#[test]
+fn back_edge_into_the_exit_block_passes_the_escape_param() {
+    let before = parse(
+        "function %f(i32, i32) -> i32 {
+    block0(v0: i32, v1: i32):
+        v2 = iconst.i32 0
+        jump block1(v2)
+
+    block1(v3: i32):
+        v5 = icmp uge v3, v0
+        brif v5, block10(v3), block3
+
+    block3:
+        v9 = iconst.i32 1
+        v6 = iadd v3, v9
+        jump block1(v6)
+
+    block10(v10: i32):
+        jump block20(v2, v1)
+
+    block20(v20: i32, v21: i32):
+        v22 = iadd v21, v10
+        v23 = iconst.i32 1
+        v24 = iadd v20, v23
+        v25 = icmp ult v24, v1
+        brif v25, block20(v24, v22), block30
+
+    block30:
+        return v22
+    }",
+    );
+    let mut after = before.clone();
+    assert!(run_idiom(&mut after) > 0, "{}", after.display());
+    verify(&after);
+    check(&before, &after, &Facts::default(), &Config::default()).unwrap();
+}

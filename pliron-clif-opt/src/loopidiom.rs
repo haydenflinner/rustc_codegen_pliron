@@ -2985,11 +2985,19 @@ fn apply_dead(
             }
         }
         for (inst, slot) in edges {
+            // An edge from inside `exit_dest`'s dominion (a back edge when
+            // `exit_dest` heads a loop of its own) passes the new param
+            // itself: the fast edge now reaches `exit_dest` without the
+            // original's definition, so the original no longer dominates
+            // that edge (yaml-rust's `Scanner`, wasm32: a forwarder's
+            // param bound on the latch of the loop after it), and inside
+            // the dominion the param is what the value is called.
+            let inside = func.layout.inst_block(inst).is_some_and(|b| dominated.contains(&b));
             let dfg = &mut func.dfg;
             let bc = &mut dfg.insts[inst]
                 .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[slot];
-            for &(v, _) in &p.escapes {
-                bc.append_argument(BlockArg::Value(v), &mut dfg.value_lists);
+            for (&(v, _), &np) in p.escapes.iter().zip(&new_params) {
+                bc.append_argument(BlockArg::Value(if inside { np } else { v }), &mut dfg.value_lists);
             }
         }
     }
