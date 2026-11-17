@@ -1228,8 +1228,9 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `icmp eq (isub gt, lt), -2` (`ControlFlow::Continue`'s niche) until
    the egraph rewrites it to `iadd gt, 2 == lt`; `vrp2` sees the first
    form but `ranges::decide` only compared unsigned intervals, and
-   `gt - lt` is signed [-1, 1], unsigned everything. `PLIRON_VRP_SIGNEDEQ=1`
-   (opt-in) lets disjoint signed intervals decide: the wasm kernel module
+   `gt - lt` is signed [-1, 1], unsigned everything. `PLIRON_VRP_SIGNEDEQ`
+   (default on since 2026-11-17; native exact counts: blind-sig -44.2k,
+   -0.13%, the other seven unchanged) lets disjoint signed intervals decide: the wasm kernel module
    changes in `format_exact` (-92 B), `format_shortest` (-42) and
    `Big32x40::cmp` (-23) only; std corpus 1 function, wasm-dsa 144
    (-763 instructions); bignum compare driver 1.69x -> 1.54x LLVM (load

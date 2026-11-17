@@ -1239,7 +1239,7 @@ impl Ranges {
 pub fn decide(cc: IntCC, a: &Range, b: &Range) -> Option<bool> {
     match cc {
         IntCC::Equal => {
-            // `PLIRON_VRP_SIGNEDEQ=1` (opt-in): disjoint signed intervals
+            // `PLIRON_VRP_SIGNEDEQ` (default on, `=0` off): disjoint signed intervals
             // decide equality too. An `Ordering` built as `(a > b) - (a <
             // b)` is signed [-1, 1] but unsigned everything (it wraps to
             // 0xff), and dragon's bignum compare tests it against

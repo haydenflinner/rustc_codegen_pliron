@@ -397,6 +397,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // kernel module changes only `k_nbody_prep` (nbody within its
     // `--perturb=4` range). Corpus replays: identical verdicts. `=0` off.
     "PLIRON_SLOTCONST",
+    // 2026-11-17 (PARITY item 10): `ranges::decide` folds an equality
+    // whose operands' signed intervals are disjoint (dragon's `Ordering`
+    // against the -2 niche). Exact counts: blind-sig -44.2k (-0.13%), the
+    // other seven unchanged (their differences, at most 0.002%, are all in
+    // `RandomState` hashing and libc malloc). `=0` off.
+    "PLIRON_VRP_SIGNEDEQ",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

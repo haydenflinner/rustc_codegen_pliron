@@ -531,9 +531,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   1,329 bytes (LLVM 294) and `memcmp` 602 (LLVM 74), with `=120` they are
   340 and 116. A scratch string-search driver goes from 1.33x to 1.14x
   LLVM's time; the kernel module changes in one cold function.
-- `PLIRON_VRP_SIGNEDEQ=1` (opt-in): `ranges::decide` also folds an
-  equality whose operands' signed intervals are disjoint (dragon's
-  `Ordering` `(a > b) - (a < b)` against the -2 niche). `PLIRON_WASM_MASKELIM`
+- `PLIRON_VRP_SIGNEDEQ` (default on since 2026-11-17, `=0` off):
+  `ranges::decide` also folds an equality whose operands' signed
+  intervals are disjoint (dragon's `Ordering` `(a > b) - (a < b)`
+  against the -2 niche; native exact counts: blind-sig -0.13%, the other
+  seven unchanged). `PLIRON_WASM_MASKELIM`
   starts its fixpoint's operators at 0 bits (loop-carried carries lose
   their `& 255`); `PLIRON_WASM_MASKELIM_OPT=0` restores the old start.
 - `PLIRON_PUNROLL_COUNTED_WASM_FNMIN=<insts>` (opt-in, wasm): the
