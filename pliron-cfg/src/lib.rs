@@ -389,6 +389,14 @@ pub const DEFAULT_ON: &[&str] = &[
     // compression -1.7k, the others and the native kernels unchanged; the
     // wasm kernel module is byte-identical (PARITY item 5). `=0` off.
     "PLIRON_PUNROLL_DWLATCH",
+    // 2026-11-17 (PARITY item 10): `slotconst`, a stack-slot load of bytes
+    // that constant stores in the same block just wrote becomes the
+    // constant (stdarch's NEON constants built through memory). Exact
+    // counts: html-rewriter -25.9k, compression -2.0k, protobuf -1.7k,
+    // rust-json -0.9k, the rest equal; native kernels unchanged; the wasm
+    // kernel module changes only `k_nbody_prep` (nbody within its
+    // `--perturb=4` range). Corpus replays: identical verdicts. `=0` off.
+    "PLIRON_SLOTCONST",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

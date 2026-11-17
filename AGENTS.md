@@ -631,7 +631,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   parameters keep the zero (`PLIRON_UNDEFPHI_HDR=1`, `_LOOPS=1`,
   `_STORED=1` lift each rule): pulldown-cmark -0.18%, html-rewriter
   -0.07%, no program worse.
-- `PLIRON_SLOTCONST=1` (opt-in) — step `slotconst` before `loadfwd`: a
+- `PLIRON_SLOTCONST` (default on since 2026-11-17, `=0` off) — step `slotconst` before `loadfwd`: a
   stack-slot load of bytes that constant stores in the same block just
   wrote becomes the constant (stdarch's NEON constants built through
   memory). html-rewriter -25.9k exact, nothing worse (PARITY item 10).
