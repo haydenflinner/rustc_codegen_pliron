@@ -165,7 +165,7 @@ page failed). `validate_load_sinks` now drops such loads from the tree
 its 64-step walk. Regression: `tests/wasm/smoke/raw.rs`, compiled with
 `PLIRON_OPT_BISECT=0`.
 
-## Shared `br_table` edge blocks (`PLIRON_WASM_BRTAB_SHARE=1`, opt-in)
+## Shared `br_table` edge blocks (`PLIRON_WASM_BRTAB_SHARE`, default on since 2026-11-17, `=0` off)
 
 `backend/stackify.rs` `do_branch_select` wraps the `br_table` in one
 `block` + parameter transfer + `br` per table entry and per default, so

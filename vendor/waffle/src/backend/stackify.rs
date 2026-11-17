@@ -174,7 +174,8 @@ impl<'a, 'b> Context<'a, 'b> {
             process_stack: vec![],
             result: vec![],
             merge_node_children: vec![],
-            brtab_share: std::env::var_os("PLIRON_WASM_BRTAB_SHARE").is_some_and(|v| v == "1"),
+            // PLIRON: default on since 2026-11-17 (`=0` off).
+            brtab_share: !std::env::var_os("PLIRON_WASM_BRTAB_SHARE").is_some_and(|v| v == "0"),
         })
     }
 

@@ -76,7 +76,8 @@ fn run(share: bool) -> usize {
     if share {
         std::env::set_var("PLIRON_WASM_BRTAB_SHARE", "1");
     } else {
-        std::env::remove_var("PLIRON_WASM_BRTAB_SHARE");
+        // Default on since 2026-11-17: off has to be asked for.
+        std::env::set_var("PLIRON_WASM_BRTAB_SHARE", "0");
     }
     let (module, _) = table_module();
     let bytes = module.to_wasm_bytes().expect("compile");
