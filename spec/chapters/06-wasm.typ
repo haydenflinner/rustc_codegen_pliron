@@ -366,6 +366,11 @@ result differs from what stock rustc + LLVM produce for the same targets.
   + `if {A} else {br K}` → `i32.eqz; br_if; A` (`PLIRON_WASM_BRI2=0`);
   + audited elision of untargeted `block`/`loop` pairs
     (`PLIRON_WASM_ELIDEBLK=0`, #refr("wasm.audit.elide"));
+  + ahead of it, deletion of unreachable code after an unconditional
+    `br`/`br_table`/`return`/`unreachable` (also through the `end` of a
+    block the elision then removes), so a block only dead code branched
+    to becomes untargeted (`PLIRON_WASM_DEADTAIL=1`; the body reverts
+    unless every such block was elided and the result is wellformed);
   + emit, fusing `load; extend` pairs into the extending load,
     `i32.const 0; i32.eq` into `i32.eqz` (and the `i64` pair),
     `set x; get x` into `tee x`, and dropping a final `return`.

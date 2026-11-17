@@ -764,6 +764,9 @@ struct PeepOpts {
     /// Unused-`block`/`loop` elision (`PLIRON_WASM_ELIDEBLK=0` off);
     /// fact-audited and reverted on a broken assumption.
     elideblk: bool,
+    /// Unreachable-code deletion alternating with `elideblk`
+    /// (`PLIRON_WASM_DEADTAIL=1`; `wpeep_elide::dead_round`).
+    deadtail: bool,
 }
 
 impl PeepOpts {
@@ -786,6 +789,7 @@ impl PeepOpts {
             // Default on: −1.5 KiB regex-wasm CODE (11415→10917 blocks);
             // `=0` off. Fact-audited; bad rounds revert (`wpeep_elide`).
             elideblk: crate::env_get("PLIRON_WASM_ELIDEBLK") != Some("0"),
+            deadtail: pliron_cfg::env_is("PLIRON_WASM_DEADTAIL", "1"),
         }
     }
 }
@@ -5289,12 +5293,48 @@ fn peep_body_opts(
     // Unused-`block`/`loop` elision (`PLIRON_WASM_ELIDEBLK=0` off):
     // fact-audited — assume_untargeted + assume_empty_type +
     // assume_wellformed; a failed fact reverts the round (`wpeep_elide`).
-    if opts.elideblk {
-        for _ in 0..8 {
-            if wpeep_elide::elide_round(b, &mut ins, opts.audit_panic, &opts.tag) == 0 {
-                break;
+    //
+    // Unreachable-code deletion (`PLIRON_WASM_DEADTAIL=1`) goes first: dead
+    // code after a block whose body always branches away keeps outer
+    // blocks targeted (N9 #5). It may rely on elision of the blocks it
+    // calls transparent; if one survives, or the result does not parse,
+    // the body goes back to its state before the cut.
+    let elide_loop = |ins: &mut Vec<(WPeek, usize, usize, usize)>| {
+        if opts.elideblk {
+            for _ in 0..8 {
+                if wpeep_elide::elide_round(b, ins, opts.audit_panic, &opts.tag) == 0 {
+                    break;
+                }
             }
         }
+    };
+    if opts.deadtail {
+        let snap = ins.clone();
+        let anchor = |s: usize| prel.iter().any(|&(pp, _)| pp == s);
+        let must = wpeep_elide::dead_exact(b, &mut ins, anchor, opts.elideblk)
+            .map(|(_, m)| m)
+            .unwrap_or_default();
+        elide_loop(&mut ins);
+        let left = !must.is_empty()
+            && ins.iter().any(|&(k, s, _, _)| {
+                matches!(k, WPeek::Ctl) && matches!(b[s], 0x02 | 0x03) && must.contains(&s)
+            });
+        let bad = if left {
+            Some("a transparent block was not elided".to_string())
+        } else {
+            wpeep_elide::wellformed(b, &ins).err()
+        };
+        if let Some(e) = bad {
+            if opts.audit_panic {
+                panic!("wpeep deadtail: rejected in {}: {e}", opts.tag);
+            }
+            tracing::debug!(target: "pliron::wasm",
+                "wpeep deadtail: reverted in {}: {e}", opts.tag);
+            ins = snap;
+            elide_loop(&mut ins);
+        }
+    } else {
+        elide_loop(&mut ins);
     }
     let mut nb = Vec::with_capacity(p);
     leb(&mut nb, groups.len() as u32);
@@ -5874,6 +5914,7 @@ mod wpeep_tests {
             bri2: false,
             btr: false,
             elideblk: false,
+            deadtail: false,
         }
     }
 
@@ -7196,6 +7237,96 @@ mod wpeep_tests {
         );
         let out = peep_body_opts(&b, &[], &[], 0, &opts_btr()).unwrap();
         assert!(!has_seq(&out, &[0x0c]), "br kept: {out:02x?}");
+    }
+
+    fn opts_elide(deadtail: bool) -> PeepOpts {
+        let mut o = opts(false, false);
+        o.elideblk = true;
+        o.deadtail = deadtail;
+        o.audit_panic = true;
+        o
+    }
+
+    fn count_seq(out: &[u8], pat: &[u8]) -> usize {
+        out.windows(pat.len()).filter(|w| *w == pat).count()
+    }
+
+    /// N9 #5: block C is targeted only by a `br 0` that becomes dead once
+    /// the untargeted block A (whose body always branches away) is
+    /// elided. deadtail deletes the dead `br`, then C goes too, and the
+    /// code after C (reachable only through C) with it.
+    fn deadtail_body() -> Vec<u8> {
+        body(
+            2,
+            &[
+                0x02, 0x40, // block X
+                0x02, 0x40, // block C
+                0x02, 0x40, // block A (untargeted)
+                0x02, 0x40, // block B
+                0x20, 0x00, 0x0d, 0x00, // get 0; br_if 0 -> B
+                0x0c, 0x03, // br 3 -> X
+                0x0b, // end B
+                0x0c, 0x02, // br 2 -> X
+                0x0b, // end A
+                0x0c, 0x00, // br 0 -> C (dead: A never falls through)
+                0x0b, // end C
+                0x20, 0x01, 0x1a, // get 1; drop (reachable only via C)
+                0x0b, // end X
+            ],
+        )
+    }
+
+    #[test]
+    fn deadtail_unblocks_elide() {
+        let b = deadtail_body();
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_elide(true)).unwrap();
+        assert_eq!(count_seq(&out, &[0x02, 0x40]), 2, "blocks: {out:02x?}");
+        assert!(!has_seq(&out, &[0x20, 0x01]), "dead get kept: {out:02x?}");
+    }
+
+    // Near miss: without deadtail the dead `br 0` keeps C.
+    #[test]
+    fn deadtail_off_keeps_block() {
+        let b = deadtail_body();
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_elide(false)).unwrap();
+        assert_eq!(count_seq(&out, &[0x02, 0x40]), 3, "blocks: {out:02x?}");
+    }
+
+    // Near miss: code after a conditional `br_if` is live.
+    #[test]
+    fn deadtail_keeps_code_after_br_if() {
+        let b = body(
+            2,
+            &[
+                0x02, 0x40, // block
+                0x20, 0x00, 0x0d, 0x00, // get 0; br_if 0
+                0x20, 0x01, 0x1a, // get 1; drop
+                0x0b, // end
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_elide(true)).unwrap();
+        assert!(has_seq(&out, &[0x20, 0x01, 0x1a]), "live code cut: {out:02x?}");
+    }
+
+    // A dead region goes whole, nested `if`/`else` included, and stops at
+    // the `else` that closes the arm it is in.
+    #[test]
+    fn deadtail_cuts_nested_and_stops_at_else() {
+        let b = body(
+            2,
+            &[
+                0x20, 0x00, 0x04, 0x40, // get 0; if
+                0x0c, 0x00, // br 0
+                0x20, 0x01, 0x04, 0x40, 0x01, 0x05, 0x01, 0x0b, // dead: get 1; if nop else nop end
+                0x05, // else (outer)
+                0x20, 0x01, 0x1a, // get 1; drop (live)
+                0x0b, // end
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_elide(true)).unwrap();
+        assert_eq!(count_seq(&out, &[0x04, 0x40]), 1, "{out:02x?}");
+        assert_eq!(count_seq(&out, &[0x05]), 1, "{out:02x?}");
+        assert!(has_seq(&out, &[0x05, 0x20, 0x01, 0x1a]), "{out:02x?}");
     }
 
     // `br 2` across three void blocks folds too.

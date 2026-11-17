@@ -357,6 +357,175 @@ pub(super) fn elide_round(
     n
 }
 
+/// Delete unreachable code in one forward pass, the companion of
+/// `elide_round` (`PLIRON_WASM_DEADTAIL=1`).
+///
+/// Why it matters (N9 #5): `elide_round` deletes an untargeted block whose
+/// body always branches away, and the instruction after its old `end`
+/// (waffle emits a `br` there) is dead code that still names an outer
+/// block as its target. That block then looks targeted and is kept;
+/// wasm-bindgen's re-encoding drops the dead `br` and leaves the block
+/// untargeted in the shipped module (67k such blocks in dsa). In a nest
+/// each level hides the next, so alternating the two rounds would need
+/// one round per level.
+///
+/// The pass tracks reachability with a control stack. Code is dead after
+/// an unconditional `br`, `br_table`, `return`, `unreachable` or tail call,
+/// and stays dead through the `end` of a construct `elide_round` will
+/// delete ("transparent": a `block`/`loop` with the empty blocktype, no
+/// branch from live code to it and no `br_table` inside) when the body's
+/// end is dead. At any other `end`/`else` of a live construct it is live
+/// again, as the validator sees it. Branches in dead code target nothing.
+/// Dead constructs go whole.
+///
+/// Typing: once every transparent construct is elided, each deleted
+/// instruction follows an unconditional transfer in the same construct
+/// with only deleted code between, where wasm validates against a
+/// polymorphic stack and an empty sequence is valid for any block type.
+/// So the caller must check that `elide_round` removed every opener this
+/// returns (their byte offsets) and revert the whole body otherwise. With
+/// `transparent_ok` false nothing is transparent and the cut is valid on
+/// its own.
+///
+/// `None` (nothing changed): a branch label out of range, or a deleted
+/// instruction anchors a `local.get` prelude (`is_anchor`).
+pub(super) fn dead_exact(
+    b: &[u8],
+    ins: &mut Vec<(WPeek, usize, usize, usize)>,
+    is_anchor: impl Fn(usize) -> bool,
+    transparent_ok: bool,
+) -> Option<(u32, Vec<usize>)> {
+    struct Fr {
+        kind: u8,
+        empty: bool,
+        tgt: bool,
+        bt: bool,
+        dead_open: bool,
+        s: usize,
+    }
+    let live = |k: WPeek| !matches!(k, WPeek::Del | WPeek::Nop(_));
+    let byte = |k: WPeek, s: usize| -> Option<u8> {
+        matches!(k, WPeek::Ctl).then(|| b.get(s).copied()).flatten()
+    };
+    let mut st: Vec<Fr> = vec![Fr {
+        kind: 0,
+        empty: false,
+        tgt: false,
+        bt: false,
+        dead_open: false,
+        s: usize::MAX,
+    }];
+    let mut dead = false;
+    let mut del: Vec<usize> = Vec::new();
+    let mut must: Vec<usize> = Vec::new();
+    for i in 0..ins.len() {
+        let (k, s, e, _) = ins[i];
+        if !live(k) {
+            continue;
+        }
+        let op = byte(k, s);
+        match op {
+            Some(0x02 | 0x03 | 0x04) => {
+                if dead {
+                    del.push(i);
+                }
+                st.push(Fr {
+                    kind: b[s],
+                    empty: empty_blocktype(b, s, e),
+                    tgt: false,
+                    bt: false,
+                    dead_open: dead,
+                    s,
+                });
+                continue;
+            }
+            Some(0x05) => {
+                if st.last()?.dead_open {
+                    del.push(i);
+                } else {
+                    dead = false;
+                }
+                continue;
+            }
+            Some(0x0b) => {
+                if st.len() == 1 {
+                    break; // the body's own `end`
+                }
+                let fr = st.pop()?;
+                if fr.dead_open {
+                    del.push(i);
+                    continue;
+                }
+                if fr.bt {
+                    st.last_mut()?.bt = true;
+                }
+                let transparent = transparent_ok
+                    && matches!(fr.kind, 0x02 | 0x03)
+                    && fr.empty
+                    && !fr.tgt
+                    && !fr.bt;
+                if transparent {
+                    if dead {
+                        must.push(fr.s);
+                    }
+                } else {
+                    dead = false;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if dead {
+            del.push(i);
+            continue;
+        }
+        let n = st.len();
+        let mark = |d: u32, st: &mut Vec<Fr>| -> Option<()> {
+            let d = d as usize;
+            if d >= n {
+                return None;
+            }
+            st[n - 1 - d].tgt = true;
+            Some(())
+        };
+        match (k, op) {
+            (WPeek::Br(d), _) => {
+                mark(d, &mut st)?;
+                dead = true;
+            }
+            (WPeek::BrIf(d), _) => mark(d, &mut st)?,
+            (_, Some(0x0c | 0x0d)) => {
+                let (d, is_if) = branch_label(b, k, s)?;
+                mark(d, &mut st)?;
+                dead = !is_if;
+            }
+            (_, Some(0x0e)) => {
+                let mut p = s + 1;
+                let cnt = super::urd(b, &mut p)?;
+                for _ in 0..=cnt {
+                    let d = super::urd(b, &mut p)?;
+                    mark(d, &mut st)?;
+                }
+                st.last_mut()?.bt = true;
+                dead = true;
+            }
+            (_, Some(0x00 | 0x0f | 0x12 | 0x13)) => dead = true,
+            _ => {}
+        }
+    }
+    if del.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    if del.iter().any(|&i| is_anchor(ins[i].1)) {
+        return None;
+    }
+    for &i in &del {
+        ins[i].0 = WPeek::Del;
+    }
+    ins.retain(|&(k, _, _, _)| !matches!(k, WPeek::Del));
+    Some((del.len() as u32, must))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
