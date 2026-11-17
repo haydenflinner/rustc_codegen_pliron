@@ -3185,7 +3185,60 @@ fn s_constbr2(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+/// `PLIRON_WASM_SMALLFN=<insts>` (opt-in, wasm): a function of at most
+/// that many instructions when a loop-duplicating step comes up skips the
+/// step (`looprot`, `looprot2`, `punroll` with its peeling). V8 inlines a
+/// wasm callee only up to 500 body bytes (`--wasm-inlining-max-size`);
+/// LLVM's `memchr_aligned` is 294 bytes and its `memcmp` 74, so V8 inlines
+/// both into the string searches of the dsa `dims_page` row, while ours
+/// were 1,329 and 602 bytes (eight peeled copies of each byte loop plus
+/// the rotated guards) and stayed calls: `memchr_aligned` alone was 395 ms
+/// of self time against LLVM's 4 there. Without the three steps they are
+/// 340 and 116 bytes. Only when every loop is a search loop (two or more
+/// exit edges: a match or mismatch besides the bound): a small function
+/// with a plain counted loop (wasm `k_iterw`'s filtered sum, 4M trips per
+/// call) wants the rotated, unrolled loop and is not a hot callee.
+fn wasm_small_fn(p: &Pipe, an: &mut Analysis) -> bool {
+    if !wasm_small_size(p) {
+        return false;
+    }
+    let f = &p.clctx.func;
+    let a = an.cfg_dt_la(f);
+    let mut exits: FxHashMap<cranelift_codegen::loop_analysis::Loop, usize> = FxHashMap::default();
+    for b in f.layout.blocks() {
+        let Some(lp) = a.la.innermost_loop(b) else { continue };
+        let e = exits.entry(lp).or_default();
+        for s in a.cfg.succ_iter(b) {
+            if !a.la.is_in_loop(s, lp) {
+                *e += 1;
+            }
+        }
+    }
+    !exits.is_empty() && exits.values().all(|&n| n >= 2)
+}
+
+fn wasm_small_size(p: &Pipe) -> bool {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        pliron_cfg::env_get("PLIRON_WASM_SMALLFN").and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if *N == 0 || !p.target.is_wasm() {
+        return false;
+    }
+    let f = &p.clctx.func;
+    let mut n = 0usize;
+    for b in f.layout.blocks() {
+        n += f.layout.block_insts(b).count();
+        if n > *N {
+            return false;
+        }
+    }
+    true
+}
+
 fn s_punroll(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if wasm_small_fn(p, an) {
+        return 0;
+    }
     // The wasm-only rules in punroll are measurement boundaries.
     let k = punroll::run(&mut p.clctx.func, an, p.fname, p.prof, p.target.is_wasm());
     if k > 0 && p.dump {
@@ -4802,6 +4855,9 @@ fn s_regionfold(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_looprot(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if wasm_small_fn(p, an) {
+        return 0;
+    }
     let k = looprot::run(&mut p.clctx.func, an, p.derived, p.prof);
     p.dump("looprot");
     k

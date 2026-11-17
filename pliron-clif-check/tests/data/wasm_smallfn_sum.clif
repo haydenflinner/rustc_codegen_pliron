@@ -1,0 +1,185 @@
+function u0:0(i32, i32) -> i64 system_v {
+    ss0 = explicit_slot 1
+    gv0 = symbol colocated userextname0
+    gv1 = symbol colocated userextname1
+    sig0 = (i32, i32, i32) system_v
+    fn0 = colocated u0:1 sig0
+
+block0(v0: i32, v1: i32):
+    v2 = iconst.i32 0
+    v3 = iconst.i32 0
+    v4 = icmp ne v0, v3  ; v3 = 0
+    v5 = iconst.i32 0
+    v6 = icmp ne v0, v5  ; v5 = 0
+    v7 = iconst.i32 0
+    v8 = icmp ne v0, v7  ; v7 = 0
+    v9 = iconst.i32 0
+    v10 = icmp ne v0, v9  ; v9 = 0
+    v11 = iconst.i32 4
+    v12 = imul v1, v11  ; v11 = 4
+    v13 = iadd v0, v12
+    jump block2
+
+block2:
+    v14 = stack_addr.i32 ss0
+    v15 = iconst.i64 0
+    v71 -> v15
+    jump block3
+
+block3:
+    v16 = iconst.i32 0
+    v17 = icmp.i32 ne v13, v16  ; v16 = 0
+    v18 = iconst.i32 0
+    v19 = icmp.i32 ne v0, v18  ; v18 = 0
+    v20 = iconst.i32 0
+    v21 = icmp.i32 ne v13, v20  ; v20 = 0
+    v22 = icmp.i32 eq v0, v13
+    jump block4
+
+block4:
+    v23 = iconst.i8 1
+    v24 = band.i8 v22, v23  ; v23 = 1
+    brif v24, block6, block5
+
+block5:
+    v25 = iconst.i32 0
+    jump block7
+
+block7:
+    v26 = iconst.i32 0
+    v27 = icmp.i32 ne v13, v26  ; v26 = 0
+    v28 = iconst.i32 0
+    v29 = icmp.i32 ne v13, v28  ; v28 = 0
+    v30 = iconst.i32 0
+    v31 = icmp.i32 ne v0, v30  ; v30 = 0
+    v32 = iconst.i32 0
+    v33 = icmp.i32 ne v13, v32  ; v32 = 0
+    jump block8
+
+block8:
+    v34 = iconst.i8 1
+    v35 = iconst.i8 1
+    brif v35, block10, block9  ; v35 = 1
+
+block10:
+    v36 = iconst.i8 1
+    v37 = iconst.i8 1
+    brif v37, block11, block9  ; v37 = 1
+
+block9 cold:
+    v38 = symbol_value.i32 gv0
+    v39 = iconst.i32 73
+    v40 = symbol_value.i32 gv1
+    call fn0(v38, v39, v40)  ; v39 = 73
+    trap user2
+
+block11:
+    v41 = isub.i32 v13, v0
+    v42 = iconst.i32 4
+    v43 = udiv v41, v42  ; v42 = 4
+    jump block12(v25, v15)  ; v25 = 0, v15 = 0
+
+block12(v44: i32, v54: i64):
+    v76 -> v44
+    v78 -> v44
+    v77 -> v78
+    v45 = iconst.i32 0
+    v46 = icmp.i32 ne v0, v45  ; v45 = 0
+    v47 = iconst.i32 4
+    v48 = imul v44, v47  ; v47 = 4
+    v49 = iadd.i32 v0, v48
+    v50 = iconst.i32 0
+    v51 = icmp ne v49, v50  ; v50 = 0
+    v52 = iconst.i32 0
+    v53 = icmp ne v49, v52  ; v52 = 0
+    jump block23
+
+block23:
+    jump block29
+
+block29:
+    v55 = load.i32 notrap v49
+    v56 = iconst.i32 3
+    v57 = srem v55, v56  ; v56 = 3
+    v58 = iconst.i32 0
+    v59 = icmp ne v57, v58  ; v58 = 0
+    jump block24
+
+block24:
+    brif.i8 v59, block26, block25
+
+block25:
+    jump block28(v54, v76)
+
+block26:
+    jump block30
+
+block30:
+    jump block33
+
+block33:
+    v60 = load.i32 notrap v49
+    v61 = sextend.i64 v60
+    v62 = imul v61, v61
+    jump block31
+
+block31:
+    jump block34
+
+block34:
+    v63, v64 = sadd_overflow.i64 v54, v62
+    jump block32
+
+block32:
+    jump block27
+
+block27:
+    jump block28(v63, v77)
+
+block28(v65: i64, v75: i32):
+    v70 -> v65
+    v74 -> v65
+    v66 -> v75
+    jump block13
+
+block13:
+    jump block14
+
+block14:
+    v67 = iconst.i32 1
+    v68 = iadd.i32 v66, v67  ; v67 = 1
+    v73 -> v68
+    v69 = icmp eq v68, v43
+    brif v69, block16, block15
+
+block15:
+    jump block12(v73, v74)
+
+block16:
+    jump block17(v70)
+
+block6:
+    jump block17(v71)  ; v71 = 0
+
+block17(v72: i64):
+    jump block1
+
+block1:
+    return v72
+
+block18 cold:
+    trap user1
+
+block19 cold:
+    trap user1
+
+block20 cold:
+    trap user1
+
+block21 cold:
+    trap user1
+
+block22 cold:
+    trap user1
+}
+

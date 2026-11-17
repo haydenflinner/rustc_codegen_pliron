@@ -1,0 +1,423 @@
+function u0:0(i8, i32, i32) -> i32, i32 system_v {
+    ss0 = explicit_slot 8, align = 4
+    ss1 = explicit_slot 4
+    ss2 = explicit_slot 8, align = 4
+    gv0 = symbol colocated userextname0
+    gv1 = symbol colocated userextname1
+    gv2 = symbol colocated userextname3
+    gv3 = symbol colocated userextname5
+    gv4 = symbol colocated userextname6
+    gv5 = symbol colocated userextname7
+    sig0 = (i32, i32, i32) system_v
+    sig1 = (i32, i32, i32) system_v
+    sig2 = (i32, i32, i32, i32) system_v
+    fn0 = colocated u0:1 sig0
+    fn1 = colocated u0:2 sig1
+    fn2 = colocated u0:3 sig2
+
+block0(v0: i8, v1: i32, v2: i32):
+    v3 = iconst.i32 0
+    v4 = stack_addr.i32 ss0
+    v5 = stack_addr.i32 ss1
+    v6 = stack_addr.i32 ss2
+    jump block31
+
+block31:
+    v7 = iconst.i32 4
+    v8 = popcnt v7  ; v7 = 4
+    v9 = iconst.i32 1
+    v10 = icmp eq v8, v9  ; v9 = 1
+    brif v10, block33, block32
+
+block32 cold:
+    v11 = symbol_value.i32 gv0
+    v12 = iconst.i32 0
+    v13 = icmp ne v11, v12  ; v12 = 0
+    v14 = iconst.i32 1
+    v15 = iconst.i32 82
+    v16 = iconst.i32 83
+    v17 = iconst.i32 83
+    v18 = iconst.i32 0
+    v19 = icmp ne v17, v18  ; v17 = 83, v18 = 0
+    v20 = symbol_value.i32 gv1
+    call fn0(v11, v17, v20)  ; v17 = 83
+    trap user2
+
+block33:
+    jump block35
+
+block35:
+    v21 = iconst.i32 3
+    v22 = iconst.i8 0
+    v23 = iconst.i8 0
+    brif v23, block37, block36  ; v23 = 0
+
+block36:
+    v24 = iconst.i32 0
+    v25 = iconst.i8 1
+    brif v25, block38, block39  ; v25 = 1
+
+block39:
+    v26 = iconst.i32 1
+    v27 = ctz v26  ; v26 = 1
+    v28 = iconst.i32 4
+    v29 = ctz v28  ; v28 = 4
+    v30 = icmp ult v27, v29
+    brif v30, block45, block44
+
+block44:
+    jump block46(v29)
+
+block45:
+    jump block46(v27)
+
+block46(v31: i32):
+    v40 -> v31
+    v32 = iconst.i32 1
+    v33 = ishl v32, v31  ; v32 = 1
+    v34 = iconst.i32 1
+    v35 = isub v33, v34  ; v34 = 1
+    v36 = band.i32 v1, v35
+    v37 = iconst.i32 0
+    v38 = icmp eq v36, v37  ; v37 = 0
+    brif v38, block47, block49
+
+block49:
+    v39 = iconst.i32 -1
+    jump block51(v39)  ; v39 = -1
+
+block47:
+    v41 = iconst.i32 4
+    v42 = ushr v41, v40  ; v41 = 4
+    v43 = iconst.i32 1
+    v44 = isub v42, v43  ; v43 = 1
+    v45 = iconst.i32 1
+    v46 = ushr v45, v40  ; v45 = 1
+    v47 = band.i32 v1, v21  ; v21 = 3
+    v48 = ushr v47, v40
+    v49 = isub v42, v48
+    jump block55
+
+block55:
+    v50 = iconst.i32 1
+    v51 = isub.i32 v42, v50  ; v50 = 1
+    v52 = iconst.i32 15
+    v53 = band.i32 v46, v52  ; v52 = 15
+    v54 = iconst.i32 1
+    v55 = iconst.i32 1
+    v56 = ushr v53, v55  ; v55 = 1
+    v57 = iconst.i32 8
+    v58 = icmp ult v56, v57  ; v57 = 8
+    brif v58, block56, block57
+
+block57 cold:
+    v59 = iconst.i32 8
+    v60 = symbol_value.i32 gv2
+    call fn1(v56, v59, v60)  ; v59 = 8
+    trap user2
+
+block56:
+    v61 = symbol_value.i32 gv3
+    v62 = iconst.i32 1
+    v63 = imul.i32 v56, v62  ; v62 = 1
+    v64 = iadd v61, v63
+    v65 = load.i8 notrap v64
+    v66 = uextend.i32 v65
+    v67 = iconst.i32 16
+    jump block58(v67, v66)  ; v67 = 16
+
+block58(v68: i32, v214: i32):
+    v75 -> v68
+    v70 -> v214
+    v69 = icmp uge v68, v42
+    brif v69, block60, block59
+
+block59:
+    v71 = imul.i32 v46, v70
+    v72 = iconst.i32 2
+    v73 = isub v72, v71  ; v72 = 2
+    v74 = imul.i32 v70, v73
+    v215 -> v74
+    v76, v77 = umul_overflow.i32 v75, v75
+    v213 -> v76
+    brif v77, block62, block61
+
+block61:
+    jump block58(v213, v215)
+
+block62:
+    jump block63(v74)
+
+block60:
+    jump block63(v214)
+
+block63(v78: i32):
+    v79 = band.i32 v51, v78
+    jump block48
+
+block48:
+    v80 = imul.i32 v49, v79
+    v81 = band.i32 v44, v80
+    jump block43(v81)
+
+block38:
+    v82 = iadd.i32 v1, v21  ; v21 = 3
+    v83 = iconst.i32 -4
+    v84 = band v82, v83  ; v83 = -4
+    v85 = isub v84, v1
+    v86 = iconst.i32 4
+    v87 = icmp ult v85, v86  ; v86 = 4
+    v88 = iconst.i32 1
+    v89 = urem.i32 v1, v88  ; v88 = 1
+    v90 = iconst.i32 0
+    v91 = icmp eq v89, v90  ; v90 = 0
+    brif v91, block40, block41
+
+block41:
+    v92 = iconst.i32 -1
+    jump block42(v92)  ; v92 = -1
+
+block40:
+    v93 = iconst.i32 1
+    v94 = udiv.i32 v85, v93  ; v93 = 1
+    jump block42(v94)
+
+block42(v211: i32):
+    jump block43(v211)
+
+block43(v210: i32):
+    jump block50(v210)
+
+block37:
+    v95 = band.i32 v1, v21  ; v21 = 3
+    v96 = iconst.i32 0
+    v97 = icmp eq v95, v96  ; v96 = 0
+    brif v97, block52, block53
+
+block53:
+    v98 = iconst.i32 -1
+    jump block54(v98)  ; v98 = -1
+
+block52:
+    v99 = iconst.i32 0
+    jump block54(v99)  ; v99 = 0
+
+block54(v212: i32):
+    jump block50(v212)
+
+block50(v209: i32):
+    jump block51(v209)
+
+block51(v100: i32):
+    v103 -> v100
+    jump block34
+
+block34:
+    jump block1
+
+block1:
+    v101 = iconst.i32 0
+    v102 = icmp.i32 ugt v100, v101  ; v101 = 0
+    brif v102, block3, block2
+
+block2:
+    jump block5(v100)
+
+block3:
+    jump block64
+
+block64:
+    jump block69
+
+block69:
+    v104 = icmp.i32 ult v103, v2
+    jump block65
+
+block65:
+    brif.i8 v104, block67, block66
+
+block66:
+    jump block68(v2)
+
+block67:
+    jump block68(v103)
+
+block68(v105: i32):
+    jump block4
+
+block4:
+    v106 = iconst.i32 0
+    v107 = icmp.i32 ult v105, v106  ; v106 = 0
+    v108 = iconst.i8 0
+    brif v108, block7, block6  ; v108 = 0
+
+block6:
+    v109 = icmp.i32 ule v105, v2
+    jump block9
+
+block9:
+    v110 = iconst.i32 0
+    jump block10(v110, v105)  ; v110 = 0
+
+block10(v111: i32, v203: i32):
+    v183 -> v111
+    v190 -> v111
+    v193 -> v111
+    v204 -> v203
+    v112 = icmp ult v111, v105
+    brif v112, block12, block11
+
+block11:
+    jump block5(v203)
+
+block5(v202: i32):
+    v113 = uextend.i32 v0
+    v114 = iconst.i32 0x0101_0101
+    v115 = imul v113, v114  ; v114 = 0x0101_0101
+    jump block13(v202)
+
+block13(v116: i32):
+    v120 -> v116
+    v152 -> v116
+    v205 -> v116
+    v117 = iconst.i32 8
+    v118 = isub.i32 v2, v117  ; v117 = 8
+    v119 = icmp ule v116, v118
+    brif v119, block15, block14
+
+block14:
+    jump block16(v116)
+
+block15:
+    v121 = iconst.i32 1
+    v122 = imul.i32 v120, v121  ; v121 = 1
+    v123 = iadd.i32 v1, v122
+    v124 = load.i32 notrap v123
+    v125 = iconst.i32 4
+    v126 = iadd.i32 v120, v125  ; v125 = 4
+    v127 = iconst.i32 1
+    v128 = imul v126, v127  ; v127 = 1
+    v129 = iadd.i32 v1, v128
+    v130 = load.i32 notrap v129
+    v131 = bxor.i32 v115, v124
+    v132 = iconst.i32 0x0101_0101
+    v133 = isub v131, v132  ; v132 = 0x0101_0101
+    v134 = iconst.i32 -1
+    v135 = bxor v131, v134  ; v134 = -1
+    v136 = band v133, v135
+    v137 = iconst.i32 -2139062144
+    v138 = band v136, v137  ; v137 = -2139062144
+    v139 = iconst.i32 0
+    v140 = icmp ne v138, v139  ; v139 = 0
+    v141 = bxor.i32 v115, v130
+    v142 = iconst.i32 0x0101_0101
+    v143 = isub v141, v142  ; v142 = 0x0101_0101
+    v144 = iconst.i32 -1
+    v145 = bxor v141, v144  ; v144 = -1
+    v146 = band v143, v145
+    v147 = iconst.i32 -2139062144
+    v148 = band v146, v147  ; v147 = -2139062144
+    v149 = iconst.i32 0
+    v150 = icmp ne v148, v149  ; v149 = 0
+    v151 = icmp ne v140, v150
+    brif v151, block18, block17
+
+block17:
+    brif.i8 v140, block18, block19
+
+block19:
+    v153 = iconst.i32 8
+    v154 = iadd.i32 v152, v153  ; v153 = 8
+    jump block13(v154)
+
+block18:
+    jump block16(v205)
+
+block16(v155: i32):
+    v180 -> v155
+    v206 -> v155
+    v156 = iconst.i32 1
+    v157 = imul v155, v156  ; v156 = 1
+    v158 = iadd.i32 v1, v157
+    v159 = isub.i32 v2, v155
+    v160 = iconst.i32 0
+    jump block20(v160)  ; v160 = 0
+
+block20(v161: i32):
+    v168 -> v161
+    v175 -> v161
+    v178 -> v161
+    v162 = icmp ult v161, v159
+    brif v162, block22, block21
+
+block21:
+    v163 = symbol_value.i32 gv4
+    v164 = iconst.i32 4
+    v165 = iadd v163, v164  ; v164 = 4
+    v166 = iconst.i32 0
+    v167 = iconst.i32 0
+    jump block23(v166, v167)  ; v166 = 0, v167 = 0
+
+block22:
+    v169 = icmp.i32 ult v168, v159
+    jump block24
+
+block24:
+    v170 = iconst.i32 1
+    v171 = imul.i32 v168, v170  ; v170 = 1
+    v172 = iadd.i32 v158, v171
+    v173 = load.i8 notrap v172
+    v174 = icmp.i8 eq v0, v173
+    brif v174, block26, block25
+
+block25:
+    v176 = iconst.i32 1
+    v177 = iadd.i32 v175, v176  ; v176 = 1
+    jump block20(v177)
+
+block26:
+    v179 = iconst.i32 1
+    v181 = iadd.i32 v178, v180
+    v182 = iconst.i32 1
+    jump block23(v182, v181)  ; v182 = 1
+
+block23(v207: i32, v208: i32):
+    jump block27(v207, v208)
+
+block12:
+    v184 = icmp.i32 ult v183, v105
+    jump block28
+
+block28:
+    v185 = iconst.i32 1
+    v186 = imul.i32 v183, v185  ; v185 = 1
+    v187 = iadd.i32 v1, v186
+    v188 = load.i8 notrap v187
+    v189 = icmp.i8 eq v0, v188
+    brif v189, block30, block29
+
+block29:
+    v191 = iconst.i32 1
+    v192 = iadd.i32 v190, v191  ; v191 = 1
+    jump block10(v192, v204)
+
+block30:
+    v194 = iconst.i32 1
+    v195 = iconst.i32 1
+    jump block27(v195, v193)  ; v195 = 1
+
+block27(v196: i32, v197: i32):
+    v198 = iconst.i32 0
+    v199 = iconst.i32 0
+    return v196, v197
+
+block7 cold:
+    jump block8
+
+block8 cold:
+    v200 = iconst.i32 0
+    v201 = symbol_value.i32 gv5
+    call fn2(v200, v105, v2, v201)  ; v200 = 0
+    trap user2
+}
+
