@@ -283,6 +283,62 @@ program) and in regalloc overhead (st+ld+mov+csr), pliron side:
   at load 30-45 throughout (other agents), so timings would be noise; the
   exact counts above are the evidence.
 
+## Investigations
+
+### blake3 `portable::compress_in_place` reloads (2026-11-17)
+
+Executed per call (51,465 calls): ours 11 spill stores, 62 reloads, 4
+register moves; LLVM 11 store instructions (pairs: `stp w15, w13`),
+35 reloads, 18 moves. The function is one straight-line block of 832
+instructions.
+
+- **Register pressure**: 32-35 values live at 640 of 832 points (16
+  state words, 16 message words and the `cv` pointer live across the
+  whole round, plus temporaries). We allocate 26 integer registers
+  (x0-x15, x19-x28); LLVM uses 30 here: also x16, x17, x18 (free on
+  Linux) and x30 (a leaf). So we must keep at least 9 long-lived values in
+  memory at every point (best case about 8 x 6 = 48 reloads), LLVM 5.
+- **How we lose more than that**: the message words are the longest
+  bundles, so they are allocated first; the round's short, dense values
+  then evict them, each is split at the conflict twice
+  (`MAX_SPLITS_PER_SPILLSET` = 2) and then goes to minimal bundles: one
+  reload per use, for 11 of the 16 words. The `cv` pointer (uses at
+  instructions 0-8 and 785-831) keeps x0 throughout: 17 uses give it a
+  higher weight (236) than any message word (120-135), so evictions
+  always pick a word.
+- Tried, no gain (not committed): `RA2_LINEAR=1` (upstream spill
+  priority) 62 -> 68 reloads; raising the split cap to 3..64, 62 -> 64..68;
+  a gap split (a bundle cut at a use-free gap over 6x its average use
+  spacing, the gap to the spill bundle) frees x0 but saves 1 reload, and
+  is +0.03..0.06% static overhead on std/html.
+- **What moves it**: registers. `PLIRON_X17=1 PLIRON_X30=1` (both
+  existing opt-in knobs) take this function to 6 stores, 51 reloads,
+  4 moves (static html overhead -6.1%, std -0.9%). Dynamic results in the
+  knob evaluation below. x18 (Linux only; reserved on macOS) is not
+  allocatable in Cranelift at all; LLVM uses it on Linux.
+
+### Callee-save traffic (csr), pulldown and html-rewriter (2026-11-17)
+
+- Most of the excess is in functions LLVM inlined into their callers (0 on
+  its side: `FirstPass::parse_block`, `append_text`, html-rewriter's
+  dispatcher closure, prost's `string::encode`): an inlining difference,
+  not allocation.
+- Where both sides keep the function, we save more registers per call:
+  pulldown `Parser::next` 10 csr instructions per call against 4. Our body
+  is 557 instructions with more inlined (LLVM's: 147, calling
+  `handle_inline` and others), so more values live across calls.
+- `PLIRON_SHRINKWRAP` is on by default (the source reads `!= "0"`;
+  `=1` is identical to unset; AGENTS.md calls it opt-in, which is stale).
+  Static csr counts rise with it (saves duplicated into colder blocks),
+  so judge it dynamically only.
+- Tried, no gain (not committed): LLVM's "CSR first-time cost" (a bundle
+  that would be the first in a callee-saved register goes to minimal
+  bundles when its uses cost less than a save and restore). On
+  `Parser::next` csr stayed at 10 (later bundles take the register anyway)
+  and moves rose 102 -> 154. A rule that works must decide per register
+  (all the bundles that would use it), as `PLIRON_RA2_COLDSPLIT` does for
+  cold call regions.
+
 ## Knobs
 
 Status: **on** = default on; **opt-in**; **eval** = under evaluation.
