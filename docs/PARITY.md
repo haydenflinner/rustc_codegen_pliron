@@ -1007,7 +1007,15 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   `blake3::compress_in_place` is byte-identical and each side alone
   costs 80.4 against 82.6 ms per call (63% of it in JS
   `passStringToWasm0`); not explained.
-- **N6. hmget's loss under single-caller inlining is two licm refusals**
+- **N6, done 2026-11-17: single-caller inlining is on for wasm**
+  (`PLIRON_INLINE_ONCE_WASM=3` with licm's GTE and SLOTPROV rules,
+  `28e56c7`). Quiet-machine kernels geomean 0.931 -> 0.929, no kernel
+  outside its range (tokenize and parse_only rechecked with 5 layouts
+  twice), hmget +5.7% -> +1.9%. dsa: the 14 like-for-like rows 1.030 ->
+  0.999 against LLVM, all 19 workloads equal; current main builds the
+  module at 41.92 MB (44.09 at the start of the round, LLVM 18.71). The
+  analysis that led there:
+- **N6 (analysis). hmget's loss under single-caller inlining is two licm refusals**
   (the V8 comparison, notes in the session scratchpad `hmget_notes.md`,
   summarised in `history/2026-11-16-wasm-night.md`). Not alignment: the
   loop head sits at the same offset mod 64 in the fast and the slow

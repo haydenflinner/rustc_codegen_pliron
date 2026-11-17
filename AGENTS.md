@@ -482,14 +482,20 @@ time, memory, code size, stack frames) in ~20 min and writes
   function (`fn <symbol>`) ahead of its `fwd:` lines.
 - 2026-11-16 afternoon, each opt-in
   (`docs/history/2026-11-16-wasm-night.md`, "Afternoon"):
-  `PLIRON_INLINE_ONCE=2` (wasm: the single-caller bonus for loop-free
-  callees only; `=1` moves loops into their callers and costs hmget,
-  tokenize and sieve; `=3` allows one loop-carrying callee into a
-  loop-free caller, keeps tokenize and sieve, and loses hmget unless
-  `PLIRON_LICM_SLOTPROV=1 PLIRON_LICM_GTE=1` are on with it (then hmget
-  is better than the default); its dsa heap corruption was the
-  `memcpyopt` reader-in-a-loop bug, fixed in `7dc8138`;
-  `PLIRON_INLINE_ONCE_WASM` is the same knob read on wasm only),
+  `PLIRON_INLINE_ONCE_WASM` (wasm's single-caller inlining mode,
+  **default `3` since 2026-11-17**: a callee with a loop goes only into a
+  loop-free caller that has taken no such callee, loop-free callees
+  always; `=0` the old wasm behaviour, `=2` loop-free callees only, `=1`
+  every single-caller callee, which costs tokenize and sieve;
+  `PLIRON_INLINE_ONCE` overrides it on every target). It is on together
+  with `PLIRON_LICM_GTE_WASM` and `PLIRON_LICM_SLOTPROV_WASM` (default
+  on, wasm only; `PLIRON_LICM_GTE=0` / `PLIRON_LICM_SLOTPROV=0` off
+  everywhere, `=1` on native too): licm hoists a load that runs on every
+  iteration without a dereferenceability proof, and a slot indexed by a
+  loop counter stays its own object; without them single-caller
+  inlining costs hmget. Kernels geomean 0.931 -> 0.929, hmget +5.7% ->
+  +1.9%; dsa 14 like-for-like rows 1.030 -> 0.999, module -1.7 MB
+  (`docs/history/2026-11-16-licm-gte.md`),
   `PLIRON_INLINE_RECX=1` (a site cloned out of an inlined body does not
   inline a member of a call-graph cycle its clone chain already
   entered: derived `Clone` of a recursive AST; **on by default for
