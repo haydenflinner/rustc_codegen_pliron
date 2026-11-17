@@ -135,3 +135,27 @@ fn arm_value_does_not_dominate() {
     let (_, n) = run(src, &[5]);
     assert_eq!(n, 0);
 }
+
+/// A loop header whose parameter gets the undefined zero on entry and a
+/// value computed in the header itself on the back edge: that value does
+/// not dominate the parameter, so it stays (blind-sig's build crashed
+/// in the egraph on the use-before-def this left).
+#[test]
+fn header_value_does_not_dominate_its_own_param() {
+    let src = "function %f(i64, i64) -> i64 {
+    block0(v0: i64, v1: i64):
+        v2 = iconst.i64 0
+        v3 = iconst.i64 0
+        jump block1(v3, v2)
+    block1(v4: i64, v5: i64):
+        v6 = iadd v5, v0
+        v7 = iconst.i64 1
+        v8 = iadd v4, v7
+        v9 = icmp ult v8, v1
+        brif v9, block1(v8, v6), block2
+    block2:
+        return v6
+    }";
+    let (_, n) = run(src, &[2]);
+    assert_eq!(n, 0);
+}

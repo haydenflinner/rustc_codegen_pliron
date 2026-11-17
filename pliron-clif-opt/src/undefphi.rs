@@ -151,7 +151,12 @@ pub fn run(func: &mut Function, undef: &[Value]) -> usize {
                 continue;
             }
             let Some(db) = def_block(func, v) else { continue };
-            if !dt.block_dominates(db, b) {
+            // An instruction of `b` itself does not dominate `b`'s
+            // parameters (a loop's back edge passing a value computed in
+            // the header): only `b`'s other parameters do.
+            if !dt.block_dominates(db, b)
+                || (db == b && !matches!(func.dfg.value_def(v), ValueDef::Param(..)))
+            {
                 continue;
             }
             rm.push((b, k, p, v));
