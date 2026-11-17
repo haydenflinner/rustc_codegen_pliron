@@ -11477,6 +11477,12 @@ mod clif_emit {
             if !crate::env_is("PLIRON_WASM_BASICOPT", "0") {
                 self.b.optimize(&waffle::OptOptions::default());
             }
+            // N9 row 1 / N2: loop-carried block params that only carry one
+            // outer value (a cycle of params `basic_opt`'s per-block rule
+            // cannot see). Opt-in: `PLIRON_WASM_PARAMSCC=1`.
+            if pliron_cfg::env_is("PLIRON_WASM_PARAMSCC", "1") {
+                waffle::passes::maxssa::remove_redundant_param_sets(&mut self.b);
+            }
             if crate::env_get("PLIRON_WASM_DUMP")
                 .map(|f| f.is_empty() || self.name.contains(&f))
                 .unwrap_or(false)

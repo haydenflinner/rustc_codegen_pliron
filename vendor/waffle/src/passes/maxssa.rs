@@ -45,6 +45,15 @@ pub(crate) fn run_with_clones(
 /// reducifier makes (defined outside `clones`). Tarjan's algorithm
 /// visits each set after every set it reaches, so a set sees the
 /// earlier sets' aliases. Linear in parameters plus edge arguments.
+/// PLIRON: `remove_trivial_params` on a reducible body (no cut blocks):
+/// loop-carried parameters that only ever hold one outer value. Called
+/// from the wasm emitter under `PLIRON_WASM_PARAMSCC=1`.
+pub fn remove_redundant_param_sets(body: &mut FunctionBody) {
+    let none = HashSet::default();
+    remove_trivial_params(body, &none, &none);
+    crate::passes::resolve_aliases::run(body);
+}
+
 fn remove_trivial_params(body: &mut FunctionBody, cut: &HashSet<Block>, clones: &HashSet<Block>) {
     // Nodes: params of non-entry blocks.
     let mut node_of: HashMap<Value, usize> = HashMap::default();
