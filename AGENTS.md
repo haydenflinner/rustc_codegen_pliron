@@ -635,6 +635,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   stack-slot load of bytes that constant stores in the same block just
   wrote becomes the constant (stdarch's NEON constants built through
   memory). html-rewriter -25.9k exact, nothing worse (PARITY item 10).
+- `PLIRON_I128ID=1` (opt-in) — step `i128id` before the egraph: `x | 0`,
+  `x ^ 0`, `x + 0`, `x - 0`, `x & 0` on `i128` with `iconcat` constants
+  (foldhash's `u128` sponge). Neutral on the held-out programs.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

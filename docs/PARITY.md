@@ -1150,6 +1150,28 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    for registers; next: why those long ranges are not split around the
    loop once (`PLIRON_RA_EXPLAIN=11build_stateCshc`; note the substring
    must be contiguous in the mangled name).
+   **`build_state` answered (2026-11-17), no regalloc2 change:** the
+   function-long ranges are not loop values. They are four depth-0
+   values defined at entry and used at exit (a zero constant, the
+   stack's length, two field addresses), live across the depth-0 calls
+   between: `progpoint139-post` is the clobber point of a `bl`, so every
+   piece regalloc2 splits off restarts at that call and conflicts again
+   until the minimal-bundle fallback; there is no loop for a split-
+   around-loop to isolate (the existing depth hoist and `LOOPSPLIT` do
+   not apply). The zero constant was a missed fold: foldhash's `u128`
+   sponge starts at `iconcat 0, 0` and `0 | (x << n)` stayed an `orr`
+   with a zero register; `PLIRON_I128ID=1` (opt-in, step `i128id`
+   before the egraph, tests `pliron-clif-opt/tests/i128id.rs`) folds
+   128-bit identities with `iconcat` constants, but exact counts are
+   unchanged within noise on all eight programs (html-rewriter -25,
+   others within +-600). `PLIRON_RA2_REMATW=1` (halve the spill weight
+   of rematerializable bundles, existing opt-in) is mixed: pulldown-cmark
+   -199k, rust-protobuf +299k, html-rewriter +67k, compression +41k.
+   `build_state` itself is small at runtime (about 35 samples ours,
+   19 LLVM's; spills 8 of ours): its excess is the inlined hash code
+   (38 ALU and 15 constant instructions on the paired lines against 7
+   and 4), not the allocator. Spills stay diffuse; no cheap regalloc2
+   lever found.
 
 10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
    2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours
