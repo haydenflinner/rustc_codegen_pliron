@@ -219,7 +219,7 @@ size (`; diffcheck-sret:`), the reference's `lifetime.start` makes a
 slot's old bytes undetermined, a stub's result tag is 0 or 1, a run that
 traps after a call handed undetermined bytes is not pinned. On the wasm
 kernels + std the memcpyopt ablation has no mismatch; on the full dsa
-corpus 75 of 103 are not explained, most in serde/bincode `Deserialize`
+corpus 77 are not explained, most in serde/bincode `Deserialize`
 instances (`docs/history/2026-11-16-xcorpus.md`).
 
 ## 4. Prefix-bisect `PLIRON_PIPELINE` — rebuild-per-probe, last resort

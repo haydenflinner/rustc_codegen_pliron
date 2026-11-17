@@ -372,7 +372,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   Functions whose call sets differ (inlining, devirt) are skipped.
   Names `mcrdwrap::build` with `PLIRON_MEMCPYOPT_RDWRAP=0`; no false
   positive on the wasm kernels + std for `PLIRON_MEMCPYOPT=0`; on the
-  full dsa corpus 75 not yet explained (0.3% of pairs compared, mostly
+  full dsa corpus 77 not yet explained (0.3% of pairs compared, mostly
   serde/bincode `Deserialize` instances: compare a memcpyopt change's
   list with the tree's before it). How it works,
   what it cannot see:
