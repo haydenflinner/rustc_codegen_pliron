@@ -40,7 +40,7 @@
 //! eviction, only while it has fewer blocks (LLVM's `RS_Split2` guard);
 //! at most `PLIRON_RA2_REGION_MAX` (4) region splits per spillset, bundles
 //! live in more than `PLIRON_RA2_REGION_MAXB` (2048) blocks are left to the
-//! ordinary split, `PLIRON_RA2_REGION_K` (4) registers are cut per try, and
+//! ordinary split, `PLIRON_RA2_REGION_K` (8) registers are cut per try, and
 //! each max-flow has an operation budget linear in the graph.
 
 use super::{

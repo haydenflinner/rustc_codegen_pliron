@@ -207,28 +207,28 @@ pub(crate) fn spillhoist_on() -> bool {
     false
 }
 
-/// PLIRON: `PLIRON_RA2_REGION_K` (default 4): registers whose cut is
+/// PLIRON: `PLIRON_RA2_REGION_K` (default 8): registers whose cut is
 /// solved, the ones with the largest possible gain.
 pub(crate) fn region_k() -> usize {
     #[cfg(feature = "std")]
     {
         static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        env_f32("PLIRON_RA2_REGION_K", &C, 4.0).max(1.0) as usize
+        env_f32("PLIRON_RA2_REGION_K", &C, 8.0).max(1.0) as usize
     }
     #[cfg(not(feature = "std"))]
-    4
+    8
 }
 
-/// PLIRON: `PLIRON_RA2_REGION_CAP` (default 2): uses an S block is
+/// PLIRON: `PLIRON_RA2_REGION_CAP` (default 1): uses an S block is
 /// charged for at most (a block-local piece reloads once per stretch).
 pub(crate) fn region_use_cap() -> u32 {
     #[cfg(feature = "std")]
     {
         static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        env_f32("PLIRON_RA2_REGION_CAP", &C, 2.0).max(1.0) as u32
+        env_f32("PLIRON_RA2_REGION_CAP", &C, 1.0).max(1.0) as u32
     }
     #[cfg(not(feature = "std"))]
-    2
+    1
 }
 
 /// PLIRON: `PLIRON_RA2_REGION_MAXB` (default 2048): bundles live in more
