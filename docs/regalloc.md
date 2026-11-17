@@ -134,6 +134,43 @@ One classifier (aarch64) for both compilers and both modes:
 recorded from the held-out build); copy it from another checkout or
 record it with `PLIRON_CORPUS`.
 
+### Judging a regalloc change against placement
+
+A regalloc change shifts code, which moves loop heads past 16- and 64-byte
+lines: the emitter's loop pads (`nop`s executed on fall-through entries)
+change, and so do cycles. Placement alone moves held-out exact counts by
+up to 1.9% (regex; pulldown-cmark ±0.5%, html-rewriter -0.25..+0.39%),
+all of it `nop`s, and the `varint` kernel by 10% instructions per op.
+
+    harness/placement.py heldout pulldown-cmark,rust-html-rewriter --cand ra:PLIRON_RA2_X=1 --copies 4 --no-cycles
+    harness/placement.py kernels varint --cand ra:PLIRON_RA2_X=1 --copies 4
+
+The held-out table splits the candidate's delta into executed `nop`s and
+real instructions by class (load, store, other, branches) and charges
+both to ELF symbols. The real (non-`nop`) delta is the same in every
+copy, so one copy is enough for it: `--copies 1 --no-cycles` costs two
+builds and two callgrind runs per program. The `ld`/`st` overhead
+`rastat.py dyn` reports does not count `nop`s, so it is placement-free
+already; a total-count claim is not. Timings on this machine at load
+30-100 are noise; kernels use retired instructions and cycles per op at
+a fixed iteration count. Details:
+`history/2026-11-17-native-placement.md`.
+
+**Function tables before 2026-11-17 evening.** Callgrind's `fn=` context
+is not the function that contains an address: on pulldown-cmark it
+charged 10.1% of our executed instructions and 11.6% of LLVM's to a
+different function (ours: `FirstPass::parse_block` 5.06M by `fn=`, 8.06M
+by symbol; `HtmlWriter::run` 0.35M vs 2.34M; `item_to_event` 3.66M vs
+2.70M). `irdiff.py`'s function table read `fn=` until this change; it now
+charges by ELF symbol (`harness/elftext.py`), and its source-line table
+was never affected. So per-function figures from `irdiff.py` taken
+before this (the PARITY notes that cite "`<function>` +N" from exact
+counts, e.g. WIDE128's `parse_block` +29.8k, now +31.9k by symbol) may
+have charged a share of each delta to the wrong function; recheck one
+before acting on it. `rastat.py dyn` already charged by llvm-objdump's
+function ranges and used `fn=` only for the load offset (now 0 when the
+addresses are the binary's own); its tables stand.
+
 ### Dynamic baseline (main at d74c3554 + the harness, 2026-11-17)
 
 Executed instructions, callgrind, aarch64-unknown-linux-musl, both sides

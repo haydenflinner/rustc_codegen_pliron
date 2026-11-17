@@ -60,7 +60,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 HELD = os.path.join(ROOT, "bench", "heldout")
 PHASES = [0, 36, 24, 12, 48, 20, 56, 44]
-CLASSES = ["nop", "jump", "cbranch", "call", "ret", "load", "store", "other"]
 
 
 def load(path, name):
@@ -71,82 +70,14 @@ def load(path, name):
 
 
 run = load(os.path.join(HELD, "run.py"), "run")
+elftext = load(os.path.join(HERE, "elftext.py"), "elftext")
+CLASSES, klass, Text = elftext.CLASSES, elftext.klass, elftext.Text
 OUT = os.path.join(ROOT, "target", "placement")
 DYLIB = os.path.join(ROOT, "target", "release", run.DYLIB)
 
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
-
-
-# --------------------------------------------------------------------------
-# Instruction classes from the aarch64 encoding.
-
-def klass(w):
-    if w == 0xD503201F:
-        return "nop"
-    top6 = w & 0xFC000000
-    if top6 == 0x14000000:
-        return "jump"  # b
-    if top6 == 0x94000000:
-        return "call"  # bl
-    if (w & 0xFF000010) == 0x54000000 or (w & 0x7E000000) in (0x34000000, 0x36000000):
-        return "cbranch"  # b.cond, cbz/cbnz, tbz/tbnz
-    if (w & 0xFE000000) == 0xD6000000:  # branch to register
-        opc = (w >> 21) & 0xF
-        return {0: "jump", 1: "call", 2: "ret"}.get(opc, "other")
-    if (w & 0x0A000000) == 0x08000000:  # loads and stores
-        if (w & 0x3B000000) == 0x18000000:
-            return "load"  # ldr literal
-        return "load" if w & (1 << 22) else "store"
-    return "other"
-
-
-def elf_read(path):
-    """(executable sections [(address, bytes)], function symbols sorted
-    [(address, size, name)]) of an ELF64 LE file."""
-    data = open(path, "rb").read()
-    assert data[:4] == b"\x7fELF" and data[4] == 2 and data[5] == 1, f"{path}: not ELF64 LE"
-    shoff, = struct.unpack_from("<Q", data, 0x28)
-    shentsize, shnum = struct.unpack_from("<HH", data, 0x3A)
-    hdrs = [struct.unpack_from("<IIQQQQII", data, shoff + i * shentsize) for i in range(shnum)]
-    secs, syms = [], []
-    for _, typ, flags, addr, off, size, link, _ in hdrs:
-        if typ == 1 and flags & 0x4:  # PROGBITS, EXECINSTR
-            secs.append((addr, data[off:off + size]))
-        if typ == 2:  # SYMTAB
-            stroff = hdrs[link][4]
-            for o in range(off, off + size, 24):
-                name, info, _, shndx, value, ssize = struct.unpack_from("<IBBHQQ", data, o)
-                if info & 0xF == 2 and shndx and value:  # STT_FUNC, defined
-                    end = data.index(b"\0", stroff + name)
-                    syms.append((value, ssize, data[stroff + name:end].decode(errors="replace")))
-    syms.sort()
-    return secs, syms
-
-
-class Text:
-    """Instruction words and the function symbol of an address. Callgrind's
-    own `fn=` context is not the containing symbol on this code (an address
-    of `HtmlWriter::run` showed up under three other functions), so costs
-    are charged by the ELF symbol table instead."""
-
-    def __init__(self, path):
-        self.secs, self.syms = elf_read(path)
-        self.starts = [s[0] for s in self.syms]
-
-    def sym(self, a):
-        import bisect
-        i = bisect.bisect_right(self.starts, a) - 1
-        if i >= 0 and a < self.syms[i][0] + max(self.syms[i][1], 4):
-            return self.syms[i][2]
-        return "?"
-
-    def word(self, a):
-        for base, b in self.secs:
-            if base <= a < base + len(b) - 3:
-                return struct.unpack_from("<I", b, a - base)[0]
-        return None
 
 
 # --------------------------------------------------------------------------
@@ -172,31 +103,7 @@ def callgrind_summary(prog, exe, out_json):
     if r.returncode != 0 or not os.path.exists(raw):
         sys.exit(f"placement: callgrind failed for {exe}:\n{r.stderr[-2000:]}")
     text = Text(exe)
-    per_addr = collections.Counter()
-    skip = False
-    last = 0
-    for l in open(raw, errors="replace"):
-        c = l[:1]
-        if c.isdigit() or c in "+-*":
-            if skip:
-                skip = False
-                continue
-            p = l.split()
-            if len(p) < 2:
-                continue
-            a = p[0]
-            if a.startswith("+"):
-                addr = last + int(a[1:], 0)
-            elif a.startswith("-"):
-                addr = last - int(a[1:], 0)
-            elif a == "*":
-                addr = last
-            else:
-                addr = int(a, 0)
-            last = addr
-            per_addr[addr] += int(p[1])
-        elif l.startswith("calls="):
-            skip = True
+    per_addr, _ = elftext.callgrind_instr(raw)
     os.remove(raw)
     classes = collections.Counter()
     fns = collections.defaultdict(collections.Counter)

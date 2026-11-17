@@ -401,9 +401,17 @@ def dyn_side(run, irdiff, prog, exe, tag):
     fns = objdump_fns(run, exe)
     # Load offset (static-pie runs at a base valgrind picks): the most common
     # difference between a function's lowest executed address and its symbol.
-    starts = {n: s for n, s, _ in fns}
-    diffs = collections.Counter((fmin[n] - starts[n]) for n in fmin if n in starts)
-    off = diffs.most_common(1)[0][0] if diffs else 0
+    # Offset 0 when the executed addresses are the binary's own (our static
+    # musl builds): callgrind's `fn=` names are not the containing
+    # functions on our code (harness/elftext.py), so they only break ties.
+    addrs = {addr for _, _, insts in fns for addr, *_ in insts}
+    hit = sum(n for a, n in ir.items() if a in addrs)
+    if hit >= 0.99 * sum(ir.values()):
+        off = 0
+    else:
+        starts = {n: s for n, s, _ in fns}
+        diffs = collections.Counter((fmin[n] - starts[n]) for n in fmin if n in starts)
+        off = diffs.most_common(1)[0][0] if diffs else 0
     tot = collections.Counter()
     per = collections.defaultdict(collections.Counter)
     for name, _, insts in fns:

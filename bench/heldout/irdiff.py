@@ -10,8 +10,10 @@ and cannot resolve 1%. This counts. Both compilers build the program
 for `aarch64-unknown-linux-musl` (static; linked with `wild` or
 `rust-lld`, line tables on), and each binary runs once under
 callgrind in a Linux container (docker; the image is built on first
-use). callgrind executes every instruction and charges it to its
-function and, through the line table, to its source line.
+use). callgrind executes every instruction; each executed address is
+charged to the ELF symbol that contains it (not callgrind's `fn=`
+context, which misattributes our code: `harness/elftext.py`) and,
+through the line table, to its source line.
 
 Output: the programs' totals, then
 
@@ -41,6 +43,9 @@ def load(name):
 
 
 run = load("run")
+_spec = importlib.util.spec_from_file_location("elftext", os.path.join(run.ROOT, "harness", "elftext.py"))
+elftext = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(elftext)
 
 
 def linker_flags():
@@ -91,7 +96,9 @@ def ensure_image():
 def callgrind(prog, exe, tag):
     out_dir = os.path.join(run.OUT, "ir-out")
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, f"{prog}.{tag}.callgrind")
+    # `.icallgrind`: per-instruction dumps (older `.callgrind` files have
+    # no addresses and are not reused).
+    out = os.path.join(out_dir, f"{prog}.{tag}.icallgrind")
     if os.path.exists(out):
         # LLVM's binary only changes when cargo relinks it: reuse its counts.
         if tag == "llvm" and os.path.getmtime(out) > os.path.getmtime(exe) and os.path.getsize(out) > 0:
@@ -101,7 +108,7 @@ def callgrind(prog, exe, tag):
            "-v", f"{run.src_dir(prog)}:/src:ro", "-v", f"{os.path.dirname(exe)}:/exe:ro", "-v", f"{out_dir}:/out",
            "-w", "/src", IMAGE,
            "valgrind", "--tool=callgrind", f"--callgrind-out-file=/out/{os.path.basename(out)}",
-           "--dump-line=yes", "--compress-strings=no", "--compress-pos=no",
+           "--dump-instr=yes", "--dump-line=yes", "--compress-strings=no", "--compress-pos=no",
            f"/exe/{os.path.basename(exe)}"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(out):
@@ -129,37 +136,25 @@ def short_path(p):
     return p
 
 
-def parse(path):
-    """callgrind out -> (total, {fn: self Ir}, {(file, line): self Ir})."""
+def parse(path, exe):
+    """callgrind out (`--dump-instr=yes --dump-line=yes`) and its binary ->
+    (total, {fn: self Ir}, {(file, line): self Ir}, {(fn, file, line): self Ir}).
+
+    Functions are the ELF symbols that contain each executed address
+    (`harness/elftext.py`): callgrind's own `fn=` context charged our code
+    to the wrong functions (an address of pulldown-cmark's
+    `HtmlWriter::run` under three other names)."""
+    ir, ls = elftext.callgrind_instr(path)
+    text = elftext.Text(exe)
     fns, lines, by = collections.Counter(), collections.Counter(), collections.Counter()
-    fl = fn = cur = None
-    skip = False
-    for l in open(path, errors="replace"):
-        l = l.rstrip("\n")
-        if not l:
-            continue
-        c = l[0]
-        if c.isdigit() or c in "+-*":
-            if skip:  # the inclusive cost line of a call
-                skip = False
-                continue
-            p = l.split()
-            if len(p) >= 2 and p[0].isdigit():
-                ir = int(p[1])
-                fns[fn] += ir
-                lines[(cur, int(p[0]))] += ir
-                by[(fn, cur, int(p[0]))] += ir
-            continue
-        if l.startswith("fl="):
-            fl = cur = l[3:]
-        elif l.startswith(("fi=", "fe=")):
-            cur = l[3:]
-        elif l.startswith("fn="):
-            fn = l[3:]
-            cur = fl
-        elif l.startswith("calls="):
-            skip = True
-    return sum(fns.values()), fns, lines, by
+    sym = {}
+    for a, n in ir.items():
+        sym[a] = text.sym(a)
+        fns[sym[a]] += n
+    for (a, f, line), n in ls.items():
+        lines[(f, line)] += n
+        by[(sym.get(a, "?"), f, line)] += n
+    return sum(ir.values()), fns, lines, by
 
 
 def norm_fn(n):
@@ -167,6 +162,8 @@ def norm_fn(n):
     n = re.sub(r"\[[0-9a-f]{12,16}\]", "", n)
     n = re.sub(r"::h[0-9a-f]{16}$", "", n)
     n = re.sub(r"'\d+$", "", n)  # callgrind's recursion-level suffix
+    # LLVM's ThinLTO-local symbol suffix (`(.llvm.1516...)` demangled).
+    n = re.sub(r" ?\(?\.llvm\.\d+\)?$", "", n)
     return n
 
 
@@ -189,7 +186,7 @@ def main():
     sides = {}
     for side in ("llvm", "pliron"):
         exe = build(a.prog, binary, side, a.backend, env, a.skip_build, a.tag)
-        sides[side] = parse(callgrind(a.prog, exe, side if side == "llvm" or not a.tag else f"{side}-{a.tag}"))
+        sides[side] = parse(callgrind(a.prog, exe, side if side == "llvm" or not a.tag else f"{side}-{a.tag}"), exe)
     (lt, lf, ll, lb), (pt, pf, pl, pb) = sides["llvm"], sides["pliron"]
     print(f"{a.prog}: instructions llvm {lt / 1e6:.2f}M  pliron {pt / 1e6:.2f}M  x{pt / lt:.3f}  (+{(pt - lt) / 1e6:.2f}M)  exact {lt} {pt}")
     dm = demangle(set(lf) | set(pf))
