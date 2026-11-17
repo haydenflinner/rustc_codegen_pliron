@@ -1609,9 +1609,6 @@ pub fn run(
         // `PLIRON_INLINE_DUPCOST`: copies of each callee inlined into this
         // caller so far.
         let mut copies: FxHashMap<String, usize> = FxHashMap::default();
-        // `PLIRON_INLINE_HOTCAP`: copies of each callee this caller took
-        // only because of the loop-site bonus.
-        let mut hot_copies: FxHashMap<String, usize> = FxHashMap::default();
         // `only` (the devirt-inline pass) restricts which pre-existing
         // callsites may inline; ops this run itself splices in are fair game —
         // e.g. devirt'd `{closure}` exposes `hash_one` inside `reserve_rehash`.
@@ -1645,6 +1642,9 @@ pub fn run(
         for _round in 0..32 {
             let mut sites = Vec::new();
             let mut lean_add: Vec<[usize; 3]> = Vec::new();
+            // `PLIRON_INLINE_HOTCAP`: bonus copies this scan took, folded
+            // into `st.inline_hot_copies` after it.
+            let mut hot_add: FxHashMap<String, usize> = FxHashMap::default();
             let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
             let mut doomed: Option<FxHashSet<Ptr<BasicBlock>>> = None;
             let mut bi = 0;
@@ -1984,7 +1984,10 @@ pub fn run(
                         }
                     } else if hot > 1
                         && ci.ncalls <= 2
-                        && (hot_cap == 0 || hot_copies.get(cs).copied().unwrap_or(0) < hot_cap)
+                        && (hot_cap == 0
+                            || st.inline_hot_copies.get(&(sym.to_string(), cs.to_string())).copied().unwrap_or(0)
+                                + hot_add.get(cs.as_str()).copied().unwrap_or(0)
+                                < hot_cap)
                         && loops
                             .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                             .contains(&b)
@@ -2134,7 +2137,7 @@ pub fn run(
                             *copies.entry(cs.clone()).or_default() += 1;
                         }
                         if hot_cap > 0 && hot_raised && cost > limit {
-                            *hot_copies.entry(cs.clone()).or_default() += 1;
+                            *hot_add.entry(cs.clone()).or_default() += 1;
                         }
                         size += ci.n;
                         // The callee's own discount moves into the caller
@@ -2174,6 +2177,9 @@ pub fn run(
             t0 = std::time::Instant::now();
             if sites.is_empty() {
                 break;
+            }
+            for (cs, k) in hot_add {
+                *st.inline_hot_copies.entry((sym.to_string(), cs)).or_default() += k;
             }
             if !lean_add.is_empty() {
                 let e = st.lean_discount.entry(caller).or_default();

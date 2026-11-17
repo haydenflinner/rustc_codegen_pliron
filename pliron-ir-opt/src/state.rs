@@ -531,6 +531,10 @@ pub struct State {
     /// it as a callee, so inlining a wrapper does not make its caller
     /// look bigger to the callers above (see `inline.rs`, `lean_k`).
     pub lean_discount: rustc_hash::FxHashMap<Ptr<Operation>, [usize; 3]>,
+    /// `PLIRON_INLINE_HOTCAP`: copies of a callee (second) each caller
+    /// (first) took only because of the wasm loop-site bonus, over every
+    /// inliner round of this CGU, so the cap holds across rounds.
+    pub inline_hot_copies: rustc_hash::FxHashMap<(String, String), usize>,
     /// xcgu extra-copy symbols (`xcgu::copies` in lib.rs). Rustc never
     /// reports cross-CGU callers of a local-copy instance, so `dead_fns`
     /// must not strip them: a copy's only callers can be other copies
