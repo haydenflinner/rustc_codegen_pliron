@@ -2913,6 +2913,8 @@ fn s_licm(p: &mut Pipe, an: &mut Analysis) -> usize {
         p.operand_frozen,
         if pliron_cfg::env_is("PLIRON_LICM_NCC", "1") { p.nocap } else { &no_nocap },
         pliron_cfg::env_is("PLIRON_LICM_NASHEL", "1"),
+        // Measured on wasm only (hmget under single-caller inlining).
+        p.target.is_wasm() && pliron_cfg::env_is("PLIRON_LICM_NOPRESS_WASM", "1"),
     );
     // Hoisting can expose `base + iv` adds whose base was loop-internal
     // at indvars time; stepping them into params evicts the base's live

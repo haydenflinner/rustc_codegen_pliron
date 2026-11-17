@@ -69,7 +69,7 @@ fn run(text: &str) -> Function {
         &pliron::cols::ColMap::default(),
         &FxHashMap::default(),
         &FxHashMap::default(),
-        false,
+        false, false,
     );
     let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
     if let Err(e) = cranelift_codegen::verify_function(&f, &flags) {

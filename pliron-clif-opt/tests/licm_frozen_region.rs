@@ -67,7 +67,7 @@ fn promotion_respects_operand_frozen_reads_of_the_same_location() {
         &pliron::cols::ColMap::default(),
         &ofz,
         &FxHashMap::default(),
-        false,
+        false, false,
     );
     let facts = Facts {
         noalias: Some(&noalias),

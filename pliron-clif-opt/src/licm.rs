@@ -386,10 +386,11 @@ fn hoists(
     breg: &FxHashMap<Block, Region>,
     rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
+    gte: &FxHashSet<Inst>,
     pb: Block,
     i: Inst,
 ) -> bool {
-    hoists_inner(func, ps, na, noalias, inv, writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i)
+    hoists_inner(func, ps, na, noalias, inv, writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, gte, pb, i)
         && (!func.dfg.insts[i].opcode().can_load() || pliron_cfg::bisect("licm-load"))
 }
 
@@ -410,6 +411,7 @@ fn hoists_inner(
     breg: &FxHashMap<Block, Region>,
     rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
+    gte: &FxHashSet<Inst>,
     pb: Block,
     i: Inst,
 ) -> bool {
@@ -479,7 +481,11 @@ fn hoists_inner(
     // an enum payload is only valid on that variant's arm). Require the
     // root dereferenceable unconditionally: a stack slot, a symbol or stack
     // base, or a param rustc marked `dereferenceable` covering the access.
-    let safe = match loc.0 {
+    // `PLIRON_LICM_GTE=1`: or the load runs on every entry to the loop
+    // anyway (`guaranteed_loads`), so executing it once on the entry edge
+    // adds no access the program would not make.
+    let safe = gte.contains(&i)
+        || match loc.0 {
         // `ss` is unconditionally dereferenceable only within its own
         // bounds — `ss + wild_offset` (a `notrap` load sits on a path
         // that never runs, so its address arithmetic can point outside
@@ -743,6 +749,55 @@ fn block_pressure(func: &Function, cfg: &ControlFlowGraph) -> Option<FxHashMap<B
     )
 }
 
+/// `PLIRON_LICM_GTE=1`: the `notrap` loads that execute every time the
+/// loop is entered, before anything else can happen. Starting at the
+/// header, follow the straight line of blocks a plain `jump` leads to
+/// inside the loop (never back to the header) and collect loads until the
+/// first instruction that can keep the rest from running: a call (it may
+/// not return, or unwind), a return, a trapping instruction other than a
+/// `notrap` memory access, or a conditional terminator.
+///
+/// Hoisting such a load to the loop's entry edge is not speculation. The
+/// entry edge runs only when the header runs next, so the load would have
+/// executed on the first iteration with the same (loop-invariant)
+/// address, and nothing before it in that iteration could have stopped
+/// it or called out. The value is a separate matter: the caller's clobber
+/// scan still requires no loop write to reach the location. A load
+/// behind any branch (or after a call) inside the loop is not collected:
+/// whether it runs depends on that iteration.
+fn guaranteed_loads(func: &Function, h: Block, body: &FxHashSet<Block>) -> FxHashSet<Inst> {
+    const MAX_CHAIN: usize = 64;
+    let mut out = FxHashSet::default();
+    let mut cur = h;
+    for _ in 0..MAX_CHAIN {
+        for i in func.layout.block_insts(cur) {
+            let op = func.dfg.insts[i].opcode();
+            if op == Opcode::Load && loadfwd::notrap(func, i) {
+                out.insert(i);
+                continue;
+            }
+            if op.is_terminator() {
+                break;
+            }
+            if op.is_call() || op.is_return() || (op.can_trap() && !loadfwd::notrap(func, i)) {
+                return out;
+            }
+        }
+        let Some(t) = func.layout.last_inst(cur) else {
+            return out;
+        };
+        let InstructionData::Jump { destination, .. } = func.dfg.insts[t] else {
+            return out;
+        };
+        let next = destination.block(&func.dfg.value_lists);
+        if next == h || !body.contains(&next) {
+            return out;
+        }
+        cur = next;
+    }
+    out
+}
+
 fn run_loop(
     func: &mut Function,
     ps: &VMap<Value>,
@@ -766,6 +821,8 @@ fn run_loop(
     pe: Option<&loadfwd::ProvEsc>,
     press: &mut Option<Option<FxHashMap<Block, u32>>>,
     regs: (u32, u32),
+    gte_on: bool,
+    press_off: bool,
 ) -> usize {
     let h = la.loop_header(lp);
     // `shel`: the `noalias` entry params whose provenance can't escape
@@ -877,6 +934,12 @@ fn run_loop(
             _ => false,
         }
     };
+    let gte = if gte_on { guaranteed_loads(func, h, &body) } else { FxHashSet::default() };
+    if debug && !gte.is_empty() {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::licm", "licm gte {h:?} of {}: {} loads", func.name, gte.len())
+        };
+    }
     // The loop's memory-writing instructions, for load-hoist checks.
     let writers: Vec<Inst> = body
         .iter()
@@ -947,7 +1010,7 @@ fn run_loop(
     // SmallVec field selects out of its outer loop, and one of its two
     // inner multiply-accumulate loops then spilled its source pointer
     // every iteration.
-    let ip_mode = pliron_cfg::env_get("PLIRON_LICM_INNERPRESS").unwrap_or("0");
+    let ip_mode = if press_off { "0" } else { pliron_cfg::env_get("PLIRON_LICM_INNERPRESS").unwrap_or("0") };
     let inner_uses: Option<FxHashSet<Value>> = matches!(ip_mode, "1" | "2")
         .then(|| {
             let lvl = la.loop_level(h).level();
@@ -1028,7 +1091,8 @@ fn run_loop(
                     spends_room = true;
                 }
                 if hoists(
-                    func, ps, na, noalias, &inv, &writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, pb, i,
+                    func, ps, na, noalias, &inv, &writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, &gte,
+                    pb, i,
                 ) {
                     if debug {
                         if pliron_cfg::tracing_on() {
@@ -1930,9 +1994,14 @@ pub fn run(
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
     nocap: &FxHashMap<(Inst, u32), u64>,
     nashel: bool,
+    // Skip `PLIRON_LICM_INNERPRESS`'s register-pressure cap (the caller
+    // decides: `PLIRON_LICM_NOPRESS_WASM=1` on wasm32, where TurboFan
+    // allocates registers and the native estimate does not apply).
+    press_off: bool,
 ) -> usize {
     let mut la = LoopAnalysis::new();
     let regs = an.regs.unwrap_or((26, 10));
+    let gte_on = crate::env_is("PLIRON_LICM_GTE", "1");
     let mut press: Option<Option<FxHashMap<Block, u32>>> = None;
     let (cfg, dt) = an.cfg_dt(func);
     la.compute(func, cfg, dt);
@@ -2033,7 +2102,7 @@ pub fn run(
             let (cfg, dt) = an.cfg_dt(func);
             run_loop(
                 func, &ps, &stop, noalias, cfg, dt, &la, lp, iso_l, &escapes, deref, scoped_na, nw, nounwind, debug,
-                scoped, breg, rpar, ofz, pe.as_ref(), &mut press, regs,
+                scoped, breg, rpar, ofz, pe.as_ref(), &mut press, regs, gte_on, press_off,
             )
         };
         n += n2;
@@ -2134,6 +2203,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             false,
+            false,
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
@@ -2197,6 +2267,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            false,
             false,
         );
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
@@ -2271,6 +2342,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            false,
             false,
         );
         let blk = |v: Value| {
@@ -2356,6 +2428,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            false,
             false,
         );
         let blk = |v: Value| {
@@ -2447,6 +2520,7 @@ mod tests {
             &pliron::cols::ColMap::default(),
             &FxHashMap::default(),
             &FxHashMap::default(),
+            false,
             false,
         );
         let blk = |v: Value| {
@@ -2542,6 +2616,7 @@ mod tests {
                 &FxHashMap::default(),
                 &FxHashMap::default(),
             false,
+                false,
             );
             let flags =
                 cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
@@ -2638,6 +2713,7 @@ mod tests {
             &FxHashMap::default(),
             &FxHashMap::default(),
             true,
+            false,
         );
         let blk = |v: Value| {
             func.layout
@@ -2739,6 +2815,7 @@ mod tests {
                 &FxHashMap::default(),
                 &FxHashMap::default(),
             true,
+                false,
             );
             func.layout
                 .inst_block(func.dfg.value_def(b).inst().unwrap())
@@ -2829,6 +2906,7 @@ mod tests {
                 &FxHashMap::default(),
                 &FxHashMap::default(),
             true,
+                false,
             );
             func.layout
                 .inst_block(func.dfg.value_def(b).inst().unwrap())
