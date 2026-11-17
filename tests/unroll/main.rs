@@ -98,6 +98,43 @@ fn arith(x: u32) -> u32 {
     a.iter().fold(0, |s, &v| s.rotate_left(7) ^ v)
 }
 
+// nalgebra's small-matrix product (`gemm` -> `gemv` -> `axcpy`, column
+// major): `y = a * x * c + beta * y`, with `beta` tested against zero
+// and `alpha = 1.0`. `PLIRON_FCMPFOLD`, `PLIRON_FMUL1` and
+// `PLIRON_UNROLL2` take it apart into straight-line code (the `optin:unroll`
+// gate job). The NaN and -0.0 operands check the `x * 1.0` fold keeps
+// signs and NaN-ness.
+#[inline(always)]
+fn axcpy(y: &mut [f32], a: f32, x: &[f32], c: f32, beta: f32) {
+    if beta != 0.0 {
+        for i in 0..y.len() {
+            y[i] = a * x[i] * c + beta * y[i];
+        }
+    } else {
+        for i in 0..y.len() {
+            y[i] = a * x[i] * c;
+        }
+    }
+}
+
+#[inline(never)]
+fn gemm23x32(a: &[f32; 6], b: &[f32; 6]) -> [f32; 4] {
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    let mut y = [0.0f32; 4];
+    for j in 0..2 {
+        let col = &mut y[2 * j..2 * j + 2];
+        axcpy(col, alpha, &a[0..2], b[3 * j], beta);
+        for k in 1..3 {
+            axcpy(col, alpha, &a[2 * k..2 * k + 2], b[3 * j + k], 1.0);
+        }
+    }
+    y
+}
+
+fn bits(v: &[f32]) -> Vec<String> {
+    v.iter().map(|f| if f.is_nan() { "nan".to_string() } else { format!("{f:?}") }).collect()
+}
+
 fn main() {
     let mut inp = [0u8; 64];
     for (i, b) in inp.iter_mut().enumerate() {
@@ -116,4 +153,9 @@ fn main() {
     println!("panics {}", panics(black_box(2)));
     println!("opts {}", opts());
     println!("arith {}", arith(black_box(0xdead_beef)));
+    let a = black_box([1.5f32, -2.0, 0.25, 3.0, -0.0, 7.5]);
+    let b = black_box([2.0f32, -1.0, 0.5, -0.0, 4.0, f32::NAN]);
+    println!("gemm {:?}", bits(&gemm23x32(&a, &b)));
+    let c = black_box([-0.0f32, 1.0, f32::INFINITY, -1.0, 2.0, 0.5]);
+    println!("gemm2 {:?}", bits(&gemm23x32(&c, &a)));
 }
