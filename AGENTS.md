@@ -538,6 +538,20 @@ time, memory, code size, stack frames) in ~20 min and writes
   seven unchanged). `PLIRON_WASM_MASKELIM`
   starts its fixpoint's operators at 0 bits (loop-carried carries lose
   their `& 255`); `PLIRON_WASM_MASKELIM_OPT=0` restores the old start.
+- `PLIRON_IVMERGE=1` (opt-in, 2026-11-17, PARITY item 10) — step
+  `ivmerge` after `retest`: loop-header params of one integer type in
+  lockstep (`q = p + D`, `D` invariant, proven by joint induction over
+  linear forms; a `select` the edge decides is its pick) share one
+  register. `q`'s `eq`/`ne` end test becomes `p`'s and folds against
+  `p`'s own; loads/stores take `p + D`, any other use `p + D` at the
+  header top. Taken only when the adds it creates in the loop are at
+  most the ones that die (`Target::post_index`: an aarch64 pointer
+  stepped by its `[p]` access saves nothing; `Target::neg_mem_offset`:
+  no negative wasm offsets). Native `big_cmp` loop 23 -> 15
+  instructions, one end test. Exact counts: pulldown-cmark -0.68%,
+  rust-compression -0.25%, none worse; wasm kernels geomean 0.889 ->
+  0.884 (`parse_only` -5.1% -> -11.3% vs LLVM), module -1.2%; wasm-dsa
+  corpus -0.7% instructions. Tests `pliron-clif-opt/tests/ivmerge.rs`.
 - `PLIRON_PUNROLL_COUNTED_WASM_FNMIN=<insts>` (opt-in, wasm): the
   `COUNTED_WASM` 4-wide unroll skips functions under that many
   instructions, so small counted-loop callees stay under V8's 500-byte

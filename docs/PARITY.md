@@ -1354,6 +1354,34 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    per call in `scan_closing_code_fence`: a peeled first iteration in
    each `scan_ch_repeat` and two compares where LLVM's `subs` serves a
    bounds check and an emptiness test.
+   flt2dec/fmt functions, `strwork` within noise. What was left is the
+   loop shape: `Iterator::cmp_by` over two `Rev` iterators carries two
+   pointer IVs of equal length. (Correction: on wasm `REVCMP` already
+   leaves one end test; the earlier "both ends every limb" came from a
+   `clif-check` run without the facts header. Native, where `REVCMP` is
+   off, kept both tests, a third param with `b`'s previous value and a
+   `select` on `b`'s step.) **`PLIRON_IVMERGE=1`** (opt-in, 2026-11-17,
+   `pliron-clif-opt/src/ivmerge.rs`) drops the second IV late (after
+   `retest`): params `q = p + D` proven by joint induction (linear forms,
+   edge-decided `select`s resolved) are rewritten onto `p`, and `q`'s end
+   test becomes `p`'s and folds. Native `big_cmp` loop 23 -> 15
+   instructions (`ldr w, [a, b - a]`, one test). Measured: native exact
+   counts against the tree with `VRP_SIGNEDEQ` on, pulldown-cmark
+   -354.8k (-0.68%), rust-compression -112.5k (-0.25%), regex -4.2k,
+   blind-sig -3.7k, the rest within 0.001% (allocator/hash noise); a
+   first version lost html-rewriter +41.9k and blind-sig +36.5k because
+   an aarch64 pointer stepped by a post-indexed `[p], #1` access saves
+   nothing when dropped (now `Target::post_index`, and a tie then
+   loses). wasm kernel module 161,468 -> 159,537 B over 30 functions
+   (on wasm `ivrefold` keeps pointer params, so many `p + K` field
+   pointers carried around loops collapse onto one base); timings with
+   `--layouts=5 --perturb=4`: geomean 0.889 -> 0.884, `parse_only`
+   -5.1% -> -11.3%, `sortw` +1.0% -> -0.9%, `hashmap` -2.1% -> -2.6%,
+   `strwork` +2.7% -> +1.3%, no kernel outside its perturbed range.
+   Corpora (`--check`, `PLIRON_VERIFY=full`): all clean; instructions
+   std -36, clcg -27, wasm-bench -846, wasm-dsa -56,399 (-0.7%, 7,215
+   functions). Step time 0.8% of the pipeline on wasm-bench, 0.1% on
+   std. Not done: dsa timing (tree broken), native kernels, x64.
 
 Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
 times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,
