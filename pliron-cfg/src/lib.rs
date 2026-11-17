@@ -83,6 +83,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // wpeep (N9 #2): `block; S; br_if 0; br K; end` -> inverted test and
     // `br_if K-1`. dsa: all 99,871 non-SIMD sites; kernels -3.7 KB.
     "PLIRON_WASM_BOB",
+    // wasm emitter (N2/N9 row 1): drop sets of loop-carried block params
+    // that only ever hold one outer value (`waffle::passes::maxssa::
+    // remove_redundant_param_sets`). dsa -329 KB (loro's MovableListState
+    // apply_diff 109 -> 67 KB), all 19 workloads equal; the kernel
+    // module is byte-identical.
+    "PLIRON_WASM_PARAMSCC",
     // wasm only (each is read behind an `is_like_wasm` / `Pipe::wasm`
     // test; native was not timed). 2026-11-16, `--layouts=3` against
     // the same llvm.wasm: chars_mixed +19.9% -> -1.4%, nbody +5.4% ->
