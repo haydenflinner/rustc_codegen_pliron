@@ -38,6 +38,7 @@ pub(crate) mod postopt;
 pub(crate) mod rehome;
 pub(crate) mod regionsplit;
 pub(crate) mod spillhoist;
+pub(crate) mod hints;
 
 impl<'a, F: Function> Env<'a, F> {
     pub(crate) fn new(func: &'a F, env: &'a MachineEnv, ctx: &'a mut Ctx) -> Self {
@@ -91,6 +92,10 @@ impl<'a, F: Function> Env<'a, F> {
         self.build_liveranges()?;
         self.fixup_multi_fixed_vregs();
         self.merge_vreg_bundles();
+        // PLIRON (`PLIRON_RA2_COPYHINT`): see `ion/hints.rs`.
+        if crate::copyhint_mode() != 0 {
+            self.build_copy_hint_index();
+        }
         self.queue_bundles();
         if trace_enabled!() {
             self.dump_state();

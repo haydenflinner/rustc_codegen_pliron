@@ -563,6 +563,9 @@ pub struct Ctx {
     pub(crate) bp_merge_kind: crate::FxHashMap<u64, u8>,
     /// PLIRON (`PLIRON_RA2_MOVESTATS`): why the last `merge_bundles` failed.
     pub(crate) last_merge_fail: u8,
+    /// PLIRON (`PLIRON_RA2_COPYHINT`): blockparam edges as
+    /// `(to_vreg, from_block, from_vreg)`, sorted (`ion/hints.rs`).
+    pub(crate) bp_by_to: Vec<(u32, u32, u32)>,
 
     pub(crate) allocated_bundle_count: usize,
 
@@ -640,6 +643,7 @@ impl Default for Ctx {
             multi_fixed_reg_fixups: Default::default(),
             bp_merge_kind: Default::default(),
             last_merge_fail: 0,
+            bp_by_to: Vec::new(),
             allocated_bundle_count: Default::default(),
             debug_annotations: Default::default(),
             annotations_enabled: Default::default(),

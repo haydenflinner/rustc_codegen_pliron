@@ -1034,6 +1034,18 @@ impl<'a, F: Function> Env<'a, F> {
         if self.ctx.pregs[hint.index()].is_stack {
             hint = PReg::invalid();
         }
+        // PLIRON (`PLIRON_RA2_COPYHINT`): the register of the heaviest
+        // move neighbour already allocated (`ion/hints.rs`).
+        match crate::copyhint_mode() {
+            1 if hint == PReg::invalid() => hint = self.copy_hint(bundle),
+            2 => {
+                let c = self.copy_hint(bundle);
+                if c != PReg::invalid() {
+                    hint = c;
+                }
+            }
+            _ => {}
+        }
         trace!("process_bundle: bundle {bundle:?} hint {hint:?}");
         explain!("process {}", self.explain_bundle(bundle));
 

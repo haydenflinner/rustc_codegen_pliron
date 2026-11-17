@@ -464,6 +464,22 @@ pub(crate) fn rehome_mode() -> u8 {
     2
 }
 
+/// PLIRON (`PLIRON_RA2_COPYHINT`, default 0): copy hints (`ion/hints.rs`).
+/// `1`: a bundle without a spillset hint takes the register of its
+/// heaviest already-allocated move neighbour as its hint; `2`: the copy
+/// hint also replaces a spillset hint.
+pub(crate) fn copyhint_mode() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COPYHINT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
 /// PLIRON (`PLIRON_RA2_SLOTPAIR`, default on, `=0` off): repack
 /// spill-slot word indices so same-direction spill/reload edits
 /// emitted consecutively land on adjacent slots, letting ISA pair
