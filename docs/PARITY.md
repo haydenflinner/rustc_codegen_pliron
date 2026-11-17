@@ -864,6 +864,23 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
 5. **`contains_rng` +9.5% on wasm** (an honest gap since the `black_box`
    fix: its bounds are no longer constants). Compare with LLVM's wasm and
    TurboFan code for the loop.
+   **2026-11-17:** the loop runs rolled, one `p + 4 == end` test per
+   element (TurboFan: 9 instructions and a branch per element; LLVM
+   interleaves by 2 behind one counted test, 9.5 instructions and half a
+   branch). `punroll` keeps counted loops of unknown length rolled (the
+   native rule), and peels 8 iterations instead. Two opt-in knobs:
+   `PLIRON_PUNROLL_COUNTED_WASM=K` unrolls them K wide on wasm, and
+   `PLIRON_PUNROLL_DWLATCH=1` stops `punroll` keeping a do-while's
+   counting latch test in every copy (it was recorded as a side exit; the
+   group guard already covers copies 0..K-2), without which the unroll
+   gains nothing (K=8: guard plus 8 branches per group). Together at K=4,
+   8 layouts, quiet machine: `contains_rng` +9.7% -> -0.6% against LLVM,
+   `matmul` -25.5% -> -53.9%, `sieve` -3.6% -> -10.2%, geomean 0.927 ->
+   0.892, module -1,011 B; but `strwork` +2.7% -> +5.4% (a placement
+   control moved it +0.7), likely the short `pad`/`do_count_chars`/
+   `pad_integral` loops that lost their peel. Not flippable until
+   `strwork` keeps its time. `DWLATCH` alone leaves the kernel module
+   byte-identical.
 6. **N7, the default hmget +5% / 102 vs 96 TurboFan instructions per
    lookup**: `invparam` splits the lookup loop into two headers (the
    memory base reloads at both), the hash expression has two extra
