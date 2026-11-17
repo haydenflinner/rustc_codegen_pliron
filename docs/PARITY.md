@@ -859,7 +859,7 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    cost that does not count free ops (`inline_cost::spec_cost` is
    native-only), allocas whose loads/stores SROA removes, or constant-trip
    loops at their unrolled size; check hmget/tokenize (no kernel may lose).
-4. **`dims_page` 1.2x** (in progress 2026-11-17; diffuse in the profile): same method; the
+4. **`dims_page` 1.2x** (2026-11-17: the V8 inline-size class, see "Held-out wasm program"; `PLIRON_WASM_SMALLFN=120` landed opt-in for the search-loop half, flip once the dsa row is timed; open: inlining into small callers on wasm): same method; the
    self-time join first.
 5. **`contains_rng` +9.5% on wasm** (an honest gap since the `black_box`
    fix: its bounds are no longer constants). Compare with LLVM's wasm and
