@@ -1282,7 +1282,48 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `drop_glue::<State>` now hits `fanin`), rust-compression's
    `BrotliHistogramCombine` +113k against -21k for the
    `HistogramSelfAddHistogram` it now inlines, blind-sig's
-   `SmallVec::try_reserve` +120k against `try_grow` -115k. Small, real,
+   `SmallVec::try_reserve` +120k against `try_grow` -115k.
+   **The three losses, traced (2026-11-17, inliner trace and remarks,
+   default against 100 + `LASTCALL=20`)** have three causes:
+   (1) regex: a copy in the CGU adds callers to the CGU's own callees.
+   `HashMap<State, u32>::insert` arrives in the CGU of `cached_state`, so
+   `hash_one` has two callers there, loses the single-caller inline into
+   `HashMap::get` and `StateMap::get_ptr` calls it (`get_ptr` 1,701 ->
+   293 ops); `drop_glue::<State>` goes from 2 callers to 19 and hits
+   `fanin`. (2) blind-sig: bottom-up order. A copied `from_iter` first
+   inlines its copied `SmallVec::extend` (57 -> 974 ops) and then stays
+   a call in `clone`, `add`, `div_rem`; `Cloned::fold`, `index_mut` and
+   `clone` show up as calls (+93k, +18k, +27k). (3) rust-compression:
+   regalloc2, not the inliner. `best_idx1`/`best_idx2` are live through
+   the whole function; with `HistogramSelfAddHistogram` inlined (a
+   single-caller copy) their bundles fall to minimal splits
+   (`PLIRON_RA_EXPLAIN`) and the pair-filter loop (`cluster.rs:203-204`)
+   gets `mov x0, x11` and `mov x0, x24` before its compares: two
+   instructions an iteration, +84.5k of the +124k. Two default-off knobs
+   for the first two: `PLIRON_INLINE_XCGU_SOLO=1` (calls in copies,
+   `State::xcgu_made`, do not count for the single-caller and `fanin`
+   rules) and `PLIRON_INLINE_XCGU_LATE=1` (the first inline round leaves
+   copies as they arrived; the copies still called go to the second
+   round). Exact counts at 100 + `LASTCALL=20` against the default:
+
+   | program | +SOLO | +LATE | `LEAF=100`+`LASTCALL=20` |
+   |---|---|---|---|
+   | rust-protobuf | -0.40% | -0.76% | -0.03% |
+   | pulldown-cmark | +0.87% | +6.9% | -0.58% |
+   | regex | -0.07% | +0.34% | -0.08% |
+   | blind-sig | +0.64% | +0.07% | +0.11% |
+   | rust-compression | +1.67% | +1.37% | +0.23% |
+   | rust-json | | | -1.30% |
+   | rust-html-rewriter | | | -0.36% |
+
+   (SOLO counting this CGU's non-owner mono items as copies too gave
+   regex -0.36%, pulldown +0.86%, compression +1.94%.) Neither is a
+   fix: each repairs its own program and costs pulldown-cmark, whose
+   gain needs copies that inline their own callees before going into
+   `parse_block`. No flip candidate, so the native kernels were not
+   timed. The compression loss is in every variant that copies
+   `HistogramSelfAddHistogram`; its fix is regalloc2's split placement
+   (split around the loop, not at every use), a separate item. Small, real,
    per call in `scan_closing_code_fence`: a peeled first iteration in
    each `scan_ch_repeat` and two compares where LLVM's `subs` serves a
    bounds check and an emptiness test.
