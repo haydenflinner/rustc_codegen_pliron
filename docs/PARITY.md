@@ -1359,7 +1359,13 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `parse_block`. No flip candidate, so the native kernels were not
    timed. The compression loss is in every variant that copies
    `HistogramSelfAddHistogram`; its fix is regalloc2's split placement
-   (split around the loop, not at every use), a separate item. Small, real,
+   (split around the loop, not at every use), a separate item.
+   **Answered (2026-11-17): `PLIRON_RA2_REGION=1`** (min-cut region
+   split, `vendor/regalloc2/PLIRON_PATCH.md`). With the copy limit on,
+   compression 44,196,946 -> 42,740,891 and
+   `BrotliHistogramCombine<HistogramLiteral>` 1,914,946 -> 1,777,062: the
+   copy change costs +12k with the region split instead of +101k, so it
+   can be retimed on top of it. Small, real,
    per call in `scan_closing_code_fence`: a peeled first iteration in
    each `scan_ch_repeat` and two compares where LLVM's `subs` serves a
    bounds check and an emptiness test.
