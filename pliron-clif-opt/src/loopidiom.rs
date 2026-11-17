@@ -2712,10 +2712,19 @@ fn plan_dead(
         // loop's header params directly, which the new edge would leave
         // undefined, so the params get bound to the resolved args instead.
         let mut fwd: FxHashMap<Value, Ins> = FxHashMap::default();
+        // `exit_args` must always describe `dest`'s params: a walk that
+        // runs out of budget while still on a forwarder has stepped `dest`
+        // past the block its args were resolved for, so it gives up
+        // instead (`settled`). A chain of more than `MAX_FWD` forwarders
+        // is what an exit looks like with `PLIRON_JUMPTHREAD=0`, which
+        // leaves the forwarders jumpthread would have threaded; it
+        // crashed `apply_dead` (std `from_iter_in_place` on wasm32).
+        const MAX_FWD: usize = 8;
         let mut dest = edge_dest(func, e);
         let mut args = edge_args(func, e);
         let mut exit_args = Vec::new();
-        for _ in 0..8 {
+        let mut settled = false;
+        for _ in 0..MAX_FWD {
             if func.dfg.block_params(dest).len() != args.len() {
                 continue 'exits;
             }
@@ -2727,6 +2736,7 @@ fn plan_dead(
                 };
                 exit_args.push(a);
             }
+            settled = true;
             let mut it = func.layout.block_insts(dest);
             let Some(t) = it.next() else { break };
             if it.next().is_some() {
@@ -2735,6 +2745,7 @@ fn plan_dead(
             if !matches!(func.dfg.insts[t], InstructionData::Jump { .. }) {
                 break;
             }
+            settled = false;
             for (p, a) in func
                 .dfg
                 .block_params(dest)
@@ -2747,6 +2758,9 @@ fn plan_dead(
             let ne = Edge { inst: t, slot: 0 };
             dest = edge_dest(func, ne);
             args = edge_args(func, ne);
+        }
+        if !settled {
+            continue 'exits;
         }
         // No inst reachable from the new edge's dest — without re-entering
         // the loop — may read a loop-internal value: the deleted body no
