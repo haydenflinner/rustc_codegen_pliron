@@ -1335,24 +1335,46 @@ fn split(
         // into the new box) and `Parser::new` kept such slots (STK). The
         // value is the smallest aggregate (bytes) the rule takes: small
         // structs of byte fields (regex's `EmptyFlags`) are cheaper as one
-        // wide copy than as a store per field (`=1`: regex +0.36%).
+        // wide copy than as a store per field (`=1`: regex +0.36%). Every
+        // piece must be written by a direct store: a piece nothing writes
+        // (an enum variant's padding and unused fields) still costs the
+        // split copy a store, where the whole copy moved it for free
+        // (regex's `CompileClass::c_utf8_seq`, 32 bytes, 7 pieces, 4
+        // accesses: +96k executed instructions).
         let out_min: u64 = crate::env_get("PLIRON_SROA_FRAGCOPY_OUT").and_then(|v| v.parse().ok()).unwrap_or(0);
         let built_in_place = || {
             let mut outs = 0;
+            let mut written = vec![false; sl.len()];
             for x in &acc {
                 match x.kind {
-                    Kind::Load | Kind::Store => {}
+                    Kind::Load => {}
+                    Kind::Store => {
+                        if x.flow {
+                            return false;
+                        }
+                        let n = access_ty(ctx, x).map(|t| size_align(ctx, t).0).unwrap_or(size);
+                        for (i, sx) in sl.iter().enumerate() {
+                            if x.off < sx.off + sx.size && sx.off < x.off + n {
+                                written[i] = true;
+                            }
+                        }
+                    }
                     Kind::Copy { dst: false, .. } => outs += 1,
                     _ => return false,
                 }
             }
-            outs == 1
+            outs == 1 && written.iter().all(|&w| w)
         };
-        if whole_copy
-            && frag_copy_stays_whole(size, &pieces, direct, per, word)
-            && !(out_min > 0 && size >= out_min && built_in_place())
-        {
-            return false;
+        if whole_copy && frag_copy_stays_whole(size, &pieces, direct, per, word) {
+            if !(out_min > 0 && size >= out_min && built_in_place()) {
+                return false;
+            }
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::sroa", tracing::Level::DEBUG) {
+                let fop = alloca_fn(ctx, alloca);
+                let name = st.funcs.iter().find(|(_, f)| f.op == fop).map(|(n, _)| n.as_str()).unwrap_or("?");
+                tracing::debug!(target: "pliron::sroa", "sroa: fragcopy-out split {size} B, {} pieces, {direct} direct in {name}",
+                    pieces.len());
+            }
         }
     }
     // `PLIRON_SROA_TAILSPLIT=1`: a pinned-but-unsyncable slice whose pin
