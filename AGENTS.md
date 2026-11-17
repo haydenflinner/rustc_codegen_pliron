@@ -531,8 +531,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   1,329 bytes (LLVM 294) and `memcmp` 602 (LLVM 74), with `=120` they are
   340 and 116. A scratch string-search driver goes from 1.33x to 1.14x
   LLVM's time; the kernel module changes in one cold function.
-- `PLIRON_FCMPFOLD=1`, `PLIRON_FMUL1=1`, `PLIRON_UNROLL2=1` (opt-in,
-  2026-11-17, queue item 2): `fcmp` of two float constants folds (egraph
+- `PLIRON_FCMPFOLD=1`, `PLIRON_FMUL1=1` (opt-in) and `PLIRON_UNROLL2`
+  (default on since the evening of 2026-11-17, PARITY item 9; `=0` off),
+  2026-11-17, queue item 2: `fcmp` of two float constants folds (egraph
   rule and `jumpthread::eval`, so `unroll`'s trip walk decides it),
   `x * 1.0` is `x` (vendored egraph rule), and `unroll2` runs `unroll`
   again after the first `loadfwd`/`egraph` (then `loadfwd`, `slotprom`,
@@ -547,7 +548,7 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_SROA_FRAGWORD=<bytes>` — the word size `PLIRON_SROA_FRAGCOPY`
   counts in; default the pointer width (4 on wasm32 since 2026-11-16,
   `=8` restores the old rule there; native is 8).
-- `PLIRON_SROA_SRETNOSYNC=1` (opt-in) — sroa does not write a split
+- `PLIRON_SROA_SRETNOSYNC` (default on since 2026-11-17, `=0` off) — sroa does not write a split
   temporary back before a call whose only pin on it is its whole
   `sret` argument (the destination is uninitialized when the call
   starts; invokes keep the writeback for their cleanup). An
@@ -562,6 +563,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   parked across the openers. Kernel module -1.5% each, -3.1% together,
   timing unchanged (PARITY item 6; tests `vendor/waffle/tests/
   const_local.rs`, `blk_hoist.rs`).
+- `PLIRON_PUNROLL_DWLATCH` (default on since 2026-11-17, `=0` off) —
+  `punroll` does not keep a do-while's counting latch test in every
+  copy (PARITY items 5 and 9).
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to
@@ -653,7 +657,8 @@ time, memory, code size, stack frames) in ~20 min and writes
   open), `PLIRON_VTRUNC_UZP=1` (aarch64 lane narrowing as `uzp1`; fails
   the `simdshift` stanza when on), `PLIRON_PADJUMP=<n>` (vendored Cranelift: jump over alignment
   pads of `n`+ instructions; unmeasured).
-- `PLIRON_LICM_GTE=1` (opt-in) — licm hoists a `notrap` load that runs
+- `PLIRON_LICM_GTE` (default on everywhere since 2026-11-17, PARITY
+  item 9; `=0` off) — licm hoists a `notrap` load that runs
   on every loop entry (the header's straight line, before any branch,
   call or trapping instruction) without a dereferenceability fact;
   with `PLIRON_INLINE_ONCE=1|3` and `PLIRON_LICM_SLOTPROV=1` (+`NCC` for

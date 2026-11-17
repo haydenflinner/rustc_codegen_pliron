@@ -928,6 +928,41 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    at a time (`PLIRON_LICM_GTE=1`, `PLIRON_LICM_SLOTPROV=1`,
    `PLIRON_INLINE_RECX=1`): exact instruction counts with
    `bench/heldout/irdiff.py` decide.
+   **Done 2026-11-17.** First a binary hash per (program, knob) from
+   `ab.py` builds, to skip knobs that leave a program byte-identical (the
+   whole-process counts of `ab.py` wander by 0.1-0.2% between runs of one
+   binary on these 50-100M-instruction programs, too much for these
+   deltas). Then exact callgrind counts (`irdiff.py`, aarch64-linux-musl)
+   for each changed pair. Noise floor: two builds of the same tree differ
+   by ~200 instructions on regex and rust-json; blind-sig differs by
+   ~20k run to run (random input) and decides nothing. blake3-scalar and
+   rust-protobuf are byte-identical under every knob. Deltas against the
+   default, in instructions:
+
+   | knob | pulldown | regex | compression | html-rewriter | rust-json | blind-sig |
+   |---|---|---|---|---|---|---|
+   | `MEMCPYOPT_SIBARMS=0` (on by default) | **-25.5k** | +1.9k | = | +56.7k | +49.6k | noise |
+   | `LICM_GTE=1` | = | -57.2k | = | = | +115 (noise) | noise |
+   | `LICM_SLOTPROV=1` | = | = | 0 | = | = | = |
+   | `INLINE_RECX=1` | = | -151 | = | -30 | -423 | = |
+   | `FCMPFOLD=1`, `FMUL1=1` | = | = | = | = | = | = |
+   | `UNROLL2=1` | -11.9k | -147 | -7 | -179k | = | = |
+   | `SROA_SRETNOSYNC=1` | -18.8k | -1.0k | = | -12 | -22.4k | noise |
+   | `PUNROLL_DWLATCH=1` | = | -1.2k | -1.7k | = | = | = |
+
+   (`=`: byte-identical binary.) SIBARMS, already on, costs
+   pulldown-cmark 25.5k (+0.05%) and saves html-rewriter 56.7k and
+   rust-json 49.6k: kept on, pulldown-cmark noted. Native kernels
+   (`kernels` bench binary, per-function diff): only `UNROLL2` and
+   `SRETNOSYNC` change kernel code (`varint_postcard` -0.25% and -4.8%
+   retired instructions), the rest none. Flipped on everywhere:
+   `PLIRON_SROA_SRETNOSYNC`, `PLIRON_UNROLL2`, `PLIRON_LICM_GTE` (the
+   `_WASM` spelling still works) and `PLIRON_PUNROLL_DWLATCH`; together
+   pulldown-cmark -30.7k (-0.06%), regex -59.6k (-0.12%), compression
+   -1.7k, html-rewriter -179k (-0.18%), rust-json -22.2k (-0.04%).
+   Left as they are: `LICM_SLOTPROV`, `FCMPFOLD`, `FMUL1` (no native
+   program changes) and `INLINE_RECX` (within noise; its win is code
+   size on recursive `Clone`s, which none of the eight has).
 
 Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
 times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,
