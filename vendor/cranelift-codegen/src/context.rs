@@ -1304,14 +1304,22 @@ impl Context {
     /// it, which then lands in the parameter's register directly. Edges
     /// with the same target and arguments share one block. Loop exits are
     /// `exit_const_sink`'s and already moved.
+    /// `=1` handles `brif` and `br_table`, `=2` `br_table` only.
     fn edge_const_sink(&mut self) {
         use crate::cursor::{Cursor, FuncCursor};
         use crate::ir::{BlockArg, BlockCall, InstBuilder, InstructionData, Opcode, Value};
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_EDGECONST").as_deref() == Ok("1")) {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let mode = *MODE.get_or_init(|| {
+            std::env::var("PLIRON_EDGECONST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        if mode == 0 {
             return;
         }
-        let is_multi = |d: &InstructionData| matches!(d, InstructionData::Brif { .. } | InstructionData::BranchTable { .. });
+        let is_multi = |d: &InstructionData| match d {
+            InstructionData::Brif { .. } => mode == 1,
+            InstructionData::BranchTable { .. } => true,
+            _ => false,
+        };
         // Only worth a pass when some multi-way branch passes a constant.
         let mut cands = Vec::new();
         for b in self.func.layout.blocks() {
