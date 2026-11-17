@@ -96,6 +96,32 @@ pub fn run(func: &mut Function, undef: &[Value]) -> usize {
             }
         }
     }
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    let def_block = |func: &Function, v: Value| -> Option<Block> {
+        match func.dfg.value_def(v) {
+            ValueDef::Result(i, _) => func.layout.inst_block(i),
+            ValueDef::Param(b, _) => Some(b),
+            _ => None,
+        }
+    };
+    // `v` holds the same value as a parameter of `b` on every path only
+    // when `v` dominates `b`; an instruction of `b` itself does not (a
+    // loop's back edge passing a value computed in the header): only
+    // `b`'s other parameters do. A header parameter fed `undef` on entry
+    // and `y` on the back edge is the previous iteration's `y`, not `y`:
+    // it must stay opaque (`many`), or a join of it with the current `y`
+    // would fold.
+    let dominates = |func: &Function, v: Value, b: Block| -> bool {
+        def_block(func, v).is_some_and(|db| {
+            dt.block_dominates(db, b)
+                && (db != b || matches!(func.dfg.value_def(v), ValueDef::Param(..)))
+        })
+    };
+    let pblock = |func: &Function, p: Value| match func.dfg.value_def(p) {
+        ValueDef::Param(b, _) => b,
+        _ => unreachable!(),
+    };
     // Each state change is a step down the lattice or a switch from
     // `One(v)` to `One(q)` after `q` fell to `many`; the budget only
     // guards against a bug.
@@ -126,6 +152,11 @@ pub fn run(func: &mut Function, undef: &[Value]) -> usize {
                 break;
             }
         }
+        if let L::One(v) = s {
+            if !dominates(func, v, pblock(func, p)) {
+                s = L::Many;
+            }
+        }
         if s != st[&p] {
             st.insert(p, s);
             if let Some(us) = users.get(&p) {
@@ -133,15 +164,6 @@ pub fn run(func: &mut Function, undef: &[Value]) -> usize {
             }
         }
     }
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
-    let def_block = |func: &Function, v: Value| -> Option<Block> {
-        match func.dfg.value_def(v) {
-            ValueDef::Result(i, _) => func.layout.inst_block(i),
-            ValueDef::Param(b, _) => Some(b),
-            _ => None,
-        }
-    };
     // (block, index, param, value), checked for dominance.
     let mut rm: Vec<(Block, usize, Value, Value)> = Vec::new();
     for b in func.layout.blocks() {
@@ -150,13 +172,7 @@ pub fn run(func: &mut Function, undef: &[Value]) -> usize {
             if v == p || func.dfg.value_type(v) != func.dfg.value_type(p) {
                 continue;
             }
-            let Some(db) = def_block(func, v) else { continue };
-            // An instruction of `b` itself does not dominate `b`'s
-            // parameters (a loop's back edge passing a value computed in
-            // the header): only `b`'s other parameters do.
-            if !dt.block_dominates(db, b)
-                || (db == b && !matches!(func.dfg.value_def(v), ValueDef::Param(..)))
-            {
+            if !dominates(func, v, b) {
                 continue;
             }
             rm.push((b, k, p, v));

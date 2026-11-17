@@ -159,3 +159,34 @@ fn header_value_does_not_dominate_its_own_param() {
     let (_, n) = run(src, &[2]);
     assert_eq!(n, 0);
 }
+
+/// `prev` starts undefined and then holds the previous iteration's `y`;
+/// a join of `prev` and the current `y` must not become `y` (the lattice
+/// once treated the header parameter as equal to `y`).
+#[test]
+fn previous_iteration_is_not_the_current_value() {
+    let src = "function %f(i64, i64) -> i64 {
+    block0(v0: i64, v1: i64):
+        v2 = iconst.i64 0
+        v3 = iconst.i64 0
+        v20 = iconst.i64 0
+        jump block1(v3, v2, v20)
+    block1(v4: i64, v5: i64, v21: i64):
+        v6 = imul v4, v0
+        v7 = iconst.i64 1
+        v8 = band v4, v7
+        brif v8, block2, block3
+    block2:
+        jump block4(v6)
+    block3:
+        jump block4(v5)
+    block4(v9: i64):
+        v22 = iadd v21, v9
+        v10 = iadd v4, v7
+        v11 = icmp ult v10, v1
+        brif v11, block1(v10, v6, v22), block5
+    block5:
+        return v22
+    }";
+    let _ = run(src, &[2]);
+}
