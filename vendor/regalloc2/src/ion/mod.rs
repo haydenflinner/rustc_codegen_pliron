@@ -67,6 +67,7 @@ impl<'a, F: Function> Env<'a, F> {
         ctx.extra_spillslots_by_class = core::array::from_fn(|_| smallvec![]);
         ctx.preferred_victim_by_class = [PReg::invalid(); 3];
         ctx.multi_fixed_reg_fixups.clear();
+        ctx.bp_merge_kind.clear();
         ctx.allocated_bundle_count = 0;
         ctx.debug_annotations.clear();
         ctx.scratch_bump

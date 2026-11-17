@@ -1268,6 +1268,7 @@ dependencies = [
  "pliron",
  "pliron-cfg",
  "pliron-clif-opt",
+ "regalloc2",
  "rustc-hash",
  "serde_json",
  "target-lexicon",

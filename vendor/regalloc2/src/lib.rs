@@ -374,6 +374,67 @@ pub(crate) fn srcvreg_on() -> bool {
     false
 }
 
+/// PLIRON (`PLIRON_RA2_MOVESTATS=1`, reporting only): every move the
+/// allocator emits, register-to-register and through memory, tallied by
+/// why it exists (`MV_NAMES`, `ion/moves.rs`), each weighted by its
+/// block's frequency relative to the entry (`Function::block_hotness`,
+/// else `8^loop depth`; capped at 512), in thousandths. Read with
+/// `movestats_snapshot`.
+pub(crate) fn movestats_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_MOVESTATS").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// Move kinds of `PLIRON_RA2_MOVESTATS`; index `k` counts reg-reg moves,
+/// `16 + k` moves with a stack side.
+pub const MV_NAMES: [&str; 11] = [
+    "split",       // same vreg, two ranges in one block (not a fixed use)
+    "split-fixed", // same vreg, the new range starts at a fixed-register use
+    "xblock",      // same vreg, different allocations across a block edge
+    "bp-merged",   // blockparam move, param and input merged before splitting
+    "bp-overlap",  // blockparam move, merge refused: live ranges overlap
+    "bp-req",      // blockparam move, merge refused: requirements / pin
+    "bp-other",    // blockparam move, merge refused: complexity, class, pinned
+    "multifixed",  // one vreg in two fixed registers at one instruction
+    "reuse",       // reused-input copy
+    "?",           // scratch / unknown
+    "bp-ovl-br",   // as bp-overlap, the input defined in a block with 2+ successors
+];
+
+/// The `PLIRON_RA2_MOVESTATS` totals: per kind, count and weighted*1000.
+pub static MOVESTATS: [core::sync::atomic::AtomicU64; 64] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 64];
+
+/// Snapshot of `MOVESTATS`: `[kind][0 count, 1 weighted*1000]`, reg-reg
+/// kinds at `0..10`, kinds with a stack side at `16..26`.
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// This thread's weighted*1000 per kind since the last
+    /// `movestats_take_local` (per-function attribution in a driver).
+    pub(crate) static MOVESTATS_TL: core::cell::Cell<[u64; 32]> = const { core::cell::Cell::new([0; 32]) };
+}
+
+/// This thread's `PLIRON_RA2_MOVESTATS` weights (thousandths) per kind
+/// since the last call, and reset them.
+#[cfg(feature = "std")]
+pub fn movestats_take_local() -> [u64; 32] {
+    MOVESTATS_TL.with(|c| c.replace([0; 32]))
+}
+
+pub fn movestats_snapshot() -> [[u64; 2]; 32] {
+    let mut out = [[0u64; 2]; 32];
+    for (k, o) in out.iter_mut().enumerate() {
+        o[0] = MOVESTATS[2 * k].load(core::sync::atomic::Ordering::Relaxed);
+        o[1] = MOVESTATS[2 * k + 1].load(core::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 /// PLIRON (`PLIRON_RA2_POSTOPT_STATS=1`): one `ra2post:` line on stderr
 /// per function the post-pass changed.
 pub(crate) fn postopt_stats() -> bool {

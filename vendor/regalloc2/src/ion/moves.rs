@@ -366,6 +366,22 @@ impl<'a, F: Function> Env<'a, F> {
                             vreg.index()
                         );
                         debug_assert_eq!(range.from.pos(), InstPosition::Before);
+                        inserted_moves.kind = if crate::movestats_on() {
+                            let at = range.from.inst();
+                            let fixed = |u: &crate::ion::data_structures::Use| {
+                                matches!(u.operand.constraint(), OperandConstraint::FixedReg(_))
+                            };
+                            let new_fixed = self.ranges[entry.index]
+                                .uses
+                                .first()
+                                .is_some_and(|u| u.pos.inst() == at && fixed(u));
+                            let old_fixed = self.ranges[prev.index].uses.last().is_some_and(|u| {
+                                (u.pos.inst() == at || u.pos.inst().next() == at) && fixed(u)
+                            });
+                            if new_fixed || old_fixed { 1 } else { 0 }
+                        } else {
+                            0
+                        };
                         inserted_moves.push(
                             range.from,
                             InsertMovePrio::Regular,
@@ -645,6 +661,7 @@ impl<'a, F: Function> Env<'a, F> {
                     );
 
                     let (pos, prio) = choose_move_location(self, dest.from, dest.to);
+                    inserted_moves.kind = 2;
                     inserted_moves.push(pos, prio, src, dest.alloc, vreg);
                 }
             }
@@ -672,6 +689,12 @@ impl<'a, F: Function> Env<'a, F> {
                     Some(&v) if crate::srcvreg_on() => v,
                     _ => dest.to_vreg,
                 };
+                inserted_moves.kind = if crate::movestats_on() {
+                    let key = u64_key(dest.from_block.raw_u32(), dest.to_vreg.raw_u32());
+                    self.ctx.bp_merge_kind.get(&key).copied().unwrap_or(3)
+                } else {
+                    3
+                };
                 inserted_moves.push(pos, prio, *src_alloc, dest.alloc, self.vreg(label));
             }
         }
@@ -691,6 +714,7 @@ impl<'a, F: Function> Env<'a, F> {
                 FixedRegFixupLevel::Initial => InsertMovePrio::MultiFixedRegInitial,
                 FixedRegFixupLevel::Secondary => InsertMovePrio::MultiFixedRegSecondary,
             };
+            inserted_moves.kind = 7;
             inserted_moves.push(fixup.pos, prio, from_alloc, to_alloc, self.vreg(fixup.vreg));
             self.set_alloc(
                 fixup.pos.inst(),
@@ -770,6 +794,7 @@ impl<'a, F: Function> Env<'a, F> {
                             );
                         }
                         let input_operand = self.func.inst_operands(inst)[input_idx];
+                        inserted_moves.kind = 8;
                         inserted_moves.push(
                             ProgPoint::before(inst),
                             InsertMovePrio::ReusedInput,
@@ -788,6 +813,26 @@ impl<'a, F: Function> Env<'a, F> {
         self.output.debug_locations.sort_unstable();
 
         inserted_moves
+    }
+
+    /// PLIRON (`PLIRON_RA2_MOVESTATS`): count one emitted move.
+    fn tally_move(&self, pos: ProgPoint, src: Allocation, dst: Allocation, kind: u8) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let is_reg = |a: Allocation| a.as_reg().is_some_and(|r| !self.pregs[r.index()].is_stack);
+        let block = self.cfginfo.insn_block[pos.inst().index()];
+        let w = match self.func.block_hotness(block) {
+            Some(f) => (f as f64).min(512.0),
+            None => 8f64.powi(self.cfginfo.approx_loop_depth[block.index()].min(3) as i32),
+        };
+        let k = (kind as usize).min(15) + if is_reg(src) && is_reg(dst) { 0 } else { 16 };
+        crate::MOVESTATS[2 * k].fetch_add(1, Relaxed);
+        crate::MOVESTATS[2 * k + 1].fetch_add((w * 1000.0) as u64, Relaxed);
+        #[cfg(feature = "std")]
+        crate::MOVESTATS_TL.with(|c| {
+            let mut a = c.get();
+            a[k] += (w * 1000.0) as u64;
+            c.set(a);
+        });
     }
 
     pub fn resolve_inserted_moves(&mut self, mut inserted_moves: InsertedMoves) -> Edits {
@@ -925,6 +970,11 @@ impl<'a, F: Function> Env<'a, F> {
                     trace!(" {} -> {}", m.from_alloc, m.to_alloc);
                     parallel_moves.add(m.from_alloc, m.to_alloc, Some(m.to_vreg));
                 }
+                // PLIRON (`PLIRON_RA2_MOVESTATS`): kind by destination.
+                let stats = crate::movestats_on();
+                let kind_of = |dst: Allocation| -> u8 {
+                    moves.iter().find(|m| m.to_alloc == dst).map_or(9, |m| m.kind)
+                };
 
                 let resolved = parallel_moves.resolve();
                 let mut scratch_iter = RegTraversalIter::new(
@@ -1012,6 +1062,9 @@ impl<'a, F: Function> Env<'a, F> {
                     let dst = rewrites.get(&dst).cloned().unwrap_or(dst);
                     trace!("  resolved: {} -> {} ({:?})", src, dst, to_vreg);
                     let action = redundant_moves.process_move(src, dst, to_vreg);
+                    if !action.elide && stats {
+                        self.tally_move(pos_prio.pos, src, dst, kind_of(dst));
+                    }
                     if !action.elide {
                         edits.add_for(pos_prio, src, dst, to_vreg);
                     } else {

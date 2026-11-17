@@ -901,6 +901,9 @@ struct CgRow {
     /// and loop-weighted: what coalescing and move resolution leave.
     movs: usize,
     wmov: u64,
+    /// `PLIRON_RA2_MOVESTATS=1`: the allocator's moves by kind, weighted
+    /// by block frequency (`regalloc2::MV_NAMES`; `16 + k` stack side).
+    mv: [u64; 32],
 }
 
 /// Labels gain the CLIF loop depth: `block3: ; block7 depth=2` (a split
@@ -1066,6 +1069,7 @@ fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path, keep_vcode: bool) 
             (row.slots, row.spills) = (slots, spills);
             let depth = |b: &str| depths.get(b).copied().unwrap_or(0);
             score_vcode(&v, &mut row, i64::from(out) + i64::from(slots), &depth);
+            row.mv = regalloc2::movestats_take_local().map(|w| w / 1000);
             if keep_vcode {
                 row.vtext = format!("; frame slots={slots} spills={spills} out={out}\n{}", depth_labels(&v, &depth));
             }
@@ -1121,7 +1125,7 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
             let mut j = serde_json::json!({
                 "file": r.file, "status": r.status, "insts": r.insts, "stack": r.stack,
                 "winsts": r.winsts, "wstack": r.wstack, "slots": r.slots, "spills": r.spills, "wspill": r.wspill,
-                "movs": r.movs, "wmov": r.wmov,
+                "movs": r.movs, "wmov": r.wmov, "mv": r.mv,
             });
             if !r.msg.is_empty() {
                 j["msg"] = r.msg.chars().take(4000).collect::<String>().into();
@@ -1138,6 +1142,17 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
         }
     }
     let bad = rows.iter().filter(|r| r.status != "ok").count();
+    // `PLIRON_RA2_MOVESTATS=1`: the allocator's moves by cause.
+    if std::env::var("PLIRON_RA2_MOVESTATS").as_deref() == Ok("1") {
+        let st = regalloc2::movestats_snapshot();
+        println!("ra2 moves by kind: reg-reg count / weighted | with a stack side count / weighted");
+        for (k, name) in regalloc2::MV_NAMES.iter().enumerate() {
+            let (r, m) = (st[k], st[16 + k]);
+            if r[0] + m[0] > 0 {
+                println!("  {name:12} {:>8} {:>12.0} | {:>8} {:>12.0}", r[0], r[1] as f64 / 1000.0, m[0], m[1] as f64 / 1000.0);
+            }
+        }
+    }
     println!(
         "codegen: {} fns ({bad} failed): insts {} stack {} movs {} | weighted insts {} stack {} spill {} movs {} -> {}",
         rows.len(),

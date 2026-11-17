@@ -56,12 +56,14 @@ impl<'a, F: Function> Env<'a, F> {
         let to_rc = self.spillsets[self.bundles[to].spillset].class;
         if from_rc != to_rc {
             trace!(" -> mismatching reg classes");
+            self.ctx.last_merge_fail = 6;
             return false;
         }
 
         // If either bundle is already assigned (due to a pinned vreg), don't merge.
         if self.bundles[from].allocation.is_some() || self.bundles[to].allocation.is_some() {
             trace!("one of the bundles is already assigned (pinned)");
+            self.ctx.last_merge_fail = 6;
             return false;
         }
 
@@ -108,6 +110,7 @@ impl<'a, F: Function> Env<'a, F> {
                     range_count
                 );
                 // Limit merge complexity.
+                self.ctx.last_merge_fail = 6;
                 return false;
             }
 
@@ -124,6 +127,7 @@ impl<'a, F: Function> Env<'a, F> {
                     ranges_from[idx_from].index,
                     ranges_to[idx_to].index
                 );
+                self.ctx.last_merge_fail = 4;
                 return false;
             }
         }
@@ -138,6 +142,7 @@ impl<'a, F: Function> Env<'a, F> {
         {
             if self.merge_bundle_requirements(from, to).is_err() {
                 trace!(" -> conflicting requirements; aborting merge");
+                self.ctx.last_merge_fail = 5;
                 return false;
             }
         }
@@ -433,12 +438,22 @@ impl<'a, F: Function> Env<'a, F> {
                     _ => 0,
                 }
             };
+            // Modes 4 and 5: by the edge's block frequency (`hot_bonus`,
+            // quantized to a factor of 2) instead of the loop depth; 4
+            // breaks ties shortest range first.
+            let hot = &self.ctx.cfginfo.hot_bonus;
             order.sort_by_key(|&i| {
                 let o = &self.blockparam_outs[i];
                 let d = ::core::cmp::Reverse(depth[o.from_block.index()]);
                 match md {
                     1 => (d, 0i64),
                     2 => (d, span(o.from_vreg) as i64),
+                    4 | 5 => {
+                        let h = hot.get(o.from_block.index()).copied().unwrap_or(1.0).max(1.0);
+                        let q = ::core::cmp::Reverse(h.log2() as u32);
+                        (q, if md == 4 { span(o.from_vreg) as i64 } else { 0 })
+                    }
+                    6 => (::core::cmp::Reverse(0), span(o.from_vreg) as i64),
                     _ => (d, -(span(o.from_vreg) as i64)),
                 }
             });
@@ -472,10 +487,40 @@ impl<'a, F: Function> Env<'a, F> {
             // merge keeps the edge move, which is cheaper. (A pinned
             // try_call-ret vreg merging into a long param chain is the
             // motivating case — `BrotliCreateHqZopfli...`.)
+            let stats = crate::movestats_on();
             if crate::nopinmerge_on() && self.pin_spread_hurts(from_bundle, to_bundle) {
+                if stats {
+                    let key = crate::ion::data_structures::u64_key(
+                        self.blockparam_outs[i].from_block.raw_u32(),
+                        to_vreg.raw_u32(),
+                    );
+                    self.ctx.bp_merge_kind.insert(key, 5);
+                }
                 continue;
             }
-            self.merge_bundles(from_bundle, to_bundle);
+            if !self.merge_bundles(from_bundle, to_bundle) && stats {
+                let key = crate::ion::data_structures::u64_key(
+                    self.blockparam_outs[i].from_block.raw_u32(),
+                    to_vreg.raw_u32(),
+                );
+                let mut k = self.ctx.last_merge_fail;
+                if k == 4 {
+                    let fb = self.blockparam_outs[i].from_block;
+                    let def_block = self.vregs[from_vreg]
+                        .ranges
+                        .first()
+                        .map(|r| self.ctx.cfginfo.insn_block[r.range.from.inst().index()]);
+                    let edge_pred = match self.func.block_preds(fb) {
+                        &[p] if self.func.block_succs(fb).len() == 1 => Some(p),
+                        _ => None,
+                    };
+                    let src = if def_block == Some(fb) { Some(fb) } else { edge_pred.filter(|&p| Some(p) == def_block) };
+                    if src.is_some_and(|b| self.func.block_succs(b).len() >= 2) {
+                        k = 10;
+                    }
+                }
+                self.ctx.bp_merge_kind.insert(key, k);
+            }
         }
 
         trace!("done merging bundles");

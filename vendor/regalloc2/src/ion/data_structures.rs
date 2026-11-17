@@ -558,6 +558,11 @@ pub struct Ctx {
     // will insert a copy from wherever the VReg's primary allocation
     // was to the appropriate PReg.
     pub(crate) multi_fixed_reg_fixups: Vec<MultiFixedRegFixup>,
+    /// PLIRON (`PLIRON_RA2_MOVESTATS`): per blockparam edge
+    /// (`u64_key(from_block, to_vreg)`), why its merge failed (kind).
+    pub(crate) bp_merge_kind: crate::FxHashMap<u64, u8>,
+    /// PLIRON (`PLIRON_RA2_MOVESTATS`): why the last `merge_bundles` failed.
+    pub(crate) last_merge_fail: u8,
 
     pub(crate) allocated_bundle_count: usize,
 
@@ -633,6 +638,8 @@ impl Default for Ctx {
             extra_spillslots_by_class: Default::default(),
             preferred_victim_by_class: Default::default(),
             multi_fixed_reg_fixups: Default::default(),
+            bp_merge_kind: Default::default(),
+            last_merge_fail: 0,
             allocated_bundle_count: Default::default(),
             debug_annotations: Default::default(),
             annotations_enabled: Default::default(),
@@ -845,6 +852,8 @@ pub struct InsertedMove {
     pub from_alloc: Allocation,
     pub to_alloc: Allocation,
     pub to_vreg: VReg,
+    /// PLIRON (`PLIRON_RA2_MOVESTATS`): why the move exists (`MV_NAMES`).
+    pub kind: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -860,6 +869,8 @@ pub enum InsertMovePrio {
 #[derive(Debug, Default)]
 pub struct InsertedMoves {
     pub moves: Vec<InsertedMove>,
+    /// PLIRON (`PLIRON_RA2_MOVESTATS`): the kind `push` records.
+    pub kind: u8,
 }
 
 impl InsertedMoves {
@@ -897,6 +908,7 @@ impl InsertedMoves {
             from_alloc,
             to_alloc,
             to_vreg,
+            kind: self.kind,
         });
     }
 }
