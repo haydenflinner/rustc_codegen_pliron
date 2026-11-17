@@ -498,15 +498,20 @@ def counters(exe, kernel, n):
     return (int(ins.group(1)) if ins else 0), (int(cyc.group(1)) if cyc else 0)
 
 
-def per_op(exe, kernel, n, tries):
-    """Instructions and cycles per op at a fixed iteration count:
+def per_op(exes, cells, kernel, n, tries):
+    """{cell: (instructions, cycles) per op} at a fixed iteration count:
     (X(2N) - X(N)) / N, the smallest of `tries` runs of each (setup and a
-    loaded machine only ever add). Counters, not wall time: a core's
-    cycles while the process runs barely move with the machine's load."""
-    a = [counters(exe, kernel, n) for _ in range(tries)]
-    b = [counters(exe, kernel, 2 * n) for _ in range(tries)]
-    return ((min(x[0] for x in b) - min(x[0] for x in a)) / n,
-            (min(x[1] for x in b) - min(x[1] for x in a)) / n)
+    loaded machine only ever add). The cells run interleaved, order
+    flipped every round, so a load drift hits every side alike. Counters,
+    not wall time: retired instructions do not move with the machine's
+    load; cycles move much less than wall time, but still do."""
+    a, b = collections.defaultdict(list), collections.defaultdict(list)
+    for r in range(tries):
+        for c in (cells if r % 2 == 0 else cells[::-1]):
+            a[c].append(counters(exes[c], kernel, n))
+            b[c].append(counters(exes[c], kernel, 2 * n))
+    return {c: ((min(x[0] for x in b[c]) - min(x[0] for x in a[c])) / n,
+                (min(x[1] for x in b[c]) - min(x[1] for x in a[c])) / n) for c in cells}
 
 
 STAT = {"min": min, "median": statistics.median}
@@ -540,9 +545,10 @@ def kernels(a):
                     wall[cell][k].append(ns)
     out = {}
     for k in sorted(rough):
-        # N ~ 0.1 s of work per run at the rough speed.
-        n = max(1, int(0.1e9 / max(rough[k], 1.0)))
-        po = {c: per_op(exes[c], k, n, a.tries) for c in cells}
+        # N ~ 0.1 s of work per run at the rough speed, at least 2 (a
+        # process's setup moves ~1M instructions: noise at N = 1).
+        n = max(2, int(0.1e9 / max(rough[k], 1.0)))
+        po = per_op(exes, cells, k, n, a.tries)
         bi = [po[("base", i)][0] for i in range(len(phases))]
         bc = [po[("base", i)][1] for i in range(len(phases))]
         print(f"\n{k}: per op (N={n}): instructions {bi[0]:.0f}, base range {rng(bi, statistics.median(bi))};"
