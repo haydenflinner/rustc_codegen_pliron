@@ -145,6 +145,15 @@ impl Target {
         matches!(self.arch, Arch::Aarch64 | Arch::X86_64)
     }
 
+    /// A load or store may carry a negative immediate offset. False on
+    /// wasm32: the memarg offset is unsigned and added without wrapping,
+    /// so the emitter would turn `p-4` into `p+0xffff_fffc`. Uses:
+    /// `ivmerge` (a rebased address folds its constant into the offset
+    /// only when the result is allowed).
+    pub const fn neg_mem_offset(&self) -> bool {
+        !self.is_wasm()
+    }
+
     /// (allocatable, callee-saved) integer registers, for register
     /// pressure estimates (licm's `PLIRON_LICM_INNERPRESS=2`). `None` on
     /// wasm32, which has no register file of ours.

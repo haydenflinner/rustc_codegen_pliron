@@ -82,20 +82,23 @@ fn sext(x: i64, bits: u32) -> i64 {
     }
 }
 
-/// The address-mode facts the cost rule needs.
+/// The address-mode facts the rewrite and its cost rule need.
 #[derive(Clone, Copy)]
 pub struct Amode {
     /// `[base + index]` exists (aarch64, x64; not wasm).
     pub reg_reg: bool,
     /// `[base + index + disp]` exists (x64).
     pub reg_reg_disp: bool,
+    /// A load/store offset may be negative (not wasm).
+    pub neg_off: bool,
 }
 
 impl Amode {
     pub fn of(t: &crate::target::Target) -> Amode {
         Amode {
-            reg_reg: !t.is_wasm(),
+            reg_reg: t.amode_scale(),
             reg_reg_disp: t.is_x64(),
+            neg_off: t.neg_mem_offset(),
         }
     }
 }
@@ -146,8 +149,15 @@ impl Cx<'_> {
                     (Some(k), None) => l(args[1]).scale(k),
                     _ => Lin::leaf(v),
                 },
+                // CLIF masks the shift amount by the width: only an amount
+                // below it is a plain multiply.
                 Opcode::Ishl => match self.iconst(func, args[1]) {
-                    Some(k) if (0..32).contains(&k) => l(args[0]).scale(1i64 << k),
+                    Some(k)
+                        if (0..63).contains(&k)
+                            && (k as u32) < func.dfg.value_type(v).bits() =>
+                    {
+                        l(args[0]).scale(1i64 << k)
+                    }
                     _ => Lin::leaf(v),
                 },
                 _ => Lin::leaf(v),
@@ -448,11 +458,11 @@ impl Ctx<'_, '_> {
                 {
                     let off = i64::from(i32::from(offset)).wrapping_add(k);
                     match i32::try_from(off) {
-                        Ok(o) => {
+                        Ok(o) if o >= 0 || self.am.neg_off => {
                             cost += self.mem_cost(leaves, o);
                             out.push(Use::Mem(ui, o));
                         }
-                        Err(_) => general = true,
+                        _ => general = true,
                     }
                 }
                 InstructionData::Store { args, offset, .. }
@@ -460,11 +470,11 @@ impl Ctx<'_, '_> {
                 {
                     let off = i64::from(i32::from(offset)).wrapping_add(k);
                     match i32::try_from(off) {
-                        Ok(o) => {
+                        Ok(o) if o >= 0 || self.am.neg_off => {
                             cost += self.mem_cost(leaves, o);
                             out.push(Use::Mem(ui, o));
                         }
-                        Err(_) => general = true,
+                        _ => general = true,
                     }
                 }
                 _ => general = true,
@@ -948,6 +958,18 @@ pub fn run(func: &mut Function, an: &mut Analysis, am: Amode) -> usize {
     }
     let CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
     let loops: Vec<Loop> = la.loops().take(MAX_LOOPS).collect();
+    // Candidates need two params of one integer type on a header.
+    let two = |h: Block| {
+        let ps = func.dfg.block_params(h);
+        ps.len() <= MAX_PARAMS
+            && ps.iter().enumerate().any(|(i, &a)| {
+                let t = func.dfg.value_type(a);
+                t.is_int() && ps[i + 1..].iter().any(|&b| func.dfg.value_type(b) == t)
+            })
+    };
+    if !loops.iter().any(|&lp| two(la.loop_header(lp))) {
+        return 0;
+    }
     let mut n = 0;
     let mut applied = 0;
     let mut cmps: Vec<Inst> = Vec::new();

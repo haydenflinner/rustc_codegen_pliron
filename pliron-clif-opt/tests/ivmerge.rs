@@ -25,10 +25,12 @@ fn parse(src: &str) -> Function {
 const AARCH64: Amode = Amode {
     reg_reg: true,
     reg_reg_disp: false,
+    neg_off: true,
 };
 const WASM: Amode = Amode {
     reg_reg: false,
     reg_reg_disp: false,
+    neg_off: false,
 };
 
 fn count(f: &Function, op: Opcode) -> usize {
@@ -289,5 +291,41 @@ fn wasm_cost_rule_keeps_live_step() {
     run(&mut f, &mut Analysis::default(), WASM);
     // The duplicate goes (free), `b` stays.
     assert_eq!(params_of(&f, "block83"), 3, "{}", f.display());
+    same(&before, &f);
+}
+
+fn mem_offsets(f: &Function) -> Vec<i64> {
+    use cranelift_codegen::ir::InstructionData;
+    f.layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .filter_map(|i| match f.dfg.insts[i] {
+            InstructionData::Load { offset, .. } | InstructionData::Store { offset, .. } => {
+                Some(i64::from(offset))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// wasm's memarg offset is unsigned: a rebased address whose folded
+/// constant goes below zero keeps it in the address (the emitter would
+/// read `p+0xffff_fff8`). `b`'s load at `b - 8` is `a + (v1 - v0) + 4 - 8`.
+#[test]
+fn wasm_keeps_offsets_nonnegative() {
+    knob();
+    let src = NATIVE.replace("v490-4\n", "v490-8\n");
+    let before = parse(&src);
+    assert!(mem_offsets(&before).contains(&-8));
+    let mut f = before.clone();
+    run(&mut f, &mut Analysis::default(), WASM);
+    assert_eq!(params_of(&f, "block118"), 2, "{}", f.display());
+    // No negative offset the input did not have (it keeps its `-8`; the
+    // rewrite would have made it `-4`).
+    let neg = |g: &Function| -> Vec<i64> { mem_offsets(g).into_iter().filter(|&o| o < 0).collect() };
+    assert_eq!(neg(&f), neg(&before), "{}", f.display());
+    let mut g = before.clone();
+    run(&mut g, &mut Analysis::default(), AARCH64);
+    assert!(mem_offsets(&g).contains(&-4), "{}", g.display());
     same(&before, &f);
 }
