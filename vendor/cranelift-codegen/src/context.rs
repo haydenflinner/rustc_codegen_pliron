@@ -1438,9 +1438,24 @@ impl Context {
             }
             moved.sort_unstable();
             moved.dedup();
+            // A constant whose every use was an argument of a rewritten
+            // edge is dead; one still passed on an edge left alone (a
+            // target with one predecessor) stays.
+            let mut rewritten: crate::FxHashMap<Value, u32> = crate::FxHashMap::default();
+            for (bc, g) in dests.iter().zip(&slot_group) {
+                if g.is_some() {
+                    for a in bc.args(&self.func.dfg.value_lists) {
+                        if let BlockArg::Value(v) = a {
+                            *rewritten.entry(self.func.dfg.resolve_aliases(v)).or_default() += 1;
+                        }
+                    }
+                }
+            }
             for i in moved {
-                // Every use was an argument of this branch, now rewritten.
-                self.func.layout.remove_inst(i);
+                let v = self.func.dfg.first_result(i);
+                if rewritten.get(&v) == in_args.get(&v) {
+                    self.func.layout.remove_inst(i);
+                }
             }
             n += 1;
         }
