@@ -602,6 +602,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   wasm `i32.load8_u` instead of `i32.load` + `&255`, aarch64 `ldrb`).
   Native exact counts: pulldown-cmark -0.28%, html-rewriter -0.14%,
   protobuf -0.09%, none worse (PARITY item 8).
+- `PLIRON_SHRINKWRAP=1` (opt-in, aarch64; vendored Cranelift) — callee
+  saves and frame allocation move to the nearest closed dominator of the
+  blocks that need them (`VCode::pliron_shrink_wrap`), after a CLIF
+  live-range split at that block (`Context::shrink_split`) that runs only
+  with a non-tail call, a warm early exit and at most
+  `PLIRON_SHRINKWRAP_MAXLIVEIN` (default 3) live-ins
+  (`PLIRON_SHRINKWRAP_LEAF=1` / `_COLD=1` drop the first two rules).
+  `PLIRON_SHRINKWRAP_FNS=lo..hi` limits it to functions whose content
+  hash is in range (bisecting; `PLIRON_SHRINKWRAP_DEBUG` prints hashes).
+  Stanza `shrinkwrap`; PARITY item 10.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

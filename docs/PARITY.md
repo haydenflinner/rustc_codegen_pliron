@@ -1006,6 +1006,37 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    Left as they are: `LICM_SLOTPROV`, `FCMPFOLD`, `FMUL1` (no native
    program changes) and `INLINE_RECX` (within noise; its win is code
    size on recursive `Clone`s, which none of the eight has).
+10. **Native: the largest remaining gaps, rust-html-rewriter first**
+   (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
+   rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
+   blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
+   `LDNARROW`). `asmvs` on html-rewriter: the gap is spread over many
+   lines; by class, constants +18% of the sampled gap, explicit stack
+   slots +27% (`slot-load`/`slot-store`), stack loads +13%, spills +15%.
+   The hottest single line was a `Box<dyn Fn>` closure (selector
+   compile, `*actual == local_name`) that saves ten callee-saved
+   registers and allocates its frame before its early exit, every call:
+   LLVM shrink-wraps. **Done (opt-in): `PLIRON_SHRINKWRAP=1`** existed
+   since 2026-10-31 but crashed regex: the save block lost its saves at
+   emission when EDGEHOIST retargeted the branch into it (a save block
+   that is only regalloc moves and a jump), or when edge merging /
+   bare-jump aliasing dropped or aliased it, while the epilogue still
+   restored x19-x24 (`IntervalSet::canonicalize`; stanza `shrinkwrap`,
+   which crashes without the fix). The CLIF live-range split now runs
+   only where it can pay: a call with a value live across it (not a call
+   followed by a return or a trap), an early exit that is not cold, and
+   at most `PLIRON_SHRINKWRAP_MAXLIVEIN` (3) values live into the save
+   block (each is a copy on the save path). Exact counts against the
+   default: html-rewriter -608k (-0.60%), pulldown-cmark -112k (-0.21%),
+   protobuf -45.7k (-0.07%), regex -38k (-0.08%), compression -1.3k,
+   rust-json and blake3 equal, blind-sig within its noise; native
+   kernels: `fib` -9.9% retired instructions (its base case returns
+   before any save), `varint` -0.3%, the rest equal. All eight programs'
+   outputs match. Ready to flip (aarch64 only; x86-64 does not implement
+   it). Open: the constant and stack-slot classes; `try_from(isize)
+   .unwrap_unchecked()` (memchr's `distance`) leaves `x >= 0 ? x : 0`
+   selects because `LTUNDEF` materializes an undefined slice as 0, so the
+   phi of the value and the undefined one does not fold (LLVM: undef).
 
 Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
 times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,
