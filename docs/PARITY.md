@@ -837,6 +837,28 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   functions had edge-copy runs of 32+ copies (878 KB) before
   `f4cf460`; count again after it. `peepdiff` and the gate's wasm leg
   check the output.
+  **Done 2026-11-16 (three `vendor/waffle` patches, `PLIRON_PATCH.md`).**
+  dsa at `fad51e94`, against main's defaults (34,293,484 B of code),
+  each alone, all 19 workloads equal on each:
+  (1) shared `br_table` edge blocks (`PLIRON_WASM_BRTAB_SHARE=1`,
+  opt-in): -528,900 B (`Compiler::compile` 48,775 -> 40,651); kernels
+  -462 B (strwork, tokenize, `fmt::pad_formatted_parts`), so it waits
+  for a quiet-machine timing. (2) cut-block aliases in the reducifier's
+  max-SSA plus removal of strongly connected sets of parameters that
+  carry one value (`PLIRON_WASM_MAXSSA_CUTALIAS`, default on, `=0` off):
+  -56,915 B, kernel module identical. The rule: a cut block's parameter
+  can be an alias when every edge passes one value defined outside the
+  blocks the reducifier may copy (blocks whose header set meets an
+  irreducible header); with the exact set of copied blocks instead
+  (more aliases) `compile` under `PLIRON_REDUCIBLE=0` grew 299,624 ->
+  350,760 B, because longer outer live ranges force more edge copies, so
+  the superset stays. (3) the same parameter-set removal on every body
+  in the emitter (`PLIRON_WASM_PARAMSCC`, default on): -329,027 B
+  (loro's `MovableListState::apply_diff` 109,331 -> 67,117), kernel
+  module identical. `mimas-compile` alone with `PLIRON_REDUCIBLE=0`
+  (forced irreducible): `compile` 306,050 B; (2) 299,624; (1) 168,372;
+  both 160,639 (49,474 reducible). The rest of N9 row 1 is not
+  parameters that carry one value: in the kernels there are none.
 - **N3. Byte peepholes on bodies with SIMD.** `wpeep`'s decoder gives up
   on any `0xfd`-prefixed opcode, so a body containing one `v128.load`
   gets no peepholes at all. The emitter lowers a 24-byte constant copy
