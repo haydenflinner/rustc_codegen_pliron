@@ -135,6 +135,7 @@ pub fn check(t: TestCase) {
     check_idom_violations(&idom[..], &t.path);
 }
 
+#[cfg(feature = "fuzzing")]
 #[test]
 fn smoke() {
     arbtest::arbtest(|u| {

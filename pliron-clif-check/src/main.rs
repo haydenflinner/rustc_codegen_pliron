@@ -22,7 +22,13 @@
 //!                                          each Nth file of the sorted list;
 //!                                          PLIRON_VERIFY=full: the verifier
 //!                                          after every step, a failure is a
-//!                                          `panic` row naming the step)
+//!                                          `panic` row naming the step;
+//!                                          PLIRON_RA_CHECK=1: regalloc2's
+//!                                          checker, a failure is a `racheck`
+//!                                          row; --offset K: the --every
+//!                                          sample from file K; --vcode FILE: every fn's
+//!                                          vcode with depth labels, for
+//!                                          harness/rastat.py)
 //!   clif-check steps                       list step names
 //!   clif-check xcorpus <dirA> <dirB> <out.json>
 //!                                          the IR passes, by ablation: A is a
@@ -59,12 +65,18 @@ struct Opts {
     limit: usize,
     /// `report`/`codegen`: every Nth file (a deterministic sample of a big corpus).
     every: usize,
+    /// `codegen --offset K`: the sample starts at the Kth file (rotating
+    /// samples, harness/rafuzz.py).
+    offset: usize,
     /// `xcorpus`/`xpair`: also compare A with the pipeline's output for B.
     pipeline: bool,
     /// `xcorpus`: only symbols containing this.
     only: Option<String>,
     /// `--trials` or `PLIRON_DIFFCHECK_TRIALS` was given.
     trials_given: bool,
+    /// `codegen --vcode FILE`: write each function's vcode, labels with
+    /// loop depths, as `== <file>` sections.
+    vcode_out: Option<PathBuf>,
 }
 
 #[global_allocator]
@@ -99,9 +111,11 @@ fn main() -> ExitCode {
         jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
         limit: usize::MAX,
         every: 1,
+        offset: 0,
         pipeline: false,
         only: None,
         trials_given: std::env::var_os("PLIRON_DIFFCHECK_TRIALS").is_some(),
+        vcode_out: None,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -122,8 +136,10 @@ fn main() -> ExitCode {
             "--jobs" => opts.jobs = num().max(1) as usize,
             "--limit" => opts.limit = num() as usize,
             "--every" => opts.every = num().max(1) as usize,
+            "--offset" => opts.offset = num() as usize,
             "--pipeline" => opts.pipeline = true,
             "--fn" => opts.only = Some(it.next().expect("substring after --fn").clone()),
+            "--vcode" => opts.vcode_out = Some(PathBuf::from(it.next().expect("file after --vcode"))),
             _ => pos.push(a.clone()),
         }
     }
@@ -206,16 +222,7 @@ fn main() -> ExitCode {
             let depth = |b: &str| {
                 ctx.func.layout.blocks().find(|x| x.to_string() == b).map_or(0, |x| la.loop_level(x).level())
             };
-            // Labels gain the CLIF loop depth: `block3: ; block7 depth=2`.
-            for l in v.lines() {
-                match l.split_once("; ") {
-                    Some((h, c)) if h.trim_start().starts_with("block") => {
-                        let d = c.split("->").map(|b| depth(b.trim())).max().unwrap_or(0);
-                        println!("{h}; {c} depth={d}");
-                    }
-                    _ => println!("{l}"),
-                }
-            }
+            print!("{}", depth_labels(&v, &|b| depth(b) as u32));
             true
         }
         ["bench", dir] => bench_corpus(&*isa, Path::new(dir), 1),
@@ -225,7 +232,7 @@ fn main() -> ExitCode {
                 "{}",
                 include_str!("main.rs")
                     .lines()
-                    .take(28)
+                    .take(34)
                     .collect::<Vec<_>>()
                     .join("\n")
             );
@@ -874,6 +881,37 @@ struct CgRow {
     /// Loop-weighted stack accesses into spill slots (the rest of `wstack`
     /// is explicit stack slots: locals kept in memory).
     wspill: u64,
+    /// A failed row: the panic or compile error.
+    msg: String,
+    /// `--vcode`: the allocated vcode with depth labels.
+    vtext: String,
+}
+
+/// Labels gain the CLIF loop depth: `block3: ; block7 depth=2` (a split
+/// critical edge `a->b` takes the deeper end).
+fn depth_labels(v: &str, depth: &dyn Fn(&str) -> u32) -> String {
+    let mut out = String::with_capacity(v.len() + v.len() / 8);
+    for l in v.lines() {
+        match l.split_once("; ") {
+            Some((h, c)) if h.trim_start().starts_with("block") => {
+                let d = c.split("->").map(|b| depth(b.trim())).max().unwrap_or(0);
+                out.push_str(&format!("{h}; {c} depth={d}\n"));
+            }
+            _ => {
+                out.push_str(l);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// The text of a caught panic.
+fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "non-string panic".into())
 }
 
 /// The backend's Cranelift flags for aarch64-apple-darwin (`src/lib.rs`).
@@ -887,6 +925,11 @@ fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
     // `PLIRON_RA_ALGO=single_pass`: Cranelift's other allocator, to compare.
     if let Ok(a) = std::env::var("PLIRON_RA_ALGO") {
         fb.set("regalloc_algorithm", &a).unwrap();
+    }
+    // `PLIRON_RA_CHECK=1`: regalloc2's symbolic checker on every function,
+    // as the backend sets it (`src/lib.rs`).
+    if pliron_cfg::env_is("PLIRON_RA_CHECK", "1") {
+        fb.set("regalloc_checker", "true").unwrap();
     }
     let flags = cranelift_codegen::settings::Flags::new(fb);
     cranelift_codegen::isa::lookup_by_name("aarch64-apple-darwin")
@@ -940,7 +983,7 @@ fn score_vcode(v: &str, row: &mut CgRow, spill_from: i64, depth_of: &dyn Fn(&str
     }
 }
 
-fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path) -> CgRow {
+fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path, keep_vcode: bool) -> CgRow {
     let mut row = CgRow { file: file.strip_prefix(root).unwrap_or(file).display().to_string(), status: "ok", ..Default::default() };
     let loaded = std::fs::read_to_string(file).ok().and_then(|text| {
         let mut fs = cranelift_reader::parse_functions(&text).ok()?;
@@ -961,9 +1004,10 @@ fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path) -> CgRow {
         });
         let mut ctx = Context::for_function(after);
         ctx.set_disasm(true);
-        let v = ctx.compile(isa, &mut cranelift_codegen::control::ControlPlane::default())
-            .ok()
-            .and_then(|c| c.vcode.clone())?;
+        let v = match ctx.compile(isa, &mut cranelift_codegen::control::ControlPlane::default()) {
+            Ok(c) => c.vcode.clone().unwrap_or_default(),
+            Err(e) => return Err(format!("{:?}", e.inner)),
+        };
         // Loop depth per CLIF block of the function as compiled.
         let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(&ctx.func);
         let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(&ctx.func, &cfg);
@@ -975,16 +1019,29 @@ fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path) -> CgRow {
             .blocks()
             .map(|b| (b.to_string(), la.loop_level(b).level() as u32))
             .collect();
-        Some((v, depths))
+        Ok((v, depths))
     }));
     match r {
-        Ok(Some((v, depths))) => {
+        Ok(Ok((v, depths))) => {
             let [slots, spills, _, out, _] = cranelift_codegen::pliron_last_frame();
             (row.slots, row.spills) = (slots, spills);
-            score_vcode(&v, &mut row, i64::from(out) + i64::from(slots), &|b| depths.get(b).copied().unwrap_or(0));
+            let depth = |b: &str| depths.get(b).copied().unwrap_or(0);
+            score_vcode(&v, &mut row, i64::from(out) + i64::from(slots), &depth);
+            if keep_vcode {
+                row.vtext = format!("; frame slots={slots} spills={spills} out={out}\n{}", depth_labels(&v, &depth));
+            }
         }
-        Ok(None) => row.status = "compile",
-        Err(_) => row.status = "panic",
+        Ok(Err(msg)) => (row.status, row.msg) = ("compile", msg),
+        Err(e) => {
+            row.msg = panic_text(&*e);
+            // The checker's `expect` (machinst/compile.rs) and the
+            // post-allocation one (`PLIRON_RELOADPRE_CHECK`).
+            row.status = if row.msg.contains("register allocation checker") || row.msg.contains("checker errors") {
+                "racheck"
+            } else {
+                "panic"
+            };
+        }
     }
     row
 }
@@ -996,7 +1053,7 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
     collect_clif(dir, &mut files);
     files.sort();
     if o.every > 1 {
-        files = files.into_iter().step_by(o.every).collect();
+        files = files.into_iter().skip(o.offset % o.every).step_by(o.every).collect();
     }
     files.truncate(o.limit);
     std::panic::set_hook(Box::new(|_| {}));
@@ -1007,7 +1064,7 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(f) = files.get(i) else { break };
-                let r = codegen_one(&*isa, dir, f);
+                let r = codegen_one(&*isa, dir, f, o.vcode_out.is_some());
                 rows.lock().unwrap().push(r);
             });
         }
@@ -1020,12 +1077,25 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
         "corpus": dir.display().to_string(),
         "insts": sum(|r| r.insts as u64), "stack": sum(|r| r.stack as u64),
         "winsts": sum(|r| r.winsts), "wstack": sum(|r| r.wstack), "wspill": sum(|r| r.wspill),
-        "functions": rows.iter().map(|r| serde_json::json!({
-            "file": r.file, "status": r.status, "insts": r.insts, "stack": r.stack,
-            "winsts": r.winsts, "wstack": r.wstack, "slots": r.slots, "spills": r.spills, "wspill": r.wspill,
-        })).collect::<Vec<_>>(),
+        "functions": rows.iter().map(|r| {
+            let mut j = serde_json::json!({
+                "file": r.file, "status": r.status, "insts": r.insts, "stack": r.stack,
+                "winsts": r.winsts, "wstack": r.wstack, "slots": r.slots, "spills": r.spills, "wspill": r.wspill,
+            });
+            if !r.msg.is_empty() {
+                j["msg"] = r.msg.chars().take(4000).collect::<String>().into();
+            }
+            j
+        }).collect::<Vec<_>>(),
     });
     std::fs::write(out, serde_json::to_string(&json).unwrap()).expect("write codegen report");
+    if let Some(vp) = &o.vcode_out {
+        use std::io::Write as _;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(vp).expect("create --vcode file"));
+        for r in rows.iter().filter(|r| r.status == "ok") {
+            writeln!(w, "== {}", r.file).and_then(|_| w.write_all(r.vtext.as_bytes())).expect("write --vcode");
+        }
+    }
     let bad = rows.iter().filter(|r| r.status != "ok").count();
     println!(
         "codegen: {} fns ({bad} failed): insts {} stack {} | weighted insts {} stack {} -> {}",

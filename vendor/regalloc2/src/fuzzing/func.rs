@@ -57,9 +57,44 @@ pub struct Func {
     num_vregs: usize,
     reftype_vregs: Vec<VReg>,
     debug_value_labels: Vec<(VReg, Inst, Inst, u32)>,
+    /// PLIRON: answers for the hooks Cranelift implements (`block_hotness`,
+    /// `block_is_cold`, `is_remat`, `no_param_merge`,
+    /// `multi_spillslot_named_by_last_slot`), filled under
+    /// `Options::pliron_hints` so the knobs that read them run.
+    hints: Hints,
+}
+
+/// PLIRON: see `Func::hints`. Empty vectors answer the trait defaults.
+#[derive(Clone, Debug, Default)]
+pub struct Hints {
+    pub hot: Vec<Option<f32>>,
+    pub cold: Vec<bool>,
+    pub remat: Vec<bool>,
+    pub no_merge: Vec<bool>,
+    pub last_slot: bool,
 }
 
 impl Function for Func {
+    fn block_hotness(&self, block: Block) -> Option<f32> {
+        self.hints.hot.get(block.index()).copied().flatten()
+    }
+
+    fn block_is_cold(&self, block: Block) -> bool {
+        self.hints.cold.get(block.index()).copied().unwrap_or(false)
+    }
+
+    fn is_remat(&self, vreg: usize) -> bool {
+        self.hints.remat.get(vreg).copied().unwrap_or(false)
+    }
+
+    fn no_param_merge(&self, block: Block) -> bool {
+        self.hints.no_merge.get(block.index()).copied().unwrap_or(false)
+    }
+
+    fn multi_spillslot_named_by_last_slot(&self) -> bool {
+        self.hints.last_slot
+    }
+
     fn num_insts(&self) -> usize {
         self.insts.len()
     }
@@ -153,6 +188,7 @@ impl FuncBuilder {
                 num_vregs: 0,
                 reftype_vregs: vec![],
                 debug_value_labels: vec![],
+                hints: Hints::default(),
             },
             insts_per_block: vec![],
         }
@@ -315,8 +351,21 @@ fn convert_op_to_fixed(
     op: &mut Operand,
     fixed_early: &mut Vec<PReg>,
     fixed_late: &mut Vec<PReg>,
+    alloc_regs: usize,
 ) -> ArbitraryResult<()> {
-    let fixed_reg = PReg::new(u.int_in_range(0..=62)?, op.class());
+    // PLIRON: with fewer allocatable registers (`Options::alloc_regs`),
+    // a fixed register is one of them or a fixed stack slot (32..=62).
+    let hw = if alloc_regs >= 32 {
+        u.int_in_range(0..=62)?
+    } else {
+        let k = u.int_in_range(0..=(alloc_regs + 30))?;
+        if k < alloc_regs {
+            k
+        } else {
+            32 + (k - alloc_regs)
+        }
+    };
+    let fixed_reg = PReg::new(hw, op.class());
 
     if op.kind() == OperandKind::Def && op.pos() == OperandPos::Early {
         // Early-defs with fixed constraints conflict with
@@ -374,6 +423,12 @@ pub struct Options {
     pub num_uses_per_inst: RangeInclusive<usize>,
     pub num_callsite_ish_vregs_per_inst: RangeInclusive<usize>,
     pub num_clobbers_per_inst: RangeInclusive<usize>,
+    /// PLIRON: fill `Func::hints` (frequencies, cold blocks, remat vregs,
+    /// unmerged block params, slot naming).
+    pub pliron_hints: bool,
+    /// PLIRON: registers 0..alloc_regs are allocatable (32: all of
+    /// `machine_env`); see `machine_env_sized`.
+    pub alloc_regs: usize,
 }
 
 impl Options {
@@ -390,6 +445,8 @@ impl Options {
         num_uses_per_inst: 0..=10,
         num_callsite_ish_vregs_per_inst: 0..=20,
         num_clobbers_per_inst: 0..=10,
+        pliron_hints: false,
+        alloc_regs: 32,
     };
 }
 
@@ -542,7 +599,7 @@ impl Func {
                         // Pick an operand and make it a fixed reg.
                         let i = u.int_in_range(0..=(operands.len() - 1))?;
                         let op = &mut operands[i];
-                        convert_op_to_fixed(u, op, &mut fixed_early, &mut fixed_late)?;
+                        convert_op_to_fixed(u, op, &mut fixed_early, &mut fixed_late, opts.alloc_regs)?;
                     }
 
                     if opts.callsite_ish_constraints && bool::arbitrary(u)? {
@@ -559,7 +616,7 @@ impl Func {
                         // class, so the resulting problem is always
                         // allocatable.
                         for _ in 0..u.int_in_range(opts.num_clobbers_per_inst.clone())? {
-                            let reg = u.int_in_range(0..=30)?;
+                            let reg = u.int_in_range(0..=30.min(opts.alloc_regs - 1))?;
                             let preg = PReg::new(reg, RegClass::arbitrary(u)?);
                             if operands.iter().any(has_fixed_def_with(preg)) {
                                 continue;
@@ -569,7 +626,7 @@ impl Func {
                     }
                 } else if opts.clobbers && bool::arbitrary(u)? {
                     for _ in 0..u.int_in_range(opts.num_clobbers_per_inst.clone())? {
-                        let reg = u.int_in_range(0..=30)?;
+                        let reg = u.int_in_range(0..=30.min(opts.alloc_regs - 1))?;
                         if clobbers.iter().any(|r| r.hw_enc() == reg) {
                             continue;
                         }
@@ -636,6 +693,31 @@ impl Func {
 
         builder.f.debug_value_labels.sort_unstable();
 
+        if opts.pliron_hints {
+            // Frequencies relative to the entry (1.0), positive and finite
+            // as Cranelift's `placement::frequencies` gives them; some
+            // blocks keep `None` (the depth estimate).
+            let mut h = Hints::default();
+            for b in 0..num_blocks {
+                h.hot.push(if b == 0 {
+                    Some(1.0)
+                } else if u.ratio(1, 8)? {
+                    None
+                } else {
+                    let e: i32 = u.int_in_range(-12..=12)?;
+                    let m: u8 = u8::arbitrary(u)?;
+                    Some((1.0 + f32::from(m) / 256.0) * 2f32.powi(e))
+                });
+                h.cold.push(b > 0 && u.ratio(1, 6)?);
+                h.no_merge.push(b > 0 && u.ratio(1, 10)?);
+            }
+            for _ in 0..builder.f.num_vregs {
+                h.remat.push(u.ratio(1, 4)?);
+            }
+            h.last_slot = bool::arbitrary(u)?;
+            builder.f.hints = h;
+        }
+
         Ok(builder.finalize())
     }
 }
@@ -693,6 +775,19 @@ impl core::fmt::Debug for Func {
         write!(f, "}}\n")?;
         Ok(())
     }
+}
+
+/// PLIRON: `machine_env` with `preferred` preferred and `total - preferred`
+/// non-preferred registers per class (registers `total..32` unused), for
+/// functions generated with `Options::alloc_regs = total`.
+pub fn machine_env_sized(preferred: usize, total: usize) -> MachineEnv {
+    let mut env = machine_env();
+    for c in [RegClass::Int, RegClass::Float, RegClass::Vector] {
+        let i = c as usize;
+        env.preferred_regs_by_class[i] = (0..preferred).map(|r| PReg::new(r, c)).collect();
+        env.non_preferred_regs_by_class[i] = (preferred..total).map(|r| PReg::new(r, c)).collect();
+    }
+    env
 }
 
 pub fn machine_env() -> MachineEnv {

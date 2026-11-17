@@ -68,6 +68,7 @@ pub fn check(t: TestCase) {
     });
 }
 
+#[cfg(feature = "fuzzing")]
 #[test]
 fn smoke() {
     arbtest::arbtest(|u| {

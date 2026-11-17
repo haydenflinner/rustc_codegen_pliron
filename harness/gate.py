@@ -28,6 +28,10 @@ Runs, after one `cargo build`:
             CORPUS_SAMPLE_OVER functions (`harness/corpus.sh clcg`:
             cranelift-codegen, ~38k) is sampled, every Nth function, to
             about that many; `--full` replays all of it (~1 min more).
+  rafuzz    harness/rafuzz.py quick (~15 s): fixed regalloc2 fuzz seeds under
+            four knob combinations and the smoke corpus with regalloc2's
+            checker; only when vendor/regalloc2, cranelift's machinst or the
+            fuzzer changed since main (docs/regalloc.md)
 The `wasm` stanza (tests/wasm/run.sh) is OFF by default: it rebuilds core/std
 through the backend for every backend change (~4 min). The default gate runs
 `wasm_smoke` — emit->link->run, ~1 s — instead. `--full` or `--only wasm`
@@ -264,6 +268,10 @@ def main():
         seeds = ",".join(str(s) for s in FUZZ_REGRESS)
         jobs.append(("fuzzreg", lambda: run("fuzzreg", [sys.executable, "-I", "harness/run.py", "--suite", "fuzz",
                                                         "--no-build", "--fuzz-seeds", seeds])))
+    # Register allocation: seconds of seeded fuzzing when it changed.
+    if want("rafuzz"):
+        jobs.append(("rafuzz", lambda: run("rafuzz", [sys.executable, "-I", "harness/rafuzz.py", "quick",
+                                                      "--if-changed", "--clif-check", CLIF_CHECK])))
     cdir = os.path.join(ROOT, "target/corpus")
     for d in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
         if want(f"corpus:{d}"):

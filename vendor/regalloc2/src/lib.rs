@@ -321,7 +321,8 @@ pub use index::{Block, Inst, InstRange};
 
 pub mod checker;
 
-#[cfg(feature = "fuzzing")]
+// PLIRON: `pliron-fuzz` is `fuzzing` without arbtest (tools/rafuzz).
+#[cfg(any(feature = "fuzzing", feature = "pliron-fuzz"))]
 pub mod fuzzing;
 
 #[cfg(feature = "enable-serde")]

@@ -1,0 +1,19 @@
+[package]
+name = "rafuzz"
+version = "0.1.0"
+edition = "2024"
+description = "Seeded fuzz driver: regalloc2's random functions through ion and the checker (harness/rafuzz.py)."
+
+[dependencies]
+regalloc2 = { path = "../../vendor/regalloc2", default-features = false, features = ["std", "pliron-fuzz"] }
+arbitrary = "1.4.2"
+
+# Debug assertions and overflow checks inside regalloc2 are part of the
+# oracle; opt-level 3 keeps a seed around a millisecond.
+[profile.release]
+debug = "line-tables-only"
+debug-assertions = true
+overflow-checks = true
+panic = "unwind"
+
+[workspace]

@@ -58,6 +58,7 @@ pub fn check(t: TestCase) {
     checker.run().expect("checker failed");
 }
 
+#[cfg(feature = "fuzzing")]
 #[test]
 fn smoke() {
     arbtest::arbtest(|u| {

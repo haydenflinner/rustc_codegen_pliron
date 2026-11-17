@@ -39,6 +39,11 @@ fuzzing = [
     "trace-log",
 ]
 std = []
+# PLIRON: the generator and checker without arbtest (tools/rafuzz).
+pliron-fuzz = [
+    "arbitrary",
+    "checker",
+]
 trace-log = []
 
 [lib]

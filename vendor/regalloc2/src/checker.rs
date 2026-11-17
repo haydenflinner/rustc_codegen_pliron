@@ -167,6 +167,18 @@ pub enum CheckerError {
         into: Allocation,
         from: Allocation,
     },
+    /// PLIRON: `Output::edit_vregs` names `vreg` as the value an edit
+    /// moves, but the source holds `actual` (Cranelift rematerializes a
+    /// labelled reload from the label, so a wrong label is a miscompile
+    /// the dataflow check above cannot see).
+    EditVRegMismatch {
+        block: Block,
+        edit: usize,
+        vreg: VReg,
+        from: Allocation,
+        into: Allocation,
+        actual: FxHashSet<VReg>,
+    },
     AllocationOutsideLimit {
         inst: Inst,
         op: Operand,
@@ -516,7 +528,7 @@ impl CheckerState {
                     self.check_val(inst, *op, *alloc, val, allocs, checker)?;
                 }
             }
-            &CheckerInst::Move { into, from } => {
+            &CheckerInst::Move { into, from } | &CheckerInst::LabelledMove { into, from, .. } => {
                 // Ensure that the allocator never returns stack-to-stack moves.
                 let is_stack = |alloc: Allocation| {
                     if let Some(reg) = alloc.as_reg() {
@@ -543,7 +555,7 @@ impl CheckerState {
         self.become_defined();
 
         match checkinst {
-            &CheckerInst::Move { into, from } => {
+            &CheckerInst::Move { into, from } | &CheckerInst::LabelledMove { into, from, .. } => {
                 // Value may not be present if this move is part of
                 // the parallel move resolver's fallback sequence that
                 // saves a victim register elsewhere. (In other words,
@@ -700,6 +712,20 @@ pub(crate) enum CheckerInst {
     /// spillslots).
     Move { into: Allocation, from: Allocation },
 
+    /// PLIRON: an allocator move carrying an `edit_vregs` label: checked
+    /// like `Move`, and the label must name a vreg the source holds.
+    /// Labels that name a block parameter are not checked: a block-param
+    /// move ahead of a branch carries the successor's parameter, and
+    /// Cranelift's reload PRE moves such a reload to the predecessors, two
+    /// edges ahead of the parameter; Cranelift acts only on labels of
+    /// rematerializable vregs, which are instruction results.
+    LabelledMove {
+        into: Allocation,
+        from: Allocation,
+        vreg: VReg,
+        edit: usize,
+    },
+
     /// A parallel move in the original program. Simultaneously moves
     /// from all source vregs to all corresponding dest vregs,
     /// permitting overlap in the src and dest sets and doing all
@@ -771,6 +797,22 @@ impl<'a, F: Function> Checker<'a, F> {
     pub fn prepare(&mut self, out: &Output) {
         trace!("checker: out = {:?}", out);
         let mut last_inst = None;
+        // PLIRON: labels are checked when the output carries one per edit.
+        // `PLIRON_RA_CHECK_LABELS=0` skips them.
+        #[cfg(feature = "std")]
+        let labels_on = std::env::var("PLIRON_RA_CHECK_LABELS").as_deref() != Ok("0");
+        #[cfg(not(feature = "std"))]
+        let labels_on = true;
+        let labelled = labels_on && !out.edits.is_empty() && out.edit_vregs.len() == out.edits.len();
+        let mut params = FxHashSet::default();
+        if labelled {
+            for b in 0..self.f.num_blocks() {
+                params.extend(self.f.block_params(Block::new(b)).iter().copied());
+            }
+        }
+        let base = out.edits.as_ptr() as usize;
+        let stride = core::mem::size_of::<(crate::ProgPoint, Edit)>();
+        let field = core::mem::offset_of!((crate::ProgPoint, Edit), 1);
         for block in 0..self.f.num_blocks() {
             let block = Block::new(block);
             for inst_or_edit in out.block_insts_and_edits(self.f, block) {
@@ -780,10 +822,29 @@ impl<'a, F: Function> Checker<'a, F> {
                         last_inst = Some(inst);
                         self.handle_inst(block, inst, out);
                     }
-                    InstOrEdit::Edit(edit) => self.handle_edit(block, edit),
+                    InstOrEdit::Edit(edit) => {
+                        let idx = (edit as *const Edit as usize - base - field) / stride;
+                        let label = if labelled { out.edit_vregs[idx].filter(|v| !params.contains(v)) } else { None };
+                        match (label, edit) {
+                            (Some(vreg), &Edit::Move { from, to }) => self
+                                .bb_insts
+                                .get_mut(&block)
+                                .unwrap()
+                                .push(CheckerInst::LabelledMove { into: to, from, vreg, edit: idx }),
+                            _ => self.handle_edit(block, edit),
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// PLIRON: does `vreg` name the value of `from` in `state`? `None`:
+    /// the source's value is unknown (paths that disagree, or the
+    /// parallel move resolver's scratch save of an undefined value), not
+    /// checked.
+    fn label_ok(&self, state: &CheckerState, from: Allocation, vreg: VReg) -> Option<bool> {
+        Some(state.get_value(&from)?.vregs()?.contains(&vreg))
     }
 
     /// For each original instruction, create an `Op`.
@@ -915,6 +976,12 @@ impl<'a, F: Function> Checker<'a, F> {
         for (block, input) in &self.bb_in {
             let mut state = input.clone();
             for inst in self.bb_insts.get(block).unwrap() {
+                if let &CheckerInst::LabelledMove { into, from, vreg, edit } = inst {
+                    if self.label_ok(&state, from, vreg) == Some(false) {
+                        let actual = state.get_value(&from).and_then(|v| v.vregs()).cloned().unwrap_or_default();
+                        errors.push(CheckerError::EditVRegMismatch { block: *block, edit, vreg, from, into, actual });
+                    }
+                }
                 if let Err(e) = state.check(InstPosition::Before, inst, self) {
                     trace!("Checker error: {:?}", e);
                     errors.push(e);
@@ -975,7 +1042,7 @@ impl<'a, F: Function> Checker<'a, F> {
                             clobbers
                         );
                     }
-                    &CheckerInst::Move { from, into } => {
+                    &CheckerInst::Move { from, into } | &CheckerInst::LabelledMove { from, into, .. } => {
                         trace!("    {} -> {}", from, into);
                     }
                     &CheckerInst::ParallelMove { .. } => {

@@ -337,3 +337,27 @@ are the same). Mode `1` (regions with an edge to an earlier block only)
 gives about half of it. Compile time: regex-syntax 80.62G -> 80.65G
 retired instructions. Checked with `PLIRON_RA_CHECK=1` on the eight
 held-out programs.
+
+## Fuzzing support (`pliron-fuzz` feature, checker label check)
+
+`Cargo.toml`, `src/lib.rs`: feature `pliron-fuzz` builds the `fuzzing`
+module without `arbtest` (the upstream smoke tests stay behind
+`fuzzing`); `tools/rafuzz` (driven by `harness/rafuzz.py`) uses it.
+`src/fuzzing/func.rs`: `Options::pliron_hints` answers the hooks Cranelift
+implements (`block_hotness`, `block_is_cold`, `is_remat`,
+`no_param_merge`, `multi_spillslot_named_by_last_slot`) with arbitrary
+values, so `PLIRON_RA2_FREQ`, `_COLDSPLIT`, the remat weight and the
+unmerged-parameter path run under the fuzzer; `Options::alloc_regs` with
+`machine_env_sized` allocates with fewer registers (more splitting and
+spilling).
+
+`src/checker.rs`: when `Output::edit_vregs` has one entry per edit, a
+labelled move must move a value its label names (`EditVRegMismatch`).
+Cranelift rematerializes a labelled reload from the label (patch 76
+there), so a wrong label is a miscompile the dataflow check cannot see.
+Labels naming a block parameter are skipped: a block-param move ahead of
+a branch carries the successor's parameter, and Cranelift's reload PRE
+moves such a reload two edges ahead of it; only instruction results are
+rematerializable. `PLIRON_RA_CHECK_LABELS=0` turns the check off. It runs
+wherever the checker runs (`PLIRON_RA_CHECK=1`, `PLIRON_RELOADPRE_CHECK=1`,
+the fuzzer).

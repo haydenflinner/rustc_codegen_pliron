@@ -11,7 +11,9 @@ Usage: harness/quick.py [--tier 0|1] [--base REF] [--jobs N] [--seeds N]
                        its lib tests + the integration tests named after it),
                        and, when a CLIF pass, pliron-cfg or vendor/ changed,
                        corpus replay (`clif-check report --check`: whole CLIF
-                       pipeline + interpreter diff over every recorded function).
+                       pipeline + interpreter diff over every recorded function);
+                       when vendor/regalloc2, cranelift's machinst or the fuzzer
+                       changed, harness/rafuzz.py quick (~15 s, docs/regalloc.md).
   tier 1 (<3 min)      tier 0 + the test.sh stanzas the changed paths select
                        (+ their SM_POISON twins), wasm_smoke, the fuzz regression
                        seeds, and N fresh fuzz seeds from a rolling window
@@ -176,6 +178,12 @@ class Plan:
                     self.add_stanzas(["wasm_smoke"])
                 self.add_stanzas([n for n in self.stanza_all if n.replace("_", "") == d.replace("_", "")])
                 continue
+            if f.startswith(("vendor/regalloc2/", "vendor/cranelift-codegen/src/machinst/", "tools/rafuzz/")) \
+                    or f == "harness/rafuzz.py":
+                # Seeded regalloc fuzzing (docs/regalloc.md), seconds.
+                self.flags.add("rafuzz")
+                if f.startswith(("tools/", "harness/")):
+                    continue
             if f.startswith("harness/wasm/"):
                 # peepdiff.mjs runs inside the wasm smoke stanza.
                 self.add_stanzas(["wasm_smoke"])
@@ -384,7 +392,7 @@ def main():
     print(f"  stanzas  : {','.join(plan.stanzas) or '-'}")
     if plan.unknown:
         print(f"  unmapped (CORE fallback): {', '.join(plan.unknown)}")
-    if not (plan.crates or plan.glue or plan.stanzas or plan.test_sh):
+    if not (plan.crates or plan.glue or plan.stanzas or plan.test_sh or "rafuzz" in plan.flags):
         print("quick: only docs/harness changes; nothing to build. (harness changes: run the script you changed.)")
         return 0
     if a.dry:
@@ -406,6 +414,9 @@ def main():
             jobs.append(("unit:" + c, lambda c=c: R.unit(c)))
     if plan.waffle:
         jobs.append(("unit:waffle", R.waffle_unit))
+    if "rafuzz" in plan.flags:
+        jobs.append(("rafuzz", lambda: R.sh("rafuzz", [sys.executable, "-I", "harness/rafuzz.py", "quick",
+                                                       "--clif-check", R.cc])))
     if plan.clif_opt:
         for name in ("smoke", "std"):
             jobs.append((f"corpus:{name}", lambda n=name: R.corpus(n)))
