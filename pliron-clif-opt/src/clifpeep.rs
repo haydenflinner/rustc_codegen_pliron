@@ -775,6 +775,47 @@ pub fn ldnarrow(func: &mut Function) -> usize {
     n
 }
 
+/// `PLIRON_I128ID=1` (opt-in): identities on 128-bit integers, whose
+/// constants arrive as `iconcat` of two `iconst`s that the egraph does not
+/// see as one constant. `x | 0`, `x ^ 0`, `x + 0`, `x - 0`, `0 + x` and
+/// `0 | x` become `x`, and `x & 0` becomes the zero. foldhash's `u128`
+/// sponge starts at zero (`sponge |= x << len`): lol_html's
+/// `Stack::build_state` kept an `orr` with a zero register on every hash,
+/// and the zero itself live (and spilled) across the whole function. One
+/// pass over the instructions.
+pub fn i128_identities(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            let InstructionData::Binary { opcode, args } = pos.func.dfg.insts[inst] else {
+                continue;
+            };
+            let res = pos.func.dfg.first_result(inst);
+            if pos.func.dfg.value_type(res) != types::I128 {
+                continue;
+            }
+            let z = |v: Value| kval(pos.func, v) == Some(0);
+            let keep = match opcode {
+                Opcode::Bor | Opcode::Bxor | Opcode::Iadd if z(args[1]) => Some(args[0]),
+                Opcode::Bor | Opcode::Bxor | Opcode::Iadd if z(args[0]) => Some(args[1]),
+                Opcode::Isub if z(args[1]) => Some(args[0]),
+                Opcode::Band if z(args[1]) => Some(args[1]),
+                Opcode::Band if z(args[0]) => Some(args[0]),
+                _ => None,
+            };
+            if let Some(v) = keep {
+                let v = pos.func.dfg.resolve_aliases(v);
+                pos.func.dfg.clear_results(inst);
+                pos.remove_inst_and_step_back();
+                pos.func.dfg.change_to_alias(res, v);
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// One i64 value's use in `dem64`'s web.
 #[derive(Clone, Copy)]
 enum Dem64Use {

@@ -2676,6 +2676,16 @@ fn s_slotconst(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// 128-bit integer identities with `iconcat` constants
+// (`clifpeep::i128_identities`), ahead of the egraph.
+fn s_i128id(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = clifpeep::i128_identities(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("i128id");
+    }
+    k
+}
+
 fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     let prof = crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
@@ -5050,6 +5060,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         .needs(shape::MEM)
         .creates_all(),
         cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::STORE),
+        step("i128id", "i128id", Gate::OptIn("PLIRON_I128ID"), s_i128id),
         Step {
             name: "egraph",
             bisect: Some("egraph"),
