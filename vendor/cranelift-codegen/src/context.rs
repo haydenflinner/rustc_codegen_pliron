@@ -238,6 +238,7 @@ impl Context {
             self.const_sink();
             self.exit_const_sink();
             self.edge_const_sink();
+            self.dup_param_elim();
             self.load_remat();
             self.amode_split();
             self.shrink_split();
@@ -1176,6 +1177,118 @@ impl Context {
             self.compute_cfg();
             self.compute_domtree();
             self.compute_loop_analysis();
+        }
+    }
+
+    /// PLIRON (`PLIRON_DUPPARAM=1`, opt-in): two parameters of a block
+    /// that receive the same value on every incoming edge are one value
+    /// (LLVM's duplicate-phi elimination). The egraph proves values equal
+    /// and passes the survivor for each, so a block can end up with
+    /// `block454(v3069, v3071, v3072)` fed `(v2293, v2293, v2293)` on every
+    /// edge (`encoding_rs::mem::check_str_for_latin1_and_bidi`): three
+    /// registers and three moves per edge for one value. A parameter whose
+    /// argument on an edge is the block's own parameter (a loop passing
+    /// both back) counts as equal there when both sides are one of the
+    /// pair. The later parameter becomes an alias of the earlier and its
+    /// arguments are dropped. Edges with exception-payload arguments are
+    /// left alone; at most four rounds.
+    fn dup_param_elim(&mut self) {
+        use crate::ir::{BlockArg, BlockCall, Value};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_DUPPARAM").as_deref() == Ok("1")) {
+            return;
+        }
+        let entry = self.func.layout.entry_block();
+        for _round in 0..4 {
+            // Incoming edges per block: (branch inst, destination index).
+            let mut incoming: crate::FxHashMap<crate::ir::Block, Vec<(crate::ir::Inst, usize)>> =
+                crate::FxHashMap::default();
+            for b in self.func.layout.blocks() {
+                let Some(t) = self.func.layout.last_inst(b) else { continue };
+                let f = &self.func;
+                for (k, bc) in f.dfg.insts[t]
+                    .branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
+                    .iter()
+                    .enumerate()
+                {
+                    let tb = bc.block(&f.dfg.value_lists);
+                    if f.dfg.num_block_params(tb) >= 2 {
+                        incoming.entry(tb).or_default().push((t, k));
+                    }
+                }
+            }
+            let mut changed = false;
+            let mut blocks: Vec<crate::ir::Block> = incoming.keys().copied().collect();
+            blocks.sort_unstable();
+            for b in blocks {
+                if Some(b) == entry {
+                    continue;
+                }
+                let edges = &incoming[&b];
+                let params: Vec<Value> = self.func.dfg.block_params(b).to_vec();
+                let args: Vec<Vec<Option<Value>>> = edges
+                    .iter()
+                    .map(|&(t, k)| {
+                        let f = &self.func;
+                        let bc = f.dfg.insts[t].branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)[k];
+                        bc.args(&f.dfg.value_lists)
+                            .map(|a| match a {
+                                BlockArg::Value(v) => Some(f.dfg.resolve_aliases(v)),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .collect();
+                if args.iter().any(|a| a.len() != params.len()) {
+                    continue;
+                }
+                let mut dead = vec![false; params.len()];
+                let mut repl: Vec<(Value, Value)> = Vec::new();
+                for i in 0..params.len() {
+                    if dead[i] {
+                        continue;
+                    }
+                    for j in i + 1..params.len() {
+                        if dead[j] || self.func.dfg.value_type(params[i]) != self.func.dfg.value_type(params[j]) {
+                            continue;
+                        }
+                        let pair = [params[i], params[j]];
+                        let same = args.iter().all(|a| match (a[i], a[j]) {
+                            (Some(x), Some(y)) => x == y || (pair.contains(&x) && pair.contains(&y)),
+                            _ => false,
+                        });
+                        if same {
+                            dead[j] = true;
+                            repl.push((params[j], params[i]));
+                        }
+                    }
+                }
+                if repl.is_empty() {
+                    continue;
+                }
+                changed = true;
+                // Drop the dead positions' arguments on every incoming edge.
+                for &(t, k) in edges {
+                    let dfg = &mut self.func.dfg;
+                    let old: Vec<BlockArg> = {
+                        let d = dfg.insts[t].branch_destination(&dfg.jump_tables, &dfg.exception_tables);
+                        d[k].args(&dfg.value_lists).collect()
+                    };
+                    let kept: Vec<BlockArg> =
+                        old.into_iter().enumerate().filter(|(n, _)| !dead[*n]).map(|(_, a)| a).collect();
+                    let nb = BlockCall::new(b, kept.into_iter(), &mut dfg.value_lists);
+                    let d = dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+                    d[k] = nb;
+                }
+                for &(dup, keep) in repl.iter().rev() {
+                    self.func.dfg.remove_block_param(dup);
+                    self.func.dfg.change_to_alias(dup, keep);
+                }
+            }
+            if !changed {
+                break;
+            }
+            self.func.dfg.resolve_all_aliases();
         }
     }
 

@@ -2049,3 +2049,18 @@ else, an explicit edge block holds a copy of the constant per argument
 share its register) and jumps on; edges with the same target and
 arguments share one block. Static html corpus: +2.5k instructions (a copy
 per edge), loop-weighted -3k.
+
+## `PLIRON_DUPPARAM=1` (opt-in): duplicate block parameters (2026-11-17)
+
+`src/context.rs` (`dup_param_elim`, after `edge_const_sink` in the
+aarch64 post-egraph section): two parameters of one block that receive
+the same value on every incoming edge become one (LLVM's duplicate-phi
+elimination). The egraph passes the survivor of each proven-equal pair,
+so `encoding_rs::mem::check_str_for_latin1_and_bidi` had
+`block454(v3069, v3071, v3072)` fed `(v2293, v2293, v2293)` on every
+edge: three registers and an edge move per extra parameter, which
+regalloc2 cannot merge because the parameters overlap. An argument that
+is one of the pair itself (a loop passing both back) counts as equal.
+Edges with exception payload arguments are left alone; four rounds at
+most. Static loop-weighted instructions: html corpus 6.970M -> 6.966M,
+std 6.659M -> 6.647M.
