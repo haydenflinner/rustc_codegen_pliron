@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std mcrdwrap sretnosync
+#   o0std mcrdwrap sretnosync shrinkwrap
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -894,6 +894,18 @@ t_sretnosync() {
   PLIRON_SROA_SRETNOSYNC=0 rustc $BE --edition 2021 -O tests/sretnosync/main.rs -o $out/sretnosync$exe && [[ "$($out/sretnosync$exe)" == $want ]]
 }
 
+t_shrinkwrap() {
+  # PLIRON_SHRINKWRAP=1 (opt-in, aarch64): the save block must keep its
+  # callee saves through emission (EDGEHOIST retargeted a branch past it,
+  # edge merging could drop it: regex's IntervalSet::canonicalize restored
+  # registers it never saved). Checksum pinned from stock. Legs: defaults,
+  # shrink-wrapping, shrink-wrapping with leaf/tail-call splits.
+  local want=9046835003109166056
+  rustc $BE --edition 2021 -O tests/shrinkwrap/main.rs -o $out/shrinkwrap$exe && [[ "$($out/shrinkwrap$exe)" == $want ]] && \
+  PLIRON_SHRINKWRAP=1 rustc $BE --edition 2021 -O tests/shrinkwrap/main.rs -o $out/shrinkwrap$exe && [[ "$($out/shrinkwrap$exe)" == $want ]] && \
+  PLIRON_SHRINKWRAP=1 PLIRON_SHRINKWRAP_LEAF=1 rustc $BE --edition 2021 -O tests/shrinkwrap/main.rs -o $out/shrinkwrap$exe && [[ "$($out/shrinkwrap$exe)" == $want ]]
+}
+
 # r[verify clif.vendor.noret]
 t_noret() {
   # PLIRON_NORETTRAP (default on): no trap after a call that cannot return
@@ -1503,6 +1515,7 @@ want narrowlsr && t_narrowlsr
 want narrowext && t_narrowext
 want cmp3 && t_cmp3
 want sretnosync && t_sretnosync
+want shrinkwrap && t_shrinkwrap
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern

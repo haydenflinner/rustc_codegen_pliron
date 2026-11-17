@@ -1370,12 +1370,88 @@ impl Context {
     /// its dominance region as a block parameter, so the early range ends at
     /// the edge and the callee-saved copy starts inside `S`; constants are
     /// cloned into `S` instead.
+    /// PLIRON: does block `b` hold a call that some value may live across
+    /// (see `shrink_split`)? A call followed only by the block's
+    /// terminator, a `return` or a `jump` to a return-only block whose
+    /// arguments are all results of that call, is in tail position.
+    fn shrink_live_call(&self, b: crate::ir::Block) -> bool {
+        use crate::ir::{BlockArg, Opcode};
+        let f = &self.func;
+        let ret_only = |blk: crate::ir::Block| {
+            let mut it = f.layout.block_insts(blk);
+            matches!(it.next(), Some(t) if f.dfg.insts[t].opcode() == Opcode::Return)
+        };
+        let insts: Vec<crate::ir::Inst> = f.layout.block_insts(b).collect();
+        for (k, &i) in insts.iter().enumerate() {
+            if !f.dfg.insts[i].opcode().is_call() {
+                continue;
+            }
+            let res: Vec<crate::ir::Value> = f.dfg.inst_results(i).to_vec();
+            let from_call = |v: crate::ir::Value| res.contains(&f.dfg.resolve_aliases(v));
+            let tail = match &insts[k + 1..] {
+                [t] => {
+                    let op = f.dfg.insts[*t].opcode();
+                    if op == Opcode::Return {
+                        f.dfg.inst_args(*t).iter().all(|&v| from_call(v))
+                    } else if op == Opcode::Jump {
+                        f.dfg.insts[*t]
+                            .branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
+                            .iter()
+                            .all(|bc| {
+                                ret_only(bc.block(&f.dfg.value_lists))
+                                    && bc.args(&f.dfg.value_lists).all(|a| match a {
+                                        BlockArg::Value(v) => from_call(v),
+                                        _ => false,
+                                    })
+                            })
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if !tail {
+                return true;
+            }
+        }
+        false
+    }
+
     fn shrink_split(&mut self) {
         use crate::ir::{BlockArg, InstructionData, Opcode, Value};
         use crate::cursor::{Cursor, FuncCursor};
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         crate::machinst::vcode::PLIRON_SPLIT_BLOCK.with(|c| c.set(None));
         if !*ON.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP").as_deref() == Ok("1")) {
+            return;
+        }
+        // `PLIRON_SHRINKWRAP_FNS=lo..hi`: only functions whose content
+        // hash (FNV-1a of the signature and the opcode sequence; the name
+        // is only a `u0:N` index here) is in [lo, hi) are shrink-wrapped,
+        // for bisecting; `PLIRON_SHRINKWRAP_DEBUG` prints each hash.
+        static FNS: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+        let fns = *FNS.get_or_init(|| {
+            let v = std::env::var("PLIRON_SHRINKWRAP_FNS").ok()?;
+            let (a, b) = v.split_once("..")?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        });
+        let name = format!("{}", self.func.name);
+        let mut h = format!("{}", self.func.signature)
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3));
+        if fns.is_some() || std::env::var_os("PLIRON_SHRINKWRAP_DEBUG").is_some() {
+            for b in self.func.layout.blocks() {
+                for i in self.func.layout.block_insts(b) {
+                    h = (h ^ self.func.dfg.insts[i].opcode() as u64).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+        }
+        let off = fns.is_some_and(|(lo, hi)| h < lo || h >= hi);
+        crate::machinst::vcode::PLIRON_SW_OFF.with(|c| c.set(off));
+        if std::env::var_os("PLIRON_SHRINKWRAP_DEBUG").is_some() {
+            eprintln!("shrink_split fn {name} hash {h}{}", if off { " (off)" } else { "" });
+        }
+        if off {
             return;
         }
         const MAX_LIVEIN: usize = 16;
@@ -1392,6 +1468,26 @@ impl Context {
             .filter(|&b| self.func.layout.block_insts(b).any(|i| frame_op(self.func.dfg.insts[i].opcode())))
             .collect();
         if fblocks.is_empty() {
+            return;
+        }
+        // Without a call the region needs no callee-saved register for a
+        // value live across one, so the split only buys moving the frame
+        // allocation, and its edge copies cost more than that (serde_json's
+        // `skip_to_escape`: five `mov`s per call to skip one `sub sp`;
+        // rust-json +0.5% executed instructions). The save point itself is
+        // still chosen after regalloc. `PLIRON_SHRINKWRAP_LEAF=1` splits
+        // leaf functions too.
+        //
+        // Likewise when every call is in tail position (only a return, or
+        // a jump to a block that only returns, follows it, passing nothing
+        // but the call's results): nothing is live across such a call, so
+        // no callee-saved register is needed either (`drop_glue` of a
+        // `RawVec`: `if cap != 0 { dealloc(ptr, cap) }` got two copies and
+        // kept its frame record at the entry).
+        static LEAF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*LEAF.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP_LEAF").as_deref() == Ok("1"))
+            && !fblocks.iter().any(|&b| self.shrink_live_call(b))
+        {
             return;
         }
         self.compute_cfg();

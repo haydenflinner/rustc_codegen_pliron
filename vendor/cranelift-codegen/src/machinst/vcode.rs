@@ -106,6 +106,9 @@ std::thread_local! {
     /// for the function this thread is compiling (read before regalloc).
     pub(crate) static PLIRON_SPLIT_BLOCK: core::cell::Cell<Option<crate::ir::Block>> =
         const { core::cell::Cell::new(None) };
+    /// PLIRON: shrink-wrapping is off for the function this thread is
+    /// compiling (`PLIRON_SHRINKWRAP_FNS`, set by `Context::shrink_split`).
+    pub(crate) static PLIRON_SW_OFF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 pub struct VCode<I: VCodeInst> {
@@ -668,6 +671,9 @@ impl<I: VCodeInst> VCode<I> {
     fn pliron_shrink_wrap(&self, ra: &regalloc2::Output, order: &[BlockIndex]) -> Option<(BlockIndex, Vec<bool>)> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var("PLIRON_SHRINKWRAP").as_deref() == Ok("1")) {
+            return None;
+        }
+        if PLIRON_SW_OFF.with(|c| c.get()) {
             return None;
         }
         let fl = self.abi.frame_layout();
@@ -2349,6 +2355,19 @@ impl<I: VCodeInst> VCode<I> {
         static EDGEMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let edgemerge = *EDGEMERGE.get_or_init(|| pliron_mode("PLIRON_EDGEMERGE", 3));
         let mut merged = vec![false; self.num_blocks()];
+        // PLIRON: shrink-wrapping's save block, chosen before any block is
+        // merged away: the save block emits the callee saves, so it must
+        // neither be skipped (an edge-merge dup, a bare forwarder, an
+        // edgehoisted edge block, a `noret_dead` block) nor be the copy
+        // other blocks alias to (their paths would run the saves without
+        // the matching epilogue). Before this, a save block that was a
+        // bare forwarder after regalloc lost its saves while the
+        // epilogue still restored x19-x24 (`PLIRON_SHRINKWRAP=1` crashed
+        // regex in `IntervalSet::canonicalize`).
+        let shrink = self
+            .pliron_shrink_wrap(regalloc, &final_order)
+            .filter(|(sb, _)| !noret_dead.as_ref().is_some_and(|d| d[sb.index()]));
+        let sw_block = shrink.as_ref().map(|(sb, _)| *sb);
         // `PLIRON_EDGEMERGE=3`: like 2 (merge every duplicate) except for
         // blocks inside a loop, approximated as the emission-order interval
         // from a back-edge target to its source: a merged dup there would put
@@ -2385,7 +2404,8 @@ impl<I: VCodeInst> VCode<I> {
             for (oi, &block) in final_order.iter().enumerate() {
                 // A `noret_dead` block emits nothing, so it must be neither
                 // a copy that others alias to nor a dropped dup.
-                let dead = noret_dead.as_ref().is_some_and(|d| d[block.index()]);
+                let dead = noret_dead.as_ref().is_some_and(|d| d[block.index()])
+                    || sw_block == Some(block);
                 let dup = (!dead)
                     .then(|| self.edge_merge_key(regalloc, block, &loop_head, &ra_edits_per_block))
                     .flatten()
@@ -2452,6 +2472,8 @@ impl<I: VCodeInst> VCode<I> {
                         && self.insts[r.start].is_term() == MachTerminator::Branch
                         && self.block_succs(BlockIndex::new(b)).len() == 1
                         && regalloc.inst_allocs(InsnIndex::new(r.start)).is_empty()
+                        // PLIRON: the save block is never jumped over.
+                        && sw_block != Some(BlockIndex::new(b))
                 })
                 .collect();
             // resolve[b]: for a bare-jump block, the final non-bare
@@ -2497,6 +2519,7 @@ impl<I: VCodeInst> VCode<I> {
                 if !bare[bi]
                     || merged[bi]
                     || block == self.entry
+                    || sw_block == Some(block)
                     || noret_dead.as_ref().is_some_and(|d| d[bi])
                 {
                     continue;
@@ -2521,7 +2544,6 @@ impl<I: VCodeInst> VCode<I> {
         static EPIMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let epimerge = *EPIMERGE.get_or_init(|| pliron_mode("PLIRON_EPIMERGE", 2));
         let mut epi_label: Option<MachLabel> = None;
-        let shrink = self.pliron_shrink_wrap(regalloc, &final_order);
 
         // PLIRON: `PLIRON_EH_LOCAL=N` bounds applied edgehoists within
         // this function (deterministic bisect); `PLIRON_EH_FN=<substr>`
@@ -2956,8 +2978,11 @@ impl<I: VCodeInst> VCode<I> {
                             }
                             continue;
                         };
+                        // PLIRON: retargeting the branch past the save
+                        // block would skip the callee saves.
                         if hl.index() == ei
                             || self.block_order.is_indirect_branch_target(e)
+                            || sw_block == Some(e)
                         {
                             continue;
                         }
@@ -3040,7 +3065,8 @@ impl<I: VCodeInst> VCode<I> {
                     // E keeps its own slot — reachable for any other
                     // preds, dead bytes otherwise.
                     let mergeable = self.block_preds(e).len() == 1
-                        && canon_dups[e.index()].is_empty();
+                        && canon_dups[e.index()].is_empty()
+                        && sw_block != Some(e);
                     if eh_trace {
                         let mut pst = state.clone();
                         let edits_dbg: Vec<String> = regalloc
