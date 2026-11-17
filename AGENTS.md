@@ -523,6 +523,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   once before instcombine), `PLIRON_MEMCPYOPT_MOVEMARK=1` (a forward
   moves `dst`'s `lifetime.start` ahead of its writers instead of
   dropping `dst`'s markers).
+- `PLIRON_WASM_SMALLFN=<insts>` (opt-in, wasm, 2026-11-17, queue item
+  4): a function of at most that many CLIF instructions whose loops are
+  all search loops (two or more exit edges) skips `looprot`, `looprot2`
+  and `punroll` (with its peeling). V8 inlines a wasm callee only up to
+  500 body bytes (`--wasm-inlining-max-size`); our `memchr_aligned` was
+  1,329 bytes (LLVM 294) and `memcmp` 602 (LLVM 74), with `=120` they are
+  340 and 116. A scratch string-search driver goes from 1.33x to 1.14x
+  LLVM's time; the kernel module changes in one cold function.
 - `PLIRON_FCMPFOLD=1`, `PLIRON_FMUL1=1`, `PLIRON_UNROLL2=1` (opt-in,
   2026-11-17, queue item 2): `fcmp` of two float constants folds (egraph
   rule and `jumpthread::eval`, so `unroll`'s trip walk decides it),

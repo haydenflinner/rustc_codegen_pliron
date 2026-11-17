@@ -199,7 +199,24 @@ Open on this program:
   calls (the IR inliner sees nalgebra's unsimplified 2,294-op bodies;
   LLVM inlines the 33-instruction result), so the loops around them
   stay. The dsa row is pending: the dsa tree did not build on 11-17.
-- `dims_page` (diffuse).
+- `dims_page` (1.18 on 11-17, `pkg-pliron-flip` vs `pkg-llvm-n9`): the
+  gap is mostly small functions V8 inlines on LLVM's side and cannot on
+  ours. V8 inlines a wasm callee only up to 500 body bytes
+  (`--wasm-inlining-max-size`). 1,506 functions are at most 500 bytes in
+  LLVM's module and over 500 in ours; on `dims_page` they carry 1,143 ms
+  of our self time against 352 of LLVM's (+791 of the row's +1,253 ms;
+  LLVM's share sits in the callers it was inlined into). Top rows:
+  `memchr_aligned` 395 vs 4 ms (1,329 vs 294 bytes), `memcmp` 163 vs 16
+  (602 vs 74), `drop_glue::<DecKind>` 108 vs 0 (523 vs 239: we inline
+  `drop_glue::<Literal>` into it, LLVM calls it), `Parser::at` 53 vs 23
+  (1,122 vs 208), `char::is_contained_in` 39 vs 0 (1,010 vs 193). Two
+  causes: search loops that `looprot` and `punroll`'s peel copy eight
+  times (memchr, memcmp, `CharSearcher`: `PLIRON_WASM_SMALLFN=120`,
+  opt-in, keeps them rolled: 340 and 116 bytes, a string-search driver
+  1.33x -> 1.14x), and inlining into small callers (the drop glue,
+  `Parser::at`): open. `harness/dsa/v8inl.py LLVM.wasm OURS.wasm
+  [profiles]` lists the class. The dsa row is
+  pending (the dsa tree did not build on 11-17).
 - Compile memory: the default feature set with polars and typst needs
   5-7 GB per rustc and was not built.
 
