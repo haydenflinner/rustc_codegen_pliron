@@ -93,8 +93,11 @@ fn loop_carried_payload() {
         return v15
     }";
     // v2 is the undefined zero; v3 is a real 0 (the counter's start).
+    // Loop headers' parameters stay opaque by default
+    // (`PLIRON_UNDEFPHI_HDR`), so the join of `v0` and the carried copy
+    // is left as it is; the checker still runs.
     let (after, n) = run(src, &[2]);
-    assert!(n >= 1, "{after}");
+    assert_eq!(n, 0, "{after}");
 }
 
 #[test]

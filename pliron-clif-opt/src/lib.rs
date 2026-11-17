@@ -41,6 +41,7 @@ pub mod selxor;
 pub mod commute;
 pub mod config;
 pub mod undefphi;
+pub mod slotconst;
 pub mod constdedup;
 pub mod copypair;
 pub mod diffcheck;

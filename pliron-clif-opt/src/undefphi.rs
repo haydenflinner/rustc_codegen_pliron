@@ -77,12 +77,35 @@ pub fn run(func: &mut Function, undef: &[Value]) -> usize {
         return 0;
     }
     let is_param = |func: &Function, v: Value| matches!(func.dfg.value_def(v), ValueDef::Param(..));
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    // `PLIRON_UNDEFPHI_HDR=1` also solves loop headers' parameters. By
+    // default they stay opaque: an undefined zero entering a loop is its
+    // start value, which later passes use (a counter or an index starting
+    // at a known 0, a compare against it that folds); choosing the back
+    // edge's value instead lost those (regex +0.6%, blind-sig's
+    // `add_mul_vvw` got its bounds checks back: +26%).
+    let hdr_ok = crate::env_is("PLIRON_UNDEFPHI_HDR", "1");
+    let header = |b: Block| cfg.pred_iter(b).any(|pr| dt.block_dominates(b, pr.block));
+    // `PLIRON_UNDEFPHI_LOOPS=1` also solves parameters of blocks inside
+    // loops. By default only joins outside every loop are rewritten: in a
+    // loop the undefined zero is often what the induction-variable passes
+    // read as a start or an offset (blind-sig's `montgomery`: with a zip
+    // state's undefined fields taken from the other edge, `ivptr`,
+    // `ivdown` and `postinc` no longer fired and `add_mul_vvw` kept its
+    // bounds checks, +26% executed instructions).
+    let loops_ok = crate::env_is("PLIRON_UNDEFPHI_LOOPS", "1");
+    let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();
+    if !loops_ok {
+        la.compute(func, &cfg, &dt);
+    }
+    let in_loop = |b: Block| !loops_ok && la.innermost_loop(b).is_some();
     // State: every parameter with incoming edges starts optimistic.
     let mut st: FxHashMap<Value, L> = FxHashMap::default();
     let mut users: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
     let mut work: Vec<Value> = Vec::new();
     for b in func.layout.blocks() {
-        let ok = b != entry && !bad.contains(&b);
+        let ok = b != entry && !bad.contains(&b) && (hdr_ok || !header(b)) && !in_loop(b);
         for &p in func.dfg.block_params(b) {
             let s = if ok && inc.contains_key(&p) { L::Undef } else { L::Many };
             st.insert(p, s);
@@ -96,8 +119,6 @@ pub fn run(func: &mut Function, undef: &[Value]) -> usize {
             }
         }
     }
-    let cfg = ControlFlowGraph::with_function(func);
-    let dt = DominatorTree::with_function(func, &cfg);
     let def_block = |func: &Function, v: Value| -> Option<Block> {
         match func.dfg.value_def(v) {
             ValueDef::Result(i, _) => func.layout.inst_block(i),

@@ -2666,6 +2666,16 @@ fn s_tailrec(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+// Slot loads of bytes constant stores in the same block just wrote
+// (`slotconst`: stdarch's NEON constants built through memory).
+fn s_slotconst(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::slotconst::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("slotconst");
+    }
+    k
+}
+
 fn s_loadfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
     let prof = crate::config::tracing_on()
         && tracing::enabled!(target: "pliron::loadfwd", tracing::Level::INFO);
@@ -5010,6 +5020,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("tailmerge", "", Gate::Flag(FlagId::Tailmerge), s_tailmerge).needs(shape::BLOCKS2),
         step("taildup", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
         step("tailrec", "tailrec", Gate::Flag(FlagId::Tailrec), s_tailrec).needs(shape::CALL),
+        step("slotconst", "slotconst", Gate::OptIn("PLIRON_SLOTCONST"), s_slotconst)
+            .needs(shape::LOAD),
         Step {
             name: "loadfwd",
             bisect: Some("loadfwd"),
