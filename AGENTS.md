@@ -214,7 +214,8 @@ time, memory, code size, stack frames) in ~20 min and writes
   compiler and interpreter, rapier2d) into `/tmp/dsa-bench/pkg-*`
   (about 5 min; the build loads a keyed private copy of the dylib, so
   the backend can be rebuilt meanwhile, and a rerun with the same dylib
-  and knobs compiles nothing: `DSA_WIPE=1` forces it),
+  and knobs compiles nothing: `DSA_WIPE=1` forces it; a rustc that
+  earlyoom kills is rerun, `harness/dsa/test_retry.sh` checks that),
   `node harness/dsa/bench.mjs --llvm=DIR
   --pliron=DIR [--extra=DIR] [WORKLOAD..]` times 19 workloads
   interleaved and cross-checks every result (a mismatch is a
