@@ -540,6 +540,7 @@ fn copy_groups(
     let mut out = FxHashMap::default();
     let mut taken: FxHashSet<StackSlot> = FxHashSet::default();
     let coalcall = crate::env_is("PLIRON_SM_COALCALL", "1");
+    let coallen = crate::env_is("PLIRON_SM_COALLEN", "1");
     // Block param -> the one value all its incoming edges pass.
     let mut incoming: FxHashMap<Value, Option<Value>> = FxHashMap::default();
     for &b in order {
@@ -645,7 +646,19 @@ fn copy_groups(
             if !matches!(func.dfg.ext_funcs[fr].name, ExternalName::LibCall(LibCall::Memcpy)) || cargs.len() != 3 {
                 continue;
             }
-            let len = func.dfg.value_def(func.dfg.resolve_aliases(cargs[2])).inst().and_then(|l| match func.dfg.insts[l] {
+            // `PLIRON_SM_COALLEN=1`: the length may be a block param every
+            // incoming edge passes the same constant in (`pop_class_op`'s
+            // 288-byte `ClassState` move: `block174(v1230)`, v1230 = 288).
+            let mut lv = func.dfg.resolve_aliases(cargs[2]);
+            if coallen {
+                for _ in 0..8 {
+                    match same_in.get(&lv) {
+                        Some(&a) => lv = func.dfg.resolve_aliases(a),
+                        None => break,
+                    }
+                }
+            }
+            let len = func.dfg.value_def(lv).inst().and_then(|l| match func.dfg.insts[l] {
                 InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => Some(imm.bits()),
                 _ => None,
             });
