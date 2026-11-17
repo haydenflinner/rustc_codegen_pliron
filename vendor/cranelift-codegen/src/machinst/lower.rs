@@ -789,7 +789,27 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 }
                 // Block params are live from the block start: detach them
                 // too (as `ret_detach` does).
-                ValueDef::Param(..) => true,
+                // PLIRON (`PLIRON_ARGPARAM=1`): except a parameter of this
+                // call's block used only by this call with no other call
+                // before it in the block: its range ends here without
+                // crossing a clobber, and its fixed def / fixed use
+                // conflict is split by regalloc2 with the other arguments'
+                // moves in one parallel move. The detach copies are
+                // instructions in sequence: a wrapper passing `(0, a, b,
+                // c, d)` on to a callee went through scratch registers and
+                // overwrote `x0` twice (9 moves for 5).
+                ValueDef::Param(b, _) => {
+                    !(argparam_mode() != 0
+                        && self.value_direct_uses[v] == 1
+                        && self.f.layout.inst_block(inst) == Some(b)
+                        && (argparam_mode() == 2 || self.f.layout.entry_block() == Some(b))
+                        && !self
+                            .f
+                            .layout
+                            .block_insts(b)
+                            .take_while(|&i| i != inst)
+                            .any(|i| self.f.dfg.insts[i].opcode().is_call()))
+                }
                 _ => false,
             };
             if multi_use {
@@ -2419,4 +2439,11 @@ mod tests {
         assert_eq!(uses[v4], ValueUseState::Multiple);
         assert_eq!(uses[v5], ValueUseState::Unused);
     }
+}
+
+/// PLIRON (`PLIRON_ARGPARAM=1|2`, opt-in): see `arg_detach`. `1`: entry
+/// block parameters only; `2`: any block's.
+fn argparam_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("PLIRON_ARGPARAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }

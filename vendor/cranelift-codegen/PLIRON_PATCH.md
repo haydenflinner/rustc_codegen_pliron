@@ -2064,3 +2064,19 @@ is one of the pair itself (a loop passing both back) counts as equal.
 Edges with exception payload arguments are left alone; four rounds at
 most. Static loop-weighted instructions: html corpus 6.970M -> 6.966M,
 std 6.659M -> 6.647M.
+
+## `PLIRON_ARGPARAM=1|2` (opt-in): forwarded parameters skip the argument copy (2026-11-17)
+
+`src/machinst/lower.rs` (`arg_detach`, `argparam_mode`): patch 75 copies
+every block parameter passed to a call into a fresh vreg first. The
+copies are instructions in sequence, so a wrapper passing `(0, a, b, c,
+d)` on to its callee shuffled through scratch registers and wrote `x0`
+twice: 9 moves where 5 do. With the knob, a parameter of the call's own
+block (`1`: the entry block only; `2`: any block) whose only use is this
+call, with no other call before it in the block, is passed as is: its
+range ends at the call without crossing a clobber, and regalloc2 splits
+its fixed def / fixed use conflict with the other arguments' moves in one
+parallel move (6 moves; the constant's `movz` is an instruction ahead of
+it). Static: `=1` html corpus -571 instructions, std -267, loop-weighted
+about even; `=2` html +1.2k (weighted +25k), std weighted -28k.
+`pliron-clif-opt/tests/edge_consts.rs` `forwarded_params_one_parallel_move`.

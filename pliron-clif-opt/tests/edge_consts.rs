@@ -2,7 +2,8 @@
 //! for this whole test binary): `PLIRON_EDGECONST` (constant branch
 //! arguments materialized on their edges), `PLIRON_DUPPARAM` (duplicate
 //! block parameters), `PLIRON_AMODENEG` (negative amode offsets as `sub`),
-//! `PLIRON_MINMAXIMM` (min/max against an immediate).
+//! `PLIRON_MINMAXIMM` (min/max against an immediate), `PLIRON_ARGPARAM`
+//! (entry parameters passed straight on to a call are not copied first).
 
 #![cfg(target_arch = "aarch64")]
 
@@ -15,7 +16,7 @@ fn asm(clif: &str) -> String {
     // The knobs are read once per process; every test here wants them on.
     // SAFETY: set before any compile in this binary, by every test alike.
     unsafe {
-        for k in ["PLIRON_EDGECONST", "PLIRON_DUPPARAM", "PLIRON_AMODENEG", "PLIRON_MINMAXIMM"] {
+        for k in ["PLIRON_EDGECONST", "PLIRON_DUPPARAM", "PLIRON_AMODENEG", "PLIRON_MINMAXIMM", "PLIRON_ARGPARAM"] {
             std::env::set_var(k, "1");
         }
     }
@@ -139,4 +140,26 @@ block0(v0: i64):
 fn smax_zero_uses_xzr() {
     let a = asm(SMAX);
     assert!(a.contains("xzr") && !a.contains("movz"), "zero materialized:\n{a}");
+}
+
+/// A wrapper passing `(0, a, b, c, d)` on: one parallel move, no scratch
+/// registers, `x0` written once (it was 9 moves with a dead `mov x0`).
+const SHIFT: &str = "
+function %f(i64, i64, i64, i64) -> i64, i64 apple_aarch64 {
+    sig0 = (i64, i64, i64, i64, i64) -> i64, i64 apple_aarch64
+    fn0 = colocated %g sig0
+block0(v0: i64, v1: i64, v2: i64, v3: i64):
+    v5 = iconst.i64 0
+    v6, v7 = call fn0(v5, v0, v1, v2, v3)
+    return v6, v7
+}
+";
+
+#[test]
+fn forwarded_params_one_parallel_move() {
+    let a = asm(SHIFT);
+    let movs: Vec<&str> =
+        a.lines().map(str::trim).filter(|l| l.starts_with("mov x") || l.starts_with("movz x")).collect();
+    let x0 = movs.iter().filter(|l| l.starts_with("mov x0,") || l.starts_with("movz x0,")).count();
+    assert!(movs.len() <= 6 && x0 == 1, "argument shuffle:\n{a}");
 }

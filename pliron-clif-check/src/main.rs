@@ -905,6 +905,8 @@ struct CgRow {
     /// and loop-weighted: what coalescing and move resolution leave.
     movs: usize,
     wmov: u64,
+    deadmov: usize,
+    wdeadmov: u64,
     /// `PLIRON_RA2_MOVESTATS=1`: the allocator's moves by kind, weighted
     /// by block frequency (`regalloc2::MV_NAMES`; `16 + k` stack side).
     mv: [u64; 32],
@@ -1000,12 +1002,26 @@ fn score_vcode(v: &str, row: &mut CgRow, spill_from: i64, depth_of: &dyn Fn(&str
     }
     for (i, insts) in blocks.iter().enumerate() {
         let w = 8u64.pow(depth[i].min(3));
+        // Copies overwritten by a later copy in the same run of copies
+        // before anything read them (dead moves).
+        let mut pending: Vec<String> = Vec::new();
         for t in insts {
             row.insts += 1;
             row.winsts += w;
             if is_reg_copy(t) {
                 row.movs += 1;
                 row.wmov += w;
+                let ops: Vec<String> = t.split_once(' ').map_or("", |x| x.1).split(',')
+                    .map(|o| o.trim().split('.').next().unwrap_or("").replace('w', "x")).collect();
+                pending.retain(|r| *r != ops[1]);
+                if pending.contains(&ops[0]) {
+                    row.deadmov += 1;
+                    row.wdeadmov += w;
+                }
+                pending.retain(|r| *r != ops[0]);
+                pending.push(ops[0].clone());
+            } else {
+                pending.clear();
             }
             if t.contains("[sp") && !t.contains("]!") && !t.contains("], #") {
                 row.stack += 1;
@@ -1125,11 +1141,12 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
         "insts": sum(|r| r.insts as u64), "stack": sum(|r| r.stack as u64),
         "winsts": sum(|r| r.winsts), "wstack": sum(|r| r.wstack), "wspill": sum(|r| r.wspill),
         "movs": sum(|r| r.movs as u64), "wmov": sum(|r| r.wmov),
+        "deadmov": sum(|r| r.deadmov as u64), "wdeadmov": sum(|r| r.wdeadmov),
         "functions": rows.iter().map(|r| {
             let mut j = serde_json::json!({
                 "file": r.file, "status": r.status, "insts": r.insts, "stack": r.stack,
                 "winsts": r.winsts, "wstack": r.wstack, "slots": r.slots, "spills": r.spills, "wspill": r.wspill,
-                "movs": r.movs, "wmov": r.wmov, "mv": r.mv,
+                "movs": r.movs, "wmov": r.wmov, "mv": r.mv, "deadmov": r.deadmov,
             });
             if !r.msg.is_empty() {
                 j["msg"] = r.msg.chars().take(4000).collect::<String>().into();
@@ -1158,9 +1175,9 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
         }
     }
     println!(
-        "codegen: {} fns ({bad} failed): insts {} stack {} movs {} | weighted insts {} stack {} spill {} movs {} -> {}",
+        "codegen: {} fns ({bad} failed): insts {} stack {} movs {} | weighted insts {} stack {} spill {} movs {} (dead {} / {}) -> {}",
         rows.len(),
-        json["insts"], json["stack"], json["movs"], json["winsts"], json["wstack"], json["wspill"], json["wmov"],
+        json["insts"], json["stack"], json["movs"], json["winsts"], json["wstack"], json["wspill"], json["wmov"], json["deadmov"], json["wdeadmov"],
         out.display()
     );
     bad == 0
