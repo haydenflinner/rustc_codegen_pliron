@@ -1721,6 +1721,9 @@ fn split(
             // destination's old value there. The mimas interpreter wrote
             // 136 bytes of `Flow` before every `step_one` call.
             let skip_wb = sret_only.get(cop).copied().unwrap_or(false) && !st.invokes.contains(*cop);
+            if skip_wb && pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::sroa", "sroa: sret writeback skipped ({} slices)", ss.len());
+            }
             for &i in ss.iter().filter(|_| !skip_wb) {
                 let l = LoadOp::new(ctx, new[i], sl[i].ty).get_operation();
                 l.insert_before(ctx, *cop);

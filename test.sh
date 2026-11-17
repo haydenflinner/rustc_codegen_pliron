@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std mcrdwrap
+#   o0std mcrdwrap sretnosync
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -837,6 +837,21 @@ t_cmp3() {
   PLIRON_CMP3=1 rustc $BE --edition 2021 tests/cmp3/main.rs -o $out/cmp3$exe && [[ "$($out/cmp3$exe)" == $want ]]
 }
 
+t_sretnosync() {
+  # PLIRON_SROA_SRETNOSYNC=1 (opt-in): sroa skips the writeback of a split
+  # temporary before a call whose only pin on it is its whole sret argument
+  # (a call's destination is uninitialized when the call starts). Shapes: a
+  # dispatch loop refilling one sret destination, a destination built in
+  # place then refilled, an unwinding call into a live destination.
+  # Checksum pinned from stock. Legs: defaults, opt-in (which must skip at
+  # least one writeback), kill-switch.
+  local want=16546534420139252717
+  rustc $BE --edition 2021 -O tests/sretnosync/main.rs -o $out/sretnosync$exe && [[ "$($out/sretnosync$exe)" == $want ]] && \
+  PLIRON_SROA_SRETNOSYNC=1 PLIRON_TRACE=pliron::sroa=debug rustc $BE --edition 2021 -O tests/sretnosync/main.rs -o $out/sretnosync$exe 2> $out/sretnosync.log && [[ "$($out/sretnosync$exe)" == $want ]] && \
+  { grep -aq 'sret writeback skipped' $out/sretnosync.log || { echo "sretnosync: no writeback skipped" >&2; false; }; } && \
+  PLIRON_SROA_SRETNOSYNC=0 rustc $BE --edition 2021 -O tests/sretnosync/main.rs -o $out/sretnosync$exe && [[ "$($out/sretnosync$exe)" == $want ]]
+}
+
 # r[verify clif.vendor.noret]
 t_noret() {
   # PLIRON_NORETTRAP (default on): no trap after a call that cannot return
@@ -1443,6 +1458,7 @@ want cvariadic && t_cvariadic
 want narrowlsr && t_narrowlsr
 want narrowext && t_narrowext
 want cmp3 && t_cmp3
+want sretnosync && t_sretnosync
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern

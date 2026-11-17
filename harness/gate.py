@@ -91,7 +91,8 @@ OPTIN_STANZAS = {"bytescan": {"PLIRON_BYTESCAN": "1"},
                  "elabloops": {"PLIRON_EDGEHOIST": "1", "PLIRON_FLAGX": "1"},
                  "selmul": {"PLIRON_EDGEHOIST": "1", "PLIRON_FLAGX": "1"},
                  "inlinecm": {"PLIRON_INLINE_WARMCALLS": "0"},
-                 "unroll": {"PLIRON_FCMPFOLD": "1", "PLIRON_FMUL1": "1", "PLIRON_UNROLL2": "1"}}
+                 "unroll": {"PLIRON_FCMPFOLD": "1", "PLIRON_FMUL1": "1", "PLIRON_UNROLL2": "1"},
+                 "sretnosync": {"PLIRON_SROA_SRETNOSYNC": "1"}}
 FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309, 21920,
                 13475, 16782, 16787, 16980, 17028, 18889, 24242, 26212, 26694, 27004, 27992, 30177,
                 31625, 22177, 30621, 30694, 30696, 31084, 31403]

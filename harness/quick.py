@@ -63,7 +63,7 @@ ALIAS = {
     "pipeline": CORE + ["slotmerge", "loopvec"],
     "lib": CORE,
     "inline": ["inlinecm", "inlinerec", "inlinerecx", "std", "sroa"],
-    "sroa": ["sroa"],
+    "sroa": ["sroa", "sretnosync"],
     "memcpyopt": ["sroa", "std", "mcrdwrap"],
     "xcgu": ["xcgurot", "xcgufnptr", "std"],
     "wasm": ["wasm_smoke"],
