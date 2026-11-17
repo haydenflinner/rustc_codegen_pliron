@@ -429,7 +429,7 @@ pub fn check_cross(
         }
         // A cross-build `after` repeats what `before`'s stubs did.
         let replay = cross.map(|_| blog.as_slice());
-        let (a, _) = run(after, &world, &nowrite_names, &self_name, cfg.fuel, false, xa, replay);
+        let (a, atrace) = run(after, &world, &nowrite_names, &self_name, cfg.fuel, false, xa, replay);
         match &a {
             Outcome::Inconclusive(r) if !r.starts_with("out of fuel") => {
                 sum.inconclusive += 1;
@@ -456,7 +456,7 @@ pub fn check_cross(
                     ..world.clone()
                 };
                 let (b1, _) = run(before, &world1, &nowrite_names, &self_name, cfg.fuel, true, xb, None);
-                if underdetermined(&a, &b, &b1, sret) {
+                if underdetermined(&a, &atrace.calls, &b, &b1, sret) {
                     sum.inconclusive += 1;
                     sum.why.get_or_insert_with(|| match &b1 {
                         Outcome::Returned { .. } => {
@@ -666,7 +666,13 @@ fn same(a: &Outcome, b: &Outcome) -> bool {
 /// True when `a` differs from `b0` only on such bytes (or the original's
 /// whole behavior is fill-dependent, which leaves nothing to check).
 // r[impl clif.diffcheck.sound]
-fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome, sret: Option<(u64, u64)>) -> bool {
+fn underdetermined(
+    a: &Outcome,
+    a_calls: &[(String, Vec<DataValue>)],
+    b0: &Outcome,
+    b1: &Outcome,
+    sret: Option<(u64, u64)>,
+) -> bool {
     let (
         Outcome::Returned {
             rets: r0,
@@ -706,6 +712,27 @@ fn underdetermined(a: &Outcome, b0: &Outcome, b1: &Outcome, sret: Option<(u64, u
     // The original's own shape moved with the fill: nothing to compare.
     if r0.len() != r1.len() || c0.len() != c1.len() {
         return true;
+    }
+    // The rewritten function did not return. When the original hands a
+    // callee a value it never determined, a stub's results and writes from
+    // there on are a hash of it, and so is whether a run traps later: if
+    // the rewritten function made the same calls up to that one, its trap
+    // pins nothing down. (`fuse_filaments_with`'s closure in dsa: an
+    // `i64` copy of a struct field and its 4 bytes of padding goes to a
+    // callee; slotmerge put another slot's bytes under the padding, the
+    // stub answered differently and the rewritten run took a panic path.)
+    // `a_calls`: the calls of a rewritten run that did not return, when
+    // the caller has them.
+    if !matches!(a, Outcome::Returned { .. }) {
+        let same = |x: &(String, Vec<DataValue>), y: &(String, Vec<DataValue>)| {
+            x.0 == y.0 && x.1.len() == y.1.len() && x.1.iter().map(norm).eq(y.1.iter().map(norm))
+        };
+        let Some(k) = c0.iter().zip(c1).position(|(x0, x1)| !same(x0, x1)) else {
+            return false;
+        };
+        return a_calls.len() > k
+            && a_calls[k].0 == c0[k].0
+            && a_calls[..k].iter().zip(c0).all(|(y, x)| same(y, x));
     }
     let Outcome::Returned {
         rets: ra,

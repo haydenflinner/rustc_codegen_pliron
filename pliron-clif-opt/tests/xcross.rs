@@ -137,3 +137,42 @@ fn undef_zero_pins_nothing() {
     let facts = Facts { undef: Some(&undef), ..Facts::default() };
     cross_check(&a, &b, &s, &s, &facts).unwrap_or_else(|m| panic!("{m}"));
 }
+
+const PADDING_TO_CALLEE: &str = "function %f(i64) -> i64 {
+    ss0 = explicit_slot 8
+    sig0 = (i64) -> i64
+    fn0 = u0:3 sig0
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    PRE
+    v2 = iconst.i32 0
+    store v2, v1
+    v3 = load.i64 v1
+    v4 = call fn0(v3)
+    v6 = iconst.i64 1
+    v5 = band v4, v6
+    brif v5, block1, block2
+block1:
+    trap user2
+block2:
+    return v4
+}";
+
+/// An `i64` copy of an `i32` field and its padding goes to a callee: the
+/// padding was never written, so the stub's answer, and with it whether
+/// the function takes its panic path, is not pinned down. A rewritten
+/// function with other bytes under the padding (slotmerge put another
+/// slot there: dsa's `fuse_filaments_with` closure) that then traps is not
+/// a mismatch. One that traps before making the call still is.
+#[test]
+fn trap_after_an_undetermined_call_argument_pins_nothing() {
+    let a = parse(&PADDING_TO_CALLEE.replace("PRE", ""));
+    let b = parse(&PADDING_TO_CALLEE.replace("PRE", "v9 = iconst.i64 0x1234_0000_0000\n    store v9, v1"));
+    let cfg = Config { trials: 64, ..Config::default() };
+    check(&a, &b, &Facts::default(), &cfg).unwrap_or_else(|m| panic!("{m}"));
+    let s = syms(&[("u0:3", "foo")]);
+    cross_check(&a, &b, &s, &s, &Facts::default()).unwrap_or_else(|m| panic!("{m}"));
+    // Trapping before the call is a difference the padding cannot explain.
+    let c = parse(&PADDING_TO_CALLEE.replace("PRE", "trap user2\nblock9:"));
+    assert!(check(&a, &c, &Facts::default(), &cfg).is_err());
+}
