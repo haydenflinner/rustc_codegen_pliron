@@ -1780,6 +1780,9 @@ impl<I: VCodeInst> VCode<I> {
             None => regalloc,
         };
         let mut buffer = MachBuffer::new();
+        // PLIRON: `PLIRON_PLACE_PHASE` (measurement aid, 0 = off).
+        let phase = super::pliron_place_phase();
+        buffer.set_pliron_phase(phase);
         buffer.set_log2_min_function_alignment(self.log2_min_function_alignment);
         let mut bb_starts: Vec<Option<CodeOffset>> = vec![];
 
@@ -2623,7 +2626,8 @@ impl<I: VCodeInst> VCode<I> {
                             .filter(|v: &u32| v.is_power_of_two())
                             .unwrap_or(16)
                     });
-                    new_offset = new_offset.max((buffer.cur_offset() + la - 1) & !(la - 1));
+                    new_offset = new_offset
+                        .max(((buffer.cur_offset() + phase + la - 1) & !(la - 1)) - phase);
                     if la > 32 {
                         buffer.require_alignment(la);
                     }
@@ -2639,8 +2643,8 @@ impl<I: VCodeInst> VCode<I> {
                     && *ALIGN64.get_or_init(|| std::env::var("PLIRON_ALIGN64").as_deref() != Ok("0"))
                 {
                     let bytes = est;
-                    if !calls && bytes > 0 && bytes <= 64 && (new_offset % 64) + bytes > 64 {
-                        new_offset = (new_offset + 63) & !63;
+                    if !calls && bytes > 0 && bytes <= 64 && ((new_offset + phase) % 64) + bytes > 64 {
+                        new_offset = ((new_offset + phase + 63) & !63) - phase;
                         buffer.require_alignment(64);
                     }
                 }

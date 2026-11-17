@@ -672,7 +672,19 @@ impl ObjectModule {
         } else {
             self.object.section_id(StandardSection::Text)
         };
-        let offset = self.object.add_symbol_data(symbol, section, bytes, align);
+        // PLIRON: `PLIRON_PLACE_PHASE=<bytes>` (measurement aid, default 0):
+        // the function starts `bytes` past a 64-byte boundary, behind a pad
+        // that is never executed; the emitter aligned its loops and
+        // constants for that address (`cranelift_codegen::pliron_place_phase`).
+        let phase = u64::from(cranelift_codegen::pliron_place_phase());
+        let offset = if phase > 0 {
+            let align = align.max(64);
+            self.object
+                .append_section_data(section, &vec![0u8; phase as usize], align);
+            self.object.add_symbol_data(symbol, section, bytes, 4)
+        } else {
+            self.object.add_symbol_data(symbol, section, bytes, align)
+        };
 
         if !relocs.is_empty() {
             self.relocs.push(SymbolRelocs {

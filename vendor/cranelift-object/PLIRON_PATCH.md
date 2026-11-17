@@ -9,3 +9,6 @@ Vendored from crates.io cranelift-object 0.135.5 for two changes, each marked
 - `define_function_inner` raises each function symbol's alignment to the
   ISA's `function_alignment().preferred`, so buffer-relative loop-header
   alignment (item 16) holds in the final image.
+- `define_function_inner` places a function `PLIRON_PLACE_PHASE` bytes
+  past a 64-byte boundary behind a never-executed pad (measurement aid,
+  default 0 = off; cranelift-codegen item 135).

@@ -51,6 +51,8 @@ mod machinst;
 // PLIRON: frame breakdown of the last compiled function (debug aid).
 pub use crate::machinst::pliron_last_frame;
 pub use crate::machinst::pliron_last_layout;
+// PLIRON: placement phase knob (`PLIRON_PLACE_PHASE`, measurement aid).
+pub use crate::machinst::pliron_place_phase;
 // PLIRON: FASTCC per-callee clobber sets (`machinst/abi.rs`).
 pub use crate::machinst::{PlironRegSet, pliron_fastcc_begin, pliron_fastcc_end};
 /// PLIRON: regalloc2 decision logging for the next allocations on this thread.

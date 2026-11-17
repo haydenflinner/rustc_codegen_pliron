@@ -270,6 +270,11 @@ pub struct MachBuffer<I: VCodeInst> {
     data: SmallVec<[u8; 1024]>,
     /// The required alignment of this buffer.
     min_alignment: u32,
+    /// PLIRON: placement phase (`PLIRON_PLACE_PHASE`, see
+    /// [`crate::pliron_place_phase`]): the function will start this many
+    /// bytes past a multiple of its alignment, so `align_to` aligns
+    /// `offset + phase`. 0 outside the measurement knob.
+    pliron_phase: u32,
     /// Any relocations referring to this code. Note that only *external*
     /// relocations are tracked here; references to labels within the buffer are
     /// resolved before emission.
@@ -510,6 +515,7 @@ impl<I: VCodeInst> MachBuffer<I> {
         MachBuffer {
             data: SmallVec::new(),
             min_alignment: I::function_alignment().minimum,
+            pliron_phase: 0,
             relocs: SmallVec::new(),
             traps: SmallVec::new(),
             call_sites: SmallVec::new(),
@@ -702,6 +708,16 @@ impl<I: VCodeInst> MachBuffer<I> {
         self.min_alignment = self.min_alignment.max(align);
     }
 
+    /// PLIRON: set the placement phase (see the field).
+    pub fn set_pliron_phase(&mut self, phase: u32) {
+        self.pliron_phase = phase;
+    }
+
+    /// PLIRON: the placement phase (see the field).
+    pub fn pliron_phase(&self) -> u32 {
+        self.pliron_phase
+    }
+
     /// Align up to the given alignment.
     pub fn align_to(&mut self, align_to: CodeOffset) {
         trace!("MachBuffer: align to {}", align_to);
@@ -709,7 +725,7 @@ impl<I: VCodeInst> MachBuffer<I> {
             align_to.is_power_of_two(),
             "{align_to} is not a power of two"
         );
-        while self.cur_offset() & (align_to - 1) != 0 {
+        while (self.cur_offset() + self.pliron_phase) & (align_to - 1) != 0 {
             self.put1(0);
         }
 

@@ -1029,3 +1029,23 @@ pub trait TextSectionBuilder {
     /// the bytes of the text section.
     fn finish(&mut self, ctrl_plane: &mut ControlPlane) -> Vec<u8>;
 }
+
+/// PLIRON: `PLIRON_PLACE_PHASE=<bytes>` (a measurement aid, default 0 =
+/// off; a multiple of 4 below 64, anything else is 0). Every function is
+/// placed `bytes` past a 64-byte boundary (`cranelift-object` pads ahead of
+/// its symbol; the pad is never executed) and the emitter aligns loop
+/// heads, the 64-byte loop rule and constants on those real addresses. The
+/// code is the default's, laid out as if `bytes` of code preceded it: the
+/// loop pads (executed `nop`s on fall-through entries) and every cache-line
+/// crossing change, nothing else. `harness/placement.py` builds copies of
+/// a program under several phases to measure what placement alone moves.
+pub fn pliron_place_phase() -> u32 {
+    static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("PLIRON_PLACE_PHASE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v % 4 == 0 && v < 64)
+            .unwrap_or(0)
+    })
+}

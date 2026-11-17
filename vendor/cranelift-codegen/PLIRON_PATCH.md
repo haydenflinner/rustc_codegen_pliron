@@ -2001,3 +2001,16 @@ signaling), which Rust's NaN rules allow and LLVM does too. Both exist
 for nalgebra's `gemm`/`gemv` (`!beta.is_zero()` on a constant `beta`,
 `alpha = 1.0`), with the pipeline's `PLIRON_UNROLL2` step; tests in
 `pliron-clif-opt/tests/fcmpfold.rs`.
+
+135. Placement phase (`PLIRON_PLACE_PHASE=<bytes>`, a measurement aid,
+default 0 = off; a multiple of 4 below 64). `machinst/mod.rs`
+(`pliron_place_phase`, exported from the crate root),
+`machinst/buffer.rs` (`MachBuffer::{set_,}pliron_phase`: `align_to`
+aligns `offset + phase`, so constants stay aligned in memory),
+`machinst/vcode.rs` (the loop-head pad and the 64-byte loop rule compute
+on `offset + phase`), and `vendor/cranelift-object`'s
+`define_function_inner` (the function starts `phase` bytes past a
+64-byte boundary, behind a pad that is never executed). The code is the
+default's laid out as if `phase` bytes preceded it: loop pads and line
+crossings change, nothing else. `harness/placement.py` builds copies
+under several phases to measure what placement alone moves.
