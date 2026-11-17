@@ -59,25 +59,23 @@ fn br_table_tags_on_edges() {
     );
 }
 
-/// The regression: one constant passed both on an edge into a join (moved)
-/// and on an edge into a single-predecessor block (left alone). The
-/// constant must survive for the second edge (it was removed: `regs
-/// .is_valid()` in the lowering, unicase's `lookup`).
+/// The regression: a `br_table` with two edges into `block2` (one
+/// predecessor) and one into `block3` (two predecessors), all passing
+/// `v1`. Counting predecessors instead of edges moved `v1` onto the edge
+/// into `block3`, left the two into `block2` alone and removed `v1` anyway
+/// (`regs.is_valid()` in the lowering, unicase's `lookup`).
 const SHARED: &str = "
 function %f(i32) -> i32 apple_aarch64 {
 block0(v0: i32):
     v1 = iconst.i32 105
     v2 = iconst.i32 7
-    br_table v0, block3(v2), [block2(v1), block4(v1), block3(v1)]
+    br_table v0, block1, [block2(v1), block2(v2), block3(v1)]
 block1:
     v9 = iconst.i32 1
     jump block3(v9)
 block2(v3: i32):
     v4 = iadd v3, v0
     return v4
-block4(v7: i32):
-    v8 = imul v7, v0
-    return v8
 block3(v5: i32):
     v6 = isub v5, v0
     return v6
