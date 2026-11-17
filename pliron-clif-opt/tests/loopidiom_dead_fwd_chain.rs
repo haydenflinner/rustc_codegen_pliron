@@ -120,3 +120,61 @@ fn dead_loop_short_forwarder_chain_still_folds() {
     verify(&after);
     check(&before, &after, &Facts::default(), &Config::default()).unwrap();
 }
+
+/// The exit forwarders are merges, and the scan from `dest` comes back
+/// round to the first one through an outer loop (the wasm
+/// `literate_eval::isolate::top_stmts` shape under
+/// `PLIRON_JUMPTHREAD=0`). `block10` (preds: the loop exit and
+/// `block11`) reads its own param `v10` in its `jump`; the old scan made
+/// that an escape, so `block13` gained a param that the old edge from
+/// `block12` bound to `v10`, which `block10` does not dominate
+/// (`block12` is also entered from `block22`): a verifier error.
+#[test]
+fn dead_loop_merge_forwarders_reached_from_an_outer_loop() {
+    let before = parse(
+        "function %f(i32, i32) -> i32 {
+    block0(v0: i32, v1: i32):
+        v2 = iconst.i32 0
+        jump block20(v1)
+
+    block20(v20: i32):
+        brif v20, block21, block22
+
+    block21:
+        jump block1(v2)
+
+    block1(v3: i32):
+        v5 = icmp uge v3, v0
+        brif v5, block10(v3), block3
+
+    block3:
+        v9 = iconst.i32 1
+        v6 = iadd v3, v9
+        jump block1(v6)
+
+    block22:
+        brif v1, block11, block12(v1)
+
+    block11:
+        jump block10(v1)
+
+    block10(v10: i32):
+        jump block12(v10)
+
+    block12(v12: i32):
+        jump block13
+
+    block13:
+        v30 = iconst.i32 -1
+        v31 = iadd v20, v30
+        brif v31, block20(v31), block14
+
+    block14:
+        return v1
+    }",
+    );
+    let mut after = before.clone();
+    run_idiom(&mut after);
+    verify(&after);
+    check(&before, &after, &Facts::default(), &Config::default()).unwrap();
+}

@@ -2787,6 +2787,27 @@ fn plan_dead(
         // `PathBuf::__push` wasm ICE: `isub` read `block20`'s param from
         // `block268` past the new bypass edge).
         let fwd_val = |v: Value| fwd.contains_key(&func.dfg.resolve_aliases(v));
+        // That holds only when the forwarder binding `v` dominates `dest`
+        // (so `v` is in scope on every old edge into `dest`, which passes
+        // it to the new param) and the use is in `dest` or a block it
+        // dominates (so the remap in `apply_dead` reaches it). A walked
+        // forwarder can be a merge with other preds, and the scan can come
+        // back round to the forwarders through an outer loop; without
+        // jumpthread both happen (`PLIRON_JUMPTHREAD=0`: wasm `top_stmts`
+        // passed `block175`'s param into `dest` from a block it does not
+        // dominate). A forwarder reading its own param needs no escape: it
+        // still binds it on the slow path. `Some(true)`: an escape;
+        // `Some(false)`: nothing to do; `None`: give this exit up.
+        let fwd_use = |b: Block, v: Value| -> Option<bool> {
+            let ValueDef::Param(fb, _) = func.dfg.resolved_value_def(v) else {
+                return None;
+            };
+            if b == fb {
+                return Some(false);
+            }
+            let under = b == dest || dt.block_dominates(dest, b);
+            (under && dt.block_dominates(fb, dest)).then_some(true)
+        };
         let mut escapes: Vec<(Value, Ins)> = Vec::new();
         let mut seen = info.body.clone();
         let mut wl = vec![dest];
@@ -2801,6 +2822,13 @@ fn plan_dead(
                     }
                     if b != dest && !fwd_val(a) {
                         why!("dead: {b:?} reads loop values");
+                    }
+                    if fwd_val(a) {
+                        match fwd_use(b, a) {
+                            None => continue 'exits,
+                            Some(false) => continue,
+                            Some(true) => {}
+                        }
                     }
                     if !escapes.iter().any(|&(v, _)| v == a) {
                         let Some(ins) =
@@ -2823,6 +2851,13 @@ fn plan_dead(
                         }
                         if b != dest && !fwd_val(v) {
                             why!("dead: {b:?} reads loop values");
+                        }
+                        if fwd_val(v) {
+                            match fwd_use(b, v) {
+                                None => continue 'exits,
+                                Some(false) => continue,
+                                Some(true) => {}
+                            }
                         }
                         if !escapes.iter().any(|&(e, _)| e == v) {
                             let Some(ins) =
