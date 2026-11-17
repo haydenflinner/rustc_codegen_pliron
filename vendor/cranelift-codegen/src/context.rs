@@ -1459,11 +1459,16 @@ impl Context {
         if off {
             return;
         }
-        // `PLIRON_SHRINKWRAP_MAXLIVEIN=<n>` (default 16): no split when more
-        // values than this are live into S (each is a copy on S's path).
+        // `PLIRON_SHRINKWRAP_MAXLIVEIN=<n>` (default 3): no split when more
+        // values than this are live into S (each is a copy on S's path,
+        // which is often the hot one: `RawVecInner::grow_amortized` paid
+        // four `mov`s per call to skip the saves on its zero-size exit).
+        // Exact counts against 16: rust-protobuf -0.38%, regex +0.32%,
+        // html-rewriter +0.09%; against no shrink-wrapping every held-out
+        // program is equal or better at 3 (PARITY, native item).
         static MAXLI: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let max_livein = *MAXLI.get_or_init(|| {
-            std::env::var("PLIRON_SHRINKWRAP_MAXLIVEIN").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+            std::env::var("PLIRON_SHRINKWRAP_MAXLIVEIN").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
         });
         let Some(entry) = self.func.layout.entry_block() else { return };
         let frame_op = |op: Opcode| {
