@@ -392,6 +392,17 @@ fn emit_obj(
             .sum();
         tracing::debug!(target: "pliron::wasm", "{name}: strip_realign removed {n}");
     }
+    if let Some(v) = crate::env_get("PLIRON_WASM_ONEEXIT").filter(|v| *v != "0") {
+        let sp = o.sp;
+        let n = o
+            .funcs
+            .iter_mut()
+            .filter_map(|f| f.body.as_mut())
+            .map(|b| one_exit(b, sp, v == "void"))
+            .filter(|&m| m)
+            .count();
+        tracing::debug!(target: "pliron::wasm", "{name}: one_exit merged {n}");
+    }
     pliron_cfg::mark(&format!("wasm-winline {name}"));
     let t0 = std::time::Instant::now();
     // `PLIRON_WASM_GC=1`: drop `Local` functions nothing in this module
@@ -9950,6 +9961,64 @@ fn strip_realign(b: &mut FunctionBody, sp: Global) -> usize {
             .retain(|v| !repl.contains_key(v) && uses.get(v).is_none_or(|&c| c > 0));
     }
     repl.len()
+}
+
+/// N9 #8: one stack-pointer restore per function. `CX::ret` puts
+/// `global.set sp, sp0` before every `return` (2.45 per function in dsa
+/// against LLVM's ~1); here every such return block branches to one new
+/// exit block that restores and returns, its block params carrying the
+/// returned values. `void_only`: only functions with no results (no params
+/// on the exit block). Needs two or more such returns, all restoring the
+/// same entry-block value. Off by default: `PLIRON_WASM_ONEEXIT=1` (all)
+/// or `=void`.
+fn one_exit(b: &mut FunctionBody, sp: Global, void_only: bool) -> bool {
+    if void_only && !b.rets.is_empty() {
+        return false;
+    }
+    let mut rs: Vec<WBlock> = Vec::new();
+    let mut v0: Option<WV> = None;
+    for blk in b.blocks.iter() {
+        if !matches!(b.blocks[blk].terminator, Terminator::Return { .. }) {
+            continue;
+        }
+        let Some(&last) = b.blocks[blk].insts.last() else {
+            return false;
+        };
+        let ValueDef::Operator(O::GlobalSet { global_index }, aa, _) = &b.values[last] else {
+            return false;
+        };
+        if *global_index != sp {
+            return false;
+        }
+        let v = b.resolve_alias(b.arg_pool[*aa][0]);
+        if v0.is_some_and(|x| x != v) || b.value_blocks[v] != b.entry {
+            return false;
+        }
+        v0 = Some(v);
+        rs.push(blk);
+    }
+    let (Some(v0), true) = (v0, rs.len() >= 2) else {
+        return false;
+    };
+    let x = b.add_block();
+    let rets = b.rets.clone();
+    let params: Vec<WV> = rets.iter().map(|&t| b.add_blockparam(x, t)).collect();
+    b.add_op(x, O::GlobalSet { global_index: sp }, &[v0], &[]);
+    b.blocks[x].terminator = Terminator::Return { values: params };
+    for r in rs {
+        b.blocks[r].insts.pop();
+        let Terminator::Return { values } = std::mem::take(&mut b.blocks[r].terminator) else {
+            unreachable!()
+        };
+        b.blocks[r].terminator = Terminator::Br {
+            target: waffle::BlockTarget {
+                block: x,
+                args: values,
+            },
+        };
+    }
+    fixup_edges(b);
+    true
 }
 
 // ---------- CLIF -> waffle emit ----
