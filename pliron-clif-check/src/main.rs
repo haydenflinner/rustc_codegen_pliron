@@ -931,6 +931,8 @@ fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
     // `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`: another target's ISA
     // and ABI (Linux frees x18), as the held-out builds use.
+    // `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`: the held-out
+    // programs' irdiff target (x18 allocatable, ELF TLS) instead of macOS.
     let triple = std::env::var("CLIF_CHECK_TRIPLE").unwrap_or_else(|_| "aarch64-apple-darwin".into());
     fb.set("tls_model", if triple.contains("apple") { "macho" } else { "elf_gd" }).unwrap();
     // `PLIRON_RA_ALGO=single_pass`: Cranelift's other allocator, to compare.
@@ -945,6 +947,7 @@ fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
     let flags = cranelift_codegen::settings::Flags::new(fb);
     cranelift_codegen::isa::lookup_by_name(&triple)
         .expect("ISA for CLIF_CHECK_TRIPLE")
+        .expect("aarch64 ISA")
         .finish(flags)
         .expect("ISA flags")
 }
