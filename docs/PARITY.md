@@ -859,6 +859,19 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   (forced irreducible): `compile` 306,050 B; (2) 299,624; (1) 168,372;
   both 160,639 (49,474 reducible). The rest of N9 row 1 is not
   parameters that carry one value: in the kernels there are none.
+  **Edge-copy coalescing** (`PLIRON_WCOAL_EDGE=1`, opt-in, waffle
+  `localify.rs` `coalesce_edge_copies`: merge a parameter's local with
+  an argument's local on the precise interference graph when they do not
+  interfere): small payoff. dsa (main's defaults 33,911,719 B):
+  603,375 edge transfers between different locals, 14,842 pairs did not
+  interfere, -86,693 B (-0.26%), all 19 workloads equal; kernels -115 B.
+  Of the interfering pairs (`mimas-compile`, 19,437), 63% have neither
+  value live past the edge (the old parameter is still read in the
+  predecessor after the argument is computed: a scheduling question,
+  moving the argument's computation past the parameter's last use), 34%
+  pass an argument that stays live after the edge (value-based
+  interference could merge some), 2% other. waffle's tests now run in
+  the gate (`unit:waffle`).
 - **N3. Byte peepholes on bodies with SIMD.** `wpeep`'s decoder gives up
   on any `0xfd`-prefixed opcode, so a body containing one `v128.load`
   gets no peepholes at all. The emitter lowers a 24-byte constant copy
