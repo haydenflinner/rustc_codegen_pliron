@@ -1061,6 +1061,44 @@ pub fn run_lt(
     let mut reloads: FxHashMap<Value, usize> = FxHashMap::default();
     for b in func.layout.blocks().collect::<Vec<_>>() {
         if !reach.contains(&b) {
+            // A dead block's accesses stay on memory, but its edges into
+            // a livein block must still match the params added there.
+            // Any value will do on an edge that never runs: the entry
+            // undef (the verifier checks no dominance in dead blocks).
+            // Without taildup (`PLIRON_TAILDUP=0`) such blocks reach
+            // slotprom: std `net::tcp::IntoIncoming::next` failed the
+            // verifier with a short `brif`.
+            if let Some(term) = func.layout.last_inst(b) {
+                let adds: Vec<Vec<Value>> = {
+                    let dfg = &func.dfg;
+                    dfg.insts[term]
+                        .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+                        .iter()
+                        .map(|bc| {
+                            let d = bc.block(&dfg.value_lists);
+                            match blk_ix.get(&d) {
+                                Some(&dix) if reach.contains(&d) => kept
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(ki, _)| liveins[*ki][dix as usize])
+                                    .map(|(ki, _)| fallback[ki])
+                                    .collect(),
+                                _ => Vec::new(),
+                            }
+                        })
+                        .collect()
+                };
+                let dfg = &mut func.dfg;
+                for (bc, vs) in dfg.insts[term]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+                    .iter_mut()
+                    .zip(adds)
+                {
+                    for v in vs {
+                        bc.append_argument(BlockArg::Value(v), &mut dfg.value_lists);
+                    }
+                }
+            }
             continue;
         }
         let bix = blk_ix[&b] as usize;
