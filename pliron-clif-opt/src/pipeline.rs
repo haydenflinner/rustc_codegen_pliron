@@ -4656,6 +4656,14 @@ fn s_mintrip(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_xorcancel(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::xorcancel::run(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("xorcancel");
+    }
+    k
+}
+
 fn s_demand(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = crate::demand::run(&mut p.clctx.func);
     if k > 0 {
@@ -4985,6 +4993,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             run: s_clifpeep,
             site: std::sync::OnceLock::new(),
         },
+        // Repeated leaves of an xor tree cancel (SipHash's last round:
+        // `v0` occurs twice in `v0 ^ v1 ^ v2 ^ (rotl(v3, 21) ^ v0)`).
+        step("xorcancel", "xorcancel", Gate::OptIn("PLIRON_XORCANCEL"), s_xorcancel),
         step("tailmerge", "", Gate::Flag(FlagId::Tailmerge), s_tailmerge).needs(shape::BLOCKS2),
         step("taildup", "", Gate::Flag(FlagId::Taildup), s_taildup).needs(shape::BLOCKS2),
         step("tailrec", "tailrec", Gate::Flag(FlagId::Tailrec), s_tailrec).needs(shape::CALL),

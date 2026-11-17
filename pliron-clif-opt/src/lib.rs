@@ -30,6 +30,7 @@ pub mod celim;
 pub mod dbglabel;
 pub mod cicm;
 pub mod clifpeep;
+pub mod xorcancel;
 pub mod cmp3;
 pub mod cmpcancel;
 pub mod deadslot;
