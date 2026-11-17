@@ -127,6 +127,7 @@ def prune(keep, limit=24):
     Every side is a full build of the program (50-100 MB); a night of
     A/Bs filled the disk once."""
     import shutil
+    os.makedirs(OUT, exist_ok=True)
     dirs = [d for d in os.listdir(OUT) if d.startswith("ab-") and os.path.isdir(os.path.join(OUT, d))]
     dirs = sorted((d for d in dirs if d not in keep), key=lambda d: os.path.getmtime(os.path.join(OUT, d)))
     for d in dirs[:max(0, len(dirs) - limit)]:
