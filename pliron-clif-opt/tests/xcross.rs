@@ -319,3 +319,45 @@ fn sret_fill_is_the_same_in_a_slot_and_in_parameter_memory() {
     let facts = Facts { nonnull: Some(&nn), ..Facts::default() };
     cross_check(&b, &b, &s, &s, &facts).unwrap_or_else(|m| panic!("{m}"));
 }
+
+const SRET_ALIAS_A: &str = "function %f(i64 PURPOSE, i64) {
+block0(v0: i64, v1: i64):
+    v2 = load.i64 v1
+    v3 = iconst.i64 7
+    store v3, v2
+    v4 = iconst.i64 1
+    store v4, v0
+    return
+}";
+const SRET_ALIAS_B: &str = "function %f(i64 PURPOSE, i64) {
+block0(v0: i64, v1: i64):
+    v4 = iconst.i64 1
+    store v4, v0
+    v2 = load.i64 v1
+    v3 = iconst.i64 7
+    store v3, v2
+    return
+}";
+
+/// The return slot is `noalias` (rustc marks every indirect return
+/// pointer so): no pointer the function loads can reach it, so a store
+/// through one may move across the stores to the slot. The two orders
+/// differ only when the loaded pointer lands in the slot, which the
+/// sandbox must not seed for an `sret` parameter (the `get_attached` and
+/// solver-closure reports of the SIBARMS ablation on dsa). A plain
+/// pointer parameter may be reached that way, so the same pair differs.
+#[test]
+fn sret_param_is_not_reached_through_loaded_pointers() {
+    let s = Syms::default();
+    let (nw, ext) = (FxHashSet::default(), FxHashMap::default());
+    let c = Cross { before: &s, after: &s, self_symbol: None, nowrite: &nw, extent: &ext };
+    // A seeded word lands on the slot's first word about once in a
+    // hundred trials.
+    let cfg = Config { trials: 1024, ..Config::default() };
+    let a = parse(&SRET_ALIAS_A.replace("PURPOSE", "sret"));
+    let b = parse(&SRET_ALIAS_B.replace("PURPOSE", "sret"));
+    check_cross(&a, &b, &Facts::default(), Some(&c), &cfg).unwrap_or_else(|m| panic!("{m}"));
+    let a = parse(&SRET_ALIAS_A.replace(" PURPOSE", ""));
+    let b = parse(&SRET_ALIAS_B.replace(" PURPOSE", ""));
+    assert!(check_cross(&a, &b, &Facts::default(), Some(&c), &cfg).is_err());
+}

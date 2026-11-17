@@ -1176,8 +1176,14 @@ impl World {
                     },
                 );
                 // A noalias param's memory is reachable only through the
-                // param, so no seeded word may point into it.
-                if !facts.noalias.is_some_and(|s| s.contains(p)) {
+                // param, so no seeded word may point into it. The return
+                // slot is one too: rustc marks every indirect return
+                // pointer `noalias`, and the signature's `sret` says which
+                // parameter it is (in every recorded corpus, so the facts
+                // line needs no entry for it; the lowering keeps it out of
+                // its `noalias` set, which the CLIF passes also read).
+                let sret = f.signature.params.get(i).is_some_and(|a| a.purpose == ir::ArgumentPurpose::StructReturn);
+                if !(sret || facts.noalias.is_some_and(|s| s.contains(p))) {
                     targets.push(base + PTR_SLACK);
                 }
             }
