@@ -197,6 +197,10 @@ fn main() -> ExitCode {
             // allocated vcode (what `codegen` scores).
             let isa = backend_isa();
             let (f, facts) = load(Path::new(file));
+            // `PLIRON_RA_EXPLAIN=1`: regalloc2's `ra2x:` decision log.
+            if std::env::var_os("PLIRON_RA_EXPLAIN").is_some() {
+                cranelift_codegen::ra_set_explain(true);
+            }
             let after = with_pipe(&*isa, f, &facts, |p| {
                 pipeline::run_pipeline(p);
                 p.clctx.func.clone()

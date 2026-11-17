@@ -470,3 +470,48 @@ corpus weighted stack accesses -1.6%, compression -0.9%; in
 alone (default allocator + hoist): compression -29k, pulldown -12k, the
 others within +-3k (blind-sig noise). With the region split: compression
 -15k, pulldown -24k. `PLIRON_RA_CHECK=1` clean (same runs as above).
+
+## `PLIRON_RA2_MOVESTATS=1` (reporting only): the allocator's moves by cause
+
+`src/lib.rs` (`movestats_on`, `MV_NAMES`, `MOVESTATS`,
+`movestats_snapshot`, `movestats_take_local`), `src/ion/moves.rs`
+(`InsertedMove::kind` set at every insertion site, `tally_move` after
+redundant-move elimination), `src/ion/merge.rs` (why each blockparam merge
+failed, `Ctx::bp_merge_kind`). Every emitted move is counted by kind:
+split moves inside a block (plain, or at a fixed-register use / def),
+same-vreg moves across a block edge, blockparam moves (merged before
+splitting; merge refused for overlapping ranges, with `bp-ovl-br` when
+the input is defined in a branching block; refused for requirements or
+the pin rule; other), multi-fixed fixups, reused inputs; reg-reg and with
+a stack side apart, plain and weighted by block frequency relative to the
+entry (capped at 512). `clif-check codegen` prints the totals and puts
+the weighted vector in each function's `mv`. Under `PLIRON_RA_EXPLAIN`
+merge attempts print `bpmerge` / `merge overlap` lines.
+
+html corpus (2026-11-17), reg-reg count / weighted: split 12.6k / 14k,
+split-fixed 16.3k / 25k, xblock 17.5k / 20.5k, bp-merged 7.4k / 15.6k,
+bp-overlap 4.2k / 49.6k (42.5k of it one function,
+`encoding_rs::mem::check_str_for_latin1_and_bidi`), bp-ovl-br 4.4k / 7.1k,
+bp-req 0.7k / 2.2k.
+
+## `PLIRON_RA2_MERGEDEPTH=4|5|6`: merge order by frequency / range length
+
+`src/ion/merge.rs`: 4 orders blockparam edges by `hot_bonus` (powers of
+two, hottest first) then shortest input range, 5 by `hot_bonus` only, 6
+by shortest input range only. Static html corpus loop-weighted
+instructions: base 6.970M, `=2` 6.882M, `=4` 6.910M, `=6` 6.887M. Exact
+counts are mixed (pulldown-cmark +2.30% / -0.17% / +1.37% for 2/4/6,
+regex +1.87% for 4, rust-compression -0.22% / +0.11% / -0.58%): the
+greedy merge order is not a lever, none is a flip candidate.
+
+## `PLIRON_RA2_COPYHINT=1|2` (opt-in): copy hints
+
+`src/ion/hints.rs` (new; `copy_hint`, `build_copy_hint_index`),
+`src/ion/process.rs` (`process_bundle` takes the hint), `src/lib.rs`
+(`copyhint_mode`). A bundle about to be allocated weighs the registers of
+its move neighbours already allocated (abutting ranges of its vregs,
+blockparam edges in both directions) by block frequency and tries the
+heaviest first, as LLVM's greedy allocator orders candidates by copy
+hints. `1`: only for a bundle without a spillset hint; `2`: in place of
+it. Static html corpus, `=2`: loop-weighted moves 716k -> 675k,
+instructions 6.970M -> 6.919M; `=1` almost nothing.

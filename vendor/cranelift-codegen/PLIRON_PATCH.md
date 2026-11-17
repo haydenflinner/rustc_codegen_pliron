@@ -2024,3 +2024,12 @@ offset was `add x, x, #imm`; a negative one was `mov xK, #-imm` + `add`,
 two instructions where `sub x, x, #imm` is one (pulldown-cmark's
 escape loops `ldr w1, [x26 - 4 + x25]`: about 330k executed `mov`s).
 Static, html corpus: -531 instructions, loop-weighted -8.6k.
+
+## `PLIRON_MINMAXIMM=1` (opt-in): integer min/max against a small constant (2026-11-17)
+
+`src/isa/aarch64/lower.isle` (`cmp_and_choose_imm`, `cmp_and_choose_zero`),
+`src/isa/aarch64/lower/isle.rs` (`pliron_minmax_imm`): `smax x, 0` was
+`mov x1, #0; cmp x0, x1; csel x0, x0, x1, gt`; a 32/64-bit min/max whose
+second operand is a 12-bit constant now compares with the immediate, and
+a zero operand is `xzr` in the `csel` (no constant at all). pulldown-cmark
+`scan_nextline`'s `max(0, ..)`.

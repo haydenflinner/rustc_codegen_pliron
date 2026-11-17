@@ -1640,6 +1640,24 @@
       (with_flags_reg (cmp (operand_size ty) x y)
                       (csel cc x y))))
 
+;; PLIRON (`PLIRON_MINMAXIMM=1`): a constant operand that fits 12 bits
+;; is the compare's immediate, and zero is `xzr` in the select: `smax x,
+;; 0` was `mov x1, #0; cmp x0, x1; csel x0, x0, x1, gt` (pulldown-cmark's
+;; `scan_nextline`), now `cmp x0, #0; csel x0, x0, xzr, gt`.
+(decl pure pliron_minmax_imm () bool)
+(extern constructor pliron_minmax_imm pliron_minmax_imm)
+(rule cmp_and_choose_imm 2 (cmp_and_choose (ty_32_or_64 ty) cc _ x y @ (imm12_from_value imm))
+      (if-let true (pliron_minmax_imm))
+      (let ((x Reg (put_in_reg x))
+            (y Reg (put_in_reg y)))
+       (with_flags_reg (cmp_imm (operand_size ty) x imm)
+                       (csel cc x y))))
+(rule cmp_and_choose_zero 3 (cmp_and_choose (ty_32_or_64 ty) cc _ x (iconst _ (u64_from_imm64 0)))
+      (if-let true (pliron_minmax_imm))
+      (let ((x Reg (put_in_reg x)))
+       (with_flags_reg (cmp_imm (operand_size ty) x (u8_into_imm12 0))
+                       (csel cc x (zero_reg)))))
+
 (rule umin 2 (lower (umin (and (fits_in_64 ty) (ty_int _)) x y))
       (cmp_and_choose ty (Cond.Lo) false x y))
 (rule smin 2 (lower (smin (and (fits_in_64 ty) (ty_int _)) x y))

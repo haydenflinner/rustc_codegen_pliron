@@ -127,6 +127,16 @@ impl<'a, F: Function> Env<'a, F> {
                     ranges_from[idx_from].index,
                     ranges_to[idx_to].index
                 );
+                {
+                    let (rf, rt) = (ranges_from[idx_from], ranges_to[idx_to]);
+                    explain!(
+                        "  merge overlap: v{} {:?} vs v{} {:?}",
+                        self.ranges[rf.index].vreg.index(),
+                        rf.range,
+                        self.ranges[rt.index].vreg.index(),
+                        rt.range
+                    );
+                }
                 self.ctx.last_merge_fail = 4;
                 return false;
             }
@@ -498,6 +508,13 @@ impl<'a, F: Function> Env<'a, F> {
                 }
                 continue;
             }
+            explain!(
+                "bpmerge v{} -> v{} (block{} -> block{})",
+                from_vreg.index(),
+                to_vreg.index(),
+                self.blockparam_outs[i].from_block.index(),
+                to_block.index()
+            );
             if !self.merge_bundles(from_bundle, to_bundle) && stats {
                 let key = crate::ion::data_structures::u64_key(
                     self.blockparam_outs[i].from_block.raw_u32(),

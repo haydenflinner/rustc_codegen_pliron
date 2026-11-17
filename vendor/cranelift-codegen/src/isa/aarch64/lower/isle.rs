@@ -1472,6 +1472,13 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         SImm9::maybe_from_i64(off).is_some() || UImm12Scaled::maybe_from_i64(off, ty).is_some()
     }
 
+    /// PLIRON (`PLIRON_MINMAXIMM=1`): min/max against a small constant
+    /// compares with the immediate (and selects `xzr` for zero).
+    fn pliron_minmax_imm(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_MINMAXIMM").as_deref() == Ok("1"))
+    }
+
     /// PLIRON (`PLIRON_AMODENEG=1`): `-off` as an `Imm12` for a negative
     /// `off`, so `amode_add` subtracts it instead of materializing it.
     fn amode_neg_imm12(&mut self, off: i32) -> Option<Imm12> {
