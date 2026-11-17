@@ -76,11 +76,18 @@ def run(clif_check, corpus, every, jobs, env_extra, out):
     if jobs:
         cmd += ["--jobs", str(jobs)]
     t0 = time.time()
-    p = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    # A signal (earlyoom under load kills with SIGTERM) is not a verdict
+    # on the switch: rerun, a few times.
+    for _ in range(3):
+        if out.exists():
+            out.unlink()
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if p.returncode >= 0:
+            break
     dt = time.time() - t0
     # A report with failing rows exits nonzero too: read the JSON first.
     if not out.exists():
-        return None, dt, (p.stderr or p.stdout)[-400:]
+        return None, dt, f"exit {p.returncode}: " + (p.stderr or p.stdout)[-400:]
     r = json.loads(out.read_text())
     bad = [(f["status"], f["file"], f.get("msg", "")[:160]) for f in r["functions"] if f["status"] != "ok"]
     return (len(r["functions"]), bad), dt, ""
