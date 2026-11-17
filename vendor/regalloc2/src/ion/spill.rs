@@ -17,7 +17,8 @@ use super::{
     SpillSlotIndex,
 };
 use crate::{
-    Allocation, Ctx, Edit, Function, FxHashMap, FxHashSet, InstPosition, RegClass, SpillSlot,
+    ion::data_structures::CodeRange, Allocation, Ctx, Edit, Function, FxHashMap, FxHashSet,
+    InstPosition, RegClass, SpillSlot,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -109,8 +110,76 @@ impl<'a, F: Function> Env<'a, F> {
         debug_assert!(res.is_none());
     }
 
+    /// PLIRON (`PLIRON_RA2_SLOTLIVE=1`): per required spillset, the
+    /// disjoint union of the live ranges of every range in it (all its
+    /// bundles, in registers or not), sorted. Empty for the others.
+    fn spillset_live_ranges(&self) -> Vec<Vec<CodeRange>> {
+        let mut out: Vec<Vec<CodeRange>> = vec![Vec::new(); self.ctx.spillsets.len()];
+        for v in self.ctx.vregs.iter() {
+            for e in v.ranges.iter() {
+                let r = &self.ctx.ranges[e.index];
+                if r.bundle.is_invalid() {
+                    continue;
+                }
+                let ss = self.ctx.bundles[r.bundle].spillset;
+                if ss.is_invalid() || !self.ctx.spillsets[ss].required {
+                    continue;
+                }
+                if r.range.from < r.range.to {
+                    out[ss.index()].push(r.range);
+                }
+            }
+        }
+        for l in out.iter_mut() {
+            if l.is_empty() {
+                continue;
+            }
+            l.sort_unstable_by_key(|r| r.from);
+            let mut w = 0;
+            for i in 1..l.len() {
+                if l[i].from <= l[w].to {
+                    if l[i].to > l[w].to {
+                        l[w].to = l[i].to;
+                    }
+                } else {
+                    w += 1;
+                    l[w] = l[i];
+                }
+            }
+            l.truncate(w + 1);
+        }
+        out
+    }
+
+    fn place_spillset(
+        &mut self,
+        spillset: SpillSetIndex,
+        spillslot: SpillSlotIndex,
+        ranges: Option<&[CodeRange]>,
+    ) {
+        match ranges {
+            None => self.allocate_spillset_to_spillslot(spillset, spillslot),
+            Some(rs) => {
+                self.ctx.spillsets[spillset].slot = spillslot;
+                let bt = &mut self.ctx.spillslots[spillslot.index()].ranges.btree;
+                for r in rs {
+                    let res = bt.insert(LiveRangeKey::from_range(r), spillset);
+                    debug_assert!(res.is_none());
+                }
+            }
+        }
+    }
+
     pub fn allocate_spillslots(&mut self) {
-        const MAX_ATTEMPTS: usize = 10;
+        // PLIRON (`PLIRON_RA2_SLOTLIVE=1`): spillsets share a slot when
+        // their live ranges are disjoint, not only their extents (LLVM's
+        // stack-slot colouring by live interval), and more slots are probed.
+        let live = if crate::slotlive_on() {
+            Some(self.spillset_live_ranges())
+        } else {
+            None
+        };
+        let max_attempts: usize = if live.is_some() { crate::slotlive_probes() } else { 10 };
 
         for spillset in 0..self.ctx.spillsets.len() {
             trace!("allocate spillslot: {}", spillset);
@@ -118,6 +187,12 @@ impl<'a, F: Function> Env<'a, F> {
             if !self.ctx.spillsets[spillset].required {
                 continue;
             }
+            // A spillset none of whose ranges is known (should not happen)
+            // falls back to its extent.
+            let ranges: Option<&[CodeRange]> = live
+                .as_ref()
+                .map(|l| l[spillset.index()].as_slice())
+                .filter(|l| !l.is_empty());
             let class = self.ctx.spillsets[spillset].class as usize;
             // Try a few existing spillslots.
             let mut i = self.ctx.slots_by_class[class].probe_start;
@@ -125,7 +200,7 @@ impl<'a, F: Function> Env<'a, F> {
             // Never probe the same element more than once: limit the
             // attempt count to the number of slots in existence.
             for _attempt in
-                0..core::cmp::min(self.ctx.slots_by_class[class].slots.len(), MAX_ATTEMPTS)
+                0..core::cmp::min(self.ctx.slots_by_class[class].slots.len(), max_attempts)
             {
                 // Note: this indexing of `slots` is always valid
                 // because either the `slots` list is empty and the
@@ -136,8 +211,15 @@ impl<'a, F: Function> Env<'a, F> {
                 // after this loop).
                 let spillslot = self.ctx.slots_by_class[class].slots[i];
 
-                if self.spillslot_can_fit_spillset(spillslot, spillset) {
-                    self.allocate_spillset_to_spillslot(spillset, spillslot);
+                let fits = match ranges {
+                    Some(rs) => {
+                        let bt = &self.ctx.spillslots[spillslot.index()].ranges.btree;
+                        !rs.iter().any(|r| bt.contains_key(&LiveRangeKey::from_range(r)))
+                    }
+                    None => self.spillslot_can_fit_spillset(spillslot, spillset),
+                };
+                if fits {
+                    self.place_spillset(spillset, spillslot, ranges);
                     success = true;
                     self.ctx.slots_by_class[class].probe_start = i;
                     break;
@@ -158,7 +240,7 @@ impl<'a, F: Function> Env<'a, F> {
                 self.ctx.slots_by_class[class].probe_start =
                     self.ctx.slots_by_class[class].slots.len() - 1;
 
-                self.allocate_spillset_to_spillslot(spillset, spillslot);
+                self.place_spillset(spillset, spillslot, ranges);
             }
         }
 

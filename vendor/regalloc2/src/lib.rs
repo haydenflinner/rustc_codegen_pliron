@@ -207,6 +207,30 @@ pub(crate) fn spillhoist_on() -> bool {
     false
 }
 
+/// PLIRON: `PLIRON_RA2_SLOTLIVE=1` (opt-in): spill slots are shared by
+/// live ranges, not spillset extents (`ion/spill.rs`).
+pub(crate) fn slotlive_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_SLOTLIVE", &C, 0.0) != 0.0
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON: `PLIRON_RA2_SLOTLIVE_PROBES` (default 32): existing slots a
+/// spillset is tried against under `SLOTLIVE` (upstream: 10).
+pub(crate) fn slotlive_probes() -> usize {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_SLOTLIVE_PROBES", &C, 32.0).max(1.0) as usize
+    }
+    #[cfg(not(feature = "std"))]
+    32
+}
+
 /// PLIRON: `PLIRON_RA2_REGION_K` (default 8): registers whose cut is
 /// solved, the ones with the largest possible gain.
 pub(crate) fn region_k() -> usize {

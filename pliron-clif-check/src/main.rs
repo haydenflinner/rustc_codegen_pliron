@@ -215,6 +215,10 @@ fn main() -> ExitCode {
             if explain {
                 cranelift_codegen::ra_set_explain(false);
             }
+            {
+                let [slots, spills, clobber, out, fixed] = cranelift_codegen::pliron_last_frame();
+                eprintln!("frame-info: slots={slots} spills={spills} clobber={clobber} outgoing={out} fixed={fixed}");
+            }
             let v = c.vcode.clone().unwrap_or_default();
             if std::env::var_os("CLIF_CHECK_POST_EGRAPH").is_some() {
                 // The function as Cranelift lowered it (after its egraph).
