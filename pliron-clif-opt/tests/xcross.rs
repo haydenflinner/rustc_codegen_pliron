@@ -234,3 +234,33 @@ fn bytes_from_a_slots_previous_life_pin_nothing() {
     let facts = Facts { lifetime_starts: Some(&lts), ..Facts::default() };
     cross_check(&a, &b, &s, &s, &facts).unwrap_or_else(|m| panic!("{m}"));
 }
+
+const TEST_RESULT_TAG: &str = "function %f(i64) -> i64 {
+    ss0 = explicit_slot 16
+    sig0 = (i64 sret)
+    fn0 = u0:3 sig0
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    call fn0(v1)
+    v2 = load.i32 v1
+    TEST
+    brif v4, block1, block2
+block1:
+    v5 = iconst.i64 1
+    return v5
+block2:
+    v6 = iconst.i64 0
+    return v6
+}";
+
+/// A `Result` returned through `sret` has its tag in the first word, and
+/// two builds may test it differently (`tag as u8 != 0`, `tag & 1`): the
+/// stub's value has a tag of 0 or 1, both readings agree.
+#[test]
+fn sret_result_tag_is_zero_or_one() {
+    let a = parse(&TEST_RESULT_TAG.replace("TEST", "v4 = ireduce.i8 v2"));
+    let b = parse(&TEST_RESULT_TAG.replace("TEST", "v7 = iconst.i32 1\n    v4 = band v2, v7"));
+    let mut s = syms(&[("u0:3", "foo")]);
+    s.sret.insert("foo".into(), 16);
+    cross_check(&a, &b, &s, &s, &Facts::default()).unwrap_or_else(|m| panic!("{m}"));
+}

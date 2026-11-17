@@ -2432,9 +2432,21 @@ fn stub(
         v.truncate(n);
         v
     };
+    let sret_k = f.dfg.signatures[sig].params.iter().position(|p| p.purpose == ir::ArgumentPurpose::StructReturn);
     let frame_fill = |k: usize, n: usize| -> Vec<u8> {
         if xmode {
-            return words(k, n);
+            let mut v = words(k, n);
+            // The value a callee returns through `sret` is a value of its
+            // type, and its first word is most often a discriminant
+            // (`Result`, `Option`): 0 or 1. A random word there is a tag
+            // no program makes, and two builds may test it differently
+            // (`tag as u8 != 0` against `tag & 1`: bincode's `visit_seq`
+            // for rapier's `ContactData` in dsa).
+            if Some(k) == sret_k && n >= 4 {
+                let t = u32::from(mix(h, 0x7a6) & 3 == 0);
+                v[..4].copy_from_slice(&t.to_le_bytes());
+            }
+            return v;
         }
         (0..n).map(|j| (mix(h, k as u64) >> ((j % 8) * 8)) as u8 ^ j as u8).collect()
     };
