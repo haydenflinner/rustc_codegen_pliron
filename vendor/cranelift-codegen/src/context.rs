@@ -1299,7 +1299,7 @@ impl Context {
     /// arm (pulldown-cmark's `item_to_event`: eleven `movz` ahead of the
     /// jump table on every call, each arm then moving one of them into the
     /// join's parameter) executes all of them on every path. Each target
-    /// with at least two predecessors gets a lowering edge block anyway;
+    /// entered by at least two edges gets a lowering edge block anyway;
     /// this makes it explicit and puts a copy of each constant it passes in
     /// it, which then lands in the parameter's register directly. Edges
     /// with the same target and arguments share one block. Loop exits are
@@ -1336,12 +1336,19 @@ impl Context {
         if cands.is_empty() {
             return;
         }
-        self.compute_cfg();
+        // Incoming edges per block (a `br_table` entry is one): a block
+        // entered by one edge needs no edge block, the lowering puts the
+        // moves at its head.
+        let mut in_edges: crate::FxHashMap<crate::ir::Block, u32> = crate::FxHashMap::default();
         let mut uses: crate::FxHashMap<Value, u32> = crate::FxHashMap::default();
         for b in self.func.layout.blocks() {
             for i in self.func.layout.block_insts(b) {
                 for v in self.func.dfg.inst_values(i) {
                     *uses.entry(self.func.dfg.resolve_aliases(v)).or_default() += 1;
+                }
+                let f = &self.func;
+                for bc in f.dfg.insts[i].branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables) {
+                    *in_edges.entry(bc.block(&f.dfg.value_lists)).or_default() += 1;
                 }
             }
         }
@@ -1376,7 +1383,7 @@ impl Context {
                 let target = bc.block(&self.func.dfg.value_lists);
                 let args: Vec<BlockArg> = bc.args(&self.func.dfg.value_lists).collect();
                 let moves = args.iter().any(|a| matches!(a, BlockArg::Value(v) if movable(&self.func, self.func.dfg.resolve_aliases(*v))));
-                if !moves || self.cfg.pred_iter(target).count() < 2 {
+                if !moves || in_edges.get(&target).copied().unwrap_or(0) < 2 {
                     slot_group.push(None);
                     continue;
                 }
