@@ -36,6 +36,13 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-17, N7: repeated leaves of an xor tree cancel (SipHash's last
+    // round: `v0` drops out of `v0 ^ v1 ^ v2 ^ (rotl(v3,21) ^ v0)`, and its
+    // last `rotl`/`iadd` die). Quiet wasm kernels with --perturb=4 against
+    // LLVM: hmget +1.9% -> -3.8%, hashmap +0.4% -> -2.1%, geomean 0.897 ->
+    // 0.891, every other kernel inside its range. An algebraic identity;
+    // native exact counts not yet taken. `PLIRON_XORCANCEL=0` off.
+    "PLIRON_XORCANCEL",
     // 2026-11-17: wpeep also runs on bodies with SIMD instructions (it
     // decodes the 0xfd opcodes and treats SIMD values as opaque). Quiet
     // kernels with --perturb=4 (load 5.6): geomean 0.934 -> 0.934, no
