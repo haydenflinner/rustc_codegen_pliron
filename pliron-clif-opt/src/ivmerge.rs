@@ -402,6 +402,8 @@ impl Ctx<'_, '_> {
         let bits = ty.bits();
         let k = sext(d.k, bits);
         let leaves = !d.t.is_empty();
+        // `root - leaf` folds into no address mode.
+        let sub_only = matches!(d.t[..], [(_, c)] if mask(c, bits) != mask(1, bits));
         let mut seen: FxHashSet<Inst> = FxHashSet::default();
         let mut out = Vec::new();
         let mut general = false;
@@ -459,7 +461,7 @@ impl Ctx<'_, '_> {
                     let off = i64::from(i32::from(offset)).wrapping_add(k);
                     match i32::try_from(off) {
                         Ok(o) if o >= 0 || self.am.neg_off => {
-                            cost += self.mem_cost(leaves, o);
+                            cost += self.mem_cost(leaves, sub_only, o);
                             out.push(Use::Mem(ui, o));
                         }
                         _ => general = true,
@@ -471,7 +473,7 @@ impl Ctx<'_, '_> {
                     let off = i64::from(i32::from(offset)).wrapping_add(k);
                     match i32::try_from(off) {
                         Ok(o) if o >= 0 || self.am.neg_off => {
-                            cost += self.mem_cost(leaves, o);
+                            cost += self.mem_cost(leaves, sub_only, o);
                             out.push(Use::Mem(ui, o));
                         }
                         _ => general = true,
@@ -487,8 +489,8 @@ impl Ctx<'_, '_> {
     }
 
     /// In-loop instructions a rewritten address costs.
-    fn mem_cost(&self, leaves: bool, off: i32) -> usize {
-        if !leaves || self.am.reg_reg_disp || (self.am.reg_reg && off == 0) {
+    fn mem_cost(&self, leaves: bool, sub_only: bool, off: i32) -> usize {
+        if !leaves || (!sub_only && (self.am.reg_reg_disp || (self.am.reg_reg && off == 0))) {
             0
         } else {
             1
@@ -722,8 +724,38 @@ impl Ctx<'_, '_> {
     }
 }
 
-/// `sum(c * leaf)` (unit coefficients) before `at`; `None` for no leaves.
-fn emit_leaves(func: &mut Function, at: Inst, l: &Lin, ty: Type) -> Option<Value> {
+/// `d`'s non-constant part as the rewrite applies it: one leaf added or
+/// subtracted where it is used, or a sum computed before the loop.
+#[derive(Clone, Copy)]
+enum Leaves {
+    None,
+    Add(Value),
+    Sub(Value),
+}
+
+impl Leaves {
+    /// `x + leaves`.
+    fn plus(self, cur: &mut FuncCursor, x: Value) -> Value {
+        match self {
+            Leaves::None => x,
+            Leaves::Add(v) => cur.ins().iadd(x, v),
+            Leaves::Sub(v) => cur.ins().isub(x, v),
+        }
+    }
+
+    /// `x - leaves`.
+    fn minus(self, cur: &mut FuncCursor, x: Value) -> Value {
+        match self {
+            Leaves::None => x,
+            Leaves::Add(v) => cur.ins().isub(x, v),
+            Leaves::Sub(v) => cur.ins().iadd(x, v),
+        }
+    }
+}
+
+/// `d`'s leaves: a lone leaf as is, a sum (unit coefficients) computed
+/// before `at`.
+fn emit_leaves(func: &mut Function, at: Inst, l: &Lin, ty: Type) -> Leaves {
     let bits = ty.bits();
     let pos: Vec<Value> = l
         .t
@@ -737,11 +769,17 @@ fn emit_leaves(func: &mut Function, at: Inst, l: &Lin, ty: Type) -> Option<Value
         .filter(|&&(_, c)| mask(c, bits) != mask(1, bits))
         .map(|&(v, _)| v)
         .collect();
+    match (&pos[..], &neg[..]) {
+        ([], []) => return Leaves::None,
+        ([p], []) => return Leaves::Add(*p),
+        ([], [n]) => return Leaves::Sub(*n),
+        _ => {}
+    }
     let mut cur = FuncCursor::new(func).at_inst(at);
     let mut acc = match (pos.first(), neg.first()) {
         (Some(&p), _) => p,
         (None, Some(&n)) => cur.ins().ineg(n),
-        (None, None) => return None,
+        (None, None) => unreachable!("two or more leaves"),
     };
     for &p in pos.iter().skip(1) {
         acc = cur.ins().iadd(acc, p);
@@ -749,7 +787,7 @@ fn emit_leaves(func: &mut Function, at: Inst, l: &Lin, ty: Type) -> Option<Value
     for &n in neg.iter().skip(usize::from(pos.is_empty())) {
         acc = cur.ins().isub(acc, n);
     }
-    Some(acc)
+    Leaves::Add(acc)
 }
 
 /// Apply one header's plan; the rewritten compares go to `cmps`.
@@ -759,7 +797,7 @@ fn apply(func: &mut Function, edges_of: &[Inst], plan: &LoopPlan, cmps: &mut Vec
     let params: Vec<Value> = func.dfg.block_params(h).to_vec();
     let mut drop: Vec<usize> = Vec::new();
     // (member, root, leaves of `d` computed before the loop, constant)
-    let mut alias: Vec<(Value, Value, Option<Value>, i64)> = Vec::new();
+    let mut alias: Vec<(Value, Value, Leaves, i64)> = Vec::new();
     for cp in &plan.classes {
         let root = params[cp.root];
         for m in &cp.members {
@@ -778,10 +816,7 @@ fn apply(func: &mut Function, edges_of: &[Inst], plan: &LoopPlan, cmps: &mut Vec
                             }
                             Image::Sub(q) => {
                                 let mut cur = FuncCursor::new(func).at_inst(at);
-                                let mut x = q;
-                                if let Some(dl) = leaves {
-                                    x = cur.ins().isub(x, dl);
-                                }
+                                let mut x = leaves.minus(&mut cur, q);
                                 if k != 0 {
                                     let kc = cur.ins().iconst(ty, k.wrapping_neg());
                                     x = cur.ins().iadd(x, kc);
@@ -796,10 +831,7 @@ fn apply(func: &mut Function, edges_of: &[Inst], plan: &LoopPlan, cmps: &mut Vec
                         cmps.push(ui);
                     }
                     Use::Mem(ui, off) => {
-                        let addr = match leaves {
-                            Some(dl) => FuncCursor::new(func).at_inst(ui).ins().iadd(root, dl),
-                            None => root,
-                        };
+                        let addr = leaves.plus(&mut FuncCursor::new(func).at_inst(ui), root);
                         match &mut func.dfg.insts[ui] {
                             InstructionData::Load { arg, offset, .. } => {
                                 *arg = addr;
@@ -840,10 +872,7 @@ fn apply(func: &mut Function, edges_of: &[Inst], plan: &LoopPlan, cmps: &mut Vec
     for (m, root, leaves, k) in alias {
         let ty = func.dfg.value_type(m);
         let mut cur = FuncCursor::new(func).at_inst(top);
-        let mut v = root;
-        if let Some(dl) = leaves {
-            v = cur.ins().iadd(v, dl);
-        }
+        let mut v = leaves.plus(&mut cur, root);
         if k != 0 {
             let kc = cur.ins().iconst(ty, k);
             v = cur.ins().iadd(v, kc);
