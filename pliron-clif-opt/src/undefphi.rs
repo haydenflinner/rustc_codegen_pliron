@@ -185,12 +185,41 @@ pub fn run(func: &mut Function, undef: &[Value]) -> usize {
             }
         }
     }
+    // A parameter whose value is stored keeps the zero: the store writes
+    // bytes nobody reads either way, and a zero is the cheaper value to
+    // write (`xzr`, merged zero stores; regex's `MaybeInst::fill` stored
+    // the `goto` into an unused field of each variant: +8.7% executed
+    // instructions). `PLIRON_UNDEFPHI_STORED=1` rewrites those too.
+    let stored_ok = crate::env_is("PLIRON_UNDEFPHI_STORED", "1");
+    let mut stored: FxHashSet<Value> = FxHashSet::default();
+    if !stored_ok {
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                if let cranelift_codegen::ir::InstructionData::Store { args, .. } = func.dfg.insts[i] {
+                    stored.insert(func.dfg.resolve_aliases(args[0]));
+                }
+            }
+        }
+        // Through edges: a parameter passed on to a parameter that is
+        // stored is stored too (the variant fields of `fill` travel two
+        // joins before their store).
+        let mut wl: Vec<Value> = stored.iter().copied().filter(|&v| is_param(func, v)).collect();
+        while let Some(q) = wl.pop() {
+            if let Some(args) = inc.get(&q) {
+                for &a in args.iter().flatten() {
+                    if is_param(func, a) && stored.insert(a) {
+                        wl.push(a);
+                    }
+                }
+            }
+        }
+    }
     // (block, index, param, value), checked for dominance.
     let mut rm: Vec<(Block, usize, Value, Value)> = Vec::new();
     for b in func.layout.blocks() {
         for (k, &p) in func.dfg.block_params(b).iter().enumerate() {
             let Some(L::One(v)) = st.get(&p).copied() else { continue };
-            if v == p || func.dfg.value_type(v) != func.dfg.value_type(p) {
+            if v == p || func.dfg.value_type(v) != func.dfg.value_type(p) || stored.contains(&p) {
                 continue;
             }
             if !dominates(func, v, b) {
