@@ -484,8 +484,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   `PLIRON_INLINE_ONCE=2` (wasm: the single-caller bonus for loop-free
   callees only; `=1` moves loops into their callers and costs hmget,
   tokenize and sieve; `=3` allows one loop-carrying callee into a
-  loop-free caller, keeps tokenize and sieve, loses hmget, and **its
-  dsa build corrupts the heap, not yet found**;
+  loop-free caller, keeps tokenize and sieve, and loses hmget unless
+  `PLIRON_LICM_SLOTPROV=1 PLIRON_LICM_GTE=1` are on with it (then hmget
+  is better than the default); its dsa heap corruption was the
+  `memcpyopt` reader-in-a-loop bug, fixed in `7dc8138`;
   `PLIRON_INLINE_ONCE_WASM` is the same knob read on wasm only),
   `PLIRON_INLINE_RECX=1` (a site cloned out of an inlined body does not
   inline a member of a call-graph cycle its clone chain already
