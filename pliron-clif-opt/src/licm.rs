@@ -1979,6 +1979,29 @@ fn promote_loc(
     1
 }
 
+/// Rules of `run` the caller turns on for its target. The general knobs
+/// (`PLIRON_LICM_GTE=1`, `PLIRON_LICM_SLOTPROV=1`) turn a rule on
+/// everywhere and `=0` turns it off everywhere; these flags turn it on
+/// where the caller measured it (the `_WASM` knobs, wasm32 only).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct LicmOpts {
+    /// Skip `PLIRON_LICM_INNERPRESS`'s register-pressure cap
+    /// (`PLIRON_LICM_NOPRESS_WASM=1`: TurboFan allocates registers on
+    /// wasm, the native estimate does not apply).
+    pub press_off: bool,
+    /// Guaranteed-to-execute load hoisting (`PLIRON_LICM_GTE_WASM`).
+    pub gte: bool,
+    /// Variable-indexed slots stay objects of their own
+    /// (`PLIRON_LICM_SLOTPROV_WASM`).
+    pub slotprov: bool,
+}
+
+impl From<bool> for LicmOpts {
+    fn from(press_off: bool) -> Self {
+        LicmOpts { press_off, ..Default::default() }
+    }
+}
+
 pub fn run(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
@@ -1994,14 +2017,16 @@ pub fn run(
     ofz: &FxHashMap<Value, Vec<(u64, pliron::context::Ptr<pliron::basic_block::BasicBlock>)>>,
     nocap: &FxHashMap<(Inst, u32), u64>,
     nashel: bool,
-    // Skip `PLIRON_LICM_INNERPRESS`'s register-pressure cap (the caller
-    // decides: `PLIRON_LICM_NOPRESS_WASM=1` on wasm32, where TurboFan
-    // allocates registers and the native estimate does not apply).
-    press_off: bool,
+    // Target-dependent rules the caller decides (see `LicmOpts`); a plain
+    // `bool` is `press_off` alone, which is what the tests pass.
+    opts: impl Into<LicmOpts>,
 ) -> usize {
+    let opts: LicmOpts = opts.into();
+    let press_off = opts.press_off;
     let mut la = LoopAnalysis::new();
     let regs = an.regs.unwrap_or((26, 10));
-    let gte_on = crate::env_is("PLIRON_LICM_GTE", "1");
+    let gte_on = crate::env_is("PLIRON_LICM_GTE", "1")
+        || (opts.gte && !crate::env_is("PLIRON_LICM_GTE", "0"));
     let mut press: Option<Option<FxHashMap<Block, u32>>> = None;
     let (cfg, dt) = an.cfg_dt(func);
     la.compute(func, cfg, dt);
@@ -2011,7 +2036,9 @@ pub fn run(
     // `PLIRON_LICM_SLOTPROV=1` (opt-in): slots that escaped only by a
     // variable index (`buf[i]`) still name an object of their own.
     let _slots = SlotsGuard;
-    if escapes.keys().any(|r| matches!(r, Root::S(_))) && crate::env_is("PLIRON_LICM_SLOTPROV", "1") {
+    let slotprov_on = crate::env_is("PLIRON_LICM_SLOTPROV", "1")
+        || (opts.slotprov && !crate::env_is("PLIRON_LICM_SLOTPROV", "0"));
+    if escapes.keys().any(|r| matches!(r, Root::S(_))) && slotprov_on {
         let uses = an.uses(func);
         let sp = crate::slotprov::compute(func, &uses);
         if let Some(sp) = &sp
