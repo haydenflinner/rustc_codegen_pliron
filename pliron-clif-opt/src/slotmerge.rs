@@ -1445,7 +1445,7 @@ fn stale_markers(
     // start kill (next w). Joins OR both.
     let mut dead_in = vec![0u64; nb * 2 * w];
     let run = |k: usize, st: &mut [u64], stale: &mut Option<&mut Vec<bool>>| {
-        for &(_, _, kind, s) in &ev[k] {
+        for &(pos, _, kind, s) in &ev[k] {
             let (j, bit) = (s / 64, 1u64 << (s % 64));
             let (de, ds) = (st[j] & bit != 0, st[w + j] & bit != 0);
             let bad = match kind {
@@ -1468,6 +1468,9 @@ fn stale_markers(
                 st[w + j] &= !bit;
             }
             if bad && let Some(v) = stale {
+                if !v[s] && info_on() {
+                    eprintln!("sm-info: stale ss{s}: read kind {kind} at pos {pos} in {}", order[k]);
+                }
                 v[s] = true;
             }
         }
@@ -1707,9 +1710,10 @@ pub fn run_with(
     };
     if info_on() {
         eprintln!(
-            "sm-info: slotmerge {} nslots={}",
+            "sm-info: slotmerge {} nslots={} in {}",
             func.name,
-            func.sized_stack_slots.len()
+            func.sized_stack_slots.len(),
+            CUR_FN.with(|c| c.borrow().clone())
         );
     }
     if func.sized_stack_slots.len() < 2 {

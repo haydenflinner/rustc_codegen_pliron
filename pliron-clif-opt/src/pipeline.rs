@@ -4648,7 +4648,7 @@ fn s_slotmerge(p: &mut Pipe, _an: &mut Analysis) -> usize {
                 .sum()
         })
         .unwrap_or(0);
-    if env_set("PLIRON_SM_INFO_FN") {
+    if env_set("PLIRON_SM_INFO_FN") || env_set("PLIRON_SM_INFO") {
         slotmerge::CUR_FN.with(|c| *c.borrow_mut() = p.fname.to_string());
     }
     let k = slotmerge::run_with(&mut p.clctx.func, p.nowrite, p.lifetimes, p.nocap, &p.edge_kills, &p.target);
