@@ -194,6 +194,19 @@ pub(crate) fn region_max() -> u8 {
     4
 }
 
+/// PLIRON: `PLIRON_RA2_SPILLHOIST=1` (opt-in): one spill store at the
+/// definition replaces a vreg's stores when that is cheaper
+/// (`ion/spillhoist.rs`).
+pub(crate) fn spillhoist_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_SPILLHOIST", &C, 0.0) != 0.0
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
 /// PLIRON: `PLIRON_RA2_REGION_K` (default 4): registers whose cut is
 /// solved, the ones with the largest possible gain.
 pub(crate) fn region_k() -> usize {

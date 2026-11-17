@@ -37,6 +37,7 @@ pub(crate) mod spill;
 pub(crate) mod postopt;
 pub(crate) mod rehome;
 pub(crate) mod regionsplit;
+pub(crate) mod spillhoist;
 
 impl<'a, F: Function> Env<'a, F> {
     pub(crate) fn new(func: &'a F, env: &'a MachineEnv, ctx: &'a mut Ctx) -> Self {
@@ -136,6 +137,9 @@ pub fn run<F: Function>(
 
     ctx.output.edit_vregs = edits.take_vregs();
     ctx.output.edits.extend(edits.drain_edits());
+
+    // PLIRON: one spill store at the definition (`PLIRON_RA2_SPILLHOIST`).
+    spillhoist::run(func, ctx);
 
     // PLIRON: drop redundant reloads and spill stores (`PLIRON_RA2_POSTOPT`).
     postopt::run(func, ctx);
