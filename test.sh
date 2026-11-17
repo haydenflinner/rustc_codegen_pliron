@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa spills slotpromlt byvalhome inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   sroa spills slotpromlt byvalhome inlinecm inlinelean retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
@@ -479,6 +479,27 @@ t_inlinecm() {
       $out/inlinecm$exe > $out/inlinecm.out
   PLIRON_INLINE_MODEL=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinecm/main.rs -o $out/inlinecm_l$exe &&
       $out/inlinecm_l$exe | diff --strip-trailing-cr - $out/inlinecm.out
+}
+
+t_inlinelean() {
+  # PLIRON_INLINE_LEANCOST: a nalgebra-shaped `Mat::mul` (hundreds of raw
+  # ops, about a quarter of them real) is inlined into `assemble` under a
+  # small limit only with the knob; outputs must match stock rustc either way.
+  local f
+  for f in off on; do
+    rm -f $out/inlinelean_$f.rem.*
+    if [ $f = on ]; then lc=2; else lc=0; fi
+    PLIRON_INLINE=32 PLIRON_INLINE_LEANCOST=$lc PLIRON_REMARKS=$out/inlinelean_$f.rem \
+      rustc $BE --edition 2021 -O -C codegen-units=1 tests/inlinelean/main.rs -o $out/inlinelean_$f$exe &&
+      $out/inlinelean_$f$exe | diff --strip-trailing-cr - tests/inlinelean/expected.out || return 1
+  done
+  local k_off k_on
+  k_off=$(cat $out/inlinelean_off.rem.* | grep '8assemble' | grep 'E3mul' | grep -c 'reject (score)' || true)
+  k_on=$(cat $out/inlinelean_on.rem.* | grep '8assemble' | grep 'E3mul' | grep -c 'reject (score)' || true)
+  if [ "$k_off" -eq 0 ] || [ "$k_on" -ne 0 ]; then
+    echo "inlinelean: Mat::mul score rejects in assemble: $k_off without the knob, $k_on with it (want >0, 0)" >&2
+    return 1
+  fi
 }
 
 # r[verify iropt.ipo.datalog]
@@ -1407,6 +1428,7 @@ want polsw && t_polsw
 want tailrec && t_tailrec
 want sroa && t_sroa
 want inlinecm && t_inlinecm
+want inlinelean && t_inlinelean
 want spills && t_spills
 want slotpromlt && t_slotpromlt
 want byvalhome && t_byvalhome
