@@ -253,3 +253,24 @@ unchanged under `--perturb=4`. Test: `tests/const_local.rs` (long
 `i64`/`i32`/`f64` constants in the entry, a loop, both arms of a branch
 and an edge argument; knob on and off through the interpreter; the body
 must shrink; dropping one prologue `local.set` fails it).
+
+## `src/backend/stackify.rs` — straight-line code into a following `block` (`PLIRON_WASM_BLKHOIST=1`, opt-in)
+
+`hoist_into_blocks`, the last step of `Context::compute`: the run of
+leaves and local-only parameter transfers right before a `block` moves
+to the front of the block's body, recursively, never into a `loop`.
+Entering an empty-typed `block` does nothing and the moved items hold no
+branch, so meaning and label depths are unchanged. Cause, confirmed on
+the kernel module: `rewrite_ifs_to_brif` (`PLIRON_WBRIF`, default on)
+replaces `Leaf; If` with `Leaf; block; block; br_if ..`, so a value the
+leaf sets for the condition or an arm is read across the two openers
+(`local.set X; block; block; local.get X`, which `wpeep` cannot fuse).
+Counts on the kernel module: 1,010 such sites by default, 96 with
+`PLIRON_WBRIF=0` (the merge-node openers account for few), 91 with the
+knob (90 of them cross a `loop` opener, which stays). Module 165,438 ->
+162,895 bytes (-1.5%). Transfers with an empty side (typed-`if` results
+on the operand stack) stay put. Test: `tests/blk_hoist.rs` (a diamond
+whose condition and arms read the entry leaf's value, and the same
+inside a loop; knob on and off through the interpreter; with the knob no
+value is parked across openers; moving the run to the end of the block
+instead fails it).

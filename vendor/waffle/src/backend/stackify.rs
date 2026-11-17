@@ -277,6 +277,10 @@ impl<'a, 'b> Context<'a, 'b> {
         if !std::env::var_os("PLIRON_WIFRET").is_some_and(|v| v == "0") {
             promote_if_results(&mut out);
         }
+        // PLIRON: `PLIRON_WASM_BLKHOIST=1` (opt-in), see `hoist_into_blocks`.
+        if std::env::var_os("PLIRON_WASM_BLKHOIST").is_some_and(|v| v == "1") {
+            hoist_into_blocks(&mut out);
+        }
         out
     }
 
@@ -909,6 +913,64 @@ fn rewrite_ifs_to_brif<'a>(body: &mut Vec<WasmBlock<'a>>, only_exits: bool) {
             out: Block::invalid(),
         };
         body[i] = outer;
+        i += 1;
+    }
+}
+
+/// PLIRON: straight-line code that may move into a following `block`:
+/// a leaf (its instructions leave nothing on the operand stack) or a
+/// parameter transfer that reads and writes locals only. A transfer with
+/// an empty side moves typed-`if` results through the operand stack
+/// (`promote_if_results`) and stays where it is.
+fn hoistable(b: &WasmBlock<'_>) -> bool {
+    match b {
+        WasmBlock::Leaf { .. } => true,
+        WasmBlock::BlockParams { from, to } => from.is_empty() == to.is_empty(),
+        _ => false,
+    }
+}
+
+/// PLIRON: `PLIRON_WASM_BLKHOIST=1` (opt-in). A `block` opener emitted
+/// after straight-line code (a merge node's `block` opened after its
+/// dominating leaf, the `block` of the if -> `block`+`br_if` rewrite
+/// opened after the leaf that computes the condition's inputs) separates
+/// a value from its first use: the leaf ends in `local.set X`, the
+/// openers follow, then `local.get X` (224,868 times in the 2026-11-16
+/// dsa module, never in LLVM's). Entering a `block` with an empty type
+/// does nothing, and leaves and local-only transfers contain no branch,
+/// so the run of them right before a `block` moves to the front of its
+/// body unchanged in meaning and in every label depth; repeated inward,
+/// the leaf ends next to its use and `wpeep` drops the `set; get` pair
+/// (one use) or makes it a `local.tee`. Never into a `loop` (the code
+/// would run on every iteration).
+fn hoist_into_blocks<'a>(body: &mut Vec<WasmBlock<'a>>) {
+    let mut i = 0;
+    while i < body.len() {
+        if matches!(body[i], WasmBlock::Block { .. }) {
+            let mut s = i;
+            while s > 0 && hoistable(&body[s - 1]) {
+                s -= 1;
+            }
+            if s < i {
+                let run: Vec<WasmBlock<'a>> = body.drain(s..i).collect();
+                i = s;
+                if let WasmBlock::Block { body: inner, .. } = &mut body[i] {
+                    inner.splice(0..0, run);
+                }
+            }
+        }
+        match &mut body[i] {
+            WasmBlock::Block { body: inner, .. } | WasmBlock::Loop { body: inner, .. } => {
+                hoist_into_blocks(inner);
+            }
+            WasmBlock::If {
+                if_true, if_false, ..
+            } => {
+                hoist_into_blocks(if_true);
+                hoist_into_blocks(if_false);
+            }
+            _ => {}
+        }
         i += 1;
     }
 }

@@ -75,6 +75,10 @@ path = "tests/wcoal_edge.rs"
 name = "const_local"
 path = "tests/const_local.rs"
 
+[[test]]
+name = "blk_hoist"
+path = "tests/blk_hoist.rs"
+
 [dependencies.addr2line]
 version = "0.21"
 optional = true
