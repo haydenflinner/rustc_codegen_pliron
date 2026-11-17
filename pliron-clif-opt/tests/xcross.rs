@@ -289,3 +289,33 @@ fn register_result_tag_is_zero_or_one() {
     let s = syms(&[("u0:3", "foo")]);
     cross_check(&a, &b, &s, &s, &Facts::default()).unwrap_or_else(|m| panic!("{m}"));
 }
+
+const SRET_FORWARDED: &str = "function %f(i64) {
+    ss0 = explicit_slot 16
+    sig0 = (i64 sret)
+    fn0 = u0:3 sig0
+block0(v0: i64):
+    BODY
+    return
+}";
+
+/// memcpyopt sends `call f(sret tmp); memcpy(dst, tmp)` straight into
+/// `dst`, here the caller's own (parameter) memory: the stub writes the
+/// same value there as into the slot.
+#[test]
+fn sret_fill_is_the_same_in_a_slot_and_in_parameter_memory() {
+    let a = parse(&SRET_FORWARDED.replace(
+        "BODY",
+        "v1 = stack_addr.i64 ss0\n    call fn0(v1)\n    v2 = load.i64 v1\n    store v2, v0\n    v3 = load.i64 v1+8\n    store v3, v0+8",
+    ));
+    let b = parse(&SRET_FORWARDED.replace("BODY", "call fn0(v0)"));
+    let mut s = syms(&[("u0:3", "foo")]);
+    s.sret.insert("foo".into(), 16);
+    cross_check(&a, &b, &s, &s, &Facts::default()).unwrap_or_else(|m| panic!("{m}"));
+    // Both pass their own memory (btree's `remove_kv_tracking`): the
+    // replayed fill is the original's, tag word included. (The parameter
+    // is a pointer: nothing in the function dereferences it.)
+    let nn: FxHashSet<Value> = [Value::from_u32(0)].into_iter().collect();
+    let facts = Facts { nonnull: Some(&nn), ..Facts::default() };
+    cross_check(&b, &b, &s, &s, &facts).unwrap_or_else(|m| panic!("{m}"));
+}

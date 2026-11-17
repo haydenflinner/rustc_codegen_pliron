@@ -2506,10 +2506,20 @@ fn stub(
                     .find(p, 8)
                     .is_some_and(|(base, r)| r.stub_writable && base < stack_base());
                 if writable && ext >= 8 {
-                    let v = word_fill(k);
-                    s.note_write(p, 8, |_| format!("stub fill of 8 bytes at {p:#x} (argument {k})"));
-                    s.bytes_mut(p, 8).unwrap().copy_from_slice(&v);
-                    arec[k].fill = 8;
+                    // A callee writes all of its `sret` value, wherever it
+                    // goes (memcpyopt forwards `call f(sret tmp)` into the
+                    // caller's own return area): the same bytes as into a
+                    // slot, the tag word included.
+                    let v = if xmode && Some(k) == sret_k {
+                        let room = s.find(p, 1).map_or(8, |(base, r)| base + r.data.len() as u64 - p);
+                        frame_fill(k, room.min(64).min(ext) as usize)
+                    } else {
+                        word_fill(k)
+                    };
+                    let n = v.len() as u64;
+                    s.note_write(p, n, |_| format!("stub fill of {n} bytes at {p:#x} (argument {k})"));
+                    s.bytes_mut(p, n).unwrap().copy_from_slice(&v);
+                    arec[k].fill = n as u32;
                 }
             }
         }
