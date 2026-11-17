@@ -30,7 +30,18 @@
 //! first to its last use, which is requeued (it may still find another
 //! register, or splits locally); the rest goes to the spill bundle. The
 //! moves between the pieces come from the normal edge and range move
-//! insertion (`moves.rs`). The rule runs at most once per spillset.
+//! insertion (`moves.rs`). Under `PLIRON_RA2_REGION=2` an S component of
+//! several blocks (S blocks joined by edges the bundle is live across)
+//! with uses is requeued as one bundle instead, so a loop the chosen
+//! register is busy in can still take another register whole.
+//!
+//! Termination and cost: the register part remembers its parent's block
+//! count (`LiveBundle::region_blocks`) and is region-split again, after an
+//! eviction, only while it has fewer blocks (LLVM's `RS_Split2` guard);
+//! at most `PLIRON_RA2_REGION_MAX` (4) region splits per spillset, bundles
+//! live in more than `PLIRON_RA2_REGION_MAXB` (2048) blocks are left to the
+//! ordinary split, `PLIRON_RA2_REGION_K` (4) registers are cut per try, and
+//! each max-flow has an operation budget linear in the graph.
 
 use super::{
     AllocRegResult, Env, LiveBundleIndex, LiveBundleVec, LiveRangeFlag, LiveRangeKey,
@@ -631,5 +642,59 @@ impl<'a, F: Function> Env<'a, F> {
                 .allocation_queue
                 .insert(piece, prio as usize, preg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Flow;
+
+    /// The classic six-node network (CLRS 26.1): max flow 23, and the
+    /// source side of the minimum cut is {s, v1, v2, v4}.
+    #[test]
+    fn dinic_clrs() {
+        let (s, v1, v2, v3, v4, t) = (0, 1, 2, 3, 4, 5);
+        let mut f = Flow::new(6);
+        f.add(s, v1, 16, 0);
+        f.add(s, v2, 13, 0);
+        f.add(v2, v1, 4, 0);
+        f.add(v1, v3, 12, 0);
+        f.add(v3, v2, 9, 0);
+        f.add(v2, v4, 14, 0);
+        f.add(v4, v3, 7, 0);
+        f.add(v3, t, 20, 0);
+        f.add(v4, t, 4, 0);
+        assert_eq!(f.max_flow(s, t, usize::MAX), Some(23));
+        let side = f.source_side(s);
+        assert_eq!(side, [true, true, true, false, true, false]);
+    }
+
+    /// The region-split energy: a chain of blocks a-b-c-d with the
+    /// register busy in c (c is tied to the sink). Uses in a and d cost 10
+    /// each on the stack, b's costs 1, every edge costs 1: the cut keeps
+    /// a, b in the register, puts c on the stack and d back in the
+    /// register (cost 2).
+    #[test]
+    fn chain_cut() {
+        let (a, b, d, s, t) = (0, 1, 2, 3, 4);
+        let mut f = Flow::new(5);
+        f.add(s, a, 10, 0);
+        f.add(s, d, 10, 0);
+        f.add(s, b, 1, 0); // one cheap use in b breaks the tie
+        f.add(a, b, 1, 1);
+        f.add(b, t, 1, 0); // edge b-c, c forced to the stack
+        f.add(d, t, 1, 0); // edge c-d
+        assert_eq!(f.max_flow(s, t, usize::MAX), Some(2));
+        let side = f.source_side(s);
+        assert!(side[a] && side[b] && side[d]);
+    }
+
+    /// An exhausted budget is reported, not a wrong flow.
+    #[test]
+    fn budget() {
+        let mut f = Flow::new(3);
+        f.add(0, 1, 5, 0);
+        f.add(1, 2, 5, 0);
+        assert_eq!(f.max_flow(0, 2, 0), None);
     }
 }
