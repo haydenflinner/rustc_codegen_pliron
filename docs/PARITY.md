@@ -952,7 +952,7 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   alignment rather than work. #8 and #6 are small and touch hot
   kernel bodies; not timed on a quiet machine. dsa with the three
   defaults alone: 35,337,904 -> 34,293,484 B (-1.04 MB), all 19
-  workloads equal. Open: `hash_text` reads 0.996 against 1.224 of
+  workloads equal. Open: `hash_text` reads 0.996 against 1.224 of (Rechecked at merge: alone and alternating the two builds trade places, 77.6/79.7, 83.9/78.8, 83.3/111 ms per call at load 63, and with the harness's load order swapped the slower column moves with it: the row's known position artefact, not this change.)
   LLVM's time (7 rounds, load ~60) although its hot body
   `blake3::compress_in_place` is byte-identical and each side alone
   costs 80.4 against 82.6 ms per call (63% of it in JS
