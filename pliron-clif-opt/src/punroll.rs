@@ -1559,6 +1559,15 @@ fn search_on() -> bool {
 
 /// `PLIRON_PUNROLL_COUNTED=1`: unroll counted loops of unknown length
 /// without a profile (the behaviour before 2026-11-13).
+/// `PLIRON_PUNROLL_COUNTED_WASM_FNMAX=N`: the `COUNTED_WASM` rule only in
+/// functions of at most N instructions (see `run_loop`).
+fn counted_wasm_fnmax() -> Option<usize> {
+    static M: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        pliron_cfg::env_get("PLIRON_PUNROLL_COUNTED_WASM_FNMAX").and_then(|s| s.parse().ok()).filter(|&m| m > 0)
+    });
+    *M
+}
+
 /// `PLIRON_PUNROLL_COUNTED_WASM_NOSTORE=1`: the `COUNTED_WASM` rule only
 /// for loops without stores (see `run_loop`).
 fn nostore_on() -> bool {
@@ -2601,6 +2610,19 @@ fn run_loop(
                 })
             {
                 bail!("counted loop of unknown length that stores");
+            }
+            // `PLIRON_PUNROLL_COUNTED_WASM_FNMAX=N`: only in functions of at
+            // most N instructions. Dragon's `format_exact` (thousands of
+            // instructions, a dozen loops over a few bignum limbs) is what
+            // `strwork` runs; its loops unrolled cost `strwork` 2-4 points,
+            // peeled first or not, while the kernels' own loops sit in
+            // small functions.
+            let ni = func.dfg.num_insts();
+            if pliron_cfg::tracing_on() && debug() {
+                tracing::debug!(target: "pliron::punroll", "counted-wasm {name} block{}: {ni} insts", h.as_u32());
+            }
+            if counted_wasm_fnmax().is_some_and(|m| ni > m) {
+                bail!("counted loop of unknown length in a big function");
             }
             // `PLIRON_PUNROLL_PEELFIRST=1`: short trips keep the peel the
             // rolled loop would have had (`run` peels, then unrolls what
