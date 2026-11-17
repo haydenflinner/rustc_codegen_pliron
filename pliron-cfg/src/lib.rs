@@ -438,6 +438,17 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // 2026-11-17, STK: sroa's FRAGCOPY rule does not keep whole an
+    // aggregate of at least 64 bytes that direct stores build (all but
+    // less than a word of padding) and one copy moves out: the copy
+    // becomes the stores into its destination (Box::new(PropertiesI {..}),
+    // Parser::new). regex-syntax STK 1.076 -> 1.043 with BIGTMP and
+    // KILLSLIDE. Exact counts: html -6.6k, the rest unchanged; at 32 or
+    // with unwritten pieces allowed, regex (+0.19..0.36%) and pulldown
+    // (+0.09%) lost. Native kernels within noise (iterw, tokenize
+    // change), wasm module byte-identical. Stanza fragcopyout.
+    // `PLIRON_SROA_FRAGCOPY_OUT=0` off.
+    ("PLIRON_SROA_FRAGCOPY_OUT", "64"),
     // 2026-11-17, codegen queue (contains_rng): on wasm, counted loops of
     // unknown length unroll 4 wide (one counting test per group, with
     // `PLIRON_PUNROLL_DWLATCH`), but only in functions of at most 800
