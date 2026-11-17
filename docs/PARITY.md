@@ -920,7 +920,7 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   often), other structural `br`s (748K `br` vs 81K module-wide), and
   more unrolling by our CLIF pipeline (`Memchr2/3` 500 to 2,900 B).
 
-  **Landed 2026-11-16 (#9, #5, #7, #2 default on; #8, #6 opt-in).** dsa
+  **Landed 2026-11-16 (#5, #7, #2 default on; #9, #8, #6 opt-in).** dsa
   at HEAD `fad51e94`, main's behaviour against the branch with every
   item on: code 35,337,904 -> 34,218,327 B (-1.12 MB, -3.2%; LLVM
   14,484,892), all 19 workloads return LLVM's results, peepdiff clean
@@ -942,12 +942,15 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   param whose incoming values fit, masks after `local.get` 26.5k ->
   20.3k. SIMD bodies (1,715 functions, 45k untargeted blocks, 15k
   branch-over-branch sites) are untouched: `wpeep` skips them (N3).
-  Kernels: 152,336 -> 145,096 B with the four defaults. Caveat:
-  `parse_only` moved from -10.7% to -5.0% against LLVM with #9 alone
-  (load 11-17, tight intervals), and TurboFan's code for it is identical
-  but for the dropped `and` (`harness/v8/mcode.sh`): a 4-byte shift of
-  the hot loop, i.e. code alignment, not work. #5, #7 and #2 did not
-  move it further.
+  Kernels: 152,336 -> 145,300 B with the three defaults, every kernel
+  within noise of main (`--layouts=3`, parse_only -10.8%/-10.7%,
+  tokenize -14.4%/-14.2% with `--layouts=5`). #9 stays opt-in:
+  `parse_only` moves from -10.3% to -4.4% against LLVM with it (tight
+  intervals, and tokenize turns bimodal), while TurboFan's code for
+  parse_only is identical but for the dropped `and`
+  (`harness/v8/mcode.sh`): a 4-byte shift of the hot loop, code
+  alignment rather than work. #8 and #6 are small and touch hot
+  kernel bodies; not timed on a quiet machine.
 - **N6. hmget's loss under single-caller inlining is two licm refusals**
   (the V8 comparison, notes in the session scratchpad `hmget_notes.md`,
   summarised in `history/2026-11-16-wasm-night.md`). Not alignment: the
