@@ -71,6 +71,10 @@ path = "tests/maxssa_cut.rs"
 name = "wcoal_edge"
 path = "tests/wcoal_edge.rs"
 
+[[test]]
+name = "const_local"
+path = "tests/const_local.rs"
+
 [dependencies.addr2line]
 version = "0.21"
 optional = true

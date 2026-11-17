@@ -2,7 +2,9 @@
 
 use crate::cfg::CFGInfo;
 use crate::entity::EntityRef;
-use crate::ir::{ExportKind, FuncDecl, FunctionBody, ImportKind, Module, Type, Value, ValueDef};
+use crate::ir::{
+    ExportKind, FuncDecl, FunctionBody, ImportKind, Local, Module, Type, Value, ValueDef,
+};
 use crate::Operator;
 use anyhow::Result;
 #[cfg(feature = "parallel")]
@@ -80,6 +82,131 @@ struct CompileContext<'a, 'bt> {
     locals: Localifier,
     /// PLIRON: shared multi-value blocktype allocator (optional).
     block_types: Option<&'bt Mutex<BlockTypeIntern>>,
+    /// PLIRON: rematerialized constants read from a local instead
+    /// (`PLIRON_WASM_CONSTLOCAL=1`, [`const_locals`]).
+    const_local: HashMap<Value, Local>,
+}
+
+/// PLIRON: encoded size of a signed LEB128 immediate.
+fn sleb_len(mut v: i64) -> usize {
+    let mut n = 1;
+    loop {
+        let byte = v & 0x7f;
+        v >>= 7;
+        if (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0) {
+            return n;
+        }
+        n += 1;
+    }
+}
+
+/// PLIRON: encoded size of an unsigned LEB128 immediate.
+fn uleb_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// PLIRON: (type, bits, encoded bytes) of a rematerialized constant.
+fn const_key(op: &Operator) -> Option<(Type, u64, usize)> {
+    match *op {
+        Operator::I32Const { value } => {
+            Some((Type::I32, value as u64, 1 + sleb_len(value as i32 as i64)))
+        }
+        Operator::I64Const { value } => Some((Type::I64, value, 1 + sleb_len(value as i64))),
+        Operator::F32Const { value } => Some((Type::F32, value as u64, 5)),
+        Operator::F64Const { value } => Some((Type::F64, value, 9)),
+        _ => None,
+    }
+}
+
+/// PLIRON: `PLIRON_WASM_CONSTLOCAL=1` (opt-in). Every constant is
+/// rematerialized at each use (`treeify::is_remat`), so a long one (the
+/// hashbrown group mask `0x8080808080808080`: an 11-byte `i64.const`)
+/// is spelled out again at every use. Group the function's constants by
+/// (type, bits), count their emitted uses, and give a group a local of
+/// its own, set once at function entry (which dominates every use; the
+/// locals are new, so nothing else writes them), when that is fewer
+/// bytes: `n * c` against `c + set + n * get + 2` (the `local.set`, the
+/// `local.get`s and the local's declaration, a `(1, type)` entry). Groups
+/// are taken by saving, so the most profitable get the lowest (shortest)
+/// indices. Returns the value -> local map and the entry prologue.
+fn const_locals(
+    body: &FunctionBody,
+    trees: &Trees,
+    locals: &mut Localifier,
+) -> (HashMap<Value, Local>, Vec<(Operator, Local)>) {
+    // Uses as emitted: every operator argument and terminator use of a
+    // rematerialized value is one emission of it.
+    let mut uses: HashMap<Value, usize> = HashMap::new();
+    let mut count = |v: Value| {
+        let v = body.resolve_alias(v);
+        if trees.remat.contains(&v) {
+            *uses.entry(v).or_insert(0) += 1;
+        }
+    };
+    for block in body.blocks.values() {
+        for &inst in &block.insts {
+            if let ValueDef::Operator(_, args, _) = &body.values[inst] {
+                for &a in &body.arg_pool[*args] {
+                    count(a);
+                }
+            }
+        }
+        block.terminator.visit_uses(|u| count(u));
+    }
+    // (type, bits) -> (encoded bytes, total uses, member values)
+    let mut groups: HashMap<(Type, u64), (usize, usize, Vec<Value>)> = HashMap::new();
+    for (&v, &n) in &uses {
+        if let ValueDef::Operator(op, ..) = &body.values[v] {
+            if let Some((ty, bits, len)) = const_key(op) {
+                let g = groups.entry((ty, bits)).or_insert((len, 0, Vec::new()));
+                g.1 += n;
+                g.2.push(v);
+            }
+        }
+    }
+    let saving = |len: usize, n: usize, get: usize| -> isize {
+        (n * len) as isize - (len + get + n * get + 2) as isize
+    };
+    let mut cands: Vec<((Type, u64), (usize, usize, Vec<Value>))> = groups
+        .into_iter()
+        .filter(|(_, (len, n, _))| *n >= 2 && saving(*len, *n, 2) > 0)
+        .collect();
+    // Deterministic order: best saving first (at a 2-byte index), then
+    // by type and bits.
+    let ty_rank = |t: Type| match t {
+        Type::I32 => 0,
+        Type::I64 => 1,
+        Type::F32 => 2,
+        _ => 3,
+    };
+    cands.sort_by(|a, b| {
+        saving((b.1).0, (b.1).1, 2)
+            .cmp(&saving((a.1).0, (a.1).1, 2))
+            .then(ty_rank((a.0).0).cmp(&ty_rank((b.0).0)))
+            .then((a.0).1.cmp(&(b.0).1))
+    });
+    let mut map = HashMap::new();
+    let mut prologue = Vec::new();
+    for ((ty, _), (len, n, members)) in cands {
+        let get = 1 + uleb_len(locals.locals.len() as u64);
+        if saving(len, n, get) <= 0 {
+            continue;
+        }
+        let ValueDef::Operator(op, ..) = &body.values[members[0]] else {
+            unreachable!()
+        };
+        let local = locals.locals.push(ty);
+        prologue.push((op.clone(), local));
+        for v in members {
+            map.insert(v, local);
+        }
+    }
+    (map, prologue)
 }
 
 macro_rules! op {
@@ -124,14 +251,22 @@ impl<'a> WasmFuncBackend<'a> {
         log::debug!("Trees:\n{:?}\n", trees);
         let ctrl = StackifyContext::new(&self.body, &self.cfg)?.compute();
         log::debug!("Ctrl:\n{:?}\n", ctrl);
-        let locals = Localifier::compute(&self.body, &self.cfg, &trees);
+        let mut locals = Localifier::compute(&self.body, &self.cfg, &trees);
         log::debug!("Locals:\n{:?}\n", locals);
+        // PLIRON: read once per function, like the other backend knobs.
+        let (const_local, prologue) =
+            if std::env::var_os("PLIRON_WASM_CONSTLOCAL").is_some_and(|v| v == "1") {
+                const_locals(&self.body, &trees, &mut locals)
+            } else {
+                (HashMap::new(), Vec::new())
+            };
 
         let ctx = CompileContext {
             trees,
             ctrl,
             locals,
             block_types,
+            const_local,
         };
 
         let mut func = wasm_encoder::Function::new(
@@ -143,6 +278,10 @@ impl<'a> WasmFuncBackend<'a> {
                 .collect::<Vec<_>>(),
         );
 
+        for (op, local) in &prologue {
+            self.lower_op(op, &mut func);
+            func.instruction(&wasm_encoder::Instruction::LocalSet(local.index() as u32));
+        }
         for block in &ctx.ctrl {
             self.lower_block(&ctx, block, &mut func);
         }
@@ -453,6 +592,12 @@ impl<'a> WasmFuncBackend<'a> {
         func: &mut wasm_encoder::Function,
     ) {
         log::trace!("lower_inst: value {} root {}", value, root);
+        if let Some(local) = ctx.const_local.get(&value) {
+            // PLIRON: a constant kept in a local (`const_locals`).
+            debug_assert!(!root);
+            func.instruction(&wasm_encoder::Instruction::LocalGet(local.index() as u32));
+            return;
+        }
         match &self.body.values[value] {
             &ValueDef::Operator(ref op, args, tys) => {
                 for &arg in &self.body.arg_pool[args] {

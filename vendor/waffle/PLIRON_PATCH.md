@@ -232,3 +232,24 @@ locals); `mimas-compile` 406 of 19,843. Test: `tests/wcoal_edge.rs`
 (rotating loop, a parameter read after the next value is computed, a
 three-edge join; knob on and off through the interpreter; merging
 without the interference check fails it).
+
+## `src/backend/mod.rs` — constants in locals (`PLIRON_WASM_CONSTLOCAL=1`, opt-in)
+
+`treeify::is_remat` rematerializes every constant at each use, and the
+CLIF emitter makes one IR value per use, so a long constant is spelled
+out again every time: the hashbrown group mask `0x8080808080808080` is
+an 11-byte `i64.const` (542 KB of them in the 2026-11-16 dsa module,
+138 KB in LLVM's). `const_locals`, run after the localifier, groups the
+function's rematerialized constants by (type, bits), counts their
+emitted uses (operator arguments and terminator uses), and gives a
+group a new local when `n * c > c + set + n * get + 2` (the immediate
+form against one `const; local.set` at function entry, a `local.get`
+per use and the local's `(1, type)` declaration), best saving first so
+the most profitable groups get the shortest indices. The prologue goes
+before the body's first instruction: the entry dominates every use and
+nothing else writes the new locals. `lower_inst` reads the local for a
+mapped value. Kernel module 165,438 -> 162,902 bytes (-1.5%), timing
+unchanged under `--perturb=4`. Test: `tests/const_local.rs` (long
+`i64`/`i32`/`f64` constants in the entry, a loop, both arms of a branch
+and an edge argument; knob on and off through the interpreter; the body
+must shrink; dropping one prologue `local.set` fails it).
