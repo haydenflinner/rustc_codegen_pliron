@@ -267,3 +267,86 @@ block0(v0: i8, v1: i8, v2: i8):
     );
     assert_eq!(n, 0, "{f}");
 }
+
+/// gb18030's `(b - 0x20) as u64 * 96` and `(b - 0x20) as u32 * 96`: one
+/// narrow add read by two extensions of different widths is rebuilt once,
+/// at the wider, and the narrower root reads it reduced.
+#[test]
+fn shared_top_feeds_two_roots() {
+    let (f, n) = go(
+        "function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = ireduce.i8 v0
+    v2 = iconst.i8 -32
+    v3 = iadd v1, v2
+    v4 = uextend.i64 v3
+    v5 = iconst.i64 96
+    v6 = imul v4, v5
+    v7 = uextend.i32 v3
+    v8 = iconst.i32 96
+    v9 = imul v7, v8
+    v10 = uextend.i64 v9
+    v11 = iadd v6, v10
+    return v11
+}",
+        &Target::host(),
+    );
+    assert_eq!(n, 1, "{f}");
+    assert_eq!(count(&f, Opcode::Iadd), 2, "{f}"); // the wide add and the sum
+    assert_eq!(count(&f, Opcode::Uextend), 1, "{f}"); // v10
+}
+
+/// A byte carried around a loop (`c = c.wrapping_add(k)`) and stored and
+/// zero-extended at the exit: the parameter becomes a word, the per-trip
+/// `ireduce` goes.
+#[test]
+fn loop_parameter_web() {
+    let (f, n) = go(
+        "function %f(i64, i32) -> i64 {
+    ss0 = explicit_slot 8, align = 8
+block0(v0: i64, v1: i32):
+    v2 = stack_addr.i64 ss0
+    v3 = ireduce.i8 v0
+    jump block1(v3, v1)
+block1(v4: i8, v5: i32):
+    v6 = ireduce.i8 v5
+    v7 = iadd v4, v6
+    store notrap aligned v7, v2
+    v8 = iconst.i32 1
+    v9 = isub v5, v8
+    brif v9, block1(v7, v9), block2(v7)
+block2(v10: i8):
+    v11 = uextend.i64 v10
+    v12 = load.i8 notrap aligned v2
+    v13 = uextend.i64 v12
+    v14 = iadd v11, v13
+    return v14
+}",
+        &Target::host(),
+    );
+    assert_eq!(n, 1, "{f}");
+    assert_eq!(count(&f, Opcode::Ireduce), 0, "{f}");
+    assert_eq!(count(&f, Opcode::Istore8), 1, "{f}");
+}
+
+/// A web member with a use outside the web (a compare) keeps the whole web
+/// narrow.
+#[test]
+fn hard_use_keeps_the_web() {
+    let (f, n) = go(
+        "function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = ireduce.i8 v0
+    v2 = iconst.i8 -32
+    v3 = iadd v1, v2
+    v4 = uextend.i64 v3
+    v5 = iconst.i8 7
+    v6 = icmp ult v3, v5
+    v7 = uextend.i64 v6
+    v8 = iadd v4, v7
+    return v8
+}",
+        &Target::host(),
+    );
+    assert_eq!(n, 0, "{f}");
+}
