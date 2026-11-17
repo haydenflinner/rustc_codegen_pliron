@@ -1488,7 +1488,7 @@ pub fn run(
                         tracing::debug!(target: "pliron::punroll", "punroll {name} try block{}", h.as_u32())
                     };
                 }
-                if run_loop(func, cfg, dt, la, lp, h, name, trip).is_some()
+                if run_loop(func, cfg, dt, la, lp, h, name, trip, wasm).is_some()
                     || run_region(func, cfg, dt, la, lp, h, name, trip).is_some()
                 {
                     n += 1;
@@ -1541,6 +1541,15 @@ fn search_on() -> bool {
 
 /// `PLIRON_PUNROLL_COUNTED=1`: unroll counted loops of unknown length
 /// without a profile (the behaviour before 2026-11-13).
+/// `PLIRON_PUNROLL_COUNTED_WASM=K`: the unroll width for counted loops of
+/// unknown length on wasm (0 or 1: they stay rolled). See `run_loop`.
+fn counted_wasm_k() -> i64 {
+    static K: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+        pliron_cfg::env_get("PLIRON_PUNROLL_COUNTED_WASM").and_then(|s| s.parse().ok()).unwrap_or(0)
+    });
+    *K
+}
+
 fn counted_on() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_PUNROLL_COUNTED", "1"));
     *ON
@@ -2382,6 +2391,7 @@ fn redirect_entries(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     func: &mut Function,
     cfg: &ControlFlowGraph,
@@ -2391,6 +2401,7 @@ fn run_loop(
     h: Block,
     name: &str,
     trip: Option<u64>,
+    wasm: bool,
 ) -> Option<()> {
     macro_rules! bail {
         ($why:expr) => {{
@@ -2506,6 +2517,12 @@ fn run_loop(
     // rule: rust-protobuf -0.48M (prost's `encode` loops over a
     // message's few fields), rust-html-rewriter -0.38M, pulldown-cmark
     // and rust-json 0, regex +0.08M.
+    // `PLIRON_PUNROLL_COUNTED_WASM=K` (wasm only, default off): such a
+    // loop unrolls K wide instead of staying rolled. LLVM's wasm32 build
+    // does interleave these by 2 (`contains_rng`'s `filter().count()`:
+    // two elements per counted test, against our one test per element).
+    let wk = if wasm { counted_wasm_k() } else { 0 };
+    let mut k = k;
     if !rotated && mid_exits.is_empty() && trip.is_none() && !counted_on() {
         let known = (|| {
             let iv0 = crate::loopidiom::entry_arg(func, cfg, dt, h, cnt.pidx)?;
@@ -2513,7 +2530,10 @@ fn run_loop(
             (cnt.step > 0).then(|| b.wrapping_sub(a).wrapping_sub(cnt.d) / cnt.step)
         })();
         if known.is_none_or(|t| t < 2 * k) {
-            bail!("counted loop of unknown length");
+            if wk < 2 {
+                bail!("counted loop of unknown length");
+            }
+            k = k.min(wk);
         }
     }
     let mut k = match guard_cap(func, cfg, dt, h, &cnt, k, trip) {
