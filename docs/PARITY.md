@@ -1172,6 +1172,32 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    (38 ALU and 15 constant instructions on the paired lines against 7
    and 4), not the allocator. Spills stay diffuse; no cheap regalloc2
    lever found.
+   **The inlined foldhash code (2026-11-17): `PLIRON_WIDE128=1`
+   (opt-in).** The 128-bit operations stayed wide through the whole
+   pipeline: `(a as u128 * b as u128)` as an `i128` multiply of
+   `uextend`s, `(p >> 64) as u64` as `isplit` / `iconcat hi, 0` /
+   `ireduce`, the sponge `s | (x << len)` with `len & 127` unfolded, all
+   opaque to the egraph. `pliron_clif_opt::wide128` (steps `wide128`
+   before the first egraph and `wide128b` before `egraph2`, where the
+   loop-carried `sponge_len` has become constant) rewrites them on word
+   halves: `uextend.i128` as `iconcat x, 0`, shifts by 0 and 64, bitwise
+   ops per half, `ireduce`/`isplit` of an `iconcat`, and the multiply as
+   `imul` + `umulhi` where `umulhi.i64` is one instruction
+   (`Target::mulhi64`: not on wasm32, which keeps `__multi3`).
+   `build_state`: 268 -> 196 aarch64 instructions, stack accesses
+   37 -> 29 (`clif-check codegen`); `PLIRON_I128ID` adds nothing on top.
+   Tests `pliron-clif-opt/tests/wide128.rs` (swapping a shift's halves
+   fails them). Corpus replays with `--check` (std, html, clcg every 2nd,
+   dsa every 4th, wasm-bench): identical verdicts; 102/25/54/123
+   functions change, all smaller. Exact counts against the default:
+   html-rewriter -371.0k (-0.37%), regex -172, protobuf -576, rust-json
+   +474, compression and blake3 equal, blind-sig within its noise, but
+   pulldown-cmark +23.3k (+0.045%): `parse_block` +29.8k with 43 fewer
+   static instructions (25 fewer alignment `nop`s, 10 fewer loads), a
+   layout and allocation shift rather than worse code, not yet
+   explained. wasm kernel module: 1 byte smaller (`__multi3`, and
+   `format_shortest_opt` reordered), no timed kernel changes. Stays
+   opt-in until pulldown-cmark is understood (no benchmark loses).
 
 10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
    2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours
