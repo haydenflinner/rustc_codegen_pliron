@@ -176,9 +176,7 @@ gives entries with the same target and the same argument values one
 wrapper, and an entry that passes no arguments names its target's label
 directly (plus the wrappers around the table). Read once per function
 (`Context::brtab_share`). Test: `tests/brtab_share.rs` (compiles a
-7-entry table both ways, re-parses, interprets every selector; run it
-from a copy of the crate with an empty `[workspace]` table, since the
-crate is not a workspace member).
+7-entry table both ways, re-parses, interprets every selector).
 
 ## Cut-block aliases in the reducifier's max-SSA (`PLIRON_WASM_MAXSSA_CUTALIAS`, default on, `=0` off)
 
@@ -202,3 +200,14 @@ because it decides each parameter before its cycle is closed. Tests:
 `tests/maxssa_cut.rs` (semantics through compile, re-parse and the
 interpreter; a version without the "defined outside the copies" check
 fails it with invalid IR).
+
+## Tests run in place (`[workspace]`, `Cargo.lock`)
+
+`Cargo.toml` ends with an empty `[workspace]` table, so the crate is its
+own workspace root (the repo's workspace excludes `vendor/`; without the
+table cargo walked up to it and refused). The lockfile, ignored by the
+upstream `.gitignore`, is committed (`git add -f`) and the tests run
+`--locked`: `cargo test --manifest-path vendor/waffle/Cargo.toml
+--target-dir target/waffle-test`, job `unit:waffle` in `harness/gate.py`
+and in `harness/quick.py` for `vendor/waffle/` changes. The backend still
+builds the crate as a path dependency from the repo's `Cargo.lock`.

@@ -17,6 +17,7 @@ Usage: harness/gate.py [--jobs N] [--skip unit,wasm,...] [--only a,b]
 
 Runs, after one `cargo build`:
   unit      cargo test for the stable crates (pliron-cfg, -clif-opt, -ir-opt)
+  unit:waffle  cargo test for vendor/waffle (its own workspace, --locked)
   <stanza>  every `./test.sh` stanza (nostd, std, licm, ...) as its own
             job — TEST_NOBUILD=1 ./test.sh --only=<stanza>
   corpus:*  `clif-check report --check` over each recorded corpus under
@@ -216,6 +217,12 @@ def main():
         jobs.append(("unit", lambda: run("unit", ["cargo", "test", "-q", *PROFILE_ARGS, "-p", "pliron-cfg", "-p",
                                                   "pliron-clif-opt", "-p", "pliron-ir-opt", "-p",
                                                   "pliron-clif-check"])))
+    # vendor/waffle is its own workspace root (not a member of ours), with
+    # a committed lockfile: its unit and integration tests run in place.
+    if want("unit:waffle"):
+        jobs.append(("unit:waffle", lambda: run("unit:waffle", ["cargo", "test", "-q", "--locked",
+                                                                "--manifest-path", "vendor/waffle/Cargo.toml",
+                                                                "--target-dir", "target/waffle-test"])))
     # Slowest first so the pool's tail is short.
     order = sorted(stanzas(), key=lambda n: n not in ("pgo", "std", "unwind"))
     for n in order:

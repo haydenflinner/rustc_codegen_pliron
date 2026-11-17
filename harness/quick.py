@@ -140,6 +140,7 @@ class Plan:
         self.flags = set()        # areas for the slow-command list
         self.unknown = []
         self.test_sh = False
+        self.waffle = False       # vendor/waffle changed: its own test suite (unit:waffle)
         self.clif_opt = False     # CLIF passes / cranelift changed: corpus replay is informative
         self._derive()
 
@@ -218,6 +219,9 @@ class Plan:
                     self.unknown.append(f)
                 continue
             if top == "vendor":
+                if len(parts) > 1 and parts[1] == "waffle":
+                    self.waffle = True
+                    self.add_stanzas(["wasm_smoke"])
                 self.glue = True
                 self.clif_opt = True
                 self.flags.update(["gate", "crates", "stage2"])
@@ -287,6 +291,11 @@ class Runner:
             r["ok"] = False
         r["secs"] = t
         self.report(r)
+
+    def waffle_unit(self):
+        # vendor/waffle is its own workspace root with a committed lockfile.
+        self.sh("unit:waffle", ["cargo", "test", "-q", "--locked", "--manifest-path",
+                                "vendor/waffle/Cargo.toml", "--target-dir", "target/waffle-test"])
 
     def unit(self, crate):
         sel = self.plan.units.get(crate)
@@ -395,6 +404,8 @@ def main():
     for c in sorted(plan.crates):
         if c != "pliron-clif-check":
             jobs.append(("unit:" + c, lambda c=c: R.unit(c)))
+    if plan.waffle:
+        jobs.append(("unit:waffle", R.waffle_unit))
     if plan.clif_opt:
         for name in ("smoke", "std"):
             jobs.append((f"corpus:{name}", lambda n=name: R.corpus(n)))
