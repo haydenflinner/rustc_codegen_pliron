@@ -410,6 +410,55 @@ fn dep_promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
                 }
             }
         }
+        // `PLIRON_XCGU_LASTCALL=<size>` (default off): a dep of more than
+        // `<size>` (`size_estimate`) that exactly one function of the crate
+        // references stays Internal, and the copies that would need it are
+        // not made. Its home inlines it into that one caller for free (the
+        // out-of-line body dies); promoted, it is external, the inliner
+        // prices it as a `#[cold]` callee and it stays a call. rust-protobuf
+        // at `PLIRON_XCGU_SIZE=100`: `grow_amortized` became copyable, so
+        // its cold `finish_grow` was promoted, `grow_amortized` shrank to 198
+        // ops and was inlined into `do_reserve_and_handle`, and every one of
+        // 132k vector growths went through one more call
+        // (`<RawVecInner>::finish_grow`, the `Result` returned through
+        // memory): +1.7M instructions in `raw_vec/mod.rs`.
+        let last: usize = crate::env_get("PLIRON_XCGU_LASTCALL").and_then(|s| s.parse().ok()).unwrap_or(0);
+        if last > 0 && !out.is_empty() {
+            let mut users: FxHashMap<&str, u32> = FxHashMap::default();
+            for p in parts {
+                for &item in p.items().keys() {
+                    let MonoItem::Fn(c) = item else { continue };
+                    let mut seen_here: FxHashSet<&str> = FxHashSet::default();
+                    for u in used(tcx, c).unwrap_or(&[]) {
+                        let MonoItem::Fn(d) = u.node else { continue };
+                        if d == c {
+                            continue;
+                        }
+                        let s = tcx.symbol_name(d).name;
+                        if out.contains(s) && seen_here.insert(s) {
+                            *users.entry(s).or_default() += 1;
+                        }
+                    }
+                }
+            }
+            let mut keep: Vec<String> = Vec::new();
+            for p in parts {
+                for &item in p.items().keys() {
+                    let MonoItem::Fn(d) = item else { continue };
+                    let s = tcx.symbol_name(d).name;
+                    if out.contains(s) && users.get(s).copied().unwrap_or(0) == 1 && tcx.size_estimate(d) > last {
+                        if pliron_cfg::tracing_on() {
+                            tracing::info!(target: "pliron::stats", "xcgu lastcall {} (size {})",
+                                with_no_trimmed_paths!(d.to_string()), tcx.size_estimate(d));
+                        }
+                        keep.push(s.to_string());
+                    }
+                }
+            }
+            for s in keep {
+                out.remove(&s);
+            }
+        }
         out
     })
 }
