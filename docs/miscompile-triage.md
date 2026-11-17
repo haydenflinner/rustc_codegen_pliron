@@ -211,10 +211,14 @@ by design: on the wasm kernels + std that is 15 of ~800 changed functions
 for memcpyopt, ~130 for sroa, ~250 for constload, which turns devirt off
 with it); interprocedural facts (a pass that changes a *callee's*
 behaviour shows only in the callee); stub behaviour (a callee is a hash,
-not the real function); what the sandbox stops on. Known false positives,
-all in ablations other than memcpyopt: values the program never makes
-(a `bool` or an enum tag of 0x80 in seeded memory that sroa's or
-constload's code treats differently from the original).
+not the real function); what the sandbox stops on. Known false positives:
+values the program never makes (a `bool` or an enum tag of 0x80 in seeded
+memory that sroa's or constload's code treats differently from the
+original), and a stub that fills a whole `sret` temporary where the real
+callee writes its own size only (memcpyopt ablation on dsa:
+`<[(FieldKey, Expr)]>::to_vec`). On the wasm kernels + std the
+memcpyopt ablation has none; on dsa 24 mismatches in a quarter of the
+corpus are not explained (`docs/history/2026-11-16-xcorpus.md`).
 
 ## 4. Prefix-bisect `PLIRON_PIPELINE` — rebuild-per-probe, last resort
 

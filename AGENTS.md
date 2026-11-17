@@ -371,8 +371,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   pipeline's output for B (stale lifetime markers show only there).
   Functions whose call sets differ (inlining, devirt) are skipped.
   Names `mcrdwrap::build` with `PLIRON_MEMCPYOPT_RDWRAP=0`; no false
-  positive on the wasm kernels + std for `PLIRON_MEMCPYOPT=0`, so it is
-  the check for memcpyopt work. How it works, what it cannot see:
+  positive on the wasm kernels + std for `PLIRON_MEMCPYOPT=0`, 24 not
+  yet explained on a quarter of dsa (0.4% of pairs compared; compare a
+  memcpyopt change's list with the tree's before it). How it works,
+  what it cannot see:
   `docs/miscompile-triage.md` "IR passes".
 - **wasm-only stages** (after CLIF): the waffle inliner
   (`PLIRON_WASM_INLINE=0`), byte peepholes (`PLIRON_WASM_PEEP=0`,
