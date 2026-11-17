@@ -59,6 +59,10 @@ path = "tests/select_join.rs"
 name = "cold_br"
 path = "tests/cold_br.rs"
 
+[[test]]
+name = "brtab_share"
+path = "tests/brtab_share.rs"
+
 [dependencies.addr2line]
 version = "0.21"
 optional = true

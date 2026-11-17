@@ -129,6 +129,8 @@ pub struct Context<'a, 'b> {
     result: Vec<Vec<WasmBlock<'a>>>,
     // - Stack of merge-node-children lists.
     merge_node_children: Vec<Vec<Block>>,
+    /// PLIRON: `PLIRON_WASM_BRTAB_SHARE=1`, read once per function.
+    brtab_share: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +174,7 @@ impl<'a, 'b> Context<'a, 'b> {
             process_stack: vec![],
             result: vec![],
             merge_node_children: vec![],
+            brtab_share: std::env::var_os("PLIRON_WASM_BRTAB_SHARE").is_some_and(|v| v == "1"),
         })
     }
 
@@ -404,6 +407,12 @@ impl<'a, 'b> Context<'a, 'b> {
         targets: &'a [BlockTarget],
         default: &'a BlockTarget,
     ) {
+        // PLIRON: shared edge blocks (`PLIRON_WASM_BRTAB_SHARE=1`): one
+        // wrapper per distinct (target, args) among the entries that pass
+        // arguments, and a direct branch for entries that pass none.
+        if self.brtab_share {
+            return self.do_branch_select_shared(selector, targets, default);
+        }
         let into = self.result.last_mut().unwrap();
         log::trace!("do_branch_select: {:?}, default {:?}", targets, default);
         let mut body = vec![WasmBlock::Select {
@@ -434,6 +443,77 @@ impl<'a, 'b> Context<'a, 'b> {
         }
 
         into.extend(body.into_iter());
+    }
+
+    /// PLIRON: `do_branch_select` with shared edge blocks. The stock form
+    /// wraps the `br_table` in one `block` + param transfer + `br` per
+    /// entry and the default, so a 35-entry table to 3 targets costs 36
+    /// wrappers. Here entries with the same target and the same argument
+    /// values share one wrapper (the transfer is identical), and an entry
+    /// with no arguments names its target's label directly (the wrapper
+    /// would only forward a `br`). Wrapper `g` (0 innermost) is exited by
+    /// label `g`; a direct entry's label is its target's depth plus the
+    /// `W` wrappers around the `br_table`, and wrapper `g`'s own `br` adds
+    /// the `W - 1 - g` wrappers still around it.
+    fn do_branch_select_shared(
+        &mut self,
+        selector: Value,
+        targets: &'a [BlockTarget],
+        default: &'a BlockTarget,
+    ) {
+        let entries: Vec<&'a BlockTarget> =
+            targets.iter().chain(std::iter::once(default)).collect();
+        let mut groups: Vec<&'a BlockTarget> = Vec::new();
+        let mut slot: Vec<Option<usize>> = Vec::with_capacity(entries.len());
+        for t in &entries {
+            if t.args.is_empty() {
+                slot.push(None);
+                continue;
+            }
+            let g = match groups
+                .iter()
+                .position(|u| u.block == t.block && u.args == t.args)
+            {
+                Some(g) => g,
+                None => {
+                    groups.push(t);
+                    groups.len() - 1
+                }
+            };
+            slot.push(Some(g));
+        }
+        let w = groups.len();
+        let label = |i: usize, ctrl: &[CtrlEntry]| -> WasmLabel {
+            match slot[i] {
+                Some(g) => WasmLabel::new(g),
+                None => Self::resolve_target(ctrl, entries[i].block).add(w),
+            }
+        };
+        let n = targets.len();
+        let mut body = vec![WasmBlock::Select {
+            selector,
+            targets: (0..n)
+                .map(|i| label(i, &self.ctrl_stack[..]))
+                .collect::<Vec<_>>(),
+            default: label(n, &self.ctrl_stack[..]),
+        }];
+        for (g, target) in groups.iter().enumerate() {
+            body = vec![
+                WasmBlock::Block {
+                    body,
+                    out: Block::invalid(),
+                },
+                WasmBlock::BlockParams {
+                    from: &target.args[..],
+                    to: &self.body.blocks[target.block].params[..],
+                },
+                WasmBlock::Br {
+                    target: Self::resolve_target(&self.ctrl_stack[..], target.block)
+                        .add(w - 1 - g),
+                },
+            ];
+        }
+        self.result.last_mut().unwrap().extend(body);
     }
 
     fn do_blockparam_transfer(

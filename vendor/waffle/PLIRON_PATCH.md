@@ -164,3 +164,18 @@ page failed). `validate_load_sinks` now drops such loads from the tree
 (they get a local), and also loads whose owner chain is longer than
 its 64-step walk. Regression: `tests/wasm/smoke/raw.rs`, compiled with
 `PLIRON_OPT_BISECT=0`.
+
+## Shared `br_table` edge blocks (`PLIRON_WASM_BRTAB_SHARE=1`, opt-in)
+
+`backend/stackify.rs` `do_branch_select` wraps the `br_table` in one
+`block` + parameter transfer + `br` per table entry and per default, so
+a table whose entries repeat a few targets pays one wrapper per entry
+(dsa's `Compiler::compile`: 35 entries, 35 distinct depths; LLVM's
+93-entry table for the same match has 4). `do_branch_select_shared`
+gives entries with the same target and the same argument values one
+wrapper, and an entry that passes no arguments names its target's label
+directly (plus the wrappers around the table). Read once per function
+(`Context::brtab_share`). Test: `tests/brtab_share.rs` (compiles a
+7-entry table both ways, re-parses, interprets every selector; run it
+from a copy of the crate with an empty `[workspace]` table, since the
+crate is not a workspace member).
