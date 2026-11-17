@@ -763,16 +763,25 @@ impl<'a> Context<'a> {
             }
         }
 
+        // PLIRON: edge-copy coalescing (`PLIRON_WCOAL_EDGE=1`): merge the
+        // local of a block parameter with the local of an argument passed
+        // to it when the two do not interfere, so the transfer on that
+        // edge is `local.get L; local.set L` (skipped by the emitter).
+        let rep_of = self.coalesce_edge_copies(&mut inter, n_params);
+
         let mut mapping: Vec<Local> = (0..n).map(Local::new).collect();
         for i in 0..n {
             if i < n_params {
                 mapping[i] = Local::new(i);
                 continue;
             }
+            if rep_of[i] != i {
+                continue; // colored with its representative below
+            }
             let ty = self.results.locals[Local::new(i)];
             let mut blocked = Bitset::default();
             for j in inter[i].iter() {
-                blocked.insert(mapping[j as usize].index() as u32);
+                blocked.insert(mapping[rep_of[j as usize]].index() as u32);
             }
             let mut chosen = Local::new(i);
             for k in 0..n {
@@ -786,6 +795,11 @@ impl<'a> Context<'a> {
                 break;
             }
             mapping[i] = chosen;
+        }
+        for i in 0..n {
+            if rep_of[i] != i {
+                mapping[i] = mapping[rep_of[i]];
+            }
         }
 
         if mapping.iter().enumerate().all(|(i, &m)| m.index() == i) {
@@ -820,6 +834,110 @@ impl<'a> Context<'a> {
             new_locals.len()
         );
         self.results.locals = new_locals;
+    }
+}
+
+/// PLIRON: counters for `PLIRON_WCOAL_EDGE` (read by the backend's
+/// `PLIRON_WASM_COALSTATS` report): edge transfers whose argument and
+/// parameter sit in different locals, how many of those pairs did not
+/// interfere when the pass looked at them, and how many it merged.
+pub static EDGE_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EDGE_NONINTERF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EDGE_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl<'a> Context<'a> {
+    /// PLIRON: copy coalescing on the local interference graph that
+    /// `coalesce_holes` builds from precise liveness. For each edge
+    /// transfer `arg -> param` (both in one local each, same type, the
+    /// argument not a tree or rematerialized value), merge the two
+    /// locals' classes when no member of one interferes with a member of
+    /// the other. A class's interference is the union of its members'
+    /// (kept on the representative: after a merge every neighbour of the
+    /// absorbed class also names the representative). Entry-param locals
+    /// keep their index, so a class holding one is represented by it and
+    /// two of them never merge. Sound for the same reason the recolor
+    /// is: locals that never hold live values at the same point can share
+    /// a slot; transfers are emitted on their own edge, after the branch,
+    /// reading every argument before writing any parameter. Returns each
+    /// local's representative (itself when the knob is off).
+    fn coalesce_edge_copies(&self, inter: &mut [Bitset], n_params: usize) -> Vec<usize> {
+        let n = inter.len();
+        let mut rep: Vec<usize> = (0..n).collect();
+        if !std::env::var_os("PLIRON_WCOAL_EDGE").is_some_and(|v| v == "1") {
+            return rep;
+        }
+        fn find(rep: &mut [usize], mut x: usize) -> usize {
+            while rep[x] != x {
+                rep[x] = rep[rep[x]];
+                x = rep[x];
+            }
+            x
+        }
+        let one = |v: Value| -> Option<usize> {
+            match self.results.values[v].as_slice() {
+                [l] => Some(l.index()),
+                _ => None,
+            }
+        };
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for &block in self.cfg.rpo.values() {
+            self.body.blocks[block].terminator.visit_targets(|t| {
+                for (i, &arg) in t.args.iter().enumerate() {
+                    let a = self.body.resolve_alias(arg);
+                    if is_tree_or_remat(a, self.trees) {
+                        continue;
+                    }
+                    let p = self.body.blocks[t.block].params[i].1;
+                    if let (Some(la), Some(lp)) = (one(a), one(p)) {
+                        if la != lp
+                            && self.results.locals[Local::new(la)]
+                                == self.results.locals[Local::new(lp)]
+                        {
+                            pairs.push((la, lp));
+                        }
+                    }
+                }
+            });
+        }
+        let (mut copies, mut nonint, mut merged) = (0u64, 0u64, 0u64);
+        for (la, lp) in pairs {
+            copies += 1;
+            let (ra, rp) = (find(&mut rep, la), find(&mut rep, lp));
+            if ra == rp {
+                merged += 1; // an earlier merge already joined them
+                continue;
+            }
+            if inter[ra].contains(rp as u32) || inter[rp].contains(ra as u32) {
+                continue;
+            }
+            nonint += 1;
+            if ra < n_params && rp < n_params {
+                continue;
+            }
+            // The representative: an entry param if either is one, else
+            // the lower index.
+            let (keep, gone) = if ra < n_params || (rp >= n_params && ra < rp) {
+                (ra, rp)
+            } else {
+                (rp, ra)
+            };
+            rep[gone] = keep;
+            let moved: Vec<u32> = inter[gone].iter().collect();
+            for j in moved {
+                inter[keep].insert(j);
+                inter[j as usize].insert(keep as u32);
+            }
+            merged += 1;
+        }
+        // Flatten for the caller.
+        for i in 0..n {
+            rep[i] = find(&mut rep, i);
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        EDGE_COPIES.fetch_add(copies, Relaxed);
+        EDGE_NONINTERF.fetch_add(nonint, Relaxed);
+        EDGE_MERGED.fetch_add(merged, Relaxed);
+        rep
     }
 }
 

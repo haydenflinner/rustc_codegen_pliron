@@ -67,6 +67,10 @@ path = "tests/brtab_share.rs"
 name = "maxssa_cut"
 path = "tests/maxssa_cut.rs"
 
+[[test]]
+name = "wcoal_edge"
+path = "tests/wcoal_edge.rs"
+
 [dependencies.addr2line]
 version = "0.21"
 optional = true

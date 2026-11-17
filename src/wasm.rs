@@ -557,6 +557,23 @@ fn emit_obj(
             "pliron-wasm: {name}: {stubs}/{defined} functions stubbed (PLIRON_WASM_VERBOSE=1 lists them)"
         );
     }
+    // `PLIRON_WASM_COALSTATS=<file>`: append the waffle edge-coalescing
+    // counters (`PLIRON_WCOAL_EDGE`) gathered since the last report:
+    // `<module> <edge copies> <non-interfering> <merged>`.
+    if let Some(f) = crate::env_get("PLIRON_WASM_COALSTATS") {
+        use std::sync::atomic::Ordering::Relaxed;
+        let line = format!(
+            "{name} {} {} {}\n",
+            waffle::EDGE_COPIES.swap(0, Relaxed),
+            waffle::EDGE_NONINTERF.swap(0, Relaxed),
+            waffle::EDGE_MERGED.swap(0, Relaxed)
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(f)
+            .and_then(|mut x| std::io::Write::write_all(&mut x, line.as_bytes()));
+    }
     pliron_cfg::trace("*wasm-compile*", t0.elapsed().as_secs_f64() * 1e3, name);
     pliron_cfg::mark(&format!("wasm-compile {name}"));
     let t0 = std::time::Instant::now();

@@ -211,3 +211,24 @@ upstream `.gitignore`, is committed (`git add -f`) and the tests run
 --target-dir target/waffle-test`, job `unit:waffle` in `harness/gate.py`
 and in `harness/quick.py` for `vendor/waffle/` changes. The backend still
 builds the crate as a path dependency from the repo's `Cargo.lock`.
+
+## `src/backend/localify.rs` — edge-copy coalescing (`PLIRON_WCOAL_EDGE=1`, opt-in)
+
+`coalesce_edge_copies`, called by `coalesce_holes` on its precise local
+interference graph before the greedy recolor: for each edge transfer
+`arg -> param` (one local each, same type, the argument not a tree or a
+rematerialized value) whose two local classes do not interfere, merge
+the classes (union-find; the representative carries the union of the
+members' interference; entry-param locals keep their index and never
+merge with each other). The recolor then colors classes. The emitter
+already skips a transfer between equal locals. Sound under the same
+model as the recolor: transfers are emitted on their own edge, reading
+every argument before writing any parameter. Counters
+(`waffle::EDGE_COPIES`, `EDGE_NONINTERF`, `EDGE_MERGED`) feed the
+backend's `PLIRON_WASM_COALSTATS=<file>` report. Payoff measured small:
+of 24,273 edge copies in the kernel module's objects 560 pairs were
+non-interfering when checked (2,801 transfers ended up between equal
+locals); `mimas-compile` 406 of 19,843. Test: `tests/wcoal_edge.rs`
+(rotating loop, a parameter read after the next value is computed, a
+three-edge join; knob on and off through the interpreter; merging
+without the interference check fails it).

@@ -22,6 +22,8 @@ pub use wasm_encoder;
 mod backend;
 /// PLIRON: multi-value `if` blocktype intern (see `FunctionBody::compile_with_block_types`).
 pub use backend::BlockTypeIntern;
+/// PLIRON: `PLIRON_WCOAL_EDGE` counters (edge copies seen, non-interfering, merged).
+pub use backend::localify::{EDGE_COPIES, EDGE_MERGED, EDGE_NONINTERF};
 pub mod cfg;
 pub mod entity;
 mod errors;
