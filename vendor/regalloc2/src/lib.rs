@@ -410,8 +410,6 @@ pub const MV_NAMES: [&str; 11] = [
 pub static MOVESTATS: [core::sync::atomic::AtomicU64; 64] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 64];
 
-/// Snapshot of `MOVESTATS`: `[kind][0 count, 1 weighted*1000]`, reg-reg
-/// kinds at `0..10`, kinds with a stack side at `16..26`.
 #[cfg(feature = "std")]
 std::thread_local! {
     /// This thread's weighted*1000 per kind since the last
@@ -426,6 +424,8 @@ pub fn movestats_take_local() -> [u64; 32] {
     MOVESTATS_TL.with(|c| c.replace([0; 32]))
 }
 
+/// Snapshot of `MOVESTATS`: `[kind][0 count, 1 weighted*1000]`, reg-reg
+/// kinds at `0..10`, kinds with a stack side at `16..26`.
 pub fn movestats_snapshot() -> [[u64; 2]; 32] {
     let mut out = [[0u64; 2]; 32];
     for (k, o) in out.iter_mut().enumerate() {

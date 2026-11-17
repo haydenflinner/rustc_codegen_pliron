@@ -237,6 +237,7 @@ impl Context {
         if matches!(isa.triple().architecture, target_lexicon::Architecture::Aarch64(_)) {
             self.const_sink();
             self.exit_const_sink();
+            self.edge_const_sink();
             self.load_remat();
             self.amode_split();
             self.shrink_split();
@@ -1171,6 +1172,165 @@ impl Context {
         }
         // The cached analyses describe the old CFG; the verifier and later
         // passes read them.
+        if n > 0 {
+            self.compute_cfg();
+            self.compute_domtree();
+            self.compute_loop_analysis();
+        }
+    }
+
+    /// PLIRON (`PLIRON_EDGECONST=1`, opt-in): constants that are only
+    /// arguments of a conditional branch's or a `br_table`'s edges are
+    /// materialized on those edges. Every argument of a branch is evaluated
+    /// before it, so a `match` that passes a different tag to one join per
+    /// arm (pulldown-cmark's `item_to_event`: eleven `movz` ahead of the
+    /// jump table on every call, each arm then moving one of them into the
+    /// join's parameter) executes all of them on every path. Each target
+    /// with at least two predecessors gets a lowering edge block anyway;
+    /// this makes it explicit and puts a copy of each constant it passes in
+    /// it, which then lands in the parameter's register directly. Edges
+    /// with the same target and arguments share one block. Loop exits are
+    /// `exit_const_sink`'s and already moved.
+    fn edge_const_sink(&mut self) {
+        use crate::cursor::{Cursor, FuncCursor};
+        use crate::ir::{BlockArg, BlockCall, InstBuilder, InstructionData, Opcode, Value};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_EDGECONST").as_deref() == Ok("1")) {
+            return;
+        }
+        let is_multi = |d: &InstructionData| matches!(d, InstructionData::Brif { .. } | InstructionData::BranchTable { .. });
+        // Only worth a pass when some multi-way branch passes a constant.
+        let mut cands = Vec::new();
+        for b in self.func.layout.blocks() {
+            let Some(t) = self.func.layout.last_inst(b) else { continue };
+            if !is_multi(&self.func.dfg.insts[t]) {
+                continue;
+            }
+            let f = &self.func;
+            let has = f.dfg.insts[t]
+                .branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
+                .iter()
+                .any(|bc| {
+                    bc.args(&f.dfg.value_lists).any(|a| {
+                        matches!(a, BlockArg::Value(v) if f.dfg.value_def(f.dfg.resolve_aliases(v)).inst()
+                            .is_some_and(|i| f.dfg.insts[i].opcode() == Opcode::Iconst && f.layout.inst_block(i) == Some(b)))
+                    })
+                });
+            if has {
+                cands.push((b, t));
+            }
+        }
+        if cands.is_empty() {
+            return;
+        }
+        self.compute_cfg();
+        let mut uses: crate::FxHashMap<Value, u32> = crate::FxHashMap::default();
+        for b in self.func.layout.blocks() {
+            for i in self.func.layout.block_insts(b) {
+                for v in self.func.dfg.inst_values(i) {
+                    *uses.entry(self.func.dfg.resolve_aliases(v)).or_default() += 1;
+                }
+            }
+        }
+        let mut n = 0;
+        for (b, t) in cands {
+            let dests: Vec<BlockCall> = {
+                let f = &self.func;
+                f.dfg.insts[t].branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables).to_vec()
+            };
+            // Constants defined in `b` whose every use is an argument of
+            // this branch.
+            let mut in_args: crate::FxHashMap<Value, u32> = crate::FxHashMap::default();
+            for bc in &dests {
+                for a in bc.args(&self.func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = a {
+                        *in_args.entry(self.func.dfg.resolve_aliases(v)).or_default() += 1;
+                    }
+                }
+            }
+            let movable = |f: &crate::ir::Function, v: Value| -> bool {
+                f.dfg.value_def(v).inst().is_some_and(|i| {
+                    f.dfg.insts[i].opcode() == Opcode::Iconst
+                        && f.layout.inst_block(i) == Some(b)
+                        && uses.get(&v).copied() == in_args.get(&v).copied()
+                })
+            };
+            // Groups of identical (target, args) edges that pass a movable
+            // constant into a block with two or more predecessors.
+            let mut groups: Vec<(crate::ir::Block, Vec<BlockArg>, Option<crate::ir::Block>)> = Vec::new();
+            let mut slot_group: Vec<Option<usize>> = Vec::with_capacity(dests.len());
+            for bc in &dests {
+                let target = bc.block(&self.func.dfg.value_lists);
+                let args: Vec<BlockArg> = bc.args(&self.func.dfg.value_lists).collect();
+                let moves = args.iter().any(|a| matches!(a, BlockArg::Value(v) if movable(&self.func, self.func.dfg.resolve_aliases(*v))));
+                if !moves || self.cfg.pred_iter(target).count() < 2 {
+                    slot_group.push(None);
+                    continue;
+                }
+                let g = match groups.iter().position(|(tb, ta, _)| *tb == target && *ta == args) {
+                    Some(g) => g,
+                    None => {
+                        groups.push((target, args, None));
+                        groups.len() - 1
+                    }
+                };
+                slot_group.push(Some(g));
+            }
+            if groups.is_empty() {
+                continue;
+            }
+            let mut moved: Vec<crate::ir::Inst> = Vec::new();
+            let mut after = b;
+            for g in groups.iter_mut() {
+                let e = self.func.dfg.make_block();
+                self.func.layout.insert_block_after(e, after);
+                after = e;
+                let mut cur = FuncCursor::new(&mut self.func).at_bottom(e);
+                let mut new_args = Vec::with_capacity(g.1.len());
+                for a in &g.1 {
+                    let BlockArg::Value(v) = *a else {
+                        new_args.push(*a);
+                        continue;
+                    };
+                    let v = cur.func.dfg.resolve_aliases(v);
+                    if !movable(cur.func, v) {
+                        new_args.push(*a);
+                        continue;
+                    }
+                    // One copy per argument: a constant passed for two
+                    // parameters (`(1, 1)`) would otherwise keep both
+                    // parameters from sharing its register.
+                    let i = cur.func.dfg.value_def(v).inst().unwrap();
+                    let InstructionData::UnaryImm { imm, .. } = cur.func.dfg.insts[i] else { unreachable!() };
+                    let ty = cur.func.dfg.value_type(v);
+                    moved.push(i);
+                    let c = cur.ins().iconst(ty, imm);
+                    new_args.push(BlockArg::Value(c));
+                }
+                cur.ins().jump(g.0, &new_args);
+                g.2 = Some(e);
+            }
+            {
+                let dfg = &mut self.func.dfg;
+                let mut new_calls = Vec::with_capacity(groups.len());
+                for g in &groups {
+                    new_calls.push(BlockCall::new(g.2.unwrap(), core::iter::empty(), &mut dfg.value_lists));
+                }
+                let d = dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+                for (slot, g) in slot_group.iter().enumerate() {
+                    if let Some(g) = g {
+                        d[slot] = new_calls[*g];
+                    }
+                }
+            }
+            moved.sort_unstable();
+            moved.dedup();
+            for i in moved {
+                // Every use was an argument of this branch, now rewritten.
+                self.func.layout.remove_inst(i);
+            }
+            n += 1;
+        }
         if n > 0 {
             self.compute_cfg();
             self.compute_domtree();

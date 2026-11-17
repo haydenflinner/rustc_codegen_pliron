@@ -2033,3 +2033,19 @@ Static, html corpus: -531 instructions, loop-weighted -8.6k.
 second operand is a 12-bit constant now compares with the immediate, and
 a zero operand is `xzr` in the `csel` (no constant at all). pulldown-cmark
 `scan_nextline`'s `max(0, ..)`.
+
+## `PLIRON_EDGECONST=1` (opt-in): constant branch arguments on their edges (2026-11-17)
+
+`src/context.rs` (`edge_const_sink`, after `exit_const_sink` in the
+aarch64 post-egraph section): every argument of a branch is evaluated
+before it, so a `brif` / `br_table` that passes constants to its targets
+materializes all of them on every path. pulldown-cmark's `item_to_event`
+ran eleven `movz` ahead of its jump table per call (484k executed), each
+arm then copying one into the join's parameter. For each edge whose
+target has two or more predecessors (the lowering makes an edge block for
+it anyway) and that passes an `iconst` of the branch's block used nowhere
+else, an explicit edge block holds a copy of the constant per argument
+(a constant passed twice gets two copies, or the two parameters could not
+share its register) and jumps on; edges with the same target and
+arguments share one block. Static html corpus: +2.5k instructions (a copy
+per edge), loop-weighted -3k.
