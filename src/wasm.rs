@@ -7300,12 +7300,12 @@ mod wpeep_tests {
             &[
                 0x02, 0x40, // block
                 0x20, 0x00, 0x0d, 0x00, // get 0; br_if 0
-                0x20, 0x01, 0x1a, // get 1; drop
+                0x20, 0x01, 0x20, 0x00, 0x36, 0x02, 0x00, // get 1; get 0; i32.store
                 0x0b, // end
             ],
         );
         let out = peep_body_opts(&b, &[], &[], 0, &opts_elide(true)).unwrap();
-        assert!(has_seq(&out, &[0x20, 0x01, 0x1a]), "live code cut: {out:02x?}");
+        assert!(has_seq(&out, &[0x20, 0x01, 0x20, 0x00, 0x36]), "live code cut: {out:02x?}");
     }
 
     // A dead region goes whole, nested `if`/`else` included, and stops at
@@ -7319,14 +7319,14 @@ mod wpeep_tests {
                 0x0c, 0x00, // br 0
                 0x20, 0x01, 0x04, 0x40, 0x01, 0x05, 0x01, 0x0b, // dead: get 1; if nop else nop end
                 0x05, // else (outer)
-                0x20, 0x01, 0x1a, // get 1; drop (live)
+                0x20, 0x01, 0x20, 0x00, 0x36, 0x02, 0x00, // live store
                 0x0b, // end
             ],
         );
         let out = peep_body_opts(&b, &[], &[], 0, &opts_elide(true)).unwrap();
         assert_eq!(count_seq(&out, &[0x04, 0x40]), 1, "{out:02x?}");
         assert_eq!(count_seq(&out, &[0x05]), 1, "{out:02x?}");
-        assert!(has_seq(&out, &[0x05, 0x20, 0x01, 0x1a]), "{out:02x?}");
+        assert!(has_seq(&out, &[0x05, 0x20, 0x01, 0x20, 0x00, 0x36]), "{out:02x?}");
     }
 
     // `br 2` across three void blocks folds too.
