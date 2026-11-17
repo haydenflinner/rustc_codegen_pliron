@@ -14,6 +14,190 @@ pub(crate) fn run(body: &mut FunctionBody, cut_blocks: Option<HashSet<Block>>, c
     MaxSSAPass::new(cut_blocks).run(body, cfg);
 }
 
+/// PLIRON: `run`, but a cut block's parameter whose incoming value is
+/// the same on every edge becomes an alias of that value when the value
+/// is defined in a block outside `clones` (the blocks the reducifier may
+/// duplicate). See `MaxSSAPass::clones`.
+pub(crate) fn run_with_clones(
+    body: &mut FunctionBody,
+    cut_blocks: HashSet<Block>,
+    clones: HashSet<Block>,
+    cfg: &CFGInfo,
+) {
+    let mut pass = MaxSSAPass::new(Some(cut_blocks));
+    pass.clones = Some(clones);
+    let cut = pass.cut_blocks.clone().unwrap_or_default();
+    let clones = pass.clones.clone().unwrap_or_default();
+    pass.run(body, cfg);
+    remove_trivial_params(body, &cut, &clones);
+}
+
+/// PLIRON: drop block parameters that only ever carry one value. The
+/// per-use walk above decides each parameter once, while its
+/// predecessors in a cycle still pass parameters not yet decided, so a
+/// loop-carried copy of an outer value survives it (`h(k) -> x(k) ->
+/// h(k)`: each parameter's incoming values are the outer `k` and the
+/// other parameter). Here, as in Braun et al.'s redundant-phi removal,
+/// the parameters form a graph (an edge from a parameter to each value
+/// passed for it); a strongly connected set of parameters whose
+/// incoming values from outside the set are all one value `v` is `v`.
+/// At a cut block, `v` must also have one name in every copy the
+/// reducifier makes (defined outside `clones`). Tarjan's algorithm
+/// visits each set after every set it reaches, so a set sees the
+/// earlier sets' aliases. Linear in parameters plus edge arguments.
+fn remove_trivial_params(body: &mut FunctionBody, cut: &HashSet<Block>, clones: &HashSet<Block>) {
+    // Nodes: params of non-entry blocks.
+    let mut node_of: HashMap<Value, usize> = HashMap::default();
+    let mut nodes: Vec<(Block, Value)> = Vec::new();
+    for blk in body.blocks.iter() {
+        if blk == body.entry {
+            continue;
+        }
+        for &(_, p) in &body.blocks[blk].params {
+            node_of.insert(p, nodes.len());
+            nodes.push((blk, p));
+        }
+    }
+    if nodes.is_empty() {
+        return;
+    }
+    // Incoming values per node.
+    let mut inc: Vec<Vec<Value>> = vec![Vec::new(); nodes.len()];
+    for blk in body.blocks.iter() {
+        body.blocks[blk].terminator.visit_targets(|t| {
+            if t.block == body.entry {
+                return;
+            }
+            for (i, &a) in t.args.iter().enumerate() {
+                let p = body.blocks[t.block].params[i].1;
+                inc[node_of[&p]].push(body.resolve_alias(a));
+            }
+        });
+    }
+    let single_name = |body: &FunctionBody, v: Value| {
+        let def = match body.values[v] {
+            ValueDef::BlockParam(b, ..) => b,
+            ValueDef::Operator(..) | ValueDef::PickOutput(..) => body.value_blocks[v],
+            _ => return false,
+        };
+        !clones.contains(&def)
+    };
+    // Iterative Tarjan.
+    let n = nodes.len();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on = vec![false; n];
+    let mut stk: Vec<usize> = Vec::new();
+    let mut next = 0usize;
+    let mut dropped: Vec<(Block, Value)> = Vec::new();
+    for root in 0..n {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        // (node, next incoming position)
+        let mut call: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stk.push(root);
+        on[root] = true;
+        while let Some(&(v, pos)) = call.last() {
+            if pos < inc[v].len() {
+                let a = inc[v][pos];
+                call.last_mut().unwrap().1 += 1;
+                if let Some(&w) = node_of.get(&a) {
+                    if index[w] == usize::MAX {
+                        index[w] = next;
+                        low[w] = next;
+                        next += 1;
+                        stk.push(w);
+                        on[w] = true;
+                        call.push((w, 0));
+                    } else if on[w] {
+                        low[v] = low[v].min(index[w]);
+                    }
+                }
+                continue;
+            }
+            call.pop();
+            if let Some(&(u, _)) = call.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] != index[v] {
+                continue;
+            }
+            // `v` roots a strongly connected set: pop it.
+            let mut scc: Vec<usize> = Vec::new();
+            loop {
+                let w = stk.pop().unwrap();
+                on[w] = false;
+                scc.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            let members: HashSet<Value> = scc.iter().map(|&w| nodes[w].1).collect();
+            let mut outside: Option<Value> = None;
+            let mut many = false;
+            for &w in &scc {
+                for &a in &inc[w] {
+                    let a = body.resolve_alias(a);
+                    if members.contains(&a) {
+                        continue;
+                    }
+                    match outside {
+                        None => outside = Some(a),
+                        Some(o) if o == a => {}
+                        Some(_) => many = true,
+                    }
+                }
+            }
+            let Some(val) = outside.filter(|_| !many) else {
+                continue;
+            };
+            if scc.iter().any(|&w| cut.contains(&nodes[w].0)) && !single_name(body, val) {
+                continue;
+            }
+            for &w in &scc {
+                let (blk, p) = nodes[w];
+                body.values[p] = ValueDef::Alias(val);
+                dropped.push((blk, p));
+            }
+        }
+    }
+    if dropped.is_empty() {
+        return;
+    }
+    // Remove the dropped params and their edge arguments.
+    let gone: HashSet<Value> = dropped.iter().map(|&(_, p)| p).collect();
+    let mut blocks: Vec<Block> = dropped.iter().map(|&(b, _)| b).collect();
+    blocks.sort();
+    blocks.dedup();
+    for blk in blocks {
+        let keep: Vec<bool> = body.blocks[blk]
+            .params
+            .iter()
+            .map(|&(_, p)| !gone.contains(&p))
+            .collect();
+        body.blocks[blk].params.retain(|&(_, p)| !gone.contains(&p));
+        let mut preds = body.blocks[blk].preds.clone();
+        preds.sort();
+        preds.dedup();
+        for pred in preds {
+            body.blocks[pred].terminator.update_targets(|t| {
+                if t.block == blk {
+                    let mut i = 0;
+                    t.args.retain(|_| {
+                        let k = keep[i];
+                        i += 1;
+                        k
+                    });
+                }
+            });
+        }
+    }
+}
+
 struct MaxSSAPass {
     /// Blocks at which all live values must cross through blockparams
     /// (or if None, then all blocks).
@@ -24,6 +208,15 @@ struct MaxSSAPass {
     /// For each block, a value map: from original value to local copy
     /// of value.
     value_map: HashMap<(Block, Value), Value>,
+    /// PLIRON: blocks the reducifier may duplicate (`run_with_clones`).
+    /// A cut block keeps a parameter for every value live across it
+    /// because its predecessors can be copies of a duplicated region, in
+    /// which a value defined inside the region has another name. A value
+    /// defined outside every block that may be duplicated has one name
+    /// in all copies, so when it is what every edge passes, the
+    /// parameter carries nothing and can be an alias, as at any other
+    /// block. `None`: stock behaviour (cut blocks keep every parameter).
+    clones: Option<HashSet<Block>>,
 }
 
 impl MaxSSAPass {
@@ -32,6 +225,7 @@ impl MaxSSAPass {
             cut_blocks,
             new_args: PerEntity::default(),
             value_map: HashMap::default(),
+            clones: None,
         }
     }
 
@@ -120,14 +314,19 @@ impl MaxSSAPass {
 
                     // If all preds have the same value, and this is not a
                     // cut-block, rewrite the blockparam to an alias instead.
-                    if !self.is_cut_block(block) {
-                        if let Some(pred_value) = iter_all_same(
+                    // PLIRON: at a cut block too, when the value is defined
+                    // outside the blocks that may be duplicated (`clones`).
+                    let cut = self.is_cut_block(block);
+                    if !cut || self.clones.is_some() {
+                        let same = iter_all_same(
                             body.blocks[block]
                                 .preds
                                 .iter()
                                 .map(|&pred| *self.value_map.get(&(pred, value)).unwrap_or(&value))
                                 .filter(|&val| val != blockparam),
-                        ) {
+                        )
+                        .filter(|&v| !cut || self.single_name(body, v));
+                        if let Some(pred_value) = same {
                             body.blocks[block].params.pop();
                             self.new_args[block].pop();
                             body.values[blockparam] = ValueDef::Alias(pred_value);
@@ -137,6 +336,21 @@ impl MaxSSAPass {
                 }
             }
         }
+    }
+
+    /// PLIRON: `v` has the same name in every copy the reducifier makes:
+    /// its defining block is not one it may duplicate.
+    fn single_name(&self, body: &FunctionBody, v: Value) -> bool {
+        let Some(clones) = self.clones.as_ref() else {
+            return false;
+        };
+        let v = body.resolve_alias(v);
+        let def = match body.values[v] {
+            ValueDef::BlockParam(b, ..) => b,
+            ValueDef::Operator(..) | ValueDef::PickOutput(..) => body.value_blocks[v],
+            _ => return false,
+        };
+        !clones.contains(&def)
     }
 
     fn is_cut_block(&self, block: Block) -> bool {

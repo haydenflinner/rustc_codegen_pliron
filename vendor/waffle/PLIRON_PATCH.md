@@ -179,3 +179,26 @@ directly (plus the wrappers around the table). Read once per function
 7-entry table both ways, re-parses, interprets every selector; run it
 from a copy of the crate with an empty `[workspace]` table, since the
 crate is not a workspace member).
+
+## Cut-block aliases in the reducifier's max-SSA (`PLIRON_WASM_MAXSSA_CUTALIAS=1`, opt-in)
+
+`passes/maxssa.rs` gives a cut block (an irreducible loop's side entry
+or exit, `backend/reducify.rs`) a parameter for every value live across
+it and never turns one into an alias, because the predecessors may be
+copies of a duplicated region in which a value defined inside the
+region has another name. A value defined in a block that is never
+copied has one name in all copies, so a parameter every edge passes it
+for carries nothing. `run_with_clones` takes the blocks that may be
+copied (a superset: blocks whose header set meets an irreducible
+header; a copy is made only in a non-empty context, and contexts hold
+only irreducible headers of the block's header set) and applies the
+all-same alias rule at cut blocks for values defined outside them.
+`remove_trivial_params` then removes parameters that carry one value
+around a cycle (Braun et al.'s redundant-phi sets: a strongly connected
+set of parameters whose incoming values from outside the set are one
+value is that value; Tarjan, linear), which the per-use walk cannot see
+because it decides each parameter before its cycle is closed. Tests:
+`reducify.rs` `cut_alias_drops_outer_params` (parameter count) and
+`tests/maxssa_cut.rs` (semantics through compile, re-parse and the
+interpreter; a version without the "defined outside the copies" check
+fails it with invalid IR).

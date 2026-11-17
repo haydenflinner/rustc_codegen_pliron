@@ -293,7 +293,27 @@ impl<'a> Reducifier<'a> {
         let mut new_body = self.body.clone();
         let cfg = CFGInfo::new(&new_body);
         crate::passes::resolve_aliases::run(&mut new_body);
-        crate::passes::maxssa::run(&mut new_body, Some(cut_blocks), &cfg);
+        // PLIRON: `PLIRON_WASM_MAXSSA_CUTALIAS=1` lets the all-same alias
+        // rule apply at cut blocks for values defined outside every block
+        // that may be duplicated: a block is copied only in a non-empty
+        // context, and contexts hold irreducible headers of the block's
+        // header set, so a block whose header set meets none is never
+        // copied (a superset of the copies, which is what soundness needs).
+        if std::env::var_os("PLIRON_WASM_MAXSSA_CUTALIAS").is_some_and(|v| v == "1") {
+            let clones: HashSet<Block> = new_body
+                .blocks
+                .iter()
+                .filter(|&b| {
+                    self.blocks[b]
+                        .headers
+                        .iter()
+                        .any(|h| irreducible_headers.contains(h))
+                })
+                .collect();
+            crate::passes::maxssa::run_with_clones(&mut new_body, cut_blocks, clones, &cfg);
+        } else {
+            crate::passes::maxssa::run(&mut new_body, Some(cut_blocks), &cfg);
+        }
         crate::passes::resolve_aliases::run(&mut new_body);
 
         log::trace!("after max-SSA run:\n{}\n", new_body.display("| ", None));
@@ -459,6 +479,69 @@ mod test {
     use crate::{
         entity::EntityRef, BlockTarget, FuncDecl, Module, Operator, SignatureData, Terminator, Type,
     };
+
+    /// PLIRON: `PLIRON_WASM_MAXSSA_CUTALIAS=1` drops the cut-block
+    /// parameters of values defined outside the duplicated region (`k`,
+    /// `m` from the entry block) and keeps the one for `d`, which `x`
+    /// and its copy define separately. Semantics: `tests/maxssa_cut.rs`.
+    #[test]
+    fn cut_alias_drops_outer_params() {
+        let build = || {
+            let mut module = Module::empty();
+            let sig = module.signatures.push(SignatureData {
+                params: vec![Type::I32, Type::I32],
+                returns: vec![Type::I32],
+            });
+            let mut body = FunctionBody::new(&module, sig);
+            let e = body.entry;
+            let (c, n) = (body.blocks[e].params[0].1, body.blocks[e].params[1].1);
+            let k = body.add_op(e, Operator::I32Add, &[n, n], &[Type::I32]);
+            let m = body.add_op(e, Operator::I32Xor, &[n, c], &[Type::I32]);
+            let h = body.add_block();
+            let x = body.add_block();
+            let exit = body.add_block();
+            let i = body.add_blockparam(h, Type::I32);
+            let j = body.add_blockparam(x, Type::I32);
+            let i1 = body.add_op(h, Operator::I32Add, &[i, k], &[Type::I32]);
+            let j1 = body.add_op(x, Operator::I32Add, &[j, m], &[Type::I32]);
+            let d = body.add_op(x, Operator::I32Mul, &[j1, j1], &[Type::I32]);
+            let r = body.add_op(exit, Operator::I32Add, &[d, k], &[Type::I32]);
+            let to = |block, args: Vec<Value>| BlockTarget { block, args };
+            body.set_terminator(
+                e,
+                Terminator::CondBr { cond: c, if_true: to(h, vec![n]), if_false: to(x, vec![n]) },
+            );
+            body.set_terminator(h, Terminator::Br { target: to(x, vec![i1]) });
+            body.set_terminator(
+                x,
+                Terminator::CondBr { cond: j1, if_true: to(h, vec![j1]), if_false: to(exit, vec![]) },
+            );
+            body.set_terminator(exit, Terminator::Return { values: vec![r] });
+            body.validate().unwrap();
+            body
+        };
+        let params = |on: bool| {
+            if on {
+                std::env::set_var("PLIRON_WASM_MAXSSA_CUTALIAS", "1");
+            } else {
+                std::env::remove_var("PLIRON_WASM_MAXSSA_CUTALIAS");
+            }
+            let body = build();
+            let out = Reducifier::new(&body).run().into_owned();
+            std::env::remove_var("PLIRON_WASM_MAXSSA_CUTALIAS");
+            out.validate().unwrap();
+            out.blocks
+                .iter()
+                .filter(|&b| b != out.entry)
+                .map(|b| out.blocks[b].params.len())
+                .sum::<usize>()
+        };
+        let (stock, on) = (params(false), params(true));
+        assert!(on < stock, "params with cut-alias {} >= stock {}", on, stock);
+        // `h`, `x` and the copy of `x` keep their own parameter, `exit`
+        // keeps `d`'s: at least four.
+        assert!(on >= 4, "{}", on);
+    }
 
     #[test]
     fn test_irreducible() {
