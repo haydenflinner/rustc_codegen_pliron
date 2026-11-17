@@ -1798,6 +1798,17 @@ Ranked by expected card gain per effort. Each item links its evidence.
   <name>`. Placement check: `bench/layout.sh <kernel> [N]` (relinks under
   shuffled symbol orders, reports the cross-layout median) and
   `bench/wasm/run.mjs --layouts=N`. V8 attribution tools: `harness/v8/`.
+- Is a native delta placement? `harness/placement.py heldout PROG|all
+  --cand NAME:K=V --copies 8` and `harness/placement.py kernels
+  FILTER|all --cand ...` (the native `--perturb`): K copies of the
+  default and of the candidate under `PLIRON_PLACE_PHASE` (every
+  function laid out as if N bytes of code preceded it) and random link
+  orders. Exact counts split every delta into executed `nop`s (loop
+  pads: placement) and real instructions by class; the timing verdict
+  needs each side's median outside the other's range. Placement alone
+  moves held-out exact counts by up to 1.9% (regex, all `nop`s) and the
+  `varint` kernel by 10% instructions per op
+  (`history/2026-11-17-native-placement.md`).
 - Compile time: `harness/ctime.py [--only regex-syntax]` (release
   dylib; also records peak RSS and machine-code bytes). Inside one
   compile: `PLIRON_TIMING=1`, `PLIRON_TRACE_FILE=t.txt`,
