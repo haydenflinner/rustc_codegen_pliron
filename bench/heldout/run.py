@@ -48,6 +48,16 @@ SG = os.environ.get(
     "SIGHTGLASS_BENCHMARKS",
     os.path.join(os.path.dirname(ROOT), "are-we-fast-yet", "sightglass", "benchmarks"),
 )
+if not os.path.isdir(SG) and "SIGHTGLASS_BENCHMARKS" not in os.environ:
+    # A git worktree (`.claude/worktrees/X`) sits deeper than the checkout:
+    # look for the sibling `are-we-fast-yet` above it.
+    _d = ROOT
+    while os.path.dirname(_d) != _d:
+        _d = os.path.dirname(_d)
+        _c = os.path.join(_d, "are-we-fast-yet", "sightglass", "benchmarks")
+        if os.path.isdir(_c):
+            SG = _c
+            break
 OUT = os.path.join(ROOT, "target", "heldout")
 SHIM = os.path.join(ROOT, "bench", "heldout", "sightglass-api")
 TOOLCHAIN = "nightly-2026-10-22"

@@ -765,12 +765,16 @@ impl<'a> Suite<'a> {
 /// fails for lowercase CLI filters (`fib`) against the capitalized
 /// `BenchmarkFib` names `sanitize_bench_name` produces. This version matches
 /// case-insensitively and treats `|` as alternation, covering the common
-/// regex-ish `-bench 'sieve|hmget'` usage Go supports.
+/// regex-ish `-bench 'sieve|hmget'` usage Go supports. PLIRON: a part
+/// spelled `=name` matches that one benchmark exactly (`=varint` is not
+/// `varint_postcard`; `harness/placement.py` counts one kernel's
+/// instructions per op that way).
 fn name_matches_filter(name: &str, filter: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    filter
-        .split('|')
-        .any(|part| !part.is_empty() && name.contains(&part.to_ascii_lowercase()))
+    filter.split('|').any(|part| match part.strip_prefix('=') {
+        Some(exact) => name.trim_start_matches("benchmark") == exact.to_ascii_lowercase(),
+        None => !part.is_empty() && name.contains(&part.to_ascii_lowercase()),
+    })
 }
 
 fn run_single_epoch<'a>(

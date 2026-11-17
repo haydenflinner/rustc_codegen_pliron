@@ -12,3 +12,5 @@ Local patches (marked `PLIRON:` in source):
 - `src/lib.rs` `name_matches_filter`: `-bench`/positional filter matches
   case-insensitively and splits `|` as alternation, so `-bench fib` hits
   `BenchmarkFib` and `-bench 'sieve|hmget'` works like a Go regex.
+  A part spelled `=name` matches one benchmark exactly (`=varint` is not
+  `varint_postcard`), for `harness/placement.py`'s instructions per op.
