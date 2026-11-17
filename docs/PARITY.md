@@ -186,8 +186,20 @@ Open on this program:
   recursion rule `PLIRON_INLINE_RECX_WASM`, default since `bbd0cc5`;
   35,550 functions against 19,544). Largest single functions:
   `Compiler::compile` 305 KB (LLVM 74 KB), `Search::go_explore` 276 KB.
-- `game_asteroids` (rapier2d's soft-FEM assembly and solve) and
-  `dims_page` (diffuse).
+- `game_asteroids` (rapier2d's soft-FEM assembly and solve): the gap is
+  `SoftFemSystem::assemble_operator` (3.2x LLVM's self time). nalgebra's
+  small products (`gemm` -> `gemv` -> `axcpy`) stayed six loops each:
+  `!beta.is_zero()` on a `beta` held in a stack slot keeps the early
+  `unroll` from deciding the trip, and nothing folded `fcmp` of
+  constants. `PLIRON_FCMPFOLD=1 PLIRON_FMUL1=1 PLIRON_UNROLL2=1`
+  (opt-in, 2026-11-17) make them straight-line; on a rapier2d driver
+  (`$TMPDIR/astdrv`, four squish-style Neo-Hookean FEM bodies, 60
+  steps) pliron/LLVM goes 1.57 -> 1.37 (load 7, checksums equal), `assemble_operator` self time
+  761 -> 328 ms against LLVM's 173. What is left there: the products are
+  calls (the IR inliner sees nalgebra's unsimplified 2,294-op bodies;
+  LLVM inlines the 33-instruction result), so the loops around them
+  stay. The dsa row is pending: the dsa tree did not build on 11-17.
+- `dims_page` (diffuse).
 - Compile memory: the default feature set with polars and typst needs
   5-7 GB per rustc and was not built.
 

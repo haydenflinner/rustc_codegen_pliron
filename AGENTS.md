@@ -523,6 +523,19 @@ time, memory, code size, stack frames) in ~20 min and writes
   once before instcombine), `PLIRON_MEMCPYOPT_MOVEMARK=1` (a forward
   moves `dst`'s `lifetime.start` ahead of its writers instead of
   dropping `dst`'s markers).
+- `PLIRON_FCMPFOLD=1`, `PLIRON_FMUL1=1`, `PLIRON_UNROLL2=1` (opt-in,
+  2026-11-17, queue item 2): `fcmp` of two float constants folds (egraph
+  rule and `jumpthread::eval`, so `unroll`'s trip walk decides it),
+  `x * 1.0` is `x` (vendored egraph rule), and `unroll2` runs `unroll`
+  again after the first `loadfwd`/`egraph` (then `loadfwd`, `slotprom`,
+  `dse`, `egraph` once more when it unrolled anything; loops with a call
+  or `black_box` stay; emission cap `PLIRON_UNROLL2_INSTS`, default 256).
+  Together they turn nalgebra's small matrix products (`gemm` testing a
+  constant `beta` against zero) into straight-line code: rapier2d's
+  `Matrix<2,3> * Matrix<3,2>` 192 -> 33 CLIF instructions, and a
+  rapier2d soft-FEM driver on wasm from 1.57x to 1.37x LLVM's time. The
+  wasm kernel module is byte-identical with them on. Not yet timed on
+  dsa (its tree did not build) or on native.
 - `PLIRON_SROA_FRAGWORD=<bytes>` — the word size `PLIRON_SROA_FRAGCOPY`
   counts in; default the pointer width (4 on wasm32 since 2026-11-16,
   `=8` restores the old rule there; native is 8).
