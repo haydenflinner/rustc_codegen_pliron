@@ -198,7 +198,8 @@ What the cross-build mode adds to the checker (`diffcheck::check_cross`):
   one two functions must treat alike), and the stub's fills are words a
   program can go on with (pointers into the heap regions, small integers).
 
-Default 64 trials (`report` uses 16). Acceptance, 2026-11-16: with
+Default 256 trials (`report` uses 16; on a dsa-sized corpus pass
+`--trials 64 --every 4`, 256 takes hours). Acceptance, 2026-11-16: with
 `PLIRON_MEMCPYOPT_RDWRAP=0` it names `mcrdwrap::build` (call 5,
 `core::fmt::write`, reads `{cap 0, ptr 1, len 0}` in A and `body`'s
 header in B: the second iteration's `String` starts as a copy of

@@ -225,12 +225,14 @@ struct Row {
     b_alone: &'static str,
 }
 
-/// The pair, checked. `text_*` are the two files.
 /// Trials per pair unless `--trials`/`PLIRON_DIFFCHECK_TRIALS` says
-/// otherwise: four times `report`'s. An IR pass's wrong value often shows
+/// otherwise: 16 times `report`'s. An IR pass's wrong value often shows
 /// only in a loop's second iteration, which few seeds reach
-/// (`tests/mcrdwrap` needs about 30).
-const XTRIALS: u32 = 64;
+/// (`tests/mcrdwrap`: the first trial that shows it is number 138). On a
+/// dsa-sized corpus pass `--trials 64` (and `--every N`): 256 takes hours.
+const XTRIALS: u32 = 256;
+
+/// The pair, checked. `text_*` are the two files.
 
 fn check_pair(isa: &dyn TargetIsa, text_a: &str, text_b: &str, o: &Opts, row: &mut Row) -> Option<Function> {
     let cfg = diffcheck::Config {
