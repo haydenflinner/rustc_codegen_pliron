@@ -1541,6 +1541,13 @@ fn search_on() -> bool {
 
 /// `PLIRON_PUNROLL_COUNTED=1`: unroll counted loops of unknown length
 /// without a profile (the behaviour before 2026-11-13).
+/// `PLIRON_PUNROLL_DWLATCH=1`: a do-while's counting latch test is not
+/// kept per copy (see `run_loop`).
+fn dw_latch_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_PUNROLL_DWLATCH", "1"));
+    *ON
+}
+
 /// `PLIRON_PUNROLL_COUNTED_WASM=K`: the unroll width for counted loops of
 /// unknown length on wasm (0 or 1: they stay rolled). See `run_loop`.
 fn counted_wasm_k() -> i64 {
@@ -2508,6 +2515,16 @@ fn run_loop(
         }
     };
     let exit_bc = texit_bc;
+    // `PLIRON_PUNROLL_DWLATCH=1` (default off): in a do-while (not
+    // rotated) the latch's conditional backedge is the counting test
+    // itself, which the group guard covers for copies 0..K-2. `walk`
+    // still records it as `latch_exit`, and the copy emission then keeps
+    // it in every copy as if it were a data test: `contains_rng`'s
+    // `filter().count()` paid the guard plus a compare and branch per
+    // element. Dropping it gives the fused shape: one test per group.
+    if !rotated && latch_exit.is_some() && dw_latch_on() {
+        latch_exit = None;
+    }
     // A plain counted loop (no retained exit) of unknown length: with
     // neither a measured trip count nor a constant one of at least two
     // groups it stays rolled (`PLIRON_PUNROLL_COUNTED=1` unrolls it as
