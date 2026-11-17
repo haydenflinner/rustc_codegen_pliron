@@ -894,18 +894,27 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
 - **N9. Code density: the same function is 1.42x LLVM's bytes, and the
   excess is in small functions** (13,089 functions present in both:
   under 256 B 2.45x, 256 B-1 KB 2.00x, 1-4 KB 1.42x, 4-16 KB 1.29x,
-  16 KB+ 0.81x). 65% of the excess is local traffic (a quarter of it
-  runs of pure local-to-local copies), 28% control structure, 4%
-  constants; loads, stores and calls account for nothing. Module-wide
-  the 21.6 MB gap is locals 10.5 MB, control 4.5, constants 2.6. A
-  concrete lead: we realign the shadow stack pointer (`i32.const -16;
-  i32.and`) about 17,229 times against LLVM's 101, and restore it
-  (`global.set 0`) about 60,551 times against 20,855 (byte-pattern
-  counts): a frame that needs no 16-byte alignment should not realign,
-  and one exit should restore once. Then the waffle backend's local
-  allocation and block structure for small functions (`stackify`,
-  `localify`), compared function by function with LLVM's output for a
-  sample of the 256 B-1 KB bucket.
+  16 KB+ 0.81x; 65% of the excess local traffic, 28% control). Decoded
+  module-wide, ranked by bytes (analysis and scripts: session
+  scratchpad `n9/NOTES.md`):
+
+  | # | change | where | saves |
+  |---|---|---|---|
+  | 1 | drop block params every edge passes unchanged; coalesce a param's local with its edge argument | waffle `passes/maxssa.rs`, `backend/localify.rs`, `BlockParams` moves in `backend/mod.rs` | est. 1.0-1.6 MB (copies 2.24 MB vs LLVM 0.15) |
+  | 2 | `block; ..; br_if 0; br K; end` -> inverted test; `br_if K-1` | `wpeep`, or stackify's `If` rewrite (`PLIRON_WBRIF`) | 557 KB (114,763 sites; LLVM 676) |
+  | 3 | keep a repeated long constant in a local instead of rematerializing | waffle `treeify.rs::is_remat` | up to 824 KB (481 KB of it gap) |
+  | 4 | `local.set X; block+; local.get X` (224,868; LLVM 0): open blocks before the value is computed so it stays on the stack or tees | waffle `stackify.rs` | 0.3-0.6 MB |
+  | 5 | blocks nothing branches to (185k in 20,462 functions) although `wpeep_elide` exists and is on: find why it misses them first | `src/wpeep_elide.rs` | 370 KB |
+  | 6 | `i32.const 255; i32.and` on values already zero-extended (41,399 vs 4,926; 11,639 double masks) | `clif_emit` narrow values | ~180 KB |
+  | 7 | a `br` whose fallthrough reaches the same place | `wpeep` | 104 KB |
+  | 8 | restore the stack pointer once per function, not before every `return` (2.45 per function vs ~1) | `src/wasm.rs` `CX::ret` | 75-100 KB |
+  | 9 | no `& -16` realignment for frames that need at most 16 (all 17,050 frames emit it; none needs more) | `src/wasm.rs` `CX::finish` | 51 KB, certain |
+  | 10 | renumber locals by use count in the 61 functions with 128+ locals | `localify.rs` | 56 KB |
+
+  Measured items: 3.2-4.4 MB of the 21.6 MB gap. The rest in a 20-function
+  sample is locals LLVM's stackifier sinks or tees (we tee half as
+  often), other structural `br`s (748K `br` vs 81K module-wide), and
+  more unrolling by our CLIF pipeline (`Memchr2/3` 500 to 2,900 B).
 - **N6. hmget's loss under single-caller inlining is two licm refusals**
   (the V8 comparison, notes in the session scratchpad `hmget_notes.md`,
   summarised in `history/2026-11-16-wasm-night.md`). Not alignment: the
@@ -928,10 +937,15 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   `PLIRON_LICM_INNERPRESS=0` has 96 machine instructions per lookup
   against the default's 102 (timing pending). Each fix must keep every
   other kernel (`bench/wasm/run.mjs`) and the default dsa rows.
-- **N7. Why the default hmget is itself +5% against LLVM**: its lookup
-  loop reloads 8 spilled values per lookup, the memory base among them.
-  Compare with LLVM's TurboFan code for the same loop
-  (`harness/v8/mcode.sh`, fixed 2026-11-16 to pick the right function).
+- **N7. The default hmget, +5% against LLVM: analysed.** Our lookup
+  miss path is 102 TurboFan instructions against LLVM's 96. `invparam`
+  splits the lookup loop into two headers, and TurboFan reloads the
+  memory base at both; `PLIRON_INVPARAM=0` gives one header and keeps
+  the base in a register (1,872 B of TurboFan code against 2,008) but
+  the count stays 102 as another value spills. The other 6: our hash
+  expression has 27 xor/27 rotate against 25/25, and `k + (round & 1)`
+  is recomputed per lookup where LLVM hoists the parity into one
+  `madd`. Not timed (load 60-110 throughout).
 
 In flight at the same time (agents): the IR-pass differential checker
 (`clif-check xcorpus`, gate for further `memcpyopt` work: `noalias`
