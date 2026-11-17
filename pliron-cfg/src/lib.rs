@@ -352,6 +352,13 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // 2026-11-17: wasm functions restore the shadow stack pointer once, in
+    // a single exit block, instead of before every `return` (2.45
+    // restores per function against LLVM's ~1). Quiet-machine kernels
+    // geomean 0.927 -> 0.927 against LLVM, no kernel worse than the
+    // default's own range; dsa restores 54.7k -> 32.0k, ~36 KB.
+    // `PLIRON_WASM_ONEEXIT=0` off.
+    ("PLIRON_WASM_ONEEXIT", "1"),
     // 2026-11-17: wasm's single-caller inlining mode `3`, one loop nest
     // per function (a callee with a loop only into a loop-free caller
     // that has taken no such callee). With the two licm rules above, on
