@@ -786,6 +786,15 @@ struct PeepOpts {
     btr2: bool,
     /// Branch-over-branch fold (`PLIRON_WASM_BOB=1`; `wpeep_elide::bob_round`).
     bob: bool,
+    /// Decode `0xfd` (SIMD) opcodes instead of skipping the body
+    /// (`PLIRON_WASM_PEEP_SIMD=1`, N3). SIMD instructions are opaque to
+    /// every rewrite (unknown to their effect tables, a clobber for
+    /// `sfwd`) and v128 locals are never a candidate of a local rewrite.
+    simd: bool,
+    /// The body's signature has a v128 param, whose type the local
+    /// rules cannot see (`groups` holds declared locals only): a body
+    /// with SIMD instructions is then skipped as before. Set per body.
+    v128_sig: bool,
 }
 
 impl PeepOpts {
@@ -811,6 +820,8 @@ impl PeepOpts {
             deadtail: pliron_cfg::env_is("PLIRON_WASM_DEADTAIL", "1"),
             btr2: pliron_cfg::env_is("PLIRON_WASM_BTR2", "1"),
             bob: pliron_cfg::env_is("PLIRON_WASM_BOB", "1"),
+            simd: pliron_cfg::env_is("PLIRON_WASM_PEEP_SIMD", "1"),
+            v128_sig: false,
         }
     }
 }
@@ -1260,6 +1271,7 @@ fn peep_body_opts(
     let mut dop: Vec<u8> = Vec::new();
     let mut stack: Vec<(u32, u8)> = Vec::new();
     let mut depth = 0i32;
+    let mut has_simd = false;
     loop {
         if p >= b.len() {
             return None;
@@ -1379,7 +1391,31 @@ fn peep_body_opts(
                 }
                 WPeek::Other
             }
-            _ => return None, // 0xfb GC, 0xfd SIMD, 0xfe atomics, EH ops
+            // SIMD (`PLIRON_WASM_PEEP_SIMD=1`): only the immediates are
+            // decoded; every pass sees an opaque `Other`.
+            0xfd if opts.simd => {
+                has_simd = true;
+                match urd(b, &mut p)? {
+                    // v128.load*, v128.store, load32/64_zero: memarg
+                    0..=11 | 92 | 93 => {
+                        urd(b, &mut p)?;
+                        urd(b, &mut p)?;
+                    }
+                    // v128.const, i8x16.shuffle: 16 bytes
+                    12 | 13 => nskip(b, &mut p, 16)?,
+                    // extract/replace_lane: lane index
+                    21..=34 => nskip(b, &mut p, 1)?,
+                    // load/store lane: memarg + lane index
+                    84..=91 => {
+                        urd(b, &mut p)?;
+                        urd(b, &mut p)?;
+                        nskip(b, &mut p, 1)?;
+                    }
+                    _ => {}
+                }
+                WPeek::Other
+            }
+            _ => return None, // 0xfb GC, 0xfd SIMD (unless `simd`), 0xfe atomics, EH ops
         };
         ctx.push(stack.clone());
         dop.push(op);
@@ -1388,6 +1424,23 @@ fn peep_body_opts(
     if p != b.len() {
         return None; // trailing bytes after the body `end`
     }
+    if has_simd && opts.v128_sig {
+        return None;
+    }
+    // v128 locals (declared ones; params are excluded by `v128_sig`):
+    // never a candidate of a local rewrite under `simd`.
+    let v128_ranges: Vec<(u32, u32)> = {
+        let mut r = Vec::new();
+        let mut at = nparams;
+        for &(c, t) in &groups {
+            if t == 0x7b {
+                r.push((at, at + c));
+            }
+            at += c;
+        }
+        r
+    };
+    let is_v128 = |l: u32| opts.simd && v128_ranges.iter().any(|&(a, e)| a <= l && l < e);
     wtrace!("decode", ins);
     // Coalesce adjacent pairs until none rewrite.
     loop {
@@ -1541,6 +1594,9 @@ fn peep_body_opts(
         };
         let fwd = |i: usize, del: &[bool]| -> Option<(u32, usize)> {
             let WPeek::Set(t) = ins[i].0 else { return None };
+            if is_v128(t) {
+                return None;
+            }
             if del[i] || !defs.get(&t).map(|v| v.contains(&i)).unwrap_or(false) {
                 return None;
             }
@@ -1836,7 +1892,7 @@ fn peep_body_opts(
             let mut i = nparams;
             for &(c, ty) in &groups {
                 if l < i + c {
-                    return Some(ty);
+                    return Some(ty).filter(|_| !is_v128(l));
                 }
                 i += c;
             }
@@ -2403,7 +2459,7 @@ fn peep_body_opts(
             };
             for s in 0..ins.len() {
                 let t = match ins[s].0 {
-                    WPeek::Set(t) if !protected.contains(&ins[s].1) => t,
+                    WPeek::Set(t) if !protected.contains(&ins[s].1) && !is_v128(t) => t,
                     _ => continue,
                 };
                 // next `local.get t` in the same context, with no other
@@ -3691,6 +3747,16 @@ fn peep_body_opts(
         let mut drops: Vec<usize> = Vec::new();
         let mut rewrites: Vec<(usize, WPeek)> = Vec::new();
         for i in 0..ins.len() {
+            // A v128 local is opaque here, like an unknown instruction.
+            if let WPeek::Get(l) | WPeek::Set(l) | WPeek::Tee(l) | WPeek::Nop(l) = ins[i].0
+                && is_v128(l)
+            {
+                vstack.clear();
+                pend.clear();
+                copymap.clear();
+                last_write.clear();
+                continue;
+            }
             match ins[i].0 {
                 WPeek::Del => continue,
                 WPeek::Nop(l) => {
@@ -4858,7 +4924,9 @@ fn peep_body_opts(
                 WPeek::Other => match b[ins[i].1] {
                     // calls decode as Ctl; `memory.*`/`0xfb`-`0xfe` are
                     // opaque — atomics/SIMD/GC bail at decode anyway.
-                    0xfc => {
+                    // `memory.*` and SIMD loads/stores (`PLIRON_WASM_PEEP_SIMD`)
+                    // may read or write any slot.
+                    0xfb..=0xff => {
                         n_clear += 1;
                         fmap.clear();
                     }
@@ -5556,6 +5624,9 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
     // stack-effect tracking inside `peep_body`.
     let mut tsig: Vec<(u32, u32)> = Vec::new();
     let mut fsig: Vec<(u32, u32)> = Vec::new();
+    // Per type: a v128 param; per defined function: its type's flag.
+    let mut tv128: Vec<bool> = Vec::new();
+    let mut fv128: Vec<bool> = Vec::new();
     let mut p = 8usize;
     while p < bytes.len() {
         let id = bytes[p];
@@ -5585,8 +5656,10 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
                             break;
                         }
                         let Some(np) = urd(bytes, &mut q) else { return };
+                        let mut pv = false;
                         for _ in 0..np {
-                            let Some(_) = bytes.get(q) else { return };
+                            let Some(&t) = bytes.get(q) else { return };
+                            pv |= t == 0x7b;
                             q += 1;
                         }
                         let Some(nr) = urd(bytes, &mut q) else { return };
@@ -5595,6 +5668,7 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
                             q += 1;
                         }
                         tsig.push((np, nr));
+                        tv128.push(pv);
                     }
                 }
                 2 => {
@@ -5670,6 +5744,7 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
                         } else {
                             fsig.push((0, 0));
                         }
+                        fv128.push(tv128.get(ti as usize).copied().unwrap_or(true));
                     }
                 }
                 _ => {}
@@ -5747,6 +5822,7 @@ fn wpeep(bytes: &mut Vec<u8>, name: &str) {
                 let out = {
                     let mut opts = PeepOpts::from_env();
                     opts.tag = format!("{name}#{fi}");
+                    opts.v128_sig = fv128.get(fi).copied().unwrap_or(true);
                     opts.trace = crate::env_get("PLIRON_WASM_TRACE_BODY")
                         .and_then(|v| v.parse::<u64>().ok())
                         == Some(k);
@@ -5997,6 +6073,8 @@ mod wpeep_tests {
             deadtail: false,
             btr2: false,
             bob: false,
+            simd: false,
+            v128_sig: false,
         }
     }
 
