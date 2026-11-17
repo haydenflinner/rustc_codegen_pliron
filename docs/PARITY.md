@@ -908,6 +908,23 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    lookup**: `invparam` splits the lookup loop into two headers (the
    memory base reloads at both), the hash expression has two extra
    xor/rotate pairs, `k + (round & 1)` is recomputed per lookup.
+   **2026-11-17:** on current main `hmget` is +1.9%, and the parity is
+   hoisted (the CLIF carries `k` stepping by 977). The hash's extra ops
+   are SipHash's last round: `v3 = rotl(v3, 21) ^ v0` and the result
+   `v0 ^ v1 ^ v2 ^ v3`, where `v0` occurs twice in one xor tree; LLVM
+   cancels it (and `v0`'s last `rotl 32` and `iadd` die), our egraph only
+   cancels `x ^ x` inside one `bxor`. New CLIF step `xorcancel`
+   (`PLIRON_XORCANCEL=1`, opt-in, after `clifpeep`): repeated leaves of
+   an xor tree cancel. `hmget`'s lookup loop 357 -> 343 wasm ops (xor 29
+   -> 27, LLVM's count), module -144 B; quiet machine, `--perturb=4`:
+   `hmget` +1.9% -> -3.8% against LLVM, `hashmap` +0.4% -> -2.1%, every
+   other kernel within its range, geomean 0.897 -> 0.891. Step
+   diffcheck on the kernels and corpus replays (std, clcg every 8th,
+   wasm bench, wasm dsa every 8th) clean. `PLIRON_INVPARAM=0` on top
+   adds nothing measurable (`sieve` looked worse). Proposed flip:
+   `PLIRON_XORCANCEL` default on (it is target-independent; native was
+   not timed). Remaining difference: our wasm keeps more values in locals
+   (`local.get`/`set` 98/37 against LLVM's 64/6 in the loop), N9 #4.
 7. **N9 #3 and #4**, constant rematerialization (up to 824 KB on dsa)
    and values parked in locals across block openers (0.3-0.6 MB):
    waffle `treeify.rs::is_remat`, `stackify.rs`. Done 2026-11-17 as
