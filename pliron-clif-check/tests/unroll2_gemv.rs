@@ -37,11 +37,12 @@ fn late_unroll_takes_the_gemv_nest_apart() {
     assert_eq!(final_brifs(&[("PLIRON_FCMPFOLD", "1"), ("PLIRON_UNROLL2", "1")]), 0);
 }
 
-/// Without the late step the column loop stays (the beta test folds, the
-/// loop does not).
+/// Without the late step (`PLIRON_UNROLL2` is on by default since
+/// 2026-11-17) the column loop stays (the beta test folds, the loop does
+/// not).
 #[test]
 fn constant_fcmp_alone_keeps_the_loop() {
-    assert!(final_brifs(&[("PLIRON_FCMPFOLD", "1")]) >= 1);
+    assert!(final_brifs(&[("PLIRON_FCMPFOLD", "1"), ("PLIRON_UNROLL2", "0")]) >= 1);
 }
 
 /// Without the fold the late step has no decided trip either.
@@ -50,6 +51,7 @@ fn late_unroll_alone_keeps_the_loop() {
     assert!(final_brifs(&[("PLIRON_UNROLL2", "1")]) >= 1);
 }
 
+/// The default: `unroll2` on, `fcmpfold` off.
 #[test]
 fn default_keeps_the_loops() {
     assert!(final_brifs(&[]) >= 1);
