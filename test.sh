@@ -9,7 +9,7 @@
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
-#   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync shrinkwrap
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
@@ -519,6 +519,26 @@ t_inlinev8cap() {
   n_drive=$(cat $out/inlinev8cap_on.rem.* | grep '5drive' | grep -c 'reject (v8cap)' || true)
   if [ "$n_off" -ne 0 ] || [ "$n_pick" -eq 0 ] || [ "$n_drive" -ne 0 ]; then
     echo "inlinev8cap: v8cap rejects: off $n_off, pick->mix $n_pick, drive $n_drive (want 0, >0, 0)" >&2
+    return 1
+  fi
+}
+
+t_maskelimloop() {
+  # PLIRON_WASM_MASKELIM: no `& 255` left on the bignum borrow carried
+  # around `big_sub`'s limb loop (the mask fixpoint starts operators at 0
+  # bits); with PLIRON_WASM_MASKELIM_OPT=0 the old fixpoint keeps some.
+  command -v wasm-objdump >/dev/null || { echo "maskelimloop: no wasm-objdump, skipped" >&2; return 0; }
+  local f n
+  for f in opt old; do
+    if [ $f = old ]; then o=0; else o=1; fi
+    PLIRON_WASM_MASKELIM=1 PLIRON_WASM_MASKELIM_OPT=$o \
+      rustc $BE --crate-type=lib --edition 2024 -O --target wasm32-unknown-unknown \
+        --emit obj -o $out/maskelimloop_$f.o tests/maskelimloop/lib.rs || return 1
+  done
+  n_opt=$(wasm-objdump -d $out/maskelimloop_opt.o | awk '/<big_sub>:/{p=1} p' | grep -c 'i32.const 255' || true)
+  n_old=$(wasm-objdump -d $out/maskelimloop_old.o | awk '/<big_sub>:/{p=1} p' | grep -c 'i32.const 255' || true)
+  if [ "$n_opt" -ne 0 ] || [ "$n_old" -eq 0 ]; then
+    echo "maskelimloop: & 255 in big_sub: $n_opt with the fix, $n_old without (want 0, >0)" >&2
     return 1
   fi
 }
@@ -1463,6 +1483,7 @@ want sroa && t_sroa
 want inlinecm && t_inlinecm
 want inlinelean && t_inlinelean
 want inlinev8cap && t_inlinev8cap
+want maskelimloop && t_maskelimloop
 want spills && t_spills
 want slotpromlt && t_slotpromlt
 want byvalhome && t_byvalhome

@@ -1239,7 +1239,14 @@ impl Ranges {
 pub fn decide(cc: IntCC, a: &Range, b: &Range) -> Option<bool> {
     match cc {
         IntCC::Equal => {
-            if a.uhi < b.ulo || b.uhi < a.ulo {
+            // `PLIRON_VRP_SIGNEDEQ=1` (opt-in): disjoint signed intervals
+            // decide equality too. An `Ordering` built as `(a > b) - (a <
+            // b)` is signed [-1, 1] but unsigned everything (it wraps to
+            // 0xff), and dragon's bignum compare tests it against
+            // `ControlFlow::Continue`'s niche -2 on every exit.
+            static SEQ: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_VRP_SIGNEDEQ", "1"));
+            if a.uhi < b.ulo || b.uhi < a.ulo || (*SEQ && (a.shi < b.slo || b.shi < a.slo)) {
                 Some(false)
             } else if let (Some(x), Some(y)) = (a.is_const(), b.is_const()) {
                 Some(x == y)

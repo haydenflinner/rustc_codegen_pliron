@@ -10296,6 +10296,24 @@ fn mask_elim(b: &mut FunctionBody) -> usize {
             }
         }
     }
+    // Operators start at 0 bits too (they only grow): a loop header's
+    // param whose back-edge argument is computed later in the same body
+    // (a bignum carry, `or` of two compares) was read as 32 bits on the
+    // first round, before its operator had been visited, and the bound
+    // could never come down again. `PLIRON_WASM_MASKELIM_OPT=0` restores
+    // that.
+    if !pliron_cfg::env_is("PLIRON_WASM_MASKELIM_OPT", "0") {
+        for blk in b.blocks.iter() {
+            for &v in &b.blocks[blk].insts {
+                if let ValueDef::Operator(_, _, tys) = &b.values[v]
+                    && b.type_pool[*tys].len() == 1
+                    && b.type_pool[*tys][0] == WT::I32
+                {
+                    bits.insert(v, 0);
+                }
+            }
+        }
+    }
     let get = |bits: &FxHashMap<WV, u32>, b: &FunctionBody, v: WV| -> u32 {
         *bits.get(&b.resolve_alias(v)).unwrap_or(&32)
     };
