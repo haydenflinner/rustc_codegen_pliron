@@ -1245,10 +1245,44 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    (opt-in, `src/xcgu.rs`: leaf callees only, transitively through small
    leaves, cold calls and intrinsics): json -1.7%, html-rewriter -0.8%,
    pulldown -0.3%, protobuf +3.3%, regex +0.5%. An allocator-free filter
-   made pulldown worse. Next: why extra cross-CGU bodies cost
-   rust-protobuf (`merge_loop`, `do_reserve_and_handle` and
-   `finish_grow` grow when `grow_amortized` and `merge_field` are
-   inlined), so the bigger limit can apply where it pays. Small, real,
+   made pulldown worse. **Why the bigger limit cost rust-protobuf**
+   (2026-11-17): not the inlining of the `merge_field` copy (refusing
+   the free inline of big copies made both programs worse: protobuf
+   69.0-69.6M, pulldown 51.6-53.9M). At 100, `grow_amortized` becomes
+   copyable, so `dep_promoted` makes its `#[cold]` dep `finish_grow`
+   hidden-external. At home `finish_grow` had one caller and inlined into
+   it for free; promoted, it is no longer `Local`, the inliner prices it
+   as a cold callee (cost 1,708 against t=500) and it stays a call, the
+   now 198-op `grow_amortized` inlines into `do_reserve_and_handle`, and
+   each of 132k vector growths takes one more call with the `Result`
+   returned through memory (+1.7M in `raw_vec/mod.rs`, +0.6M in
+   `result.rs`). `PLIRON_XCGU_LASTCALL=<size>` (opt-in, `src/xcgu.rs`): a
+   dep over `<size>` that exactly one function of the crate references
+   is not promoted, and the copies that need it are not made. Size 1 also
+   keeps `do_reserve_and_handle` (size 7, one user in pulldown's crate)
+   and loses pulldown +2.7%; 20 keeps `finish_grow` (68),
+   `decode_varint_slow`, `LazyStorage::get_or_init_slow` and a few cold
+   parsers. Exact counts against the default (main `8372c77e`):
+
+   | program | LASTCALL=20 | +SIZE=100 | +SIZE=200 |
+   |---|---|---|---|
+   | rust-protobuf | 0.00% | -0.73% | -0.48% |
+   | pulldown-cmark | 0.00% | -1.55% | -2.07% |
+   | rust-json | 0.00% | -1.20% | +0.99% |
+   | rust-html-rewriter | +0.36% | -0.23% | -0.23% |
+   | regex | 0.00% | +0.35% | -0.35% |
+   | rust-compression | 0.00% | +0.23% | +0.14% |
+   | blind-sig | -0.26% | +0.22% | +0.09% |
+   | blake3-scalar | 0.00% | 0.00% | 0.00% |
+
+   No column is clean, so nothing flips. What is left at 100 is not a
+   copy rule's business but the inliner's in the hot function: regex's
+   `Fsm::cached_state` +209k (its callees arrive as copies with fewer
+   inlines of their own, `StateMap::get_ptr` 1,701 -> 293 ops, and
+   `drop_glue::<State>` now hits `fanin`), rust-compression's
+   `BrotliHistogramCombine` +113k against -21k for the
+   `HistogramSelfAddHistogram` it now inlines, blind-sig's
+   `SmallVec::try_reserve` +120k against `try_grow` -115k. Small, real,
    per call in `scan_closing_code_fence`: a peeled first iteration in
    each `scan_ch_repeat` and two compares where LLVM's `subs` serves a
    bounds check and an emptiness test.
