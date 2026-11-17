@@ -1583,6 +1583,30 @@ pub fn run(
     // code, are not).
     let leancost_pct: usize =
         crate::env_get("PLIRON_INLINE_LEANCOST_PCT").and_then(|s| s.parse().ok()).unwrap_or(30);
+    // `PLIRON_INLINE_V8CAP=<lean ops>` (opt-in, wasm only): V8 inlines a
+    // wasm callee only up to 500 body bytes (`--wasm-inlining-max-size`),
+    // about 115 `lean_cost` ops (rapier2d's 2,401 functions: median 4.4
+    // bytes per lean op; `lean > 100` predicts `> 500 B` for 93% of them).
+    // An inline that takes a caller from at most `<lean ops>` to past it,
+    // where the caller has at least `PLIRON_INLINE_V8CAP_SITES` (default
+    // 2) call sites, is refused unless the callee is call-sized
+    // (`PLIRON_INLINE_V8CAP_TINY`, default 8 lean ops): the caller stops
+    // being one V8 can inline at those sites (`drop_glue::<DecKind>` with
+    // `drop_glue::<Literal>` inlined: 523 bytes, LLVM's 239).
+    let v8cap: usize = if small && !always_only {
+        crate::env_get("PLIRON_INLINE_V8CAP").and_then(|s| s.parse().ok()).unwrap_or(0)
+    } else {
+        0
+    };
+    let v8cap_sites: usize =
+        crate::env_get("PLIRON_INLINE_V8CAP_SITES").and_then(|s| s.parse().ok()).unwrap_or(2);
+    let v8cap_calls: usize =
+        crate::env_get("PLIRON_INLINE_V8CAP_CALLS").and_then(|s| s.parse().ok()).unwrap_or(3);
+    let v8cap_tiny: usize =
+        crate::env_get("PLIRON_INLINE_V8CAP_TINY").and_then(|s| s.parse().ok()).unwrap_or(8);
+    if v8cap > 0 {
+        adj.get_or_insert_with(|| Adj::build(ctx, st));
+    }
     let lean_pure = crate::cleanup::Pure::new();
     let mut lean_memo: FxHashMap<String, crate::inline_cost::SpecCost> = FxHashMap::default();
     let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
@@ -1632,6 +1656,9 @@ pub fn run(
             .map(|b| b.deref(ctx).iter(ctx).count())
             .sum();
         let mut grown = 0usize;
+        // `PLIRON_INLINE_V8CAP`: the caller's lean size, computed at its
+        // first candidate site and grown by each accepted callee's.
+        let mut caller_lean: Option<(usize, usize)> = None;
         // `PLIRON_INLINE_DUPCOST`: copies of each callee inlined into this
         // caller so far.
         let mut copies: FxHashMap<String, usize> = FxHashMap::default();
@@ -2143,6 +2170,28 @@ pub fn run(
                         "reject (small-scc)"
                     } else if size + ci.n > cap {
                         "reject (cap)"
+                    } else if v8cap > 0
+                        && !f.always_inline
+                        && adj
+                            .as_ref()
+                            .and_then(|a| a.callers_of.get(sym.as_str()))
+                            .is_some_and(|v| v.len() >= v8cap_sites)
+                        && {
+                            let (cl, ccalls) = *caller_lean.get_or_insert_with(|| {
+                                let c = crate::inline_cost::lean_cost(ctx, st, caller, &lean_pure);
+                                (c.n, c.ncalls)
+                            });
+                            let ce = lean_memo
+                                .entry(cs.clone())
+                                .or_insert_with(|| crate::inline_cost::lean_cost(ctx, st, ci.op, &lean_pure))
+                                .n;
+                            // A call-dense caller is a dispatcher, not a leaf:
+                            // keeping it small only moves its callees into
+                            // each of its callers (dragon's `mul_pow10`).
+                            ccalls <= v8cap_calls && cl <= v8cap && cl + ce > v8cap && ce > v8cap_tiny
+                        }
+                    {
+                        "reject (v8cap)"
                     } else if fanin > 0
                         && !free
                         && !hot_site
@@ -2165,6 +2214,13 @@ pub fn run(
                     {
                         "reject (dup)"
                     } else {
+                        if let Some((cl, _)) = caller_lean.as_mut() {
+                            let ce = lean_memo
+                                .entry(cs.clone())
+                                .or_insert_with(|| crate::inline_cost::lean_cost(ctx, st, ci.op, &lean_pure))
+                                .n;
+                            *cl += ce;
+                        }
                         if model && !free && !lean {
                             grown += sn;
                         }
@@ -2352,6 +2408,29 @@ pub fn run(
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
     {
         left_stats(ctx, st, &mut infos, model, limit, bonus, fold);
+    }
+    // `PLIRON_INLINE_SIZELOG=<prefix>` (diagnostic): every bodied
+    // function's raw op count and `lean_cost` after inlining, one line
+    // each, to `<prefix>.<pid>` (calibrating op counts against wasm bytes).
+    if !always_only && let Some(pfx) = crate::env_get("PLIRON_INLINE_SIZELOG") {
+        use std::io::Write;
+        let pure = crate::cleanup::Pure::new();
+        let mut out = String::new();
+        for (name, f) in &st.funcs {
+            if !has_body(ctx, f.op) {
+                continue;
+            }
+            let raw: usize = blocks_iter(ctx, f.op).map(|b| b.deref(ctx).iter(ctx).count()).sum();
+            let lean = crate::inline_cost::lean_cost(ctx, st, f.op, &pure);
+            out.push_str(&format!("{name}\t{raw}\t{}\t{}\n", lean.n, lean.ncalls));
+        }
+        if let Ok(mut fh) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{pfx}.{}", std::process::id()))
+        {
+            let _ = fh.write_all(out.as_bytes());
+        }
     }
     delta
 }
