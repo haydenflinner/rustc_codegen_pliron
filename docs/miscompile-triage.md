@@ -214,11 +214,13 @@ behaviour shows only in the callee); stub behaviour (a callee is a hash,
 not the real function); what the sandbox stops on. Known false positives:
 values the program never makes (a `bool` or an enum tag of 0x80 in seeded
 memory that sroa's or constload's code treats differently from the
-original), and a stub that fills a whole `sret` temporary where the real
-callee writes its own size only (memcpyopt ablation on dsa:
-`<[(FieldKey, Expr)]>::to_vec`). On the wasm kernels + std the
-memcpyopt ablation has none; on dsa 24 mismatches in a quarter of the
-corpus are not explained (`docs/history/2026-11-16-xcorpus.md`).
+original). Handled in the cross mode: `sret` fills stop at the value's
+size (`; diffcheck-sret:`), the reference's `lifetime.start` makes a
+slot's old bytes undetermined, a stub's result tag is 0 or 1, a run that
+traps after a call handed undetermined bytes is not pinned. On the wasm
+kernels + std the memcpyopt ablation has no mismatch; on the full dsa
+corpus 75 of 103 are not explained, most in serde/bincode `Deserialize`
+instances (`docs/history/2026-11-16-xcorpus.md`).
 
 ## 4. Prefix-bisect `PLIRON_PIPELINE` — rebuild-per-probe, last resort
 
