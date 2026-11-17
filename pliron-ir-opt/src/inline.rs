@@ -1440,6 +1440,15 @@ pub fn run(
     // output can't afford it.
     let smallscc = small && crate::env_is("PLIRON_INLINE_SMALLSCC", "1");
     let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
+    // `PLIRON_INLINE_HOTCAP=<k>` (default off): at most `k` copies of one
+    // callee per caller get in on the wasm loop-site bonus (`hot`). A site
+    // past the cap is scored against the flat limit like any other. The
+    // bonus pays for the call every iteration of the loop around one site;
+    // `k` more copies of the same body in one caller are `k` times the code
+    // for loops that are often not hot (`hash_one` 9 times in one dsa
+    // function), while the kernels' `hash_one` sites are at most 2 per
+    // caller (`hashmap::run`).
+    let hot_cap: usize = crate::env_get("PLIRON_INLINE_HOTCAP").and_then(|s| s.parse().ok()).unwrap_or(0);
     let glue_warm = crate::env_is("PLIRON_INLINE_GLUEWARM", "1");
     // `PLIRON_INLINE_FREEMAX=<n>` (opt-in): a single-site callee over n ops
     // gets no "free" threshold. memchr's 809-op search closure, inlined
@@ -1600,6 +1609,9 @@ pub fn run(
         // `PLIRON_INLINE_DUPCOST`: copies of each callee inlined into this
         // caller so far.
         let mut copies: FxHashMap<String, usize> = FxHashMap::default();
+        // `PLIRON_INLINE_HOTCAP`: copies of each callee this caller took
+        // only because of the loop-site bonus.
+        let mut hot_copies: FxHashMap<String, usize> = FxHashMap::default();
         // `only` (the devirt-inline pass) restricts which pre-existing
         // callsites may inline; ops this run itself splices in are fair game —
         // e.g. devirt'd `{closure}` exposes `hash_one` inside `reserve_rehash`.
@@ -1779,6 +1791,8 @@ pub fn run(
                     } else {
                         limit
                     };
+                    // The loop-site bonus raised this site's threshold.
+                    let mut hot_raised = false;
                     let mut t = if free {
                         limit.saturating_mul(free_mul)
                     } else {
@@ -1970,6 +1984,7 @@ pub fn run(
                         }
                     } else if hot > 1
                         && ci.ncalls <= 2
+                        && (hot_cap == 0 || hot_copies.get(cs).copied().unwrap_or(0) < hot_cap)
                         && loops
                             .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                             .contains(&b)
@@ -1983,6 +1998,7 @@ pub fn run(
                         // just moves that call traffic into the loop and
                         // regressed `tokenize` ~30% at `hot=2`.
                         t = t.max(limit.saturating_mul(hot));
+                        hot_raised = true;
                     }
                     // A callee with landing pads may go into an invoke whose pad is a
                     // cleanup: its `_Unwind_Resume` becomes an invoke of that pad. Not
@@ -2116,6 +2132,9 @@ pub fn run(
                         }
                         if dupcost {
                             *copies.entry(cs.clone()).or_default() += 1;
+                        }
+                        if hot_cap > 0 && hot_raised && cost > limit {
+                            *hot_copies.entry(cs.clone()).or_default() += 1;
                         }
                         size += ci.n;
                         // The callee's own discount moves into the caller
