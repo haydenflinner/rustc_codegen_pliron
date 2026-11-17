@@ -731,8 +731,38 @@ fn try_forward(
     // code) never ran a writer, so `tmp` is still alloca-undef there
     // and `dst`'s bytes are a legal refinement. Partial-coverage
     // writers fall back to the dominance path below.
+    //
+    // `PLIRON_MEMCPYOPT_SIBARMS=1` takes partial writers that do not all
+    // dominate `m` through the same scan, with "first touch is a writer"
+    // generalized to byte coverage (`if c { tmp.a = x } else { tmp.a = y };
+    // tmp.b = z; memcpy(dst, tmp)`). The coverage condition: walking
+    // backward from a consumer (`m` with the bytes `[0, n)`, a `tmp`
+    // reader with its own range), a route carries the set of bytes no
+    // writer seen on it so far covers; a writer removes its range, and
+    // the route is cut once the set is empty. Up to that cut, no other op
+    // may touch `dst`'s copy range (`poison`, as above). Why that is
+    // enough: at the consumer, each byte holds the value of the last
+    // writer of that byte on the route taken, which is the one the scan
+    // met first for it; after the rebase that writer wrote the byte to
+    // `dst` instead, and nothing between it and the consumer touched
+    // `dst` (every op between them was scanned while the byte was still
+    // uncovered, or it is a later writer of other bytes). A byte still
+    // uncovered where the route ends at a pred-less block was written by
+    // no writer on that route: `tmp`'s alloca-undef in the original, so
+    // `dst`'s own bytes are a refinement. Routes that wrap around a loop
+    // keep walking with their set, so a writer of the previous iteration
+    // counts only for bytes nothing later on the route rewrote. Writers
+    // before the cut on a route are earlier writes of bytes a later
+    // writer covers: they land in `dst` earlier than before, which the
+    // reader mirror check below (a `dst` read that a writer reaches) and,
+    // for a parameter `dst`, `exits_between` keep unobservable. The scan
+    // A writer the scan never meets wrote only bytes that later writers
+    // rewrite (see the check after the scan). With full-range writers the
+    // set has one piece and this is the scan as it was.
     let full = !writers.is_empty() && writers.iter().all(|&(_, lo, hi)| lo == 0 && hi == n);
-    if full {
+    let sib = !full && !all_dom && !writers.is_empty() && sibarms_on();
+    let cover = full || sib;
+    if cover {
         // Profitability, not soundness: a `tmp` written only by scalar
         // ops could still promote — its copies and readers would
         // scalarize away — so sinking it into a `dst` whose address a
@@ -769,48 +799,94 @@ fn try_forward(
             poison.remove(&w);
         }
         poison.remove(&m);
-        let mut stack: Vec<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> = Vec::new();
-        if let Some(mb) = m.deref(ctx).get_parent_block() {
-            stack.push((mb, Some(m)));
+        // Byte coverage as a bit set over the pieces between writer range
+        // ends (one piece for full-range writers).
+        let mut bounds: Vec<u64> = vec![0, n];
+        for &(_, lo, hi) in &writers {
+            bounds.extend([lo, hi]);
         }
-        for &(r, _, _) in &readers {
+        bounds.sort_unstable();
+        bounds.dedup();
+        if bounds.len() > 65 {
+            why!("too many writer pieces");
+        }
+        let pieces = |lo: u64, hi: u64, overlap: bool| -> u64 {
+            let mut k = 0u64;
+            for (i, w) in bounds.windows(2).enumerate() {
+                let inside = if overlap { w[0] < hi && lo < w[1] } else { lo <= w[0] && w[1] <= hi };
+                if inside {
+                    k |= 1 << i;
+                }
+            }
+            k
+        };
+        let mut wmask: FxHashMap<Ptr<Operation>, u64> = FxHashMap::default();
+        for &(w, lo, hi) in &writers {
+            *wmask.entry(w).or_default() |= pieces(lo, hi, false);
+        }
+        let mut stack: Vec<(Ptr<BasicBlock>, Option<Ptr<Operation>>, u64)> = Vec::new();
+        if let Some(mb) = m.deref(ctx).get_parent_block() {
+            stack.push((mb, Some(m), pieces(0, n, true)));
+        }
+        for &(r, ro, rh) in &readers {
             if let Some(rb) = r.deref(ctx).get_parent_block() {
-                stack.push((rb, Some(r)));
+                stack.push((rb, Some(r), pieces(ro, rh, true)));
             }
         }
-        // A node is `(block, stop-before)`: the seed scans only ops
-        // before its consumer; a block reached on a route sits whole on
-        // that route and scans all its ops (so a post-`m` touch in `m`'s
-        // own block still poisons a wrap).
-        let mut seen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> =
+        // A node is `(block, stop-before, uncovered)`: the seed scans only
+        // ops before its consumer; a block reached on a route sits whole
+        // on that route and scans all its ops (so a post-`m` touch in
+        // `m`'s own block still poisons a wrap).
+        let mut seen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>, u64)> =
             FxHashSet::default();
         let mut steps = 0usize;
-        while let Some((b, upto)) = stack.pop() {
-            if !seen.insert((b, upto)) {
+        while let Some((b, upto, left)) = stack.pop() {
+            if !seen.insert((b, upto, left)) {
                 continue;
             }
             let ops: Vec<Ptr<Operation>> = b.deref(ctx).iter(ctx).collect();
             let end = upto
                 .and_then(|u| ops.iter().position(|&o| o == u))
                 .unwrap_or(ops.len());
-            let mut cut = false;
+            let mut left = left;
             for &o in ops[..end].iter().rev() {
                 steps += 1;
                 if steps > 8192 {
                     why!("route scan over budget");
                 }
-                if wset.contains(&o) {
-                    cut = true;
-                    break;
+                if let Some(&k) = wmask.get(&o) {
+                    left &= !k;
+                    if left == 0 {
+                        break;
+                    }
+                    continue;
                 }
                 if poison.contains(&o) {
                     why!("dst touched on an uncovered route");
                 }
             }
-            if cut {
+            if left == 0 {
                 continue;
             }
-            stack.extend(b.preds(ctx).into_iter().map(|p| (p, None)));
+            stack.extend(b.preds(ctx).into_iter().map(|p| (p, None, left)));
+        }
+        // A writer the scan never met has every byte rewritten by a later
+        // writer on every route into a consumer. Its early `dst` bytes,
+        // like those of an arm writer whose arm can also leave the
+        // function, are seen only by a `dst` read it reaches (the mirror
+        // check below) or, for memory the caller owns, at an exit: the
+        // `noalias` parameter case checked `exits_between` above, and an
+        // `sret` destination gets the same check here. Full-range writers
+        // keep the rule they had.
+        if sib && sret_args.contains(&dbase) {
+            for &(w, _, _) in &writers {
+                if may_unwind(ctx, st, w) {
+                    why!("sret dst: a writer may unwind after a partial write");
+                }
+            }
+            if exits_between(ctx, st, &writers, m) {
+                why!("sret dst: the caller may see it between a writer and the copy");
+            }
         }
         // `dst` readers get the mirror check: the transform drops `m`'s
         // write, so a `dst` read sees the last write among {plain `dst`
@@ -828,6 +904,7 @@ fn try_forward(
         // leave `dst` alloca-undef on both sides.
         let mut rseen: FxHashSet<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> =
             FxHashSet::default();
+        let mut stack: Vec<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> = Vec::new();
         for (&r, &kind) in &touch {
             if kind == TouchKind::Write {
                 continue;
@@ -943,7 +1020,7 @@ fn try_forward(
     // readers below (the rule until 2026-11-16; for bisecting only).
     let rdwrap = pliron_cfg::pass_enabled("PLIRON_MEMCPYOPT_RDWRAP");
     for &(r, ro, rh) in &readers {
-        if full {
+        if cover {
             continue;
         }
         if op_dominates(ctx, st, dom, f, r, m) {
@@ -1298,6 +1375,16 @@ fn noalias_dst(
 thread_local! {
     /// Unit tests turn `PLIRON_MEMCPYOPT_NOALIASDST` on without the env.
     static TEST_NOALIASDST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The same for `PLIRON_MEMCPYOPT_SIBARMS`.
+    static TEST_SIBARMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `PLIRON_MEMCPYOPT_SIBARMS=1`: partial writers that do not all dominate
+/// the copy go through the coverage scan of `try_forward`.
+fn sibarms_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_MEMCPYOPT_SIBARMS", "1"));
+    *ON || TEST_SIBARMS.with(|c| c.get())
 }
 
 /// May `op` unwind out of the function (or into a landing pad, whose
@@ -2763,5 +2850,110 @@ mod tests {
         let ok = try_forward(ctx, st, f, &mut None, &mut None, &[], m);
         TEST_NOALIASDST.with(|c| c.set(false));
         assert!(!ok);
+    }
+
+    // ---- `PLIRON_MEMCPYOPT_SIBARMS`: a 16-byte `tmp` written in pieces
+    // (`tmp` = bytes 0..8, `tmp8` = bytes 8..16) by writers that do not
+    // all dominate the copy.
+
+    const SIB_HEAD: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            sixteen = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x sixteen] : llvm.ptr (0);
+            dst = llvm.alloca [builtin.integer i8 x sixteen] : llvm.ptr (0);
+            tmp8 = llvm.gep <builtin.integer i8> (tmp, eight)[OperandIdx(1)] : llvm.ptr (0);
+            dst8 = llvm.gep <builtin.integer i8> (dst, eight)[OperandIdx(1)] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+            w = llvm.constant <builtin.integer <9: i64>> : builtin.integer i64;
+            flag = llvm.constant <builtin.integer <1: i1>> : builtin.integer i1;
+    "#;
+    const SIB_MC: &str = "            m = llvm.call_intrinsic @\"llvm.memcpy\" (dst, tmp, sixteen) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n";
+
+    /// Parse a `SIB_HEAD` body (16-byte allocas, constant GEP indices) and
+    /// try the forward with `PLIRON_MEMCPYOPT_SIBARMS` on or off.
+    fn sib_forward(body: &str, on: bool) -> bool {
+        let input = format!("{SIB_HEAD}{body}            llvm.return\n        }}\n    }}\n");
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        for b in blocks(ctx, f) {
+            for o in ops(ctx, b) {
+                if Operation::is_op::<AllocaOp>(o, ctx) {
+                    st.allocas.insert(o.deref(ctx).get_result(ctx, 0), (16, 8));
+                }
+                if Operation::is_op::<GetElementPtrOp>(o, ctx) {
+                    st.consts.insert(o.deref(ctx).get_operand(ctx, 1), crate::state::ConstVal::Bits(8));
+                }
+            }
+        }
+        st.consts.insert(m.deref(ctx).get_operand(ctx, 2), crate::state::ConstVal::Bits(16));
+        TEST_SIBARMS.with(|c| c.set(on));
+        let ok = try_forward(ctx, st, f, &mut None, &mut None, &[], m);
+        TEST_SIBARMS.with(|c| c.set(false));
+        ok
+    }
+
+    /// `if c { tmp.a = 7 } else { tmp.a = 9 }; tmp.b = 7; dst = tmp`:
+    /// every route into the copy covers both halves. Forwarded with the
+    /// knob, refused without it (no single writer dominates). An arm that
+    /// leaves `tmp.a` unwritten forwards too: on that route the copied
+    /// bytes are the alloca's undef, and `dst`'s own bytes refine them.
+    #[test]
+    fn sibarms_partial_arms_forwarded() {
+        let body = format!(
+            "            llvm.cond_br if flag ^a() else ^b()\n          ^a():\n            llvm.store *tmp <- v;\n            llvm.br ^join()\n          ^b():\n            llvm.store *tmp <- w;\n            llvm.br ^join()\n          ^join():\n            llvm.store *tmp8 <- v;\n{SIB_MC}"
+        );
+        assert!(sib_forward(&body, true));
+        assert!(!sib_forward(&body, false));
+        let undef_arm = format!(
+            "            llvm.cond_br if flag ^a() else ^b()\n          ^a():\n            llvm.store *tmp <- v;\n            llvm.br ^join()\n          ^b():\n            llvm.br ^join()\n          ^join():\n            llvm.store *tmp8 <- v;\n{SIB_MC}"
+        );
+        assert!(sib_forward(&undef_arm, true));
+    }
+
+    /// `tmp.a = 7` before the branch; the `else` arm writes `dst.a` and
+    /// then only `tmp.b`. On that route `dst.a` must end up 7 (the entry
+    /// writer, copied by `m`); rebased, the entry writer's 7 would land in
+    /// `dst` before the arm's `dst` store overwrote it. The scan reaches
+    /// that store with `tmp.a`'s bytes still uncovered: refuse. (Cutting
+    /// the route at the first writer, as for full-range writers, would
+    /// accept it.) With the arm writing `tmp.a` after its `dst` store the
+    /// route is covered first, and the forward stands.
+    #[test]
+    fn sibarms_partial_arm_refused() {
+        let arms = |b: &str| {
+            format!(
+                "            llvm.store *tmp <- v;\n            llvm.cond_br if flag ^a() else ^b()\n          ^a():\n            llvm.store *tmp <- w;\n            llvm.store *tmp8 <- w;\n            llvm.br ^join()\n          ^b():\n{b}            llvm.br ^join()\n          ^join():\n{SIB_MC}"
+            )
+        };
+        let part = arms("            llvm.store *dst <- w;\n            llvm.store *tmp8 <- v;\n");
+        assert!(!sib_forward(&part, true));
+        let whole = arms("            llvm.store *dst <- w;\n            llvm.store *tmp <- v;\n            llvm.store *tmp8 <- v;\n");
+        assert!(sib_forward(&whole, true));
+    }
+
+    /// A route that reads `dst` between a writer and the copy would see
+    /// the writer's bytes early once they land in `dst`. Refuse.
+    #[test]
+    fn sibarms_dst_read_between_refused() {
+        let body = format!(
+            "            llvm.cond_br if flag ^a() else ^b()\n          ^a():\n            llvm.store *tmp <- v;\n            llvm.br ^join()\n          ^b():\n            llvm.store *tmp <- w;\n            r = llvm.load dst : builtin.integer i64;\n            llvm.br ^join()\n          ^join():\n            llvm.store *tmp8 <- v;\n{SIB_MC}"
+        );
+        assert!(!sib_forward(&body, true));
+    }
+
+    /// The read in the window is of the half no writer on its route has
+    /// written yet (`dst.b`, before `tmp.b`'s writer), but it is still
+    /// between a writer (`tmp.a`) and the copy on the same route. Refuse.
+    #[test]
+    fn sibarms_dst_other_half_read_refused() {
+        let body = format!(
+            "            llvm.cond_br if flag ^a() else ^b()\n          ^a():\n            llvm.store *tmp <- v;\n            llvm.br ^join()\n          ^b():\n            llvm.store *tmp <- w;\n            llvm.br ^join()\n          ^join():\n            r = llvm.load dst8 : builtin.integer i64;\n            llvm.store *tmp8 <- v;\n{SIB_MC}"
+        );
+        assert!(!sib_forward(&body, true));
     }
 }
