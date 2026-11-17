@@ -10,9 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std mcrdwrap sretnosync shrinkwrap regionsplit
-#   o0std mcrdwrap sretnosync shrinkwrap bigtmp
-#   o0std mcrdwrap sretnosync shrinkwrap bigtmp fragcopyout
+#   o0std mcrdwrap sretnosync shrinkwrap regionsplit bigtmp fragcopyout
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
