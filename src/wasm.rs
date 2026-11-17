@@ -382,6 +382,16 @@ fn emit_obj(
         winline(&mut o.funcs, verbose, o.sp);
     }
     pliron_cfg::trace("*wasm-winline*", t0.elapsed().as_secs_f64() * 1e3, name);
+    if pliron_cfg::env_is("PLIRON_WASM_NOREALIGN", "1") {
+        let sp = o.sp;
+        let n: usize = o
+            .funcs
+            .iter_mut()
+            .filter_map(|f| f.body.as_mut())
+            .map(|b| strip_realign(b, sp))
+            .sum();
+        tracing::debug!(target: "pliron::wasm", "{name}: strip_realign removed {n}");
+    }
     pliron_cfg::mark(&format!("wasm-winline {name}"));
     let t0 = std::time::Instant::now();
     // `PLIRON_WASM_GC=1`: drop `Local` functions nothing in this module
@@ -9540,6 +9550,93 @@ fn elide_sp_frame(b: &mut FunctionBody, sp: Global, roots: [WV; 4]) {
             b.blocks[blk].insts.retain(|i| !kill.contains(i));
         }
     }
+}
+
+/// N9 #9: drop the frame realignment `fp = (sp0 - SZ) & -A` when `A <= 16`
+/// and `SZ` is a multiple of 16. The stack pointer is 16-aligned on entry
+/// to every function: `pliron-wasm-ld` places it at `1024 + stack`
+/// (a multiple of 16), our frames and `winline`'s folded reservations move
+/// it by multiples of 16, and LLVM-built wasm keeps the same rule. So the
+/// `and` is the identity there: 3 bytes (`i32.const -16; i32.and`) per
+/// frame. Runs after `winline`, which matches the `and` to find and grow
+/// frame chains, so its patterns stay as they were. Returns the number of
+/// `and`s removed. Off switch: `PLIRON_WASM_NOREALIGN=0`.
+fn strip_realign(b: &mut FunctionBody, sp: Global) -> usize {
+    let mut repl: FxHashMap<WV, WV> = FxHashMap::default();
+    let mut masks: Vec<WV> = Vec::new();
+    for blk in b.blocks.iter() {
+        for &v in &b.blocks[blk].insts {
+            let ValueDef::Operator(O::I32And, aa, _) = &b.values[v] else {
+                continue;
+            };
+            let (x, m) = (b.arg_pool[*aa][0], b.arg_pool[*aa][1]);
+            let Some(mask) = wconst(b, m) else { continue };
+            let align = mask.wrapping_neg();
+            if !(1..=16).contains(&align) || (align & (align - 1)) != 0 {
+                continue;
+            }
+            let x = b.resolve_alias(x);
+            let ValueDef::Operator(O::I32Sub, sa, _) = &b.values[x] else {
+                continue;
+            };
+            let (g, k) = (b.arg_pool[*sa][0], b.arg_pool[*sa][1]);
+            let is_sp = matches!(
+                b.values[b.resolve_alias(g)],
+                ValueDef::Operator(O::GlobalGet { global_index }, ..) if global_index == sp
+            );
+            if !is_sp || wconst(b, k).is_none_or(|k| k % 16 != 0) {
+                continue;
+            }
+            repl.insert(v, x);
+            masks.push(b.resolve_alias(m));
+        }
+    }
+    if repl.is_empty() {
+        return 0;
+    }
+    let mut uses: FxHashMap<WV, u32> = masks.iter().map(|&m| (m, 0)).collect();
+    for blk in b.blocks.iter() {
+        for i in 0..b.blocks[blk].insts.len() {
+            let v = b.blocks[blk].insts[i];
+            if repl.contains_key(&v) {
+                continue;
+            }
+            b.values[v].update_uses(&mut b.arg_pool, |u| {
+                if let Some(&x) = repl.get(u) {
+                    *u = x;
+                }
+            });
+            b.values[v].visit_uses(&b.arg_pool, |u| {
+                if let Some(c) = uses.get_mut(&u) {
+                    *c += 1;
+                }
+            });
+        }
+        b.blocks[blk].terminator.update_uses(|u| {
+            if let Some(&x) = repl.get(u) {
+                *u = x;
+            }
+        });
+        b.blocks[blk].terminator.visit_uses(|u| {
+            if let Some(c) = uses.get_mut(&u) {
+                *c += 1;
+            }
+        });
+    }
+    // Aliases pointing at a removed `and` follow it to `x` too.
+    for v in b.values.iter() {
+        if let ValueDef::Alias(a) = &mut b.values[v]
+            && let Some(&x) = repl.get(a)
+        {
+            *a = x;
+        }
+    }
+    for blk in b.blocks.iter() {
+        b.blocks[blk]
+            .insts
+            .retain(|v| !repl.contains_key(v) && uses.get(v).is_none_or(|&c| c > 0));
+    }
+    repl.len()
 }
 
 // ---------- CLIF -> waffle emit ----
