@@ -419,6 +419,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   run once before the first export's body; `PLIRON_WASM_CTORWRAP=0`
   (read by the linker) leaves the exports alone. Tests: the `ctors`
   rows of `tests/wasm/smoke.sh`, `tools/pliron-wasm-ld/tests/ctors.rs`.
+- **Identical-code folding** (`PLIRON_WASM_ICF=1`, opt-in, read by
+  the linker): `pliron-wasm-ld` keeps one body per class of identical
+  functions (same type, same bytes, call and `ref.func` targets equal
+  by class: partition refinement to a fixpoint, so mutually recursive
+  copies fold) and points calls, table entries, exports, `start` and the
+  name section at the lowest-index member
+  (`tools/pliron-wasm-ld/src/icf.rs`, tests `tests/icf.rs`).
+  `PLIRON_WASM_LD_VERBOSE=1` prints the count, bytes and time.
 - **Audits** (`docs/audit.md`): `PLIRON_WASM_AUDIT=1|panic` checks
   every wpeep copy-forward round with a Datalog translation validator
   (the code and the rewrite's assumptions as one fact stream) and
