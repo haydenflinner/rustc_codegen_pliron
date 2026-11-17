@@ -36,6 +36,14 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-17: memcpyopt redirects writers spread over branch arms that
+    // together write every byte on every route into the copy. Quiet-machine
+    // wasm kernels geomean 0.929 -> 0.917 against LLVM, no kernel worse than
+    // the default's range; dsa +27k forwards, -184 KB, all 19 workloads
+    // equal (fad51e94); xcorpus: 0 mismatches on kernels+std, the 14 dsa
+    // ones explained as checker limits (docs/history/2026-11-16-xcorpus.md).
+    // Native not timed.
+    "PLIRON_MEMCPYOPT_SIBARMS",
     // 2026-11-17, wasm only, with `PLIRON_INLINE_ONCE_WASM=3` below
     // (docs/history/2026-11-16-licm-gte.md, -wasm-night.md): licm
     // hoists a load that runs on every iteration without a

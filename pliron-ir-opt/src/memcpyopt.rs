@@ -1375,16 +1375,18 @@ fn noalias_dst(
 thread_local! {
     /// Unit tests turn `PLIRON_MEMCPYOPT_NOALIASDST` on without the env.
     static TEST_NOALIASDST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The same for `PLIRON_MEMCPYOPT_SIBARMS`.
-    static TEST_SIBARMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Unit tests set `PLIRON_MEMCPYOPT_SIBARMS` (default on) per case:
+    /// `Some(on)` overrides the environment, `None` reads it.
+    static TEST_SIBARMS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// `PLIRON_MEMCPYOPT_SIBARMS=1`: partial writers that do not all dominate
-/// the copy go through the coverage scan of `try_forward`.
+/// `PLIRON_MEMCPYOPT_SIBARMS` (default on since 2026-11-17, `=0` off):
+/// partial writers that do not all dominate the copy go through the
+/// coverage scan of `try_forward`.
 fn sibarms_on() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_MEMCPYOPT_SIBARMS", "1"));
-    *ON || TEST_SIBARMS.with(|c| c.get())
+    TEST_SIBARMS.with(|c| c.get()).unwrap_or(*ON)
 }
 
 /// May `op` unwind out of the function (or into a landing pad, whose
@@ -2908,9 +2910,9 @@ mod tests {
             }
         }
         st.consts.insert(m.deref(ctx).get_operand(ctx, 2), crate::state::ConstVal::Bits(16));
-        TEST_SIBARMS.with(|c| c.set(on));
+        TEST_SIBARMS.with(|c| c.set(Some(on)));
         let ok = try_forward(ctx, st, f, &mut None, &mut None, &[], m);
-        TEST_SIBARMS.with(|c| c.set(false));
+        TEST_SIBARMS.with(|c| c.set(None));
         ok
     }
 
