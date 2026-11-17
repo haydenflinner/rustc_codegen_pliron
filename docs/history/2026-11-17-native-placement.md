@@ -105,4 +105,26 @@ Exact: pulldown-cmark -95.7k (-0.18%, real), html-rewriter -69.2k
 median, noise). Kernels: `varint` identical in every phase (the
 reported +0.2% on `varint` was placement or a mislabel); `varint_postcard`
 +0.53% instructions per op in all four copies (base range ±0.02%), real.
-Cycles: KERNELS-TBD.
+Cycles at a fixed count: inside the placement range on `varint_postcard`
+(+4.1% median, base range -1.1..+6.4% at load 45-90); not evidence either
+way. Stays opt-in for `varint_postcard`'s instructions (the earlier note
+put them on `varint`).
+
+## Kernels at a fixed iteration count
+
+Wall-clock epochs at load 60-100 (six agents building) spread ±30%
+between runs of one binary, so `placement.py kernels` now measures
+retired instructions and cycles per op from `-benchtime Nx` and `2Nx`
+runs (the smallest of 2-3 tries each). Base range of instructions per op
+over 8 copies, `varint` -6.4..+3.5%, `fib` ±4.6%, `hashmap` -2.4..+1.4%,
+`arrayvec` -0.1..+2.2%, `strwork` ±1.5%, `tokenize` 0..+3.2%, `nbody`
+±1.5%, `matmul` -0.05..+0.6%, the other twelve within ±0.2%: those are
+pads on loops entered by fall-through once per outer iteration. Cycles
+per op spread 3-25% at that load, even from counters: a quiet-machine
+timing is still owed for any default flip.
+
+WIDE128: no kernel's instructions per op leave the base range (largest
+medians: `strwork` +1.4%, inside ±1.5%; `varint` +0.19%;
+`varint_postcard` +0.11%, inside ±0.2%; `parse_only` +0.06% at N = 1,
+the noise floor there). UNDEFPHI: `varint_postcard` +0.63% (both runs:
++0.53% and +0.63%, every copy), real; everything else inside its range.
