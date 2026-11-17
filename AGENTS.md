@@ -627,8 +627,14 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_UNDEFPHI=1` (opt-in, not ready; PARITY item 10) — a block
   parameter whose inputs are one dominating value or the lowering's
   undefined zeros becomes that value (`pliron_clif_opt::undefphi`, run
-  on the lowered function). Mixed: html-rewriter -0.22%, regex +0.6%,
-  blind-sig +26%.
+  on the lowered function). Loop headers, in-loop joins and stored
+  parameters keep the zero (`PLIRON_UNDEFPHI_HDR=1`, `_LOOPS=1`,
+  `_STORED=1` lift each rule): pulldown-cmark -0.18%, html-rewriter
+  -0.07%, no program worse.
+- `PLIRON_SLOTCONST=1` (opt-in) — step `slotconst` before `loadfwd`: a
+  stack-slot load of bytes that constant stores in the same block just
+  wrote becomes the constant (stdarch's NEON constants built through
+  memory). html-rewriter -25.9k exact, nothing worse (PARITY item 10).
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

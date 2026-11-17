@@ -1095,6 +1095,42 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    (`pliron-clif-opt/tests/undefphi.rs`): a value computed in the
    parameter's own block, and a loop header parameter treated as equal to
    the current iteration's value.
+   **Per-join rules (same day):** loop headers' parameters and every
+   parameter of a block inside a loop stay opaque (`_HDR=1`, `_LOOPS=1`
+   restore them: the undefined zero there is a start value the
+   induction-variable passes use; with it gone blind-sig's `montgomery`
+   lost `ivptr`/`ivdown`/`postinc`), and so does a parameter whose value
+   is stored, also through later joins (`_STORED=1`: a zero is the
+   cheaper junk to store; regex's `MaybeInst::fill` +8.7%). Exact counts
+   against the default: pulldown-cmark -95.7k (-0.18%), html-rewriter
+   -69.1k (-0.07%), rust-json -0.6k, regex +0.8k (0.002%), the other four
+   equal or within noise; native kernels: only `varint` changes, +0.2%
+   retired instructions with shorter code (`sum_postcard` no longer saves
+   a callee-saved register; its loop lost its alignment pad). memchr's
+   select sits in a loop, so this version leaves it. Correctness:
+   `xcorpus` std and wasm (A: off, B: on) find no mismatch attributable to
+   the pass; with every rule on, std shows three `A against pipeline(B)`
+   mismatches that the control (A against the pipeline of an equivalent
+   copy of A) reproduces: the checker's sandbox leaves a `nonnull` call
+   result unbacked and the pipeline's hoisted `notrap` load traps there.
+   Still opt-in: html-rewriter's -228k came from in-loop joins.
+   **`PLIRON_SLOTCONST=1` (opt-in, ready):** the stack-slot class. A
+   per-function count of explicit slot traffic over html-rewriter's
+   15,352 functions (`clif-check codegen` on a recorded corpus,
+   weighted by loop depth): explicit slots 254k against spills 410k, and
+   in the hot functions (`ExecutionCtx`, `SelectorMatchingVm`, the
+   selector `Stack`) spills dominate (8.6k/9.4k/5.2k against 0.3k/
+   0.2k/0.7k explicit). The largest explicit pattern in a hot function:
+   stdarch builds a NEON zero in memory, eight `strb wzr` and an `ldr d`
+   per hashbrown group probe. The step `slotconst` (before `loadfwd`)
+   turns a slot load of bytes that same-block constant stores wrote into
+   the constant. Weighted stack traffic -3.7% on that corpus; exact
+   counts: html-rewriter -25.9k, compression -2.0k, protobuf -1.7k,
+   rust-json -0.9k, the rest equal or within noise; native kernels
+   unchanged. Corpus replays with `--check` (std, clcg every 4th, the dsa
+   corpus every 8th): identical verdicts; 26/122/44 functions change.
+   Tests `pliron-clif-opt/tests/slotconst.rs` (a byte-order bug fails
+   them). Next for this class: the spills in those hot functions.
 
 10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
    2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours
