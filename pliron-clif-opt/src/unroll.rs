@@ -40,11 +40,24 @@ const MAX_LOOPS: usize = 8;
 
 fn max_insts() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
+    let v = *V.get_or_init(|| {
         crate::env_get("PLIRON_UNROLL_INSTS")
             .and_then(|v| v.parse().ok())
             .unwrap_or(MAX_INSTS)
-    })
+    });
+    v.min(ROUND_CAP.with(|c| c.get()))
+}
+
+/// The late round's own emission cap (`PLIRON_UNROLL2_INSTS`, default
+/// [`LATE_INSTS`]): a 2x3 by 3x2 product unrolls in a few dozen
+/// instructions, and on the dsa corpus the round's big growers (a block
+/// RNG's refill, uuid's parser, a 112-entry `binary_search`) were all
+/// past 256.
+const LATE_INSTS: usize = 256;
+
+thread_local! {
+    /// `max_insts` for the round in progress (`run_opts`).
+    static ROUND_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 pub fn run(
@@ -78,6 +91,28 @@ pub fn run_with(
 /// branch, and copying a benchmark's `black_box` loop only moves code
 /// (wasm `k_fib`'s eight `fib(black_box(28))` calls).
 pub fn run_opts(
+    func: &mut Function,
+    an: &mut crate::pipeline::Analysis,
+    loads: &FxHashSet<Value>,
+    derived: &VMap<Value>,
+    prof: &FxHashMap<Block, u64>,
+    symon: bool,
+    pure_only: bool,
+) -> usize {
+    let cap = if pure_only {
+        crate::env_get("PLIRON_UNROLL2_INSTS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(LATE_INSTS)
+    } else {
+        usize::MAX
+    };
+    ROUND_CAP.with(|c| c.set(cap));
+    let n = run_round(func, an, loads, derived, prof, symon, pure_only);
+    ROUND_CAP.with(|c| c.set(usize::MAX));
+    n
+}
+
+fn run_round(
     func: &mut Function,
     an: &mut crate::pipeline::Analysis,
     loads: &FxHashSet<Value>,
