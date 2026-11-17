@@ -531,8 +531,14 @@ fn try_forward(
     }
     // Where `tmp`'s range lands in `dst`: the caller's `sret` arg at
     // offset 0, or a constant-offset field of an alloca it fits inside.
+    // `PLIRON_MEMCPYOPT_NOALIASDST=1`: also into the pointee of one of the
+    // function's own `noalias` parameters (`&mut T`), see `noalias_dst`.
+    let mut param_dst: Option<u64> = None;
     let (dbase, doff) = if sret_args.contains(&dst) {
         (dst, 0)
+    } else if let Some((p, off, size)) = noalias_dst(ctx, st, f, dst, n) {
+        param_dst = Some(size);
+        (p, off)
     } else {
         let Some((base, off)) = alloca_base(ctx, st, inc_of(ctx, f, pin), dst) else {
             if pliron_cfg::tracing_on() {
@@ -594,7 +600,9 @@ fn try_forward(
                     continue;
                 }
                 if crate::types::leaf_is_ptr(ctx, x.get_type(ctx)).contains(&true) {
-                    if !disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst) {
+                    if !(disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst)
+                        || (param_dst.is_some() && alloca_bases(ctx, st, inc_of(ctx, f, pin), x).is_some()))
+                    {
                         why!("call writer's arg may alias dst");
                     }
                     // `concat = f(concat)`: the arg's alloca holds a byval
@@ -645,7 +653,8 @@ fn try_forward(
             let x = w.deref(ctx).operands(ctx).nth(1).unwrap();
             if alloca_bases(ctx, st, inc_of(ctx, f, pin), x)
                 .is_some_and(|bs| bs.contains(&src))
-                || !disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst)
+                || !(disjoint(ctx, st, inc_of(ctx, f, pin), sret_args, x, dst)
+                    || (param_dst.is_some() && alloca_bases(ctx, st, inc_of(ctx, f, pin), x).is_some()))
             {
                 why!("copy writer's src may alias dst");
             }
@@ -660,7 +669,21 @@ fn try_forward(
     if !dom_ok {
         why!("dst base does not dominate all rebase sites");
     }
-    let size = st.allocas.get(dbase).map(|x| x.0).unwrap_or(u64::MAX);
+    let size = st.allocas.get(dbase).map(|x| x.0).or(param_dst).unwrap_or(u64::MAX);
+    // The caller sees a `noalias` parameter's pointee when the function
+    // returns or unwinds, which a local slot it cannot reach is not: the
+    // rewritten writers must not become visible before the copy would
+    // have run. See `exits_between`.
+    if param_dst.is_some() {
+        for &(w, _, _) in &writers {
+            if may_unwind(ctx, st, w) {
+                why!("noalias dst: a writer may unwind after a partial write");
+            }
+        }
+        if exits_between(ctx, st, &writers, m) {
+            why!("noalias dst: the caller may see it between a writer and the copy");
+        }
+    }
     let mut all_touch = None;
     // `dst` copied into a call's byval temp (`memcpy(arg_tmp, dst)`,
     // arg_tmp passed to a call) is a `try_byval` home: sinking a writer
@@ -1215,6 +1238,126 @@ fn inc_value(ctx: &Context, t: Ptr<Operation>, si: usize, k: usize) -> Option<Va
         return None;
     }
     v.get(k).copied()
+}
+
+/// `PLIRON_MEMCPYOPT_NOALIASDST=1`: `dst` as a constant offset into the
+/// pointee of one of `f`'s own `noalias` parameters, writable and
+/// dereferenceable over `[off, off + n)`: `(param, off, dereferenceable
+/// bytes)`.
+///
+/// Why that is as good as a local slot: the forward's safety argument
+/// enumerates every op that may touch the destination object
+/// (`base_touches` over the uses of `dbase`). For an alloca that is every
+/// use of it; rustc's `noalias` on a `&mut T` parameter promises the same
+/// for the duration of the call: no access to the pointee while the
+/// function runs goes through a pointer not derived from the parameter,
+/// so its uses here are all of them (a callee handed a derived pointer is
+/// such a use). What a local slot does not have is an observer outside
+/// the function: the caller reads the pointee after a return or an
+/// unwind. `try_forward` therefore also refuses when a redirected writer
+/// may unwind, or a return or an unwinding op lies on a path from a
+/// writer that does not pass the copy (`exits_between`).
+///
+/// Only the function's own entry parameters count: the `noalias` of an
+/// inlined callee's parameter (`State::region_noalias`, a clone-entry
+/// block argument) holds for the inlined body only, and its copies and
+/// writers may well sit outside it.
+fn noalias_dst(
+    ctx: &Context,
+    st: &State,
+    f: Ptr<Operation>,
+    dst: Value,
+    n: u64,
+) -> Option<(Value, u64, u64)> {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_MEMCPYOPT_NOALIASDST", "1"));
+    if !*ON && !TEST_NOALIASDST.with(|c| c.get()) {
+        return None;
+    }
+    let mut v = dst;
+    let mut off: i64 = 0;
+    for _ in 0..16 {
+        match v.defining_op() {
+            Some(d) if Operation::is_op::<GetElementPtrOp>(d, ctx) => {
+                off = off.checked_add(gep_offset(ctx, st, d)?)?;
+                v = d.deref(ctx).get_operand(ctx, 0);
+            }
+            Some(_) => return None,
+            None => break,
+        }
+    }
+    let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head()?;
+    if v.defining_block() != Some(entry) || st.region_noalias.contains(v) {
+        return None;
+    }
+    let &(deref, writable) = st.noalias.get(v)?;
+    let off = u64::try_from(off).ok()?;
+    (writable && deref > 0 && off.checked_add(n)? <= deref).then_some((v, off, deref))
+}
+
+thread_local! {
+    /// Unit tests turn `PLIRON_MEMCPYOPT_NOALIASDST` on without the env.
+    static TEST_NOALIASDST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// May `op` unwind out of the function (or into a landing pad, whose
+/// path the caller then sees through `resume`)? Invokes and calls not
+/// proven `nounwind` may; intrinsics only when they throw.
+fn may_unwind(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
+    if st.invokes.contains(op) {
+        return true;
+    }
+    if let Some(name) = st.intrinsics.get(op) {
+        return name.contains("throw") || name.contains("rethrow") || name.starts_with("pliron.eh.rethrow");
+    }
+    if Operation::is_op::<CallOp>(op, ctx) {
+        return !crate::inline::direct_callee(ctx, st, op)
+            .and_then(|c| st.funcs.get(c))
+            .is_some_and(|fi| fi.nounwind);
+    }
+    false
+}
+
+/// Is there a path from one of `writers` to a point where the caller
+/// observes memory (a return, an op that may unwind) that does not pass
+/// through the copy `m`? Walked forward from each writer, stopping at
+/// `m`; a path that ends in `unreachable` observes nothing. Over budget
+/// counts as "yes".
+fn exits_between(
+    ctx: &Context,
+    st: &State,
+    writers: &[(Ptr<Operation>, u64, u64)],
+    m: Ptr<Operation>,
+) -> bool {
+    let mut seen: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
+    let mut steps = 0usize;
+    let mut stack: Vec<Option<Ptr<Operation>>> = writers.iter().map(|&(w, _, _)| w.get_next(ctx)).collect();
+    while let Some(start) = stack.pop() {
+        let mut cur = start;
+        let mut last = None;
+        while let Some(o) = cur {
+            steps += 1;
+            if steps > 8192 {
+                return true;
+            }
+            if o == m {
+                last = None;
+                break;
+            }
+            if may_unwind(ctx, st, o) || Operation::is_op::<pliron_llvm::ops::ReturnOp>(o, ctx) {
+                return true;
+            }
+            last = Some(o);
+            cur = o.get_next(ctx);
+        }
+        let Some(t) = last else { continue };
+        for s in t.deref(ctx).successors(ctx) {
+            if seen.insert(s) {
+                stack.push(s.deref(ctx).iter(ctx).next());
+            }
+        }
+    }
+    false
 }
 
 /// The alloca `v` points into and the constant byte offset, through a chain
@@ -2526,5 +2669,99 @@ mod tests {
     fn dst_marker_before_writer_kept() {
         let n = dst_markers_after_forward(&format!("{LT}            llvm.store *tmp <- v;\n{MC}"));
         assert_eq!(n, 1);
+    }
+
+    // ---- `PLIRON_MEMCPYOPT_NOALIASDST`: the copy goes to `*p`, `p` a
+    // `noalias` (`&mut [u8; 8]`) entry parameter.
+
+    const NA_HEAD: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void (llvm.ptr (0)) variadic = false> [] {
+          ^entry(p: llvm.ptr (0)):
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+            flag = llvm.constant <builtin.integer <1: i1>> : builtin.integer i1;
+    "#;
+    const NA_TAIL: &str = "        };\n          llvm.func @g: llvm.func <llvm.void () variadic = false> []\n    }\n";
+    const NA_MC: &str = "            m = llvm.call_intrinsic @\"llvm.memcpy\" (p, tmp, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n";
+
+    /// Parse a `NA_HEAD` body, mark `p` `noalias` (`deref` bytes,
+    /// `writable`) and try the forward with the knob on or off.
+    fn na_forward(body: &str, on: bool, deref: u64, writable: bool) -> bool {
+        let input = format!("{NA_HEAD}{body}{NA_TAIL}");
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head().unwrap();
+        let p = entry.deref(ctx).get_argument(ctx, 0);
+        st.noalias.insert(p, (deref, writable));
+        TEST_NOALIASDST.with(|c| c.set(on));
+        let ok = try_forward(ctx, st, f, &mut None, &mut None, &[], m);
+        TEST_NOALIASDST.with(|c| c.set(false));
+        ok
+    }
+
+    /// `*p = { tmp.x = 7; tmp }`: forwarded into the parameter's pointee
+    /// with the knob, refused without it, and refused when `p` is
+    /// `readonly` or not known dereferenceable over the copy.
+    #[test]
+    fn noalias_param_dst_forwarded() {
+        let body = format!("            llvm.store *tmp <- v;\n{NA_MC}            llvm.return\n");
+        assert!(na_forward(&body, true, 8, true));
+        assert!(!na_forward(&body, false, 8, true));
+        assert!(!na_forward(&body, true, 8, false));
+        assert!(!na_forward(&body, true, 4, true));
+    }
+
+    /// A call that may unwind between the redirected writer and the copy:
+    /// the caller's landing pad would see `*p` already written. Refuse.
+    #[test]
+    fn noalias_param_dst_unwind_between_refused() {
+        let body = format!(
+            "            llvm.store *tmp <- v;\n            c = llvm.call @g () : llvm.func <llvm.void () variadic = false>;\n{NA_MC}            llvm.return\n"
+        );
+        assert!(!na_forward(&body, true, 8, true));
+    }
+
+    /// A path from the writer that returns without reaching the copy: the
+    /// caller would see `*p` written where it was not. Refuse.
+    #[test]
+    fn noalias_param_dst_return_between_refused() {
+        let body = format!(
+            "            llvm.store *tmp <- v;\n            llvm.cond_br if flag ^out() else ^c()\n          ^out():\n            llvm.return\n          ^c():\n{NA_MC}            llvm.return\n"
+        );
+        assert!(!na_forward(&body, true, 8, true));
+    }
+
+    /// `*p` read between the writer and the copy sees the old bytes;
+    /// redirected, it would see the new ones. Refuse.
+    #[test]
+    fn noalias_param_dst_read_between_refused() {
+        let body = format!(
+            "            llvm.store *tmp <- v;\n            old = llvm.load p : builtin.integer i64;\n{NA_MC}            llvm.return\n"
+        );
+        assert!(!na_forward(&body, true, 8, true));
+    }
+
+    /// The `noalias` of an inlined callee's parameter (a clone-entry block
+    /// argument, `region_noalias`) holds for the inlined body only: not a
+    /// destination, even with an `st.noalias` entry claiming it.
+    #[test]
+    fn scoped_noalias_dst_refused() {
+        let input = format!(
+            "{NA_HEAD}            llvm.br ^clone(p)\n          ^clone(q: llvm.ptr (0)):\n            llvm.store *tmp <- v;\n            m = llvm.call_intrinsic @\"llvm.memcpy\" (q, tmp, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n            llvm.return\n{NA_TAIL}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        let q = m.deref(ctx).get_operand(ctx, 0);
+        st.noalias.insert(q, (8, true));
+        st.region_noalias.insert(q, vec![0]);
+        TEST_NOALIASDST.with(|c| c.set(true));
+        let ok = try_forward(ctx, st, f, &mut None, &mut None, &[], m);
+        TEST_NOALIASDST.with(|c| c.set(false));
+        assert!(!ok);
     }
 }
