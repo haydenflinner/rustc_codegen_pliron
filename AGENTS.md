@@ -531,6 +531,22 @@ time, memory, code size, stack frames) in ~20 min and writes
   1,329 bytes (LLVM 294) and `memcmp` 602 (LLVM 74), with `=120` they are
   340 and 116. A scratch string-search driver goes from 1.33x to 1.14x
   LLVM's time; the kernel module changes in one cold function.
+- `PLIRON_INLINE_LEANCOST=<w>` and `PLIRON_UNROLL2_BUNROLL=<insts>`
+  (opt-in, 2026-11-17, queue item 3). The first scores a callee with at
+  most `w` warm calls by its `inline_cost::lean_cost` (jumps, slots,
+  markers, slot loads/stores and dead compares free) when that is below
+  the threshold and at most `PLIRON_INLINE_LEANCOST_PCT` (default 30) of
+  its raw count: nalgebra's `Matrix<2,3> * Matrix<3,2>` is 2,294 raw ops
+  and 478 lean, and is inlined into rapier2d's `assemble_operator`. The
+  second (with `PLIRON_UNROLL2`) runs `bunroll` in the late round on
+  loops that contain loops, up to three rounds, with exact trip counts
+  and the copies' total capped at `<insts>` (256): `for q in 0..3 { for
+  p in 0..=q { if blocks[..] == MAX { continue } .. } }`, which `unroll`'s
+  trip walk cannot take. `PLIRON_UNROLL2_LOOPS` (default 32) is the late
+  `unroll`'s loop budget. Rapier2d driver: 1.353 (item 2's knobs) ->
+  1.281 (+LEANCOST) / 1.240 (+BUNROLL) / 1.197 (both); the wasm kernel
+  module is byte-identical with `UNROLL2_BUNROLL`, LEANCOST changes
+  `quicksort` and dlmalloc's `free`.
 - `PLIRON_FCMPFOLD=1`, `PLIRON_FMUL1=1` (opt-in) and `PLIRON_UNROLL2`
   (default on since the evening of 2026-11-17, PARITY item 9; `=0` off),
   2026-11-17, queue item 2: `fcmp` of two float constants folds (egraph

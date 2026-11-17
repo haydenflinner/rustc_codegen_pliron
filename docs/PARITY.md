@@ -843,7 +843,7 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    the top functions by self time and what our code does worse there
    (V8 machine code via `harness/v8/mcode.sh`-style listings), fix the
    largest cause.
-3. **Inline nalgebra's small products by their simplified size.** (in progress 2026-11-17) After
+3. **Inline nalgebra's small products by their simplified size.** (2026-11-17: `PLIRON_INLINE_LEANCOST=2` and `PLIRON_UNROLL2_BUNROLL=256` landed opt-in; rapier2d driver 1.353 -> 1.197 with item 2's knobs, `assemble_operator` still about 1.5x LLVM's; open: the V8 push-over half of item 4, which lean scoring does not serve) After
    item 2's knobs, rapier2d's `Matrix<2,3> * Matrix<3,2>` (`Mul::mul`)
    compiles to 33 CLIF instructions (12 loads, 8 `fmul`, 4 `fadd`), but
    the IR inliner scores its unsimplified body: `reject (score) n=2294
