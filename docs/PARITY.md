@@ -1141,6 +1141,16 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    It stays off until `varint` (+3% cycles, a loop that lost its
    alignment pad) is shown placement-neutral: no benchmark may lose to
    win elsewhere.
+   **Placement verdict (2026-11-17, `harness/placement.py`, 8 copies):
+   not placement, stays opt-in.** The kernel that loses is
+   `varint_postcard` (`sum_postcard`), not `varint`: +0.53% and +0.63%
+   retired instructions per op in two runs, in every copy, against a
+   base range of ±0.2%; `varint` itself is identical in every phase
+   (its count moves -6.4..+3.5% with placement alone). Held-out exact:
+   pulldown-cmark -95.7k and html-rewriter -69.2k real (no `nop` in
+   either), the other six inside their noise. Cycles at load 45-90 are
+   inside the ranges everywhere and owe a quiet-machine run
+   (`history/2026-11-17-native-placement.md`).
    **`PLIRON_SLOTCONST` (default on since 2026-11-17):** the stack-slot class. A
    per-function count of explicit slot traffic over html-rewriter's
    15,352 functions (`clif-check codegen` on a recorded corpus,
@@ -1222,6 +1232,19 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    explained. wasm kernel module: 1 byte smaller (`__multi3`, and
    `format_shortest_opt` reordered), no timed kernel changes. Stays
    opt-in until pulldown-cmark is understood (no benchmark loses).
+   **Placement verdict (2026-11-17, `harness/placement.py`, 8 copies):
+   pulldown-cmark's loss is real code, not placement; stays opt-in.**
+   +23.3k at copy 0 is `nop` -8.6k and non-`nop` +31.9k, the same
+   +31.8k in every copy (base non-`nop` spread 2.4k, total range
+   ±0.47%), all in `FirstPass::parse_block`: load +52.9k, store -7.0k,
+   other -14.1k. The fewer pads are real but the function executes 53k
+   more loads, an allocation shift (rechecked after the regalloc merges
+   of the same day: non-`nop` +31.8k, unchanged; the `nop` part is now
+   +7.9k at copy 0, placement going the other way). html-rewriter -377.5k non-`nop`
+   (-0.37%, real); no native kernel leaves its placement range;
+   cycles inside the ranges (load 10-90, a quiet run is owed). It can
+   flip once `parse_block`'s loads are gone: a regalloc question
+   (`history/2026-11-17-native-placement.md`).
 
 10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
    2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours
