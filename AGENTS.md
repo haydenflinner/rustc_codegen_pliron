@@ -539,6 +539,13 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_SROA_FRAGWORD=<bytes>` — the word size `PLIRON_SROA_FRAGCOPY`
   counts in; default the pointer width (4 on wasm32 since 2026-11-16,
   `=8` restores the old rule there; native is 8).
+- `PLIRON_SROA_SRETNOSYNC=1` (opt-in) — sroa does not write a split
+  temporary back before a call whose only pin on it is its whole
+  `sret` argument (the destination is uninitialized when the call
+  starts; invokes keep the writeback for their cleanup). An
+  interpreter loop refilling one sret `Flow` lost 18 stores per step
+  (PARITY item 7); stanza `sretnosync`,
+  `PLIRON_TRACE=pliron::sroa=debug` prints `sret writeback skipped`.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

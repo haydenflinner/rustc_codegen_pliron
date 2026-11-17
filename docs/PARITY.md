@@ -839,7 +839,26 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    and values parked in locals across block openers (0.3-0.6 MB):
    waffle `treeify.rs::is_remat`, `stackify.rs`.
 7. **vm_loop / vm_mandelbrot +5-10%** (the Mimas interpreter's dispatch
-   loop): profile `step_one`. (In progress 2026-11-17.)
+   loop): profile `step_one`. Looked at 2026-11-17 on the fad51e94
+   packages (dsa HEAD does not build, so there is no dsa cross-check
+   yet). Retired instructions per call (`--loop=N` minus `--loop=2`):
+   vm_loop 2783M against LLVM's 2717M (+2.4%), vm_mandelbrot 3081M
+   against 3006M (+2.5%); cycles about even. The profile shares match
+   (dispatch loop ~51%, `step_one` 37-40%) and the TurboFan code of
+   both hot functions is nearly the same instruction for instruction:
+   `step_one` has a larger frame (240 bytes against 144) and loads
+   opcode tags as `ldr`+`and` where LLVM uses `ldrb`; the gap is
+   spread out, with no single cause. A standalone reduction of the
+   dispatch shape (`step` returning a 136-byte `Flow` through sret)
+   found one real cause that the dsa package does not have at its
+   `step_one` call: sroa wrote every slice of the split sret temporary
+   back before each call (18 `i64.store` per iteration; 33.1 ms
+   against LLVM's 20.2). `PLIRON_SROA_SRETNOSYNC=1` (opt-in, stanza
+   `sretnosync`) skips that writeback (21.5 ms). On the wasm kernels
+   it changes only `k_sieve` (two dead stores; timing unchanged under
+   `--perturb=4`), and on std 60 of 4,925 functions (`xcorpus`: no
+   mismatch on wasm or std). Open: what makes `step_one`'s frame
+   larger, and the byte tag loads.
 8. **Native**: the held-out programs (`bench/heldout/run.py`, 1.08x
    on 2026-11-09) with tonight's wasm-only defaults tried on native one
    at a time (`PLIRON_LICM_GTE=1`, `PLIRON_LICM_SLOTPROV=1`,
