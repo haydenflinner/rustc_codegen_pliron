@@ -7441,6 +7441,76 @@ mod wpeep_tests {
         assert_eq!(count_seq(&out, &[0x0c, 0x01]), 1, "{out:02x?}");
     }
 
+    fn opts_bob() -> PeepOpts {
+        let mut o = opts(false, false);
+        o.bob = true;
+        o.audit_panic = true;
+        o
+    }
+
+    /// N9 #2: `block; get 0; get 1; i32.lt_u; br_if 0; br 1; end` ->
+    /// `get 0; get 1; i32.ge_u; br_if 0`.
+    #[test]
+    fn bob_flips_compare() {
+        let b = body(
+            2,
+            &[
+                0x02, 0x40, // block X
+                0x02, 0x40, // block B
+                0x20, 0x00, 0x20, 0x01, 0x49, // get 0; get 1; i32.lt_u
+                0x0d, 0x00, // br_if 0 -> B
+                0x0c, 0x01, // br 1 -> X
+                0x0b, // end B
+                0x20, 0x01, 0x20, 0x00, 0x36, 0x02, 0x00, // store
+                0x0b, // end X
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 0, &opts_bob()).unwrap();
+        assert!(
+            has_seq(&out, &[0x02, 0x40, 0x20, 0x00, 0x20, 0x01, 0x4f, 0x0d, 0x00, 0x20, 0x01]),
+            "{out:02x?}"
+        );
+        assert_eq!(count_seq(&out, &[0x02, 0x40]), 1, "{out:02x?}");
+    }
+
+    // `i32.eqz` before the `br_if` goes; `i32.const 0; i32.eq` too.
+    #[test]
+    fn bob_drops_eqz() {
+        for cond in [&[0x45u8][..], &[0x41, 0x00, 0x46][..]] {
+            let mut ins = vec![0x02, 0x40, 0x02, 0x40, 0x20, 0x00];
+            ins.extend_from_slice(cond);
+            ins.extend_from_slice(&[0x0d, 0x00, 0x0c, 0x01, 0x0b, 0x01, 0x0b]);
+            let out = peep_body_opts(&body(2, &ins), &[], &[], 0, &opts_bob()).unwrap();
+            assert!(has_seq(&out, &[0x02, 0x40, 0x20, 0x00, 0x0d, 0x00]), "{out:02x?}");
+        }
+    }
+
+    // Near misses: a value left under the condition (the `br` would drop
+    // it, the fold would leak it), and `br 0` to the block itself.
+    #[test]
+    fn bob_near_misses_kept() {
+        let deep = body(
+            2,
+            &[
+                0x02, 0x40, 0x02, 0x40, // block X; block B
+                0x20, 0x01, // get 1 (left on the stack)
+                0x20, 0x00, 0x0d, 0x00, // get 0; br_if 0
+                0x0c, 0x01, 0x0b, 0x01, 0x0b, // br 1; end B; nop; end X
+            ],
+        );
+        let out = peep_body_opts(&deep, &[], &[], 0, &opts_bob()).unwrap();
+        assert_eq!(count_seq(&out, &[0x02, 0x40]), 2, "{out:02x?}");
+        let self_br = body(
+            2,
+            &[
+                0x02, 0x40, 0x20, 0x00, 0x0d, 0x00, // block; get 0; br_if 0
+                0x0c, 0x00, 0x0b, // br 0; end
+            ],
+        );
+        let out = peep_body_opts(&self_br, &[], &[], 0, &opts_bob()).unwrap();
+        assert_eq!(count_seq(&out, &[0x02, 0x40]), 1, "{out:02x?}");
+    }
+
     // `br 2` across three void blocks folds too.
     #[test]
     fn btr_removes_br_2() {
