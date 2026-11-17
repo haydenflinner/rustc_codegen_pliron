@@ -887,7 +887,21 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    xor/rotate pairs, `k + (round & 1)` is recomputed per lookup.
 7. **N9 #3 and #4**, constant rematerialization (up to 824 KB on dsa)
    and values parked in locals across block openers (0.3-0.6 MB):
-   waffle `treeify.rs::is_remat`, `stackify.rs`.
+   waffle `treeify.rs::is_remat`, `stackify.rs`. Done 2026-11-17 as
+   two opt-in waffle knobs (`vendor/waffle/PLIRON_PATCH.md`); the dsa
+   cross-check is pending until dsa builds. `PLIRON_WASM_CONSTLOCAL=1`
+   (#3): a constant group whose immediates cost more bytes than one
+   `const; local.set` at entry plus a `local.get` per use gets a local.
+   `PLIRON_WASM_BLKHOIST=1` (#4): straight-line code right before a
+   `block` moves into it. The cause of #4 is the `if` -> `block`+`br_if`
+   rewrite (`PLIRON_WBRIF`, default on), not the merge-node openers:
+   the kernel module has 1,010 parked values by default, 96 with
+   `PLIRON_WBRIF=0`, 91 with the knob (90 cross a `loop` opener).
+   Kernel module 165,438 bytes; 162,902 with CONSTLOCAL, 162,895 with
+   BLKHOIST, 160,359 with both (-3.1%). Every kernel's result matches
+   and none moves outside its `--perturb=4 --best` range (load 15-23,
+   not a quiet machine): flip both once a quiet run and a dsa build
+   agree.
 8. **vm_loop / vm_mandelbrot +5-10%** (the Mimas interpreter's dispatch
    loop): profile `step_one`. Looked at 2026-11-17 on the fad51e94
    packages (dsa HEAD does not build, so there is no dsa cross-check

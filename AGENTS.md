@@ -554,6 +554,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   interpreter loop refilling one sret `Flow` lost 18 stores per step
   (PARITY item 7); stanza `sretnosync`,
   `PLIRON_TRACE=pliron::sroa=debug` prints `sret writeback skipped`.
+- `PLIRON_WASM_CONSTLOCAL=1`, `PLIRON_WASM_BLKHOIST=1` (opt-in,
+  vendored waffle, N9 #3/#4): a constant used often enough lives in a
+  local set at function entry instead of an immediate per use; the
+  straight-line code before a `block` opener moves into the block, so a
+  value set for an `if`'s condition (the `block`+`br_if` rewrite) is not
+  parked across the openers. Kernel module -1.5% each, -3.1% together,
+  timing unchanged (PARITY item 6; tests `vendor/waffle/tests/
+  const_local.rs`, `blk_hoist.rs`).
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to
