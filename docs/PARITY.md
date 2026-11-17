@@ -951,11 +951,19 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   is recomputed per lookup where LLVM hoists the parity into one
   `madd`. Not timed (load 60-110 throughout).
 
-In flight at the same time (agents): the IR-pass differential checker
-(`clif-check xcorpus`, gate for further `memcpyopt` work: `noalias`
-destinations, then sibling-arm writers whose arms together cover every
-path into the copy), the `Target` facts struct, and why hmget loses 6
-points when its loop shares a wasm function with the set-up code.
+Landed 2026-11-16 evening: the `Target` facts struct, the off-switch
+sweep (`harness/offswitch.py`, N4), and the IR-pass differential
+checker (`clif-check xcorpus`, `harness/xcorpus.py`). The checker
+catches the reintroduced `PLIRON_MEMCPYOPT_RDWRAP=0` bug and is quiet
+on the kernels+std corpus, but on dsa it still reports 24 mismatches in
+a 1-in-4 sample of the `memcpyopt` ablation (12 are a stub artefact in
+`<[(FieldKey, Expr)]>::to_vec`, 12 undiagnosed) and one dsa function,
+the closure in `cadcore_union::arrange::universal::fuse_filaments_with`,
+mismatches against its own pipeline output in the default build and
+goes away with `PLIRON_SLOTMERGE=0`: a possible live miscompile.
+Until those are cleared, gate further `memcpyopt` work (`noalias`
+destinations, sibling-arm writers whose arms together cover every
+path into the copy) by comparing mismatch lists before and after.
 
 ### Standing list
 
