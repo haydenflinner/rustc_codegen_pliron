@@ -303,6 +303,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   cranelift-codegen and its dependencies (~38k functions, ~1.5 min):
   compiling our own crates found bugs std does not show. The gate
   replays every 8th function of it (~20 s), `gate.py --full` all of it.
+- **Off switches**: `harness/offswitch.py [--corpus DIR] [--every N]
+  [--only X,Y] [--resume --out DIR]` runs `clif-check report` once per
+  CLIF off switch (`PLIRON_<X>=0`, read from the source: `Gate::Env`
+  steps, `pass_enabled` reads, the `FnFlags` categories, `DEFAULT_ON`
+  knobs pliron-clif-opt reads; 245 on 2026-11-16) under
+  `PLIRON_VERIFY=full` and fails on any row that is not `ok`. A pass
+  turned off must not break a later one: `PLIRON_JUMPTHREAD=0` crashed
+  loopidiom, `PLIRON_TAILDUP=0` broke slotprom. std every 4th function:
+  about 9 min for all switches; `wasm-*` corpora replay as wasm32. IR-pass
+  switches are not covered (corpora are recorded after the IR passes).
 - **Real crates**: `harness/crates.py [--tier 1|2|3] [--only a,b]
   [--deps stock|pliron]` runs pinned crates' own test suites
   (`--release`) under stock and pliron and reports pliron-only failures,

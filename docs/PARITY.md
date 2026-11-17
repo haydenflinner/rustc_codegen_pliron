@@ -849,13 +849,17 @@ then a whole dsa build and `bench.mjs` for the result cross-check.
   after (`PLIRON_WASM_SIZELOG=1`), `peepdiff` the result (it skips
   v128 signatures as entry points: check it still runs the bodies),
   `PLIRON_WASM_AUDIT=panic` in the gate.
-- **N4. `PLIRON_JUMPTHREAD=0` crashes the backend** on `mimas-compile`:
-  index out of bounds at `pliron-clif-opt/src/loopidiom.rs:3030`. An
-  off switch must not crash (AGENTS.md rule 2). Reproduce with the
-  single-crate loop, record the function as a corpus file
-  (`PLIRON_CORPUS`), reduce, fix with a test, and run the corpora with
-  every pass's `=0` switch in turn to find others like it (a
-  `clif-check report` per switch is seconds on std).
+- **N4. Done 2026-11-16.** `PLIRON_JUMPTHREAD=0` crashed loopidiom's
+  dead-loop deletion: its walk over the exit's forwarder blocks stopped
+  at its 8-block budget one step past the block its args described
+  (index out of bounds, or a fast edge with the wrong values), and a
+  forwarder's param became an escape bound on edges it did not dominate
+  (verifier errors). `PLIRON_TAILDUP=0` left dead blocks whose branches
+  slotprom did not extend. clif-check also ignored the fifteen
+  step-category switches (`PLIRON_JUMPTHREAD`, `PLIRON_LICM`, ...), so a
+  corpus could not reproduce the crash. All fixed with tests;
+  `harness/offswitch.py` sweeps every CLIF off switch (std and
+  wasm-dsa-eval clean after the fixes).
 - **N5. The 19 MB in functions LLVM's module does not have: analysed**
   (2026-11-16, both modules from dsa `0caf4bb8`; scripts and every
   number in the session scratchpad `n5/NOTES.md`). Ours 36,046
