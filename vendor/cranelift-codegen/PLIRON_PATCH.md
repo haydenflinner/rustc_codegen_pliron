@@ -2112,3 +2112,12 @@ reload, so its spill store is already dropped and the definition itself
 is dead (`parse_block`'s `mov x22, #0x12; mov x22, #0x19`). Backward
 liveness starts with every register live at the block end, so a value
 live into a successor stays. `=0` is the default.
+
+## `PLIRON_VTRUEBR=1` (opt-in): branch on the reduced lane of `vall_true`/`vany_true` (2026-11-17)
+
+`src/isa/aarch64/inst.isle` (`is_nonzero_cmp`, rules at priority 6),
+`src/isa/aarch64/lower/isle.rs` (`vtruebr_on`). A `brif`, `select` or
+trap on `vall_true x` uses `uminv; fmov` and a `cbz`/`cbnz` on the result;
+on `vany_true x`, the `vanytrue` flags. The default materializes the
+bool first (`cmp; cset`) and then tests it (`tst; b.eq`), three extra
+instructions on every iteration of a vectorized search loop.

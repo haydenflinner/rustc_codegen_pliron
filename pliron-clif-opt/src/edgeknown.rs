@@ -1,7 +1,8 @@
 //! Tests on a block parameter that every incoming edge already decided
 //! (default on; `PLIRON_EDGEKNOWN=0` off). Two relatives live here:
 //! `selects` (`PLIRON_SELKNOWN=0` off) folds selects whose condition is
-//! decided where they stand, and `retests` (`PLIRON_RETEST=0` off)
+//! decided where they stand (`PLIRON_SELKNOWN_COND=1`, opt-in: also on any
+//! branch condition, not only equality tests), and `retests` (`PLIRON_RETEST=0` off)
 //! folds a branch that repeats the test on its block's only way in.
 //!
 //! `b(p): brif (p == 0), X, Y` where each predecessor reaches `b` over an
@@ -325,19 +326,36 @@ pub fn selects(func: &mut Function) -> usize {
     }
     // (operands, "differs" holds, region root).
     let mut facts: Vec<((Value, Value), bool, Block)> = Vec::new();
+    // Any other branch condition (`icmp ult i, n`): (condition, its value,
+    // region root). Only selects on that same value use these.
+    let mut cfacts: Vec<(Value, bool, Block)> = Vec::new();
+    let mut selconds: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
+    if pliron_cfg::env_is("PLIRON_SELKNOWN_COND", "1") {
+        for &b in &blocks {
+            for i in func.layout.block_insts(b) {
+                if let InstructionData::Ternary { opcode: Opcode::Select, args } = func.dfg.insts[i] {
+                    selconds.insert(func.dfg.resolve_aliases(args[0]));
+                }
+            }
+        }
+    }
     for &b in &blocks {
         // Dominating branch: its single-predecessor successors.
         if let Some(t) = func.layout.last_inst(b)
             && let InstructionData::Brif { arg, blocks: [bt, bf], .. } = func.dfg.insts[t]
-            && let Some((x, y, ne)) = eq_key(func, func.dfg.resolve_aliases(arg))
         {
+            let c = func.dfg.resolve_aliases(arg);
+            let key = eq_key(func, c);
             let (tb, fb) = (bt.block(&func.dfg.value_lists), bf.block(&func.dfg.value_lists));
-            if tb != fb {
+            if tb != fb && (key.is_some() || selconds.contains(&c)) {
                 for (s, taken) in [(tb, true), (fb, false)] {
                     let mut ps = cfg.pred_iter(s);
                     if let (Some(_), None) = (ps.next(), ps.next()) {
-                        // `ne` true and taken: differs. `ne` false and not taken: differs.
-                        facts.push(((x, y), ne == taken, s));
+                        match key {
+                            // `ne` true and taken: differs. `ne` false and not taken: differs.
+                            Some((x, y, ne)) => facts.push(((x, y), ne == taken, s)),
+                            None => cfacts.push((c, taken, s)),
+                        }
                     }
                 }
             }
@@ -396,7 +414,7 @@ pub fn selects(func: &mut Function) -> usize {
             }
         }
     }
-    if facts.is_empty() {
+    if facts.is_empty() && cfacts.is_empty() {
         return 0;
     }
     let mut n = 0;
@@ -405,30 +423,46 @@ pub fn selects(func: &mut Function) -> usize {
     // end), exit, body`): the select itself is not in the decided region,
     // its uses are. Every use in a decided block takes the arm directly.
     let mut sel: rustc_hash::FxHashMap<Value, ((Value, Value), bool, Value, Value)> = rustc_hash::FxHashMap::default();
+    // Selects on a `cfacts` condition: (condition, true arm, false arm).
+    let mut csel: rustc_hash::FxHashMap<Value, (Value, Value, Value)> = rustc_hash::FxHashMap::default();
     for &b in &blocks {
         for i in func.layout.block_insts(b) {
-            if let InstructionData::Ternary { opcode: Opcode::Select, args } = func.dfg.insts[i]
-                && let Some((x, y, ne)) = eq_key(func, func.dfg.resolve_aliases(args[0]))
-            {
-                sel.insert(func.dfg.first_result(i), ((x, y), ne, args[1], args[2]));
+            if let InstructionData::Ternary { opcode: Opcode::Select, args } = func.dfg.insts[i] {
+                let c = func.dfg.resolve_aliases(args[0]);
+                if let Some((x, y, ne)) = eq_key(func, c) {
+                    sel.insert(func.dfg.first_result(i), ((x, y), ne, args[1], args[2]));
+                } else if !cfacts.is_empty() {
+                    csel.insert(func.dfg.first_result(i), (c, args[1], args[2]));
+                }
             }
         }
     }
     for &b in &blocks {
         let live: Vec<&((Value, Value), bool, Block)> =
             facts.iter().filter(|f| domtree.block_dominates(f.2, b)).collect();
-        if live.is_empty() {
+        let clive: Vec<&(Value, bool, Block)> =
+            cfacts.iter().filter(|f| domtree.block_dominates(f.2, b)).collect();
+        if live.is_empty() && clive.is_empty() {
             continue;
         }
+        // The arm a select on a decided condition always takes here.
+        let pick = |v: Value| -> Option<Value> {
+            if let Some(&(key, ne, a, bb)) = sel.get(&v)
+                && let Some(f) = live.iter().find(|f| f.0 == key)
+            {
+                return Some(if f.1 == ne { a } else { bb });
+            }
+            let &(c, a, bb) = csel.get(&v)?;
+            let f = clive.iter().find(|f| f.0 == c)?;
+            Some(if f.1 { a } else { bb })
+        };
         let insts: Vec<Inst> = func.layout.block_insts(b).collect();
         for &i in &insts {
             let mut rmap: Vec<(Value, Value)> = Vec::new();
             for v in func.dfg.inst_values(i) {
                 let rv = func.dfg.resolve_aliases(v);
-                if let Some(&(key, ne, a, bb)) = sel.get(&rv)
-                    && let Some(f) = live.iter().find(|f| f.0 == key)
-                {
-                    rmap.push((v, if f.1 == ne { a } else { bb }));
+                if let Some(nv) = pick(rv) {
+                    rmap.push((v, nv));
                 }
             }
             if rmap.is_empty() || !pliron_cfg::bisect("edgeknown") {
@@ -442,13 +476,17 @@ pub fn selects(func: &mut Function) -> usize {
                 continue;
             }
             let InstructionData::Ternary { opcode: Opcode::Select, args } = func.dfg.insts[i] else { continue };
-            let Some((x, y, ne)) = eq_key(func, func.dfg.resolve_aliases(args[0])) else { continue };
-            let Some(f) = live.iter().find(|f| f.0 == (x, y)) else { continue };
+            let c = func.dfg.resolve_aliases(args[0]);
+            // The condition is true when "differs" matches the compare's sense.
+            let taken = match eq_key(func, c) {
+                Some((x, y, ne)) => live.iter().find(|f| f.0 == (x, y)).map(|f| f.1 == ne),
+                None => clive.iter().find(|f| f.0 == c).map(|f| f.1),
+            };
+            let Some(taken) = taken else { continue };
             if !pliron_cfg::bisect("edgeknown") {
                 continue;
             }
-            // The condition is true when "differs" matches the compare's sense.
-            let pick = if f.1 == ne { args[1] } else { args[2] };
+            let pick = if taken { args[1] } else { args[2] };
             let r = func.dfg.first_result(i);
             func.dfg.clear_results(i);
             func.dfg.change_to_alias(r, pick);

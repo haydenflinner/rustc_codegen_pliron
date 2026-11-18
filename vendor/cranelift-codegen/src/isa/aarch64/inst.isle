@@ -5261,6 +5261,24 @@
 (rule 1 (is_nonzero_cmp (maybe_uextend (icmp _ cc a b))) (emit_icmp cc a b))
 (rule 0 (is_nonzero_cmp val) (is_nonzero val))
 
+;; PLIRON (`PLIRON_VTRUEBR=1`, opt-in): a `vall_true`/`vany_true` consumed by a
+;; branch, select or trap tests the reduced lane directly (`uminv; fmov; cbz`,
+;; `umaxp; fmov; cmp; b.ne`) instead of materializing the bool first and
+;; testing that (`cmp; cset; tst; b.eq` on every vectorized search loop's
+;; exit test).
+(rule 6 (is_nonzero_cmp (maybe_uextend (vall_true _ x @ (value_type (lane_fits_in_32 ty)))))
+  (if-let true (vtruebr_on 1))
+  (if (not_vec32x2 ty))
+  (CondResult.NotZero
+    (mov_from_vec (vec_lanes (VecLanesOp.Uminv) x (vector_size ty)) 0 (ScalarSize.Size64))
+    (OperandSize.Size64)))
+(rule 6 (is_nonzero_cmp (maybe_uextend (vany_true _ x @ (value_type ty))))
+  (if-let true (vtruebr_on 1))
+  (CondResult.Cond (vanytrue x ty) (Cond.Ne)))
+
+(decl pure vtruebr_on (u64) bool)
+(extern constructor vtruebr_on vtruebr_on)
+
 ;; PLIRON (`PLIRON_CCMP`, default on): `band`/`bor` of two integer
 ;; compares is one `cmp; ccmp` flag chain — the `a && b` / `a || b`
 ;; idiom LLVM emits. `ccmp u,v,#nzcv,cc` applies the second compare

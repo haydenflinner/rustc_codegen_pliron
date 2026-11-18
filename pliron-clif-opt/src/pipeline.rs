@@ -5161,6 +5161,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // length by now (`ifconv2`'s const sweep); `loadfwd2`/`dse2`
         // later forward and drop a stack slot holding the compared bytes
         // (`ends_with(char)`).
+        // A done-flag that slotprom/loadfwd turned into a constant block
+        // parameter (`take_while`, `zip(..).take_while(..)`) still sits in
+        // a merge block the first jumpthread saw as memory; threading it
+        // leaves a plain multi-exit loop for loopvec's early exits.
+        step("jtvec", "threaded", Gate::All(&[JT, Gate::OptIn("PLIRON_JTVEC")]), s_jtround)
+            .needs(shape::LOOPS | shape::BPARAM),
         step("selknown", "edgeknown", Gate::Env("PLIRON_SELKNOWN"), s_selknown).needs(shape::CONDBR),
         step("memcmpk", "memcmpk", Gate::Env("PLIRON_MEMCMPK"), s_memcmpk).needs(shape::CALL),
         cstep(

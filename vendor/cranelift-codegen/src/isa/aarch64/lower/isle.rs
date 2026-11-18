@@ -1577,6 +1577,12 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         *ON.get_or_init(|| std::env::var("PLIRON_TBNZ_IREDUCE").as_deref() != Ok("0"))
     }
 
+    /// PLIRON: `PLIRON_VTRUEBR=1` (opt-in), see `inst.isle`.
+    fn vtruebr_on(&mut self, _bit: u64) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_VTRUEBR").as_deref() == Ok("1"))
+    }
+
     fn narrowext_on(&mut self, bit: u64) -> bool {
         narrowext_part(bit)
     }

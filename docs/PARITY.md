@@ -380,8 +380,13 @@ in the scoreboard and in the linked history files.
   program faster than LLVM. pulldown's gap decomposes in
   `history/2026-11-09-mcp-sibling-pulldown.md`: the top mechanism is
   early-exit search-loop vectorisation (`iter().any`/`memchr` shapes →
-  `cmeq`+reduce, which `loopvec` doesn't cover) plus per-copy end-test
-  cost in peeled scans.
+  `cmeq`+reduce) plus per-copy end-test cost in peeled scans. Since
+  2026-11-17 `loopvec` also takes `take_while(a || b)` and
+  `zip(..).take_while(..)` (opt-in `PLIRON_JTVEC`, `PLIRON_SELKNOWN_COND`,
+  `PLIRON_VEC_EXACT`, `PLIRON_VTRUEBR`): a 4 KiB `take_ws` scan 41,073 ->
+  1,438 instructions (LLVM 28,752), a hit at byte 0 15 -> 85
+  (`history/2026-11-17-search-vec.md`; open: a scalar prologue, countdown
+  scans).
 - **wasm local traffic.** CLIF SSA values become wasm locals; waffle's
   relooper passes block params through scratch locals at `if`/`else`
   boundaries, and we emit structured `if` diamonds where LLVM emits

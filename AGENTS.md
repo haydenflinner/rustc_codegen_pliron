@@ -699,6 +699,17 @@ time, memory, code size, stack frames) in ~20 min and writes
   stack-slot load of bytes that constant stores in the same block just
   wrote becomes the constant (stdarch's NEON constants built through
   memory). html-rewriter -25.9k exact, nothing worse (PARITY item 10).
+- `PLIRON_JTVEC=1`, `PLIRON_SELKNOWN_COND=1`, `PLIRON_VEC_EXACT=1`,
+ `PLIRON_VTRUEBR=1` (opt-in, 2026-11-17) — early-exit search loops:
+ a second jumpthread round (`jtvec`) threads `take_while`'s done flag
+ away, `edgeknown::selects` folds selects on any branch condition
+ (`zip(..).take_while(..)`'s header pointers), `loopvec`'s resume
+ re-enters the scalar loop at the first failing lane
+ (`ctz(!vhigh_bits)`), and an aarch64 branch on `vall_true`/`vany_true`
+ tests the reduced lane directly. Together: 4 KiB `take_ws` 41k -> 1.4k
+ instructions, a hit at byte 0 19 -> 85 (no scalar prologue yet).
+ `loopvec` now treats `select`s of masks as masks by default
+ (`docs/history/2026-11-17-search-vec.md`, tests `search_vec.rs`).
 - `PLIRON_I128ID=1` (opt-in) — step `i128id` before the egraph: `x | 0`,
   `x ^ 0`, `x + 0`, `x - 0`, `x & 0` on `i128` with `iconcat` constants
   (foldhash's `u128` sponge). Neutral on the held-out programs.
