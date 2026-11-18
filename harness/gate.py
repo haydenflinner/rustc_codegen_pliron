@@ -149,7 +149,7 @@ def corpus_job(dirname, full=False):
     # (webmerge on a dead self-loop, found compiling cranelift-codegen).
     env = {"PLIRON_VERIFY": "full"}
     # A corpus recorded from a wasm32 build (`PLIRON_CORPUS=<dir>` on
-    # harness/v8/variant.sh or harness/dsa/build.sh) has i32 pointers and
+    # harness/v8/variant.sh or the dsa repo's pliron-bench/build.sh) has i32 pointers and
     # went through the wasm step list: name its directory `wasm-*` and it
     # is replayed that way. Replayed as native code every function panics.
     if dirname.startswith("wasm"):

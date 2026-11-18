@@ -64,7 +64,7 @@ Entries are pruned on every call: the `--keep` most recently used stay
 (default 8, env `BACKEND_PATH_KEEP`), and so does anything used in the last
 `--min-age` hours (default 2, env `BACKEND_PATH_MIN_AGE`): a running build
 loads its entry for every crate, and one that outlives that should touch
-the entry's directory now and then (harness/dsa/build.sh does). An entry
+the entry's directory now and then (the dsa repo's pliron-bench/build.sh does). An entry
 costs the dylib's size once the build output it was cloned from is
 replaced. `harness/disk.sh --sweep` prunes to two (plus the last 2 hours').
 

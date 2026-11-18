@@ -12,7 +12,7 @@ differently.
 
     # any wasm build, with the dump knob
     harness/v8/variant.sh x PLIRON_WASM_MODDUMP=/tmp/md      # bench + std, 30 s
-    PLIRON_WASM_MODDUMP=/tmp/md harness/dsa/build.sh pliron x
+    PLIRON_WASM_MODDUMP=/tmp/md ~/code/dsa/pliron-bench/build.sh pliron x
     node harness/wasm/peepdiff.mjs /tmp/md
 
 `PLIRON_WASM_MODDUMP=<dir>` writes `<name>.pre.wasm` and
@@ -21,7 +21,7 @@ a new directory: file names carry the crate hash, so stale pairs of an
 earlier build stay, and the directory name is part of the keyed backend
 path (`harness/backend_path.py`), so a new name recompiles everything
 while a wiped old one compiles nothing in a kept target dir
-(`harness/dsa/build.sh` without `DSA_WIPE=1`) and stays empty.
+(`pliron-bench/build.sh` in the dsa repo, without `DSA_WIPE=1`) and stays empty.
 Node only, no npm packages. `tests/wasm/smoke.sh` runs it on the smoke
 objects, so `wasm_smoke` (gate, quick) fails on a difference.
 

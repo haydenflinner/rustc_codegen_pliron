@@ -145,8 +145,8 @@ tried.
 `~/code/dsa`'s `literate-wasm` (wasm-bindgen cdylib: Loro CRDT page,
 the Mimas compiler and bytecode interpreter, rapier2d soft bodies),
 features `eval,squish,cad`, never tuned on before 2026-11-16.
-`harness/dsa/build.sh {llvm,pliron} NAME` then `node
-harness/dsa/bench.mjs --llvm=DIR --pliron=DIR` (results are
+`~/code/dsa/pliron-bench/build.sh {llvm,pliron} NAME` then `node
+pliron-bench/bench.mjs --llvm=DIR --pliron=DIR` (results are
 cross-checked; a mismatch is reported and left out of the geomean).
 2026-11-16, main at `bbd0cc5`, pliron/LLVM, median of 9 rounds on a
 quiet machine, both packages built from the same dsa HEAD; all 19
@@ -225,7 +225,7 @@ Open on this program:
   1.109 -> 1.042, V8CAP alone 1.324 -> 1.343; kernels geomean 0.927 both
   ways; rapier2d's object: 15 functions drop under 500 bytes, 19 cross
   over, +2.5% bytes, so the rule trades as well as it fixes).
-  `harness/dsa/v8inl.py LLVM.wasm OURS.wasm
+  `~/code/dsa/pliron-bench/v8inl.py LLVM.wasm OURS.wasm
   [profiles]` lists the class. The dsa row is
   pending (the dsa tree did not build on 11-17).
 - Compile memory: the default feature set with polars and typst needs
@@ -878,7 +878,7 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
 1. **N1, the wasm loop-site inline bonus** (in progress 2026-11-17).
 2. **`game_asteroids` 1.39x against LLVM** (2026-11-17: `PLIRON_FCMPFOLD`, `PLIRON_FMUL1`, `PLIRON_UNROLL2` landed opt-in, see "Held-out wasm program"; flip once the dsa row is timed; next lever: inlining nalgebra's products), the worst like-for-like dsa
    row (rapier2d's soft-FEM assembly and solve). Profile both sides
-   (`harness/dsa/prof.sh game_asteroids`, `cmpprof.py`, `hot.sh`), find
+   (`~/code/dsa/pliron-bench/prof.sh game_asteroids`, `cmpprof.py`, `hot.sh`), find
    the top functions by self time and what our code does worse there
    (V8 machine code via `harness/v8/mcode.sh`-style listings), fix the
    largest cause.

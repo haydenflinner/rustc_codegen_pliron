@@ -120,7 +120,7 @@ cargo, no wrapper, target dir kept (`cargo build --release -v`, counting
 | back to A | | | 0 | 1428 |
 
 `harness/v8/variant.sh` (`bench/wasm`, `-Zbuild-std`, 28 units) with
-`VARIANT_KEEP=1`, and `harness/dsa/build.sh pliron` on a stand-in workspace
+`VARIANT_KEEP=1`, and `pliron-bench/build.sh pliron` (in the dsa repo) on a stand-in workspace
 (a `literate-wasm` cdylib with one path dependency, 29 units, stub
 wasm-bindgen), each in one kept target dir:
 
@@ -176,7 +176,7 @@ crate (2 on every run before); a knob, 2.
 
 ## Who uses it
 
-On the keyed path: `harness/dsa/build.sh` (no wipe; `DSA_WIPE=1` restores
+On the keyed path: the dsa repo's `pliron-bench/build.sh` (no wipe; `DSA_WIPE=1` restores
 it; `DSA_RUSTC_WRAPPER=sccache` is now safe), `harness/v8/variant.sh`
 (`VARIANT_KEEP=1` reuses the target dir), `bench/wasm/run.sh` (no wipe),
 `bench/run.sh` (no `cargo clean -p` unless the path moved),

@@ -229,22 +229,25 @@ time, memory, code size, stack frames) in ~20 min and writes
   optimize: each call the inliner kept (reason, cost vs threshold, cap,
   growth) and each loop `loopvec` left scalar. New passes report
   refusals with `pliron_cfg::remark!`.
-- **A whole wasm program: `harness/dsa/`.** `build.sh {llvm,pliron}
-  NAME` builds `~/code/dsa`'s `literate-wasm` (Loro CRDT, the Mimas
-  compiler and interpreter, rapier2d) into `/tmp/dsa-bench/pkg-*`
-  (about 5 min; the build loads a keyed private copy of the dylib, so
-  the backend can be rebuilt meanwhile, and a rerun with the same dylib
-  and knobs compiles nothing: `DSA_WIPE=1` forces it; a rustc that
-  earlyoom kills is rerun, `harness/dsa/test_retry.sh` checks that),
-  `node harness/dsa/bench.mjs --llvm=DIR
-  --pliron=DIR [--extra=DIR] [WORKLOAD..]` times 19 workloads
+- **A whole wasm program: `~/code/dsa/pliron-bench/`.** That repo owns
+  the `literate-wasm` source (Loro CRDT, the Mimas compiler and
+  interpreter, rapier2d) and the bench that compiles it.
+  `build.sh {llvm,pliron} NAME` writes `/tmp/dsa-bench/pkg-*`
+  (about 5 min; the build loads a keyed private copy of this repo's
+  dylib, `PLIRON_ROOT` points here, so the backend can be rebuilt
+  meanwhile, and a rerun with the same dylib and knobs compiles
+  nothing: `DSA_WIPE=1` forces it; a rustc that earlyoom kills is
+  rerun, `pliron-bench/test_retry.sh` checks that),
+  `node pliron-bench/bench.mjs --llvm=DIR
+  --pliron=DIR [--extra=DIR] [WORKLOAD..]` times the workloads
   interleaved and cross-checks every result (a mismatch is a
   miscompile until shown otherwise: five were, 2026-11-16).
   `prof.sh WORKLOAD` gives per-function self time on both sides,
   `cmpprof.py` joins the two profiles, and `hot.sh SIDE PKG FUNC
   WORKLOAD` attributes V8 ticks to machine instructions of one
-  function and names V8 runtime calls (a `memory.copy` is one). The
-  workload sources are not in the repo. Numbers and open gaps:
+  function and names V8 runtime calls (a `memory.copy` is one).
+  This repo's own benches (`bench/`, `bench/wasm/`) do not need that
+  checkout. Numbers and open gaps:
   `docs/PARITY.md` "Held-out wasm program"; how each bug was bisected
   (crate swap, stage knobs, `PLIRON_STEP_FNS`, per-body `wasm2wat`
   diff): `docs/history/2026-11-16-wasm-night.md`.
@@ -385,7 +388,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   (i32 pointers in the sandbox since 2026-11-16): in the backend it
   follows the target, and `PLIRON_CLIF_WASM=1 clif-check ...` replays a
   corpus recorded from a wasm build (`PLIRON_CORPUS=<dir>` on
-  `harness/v8/variant.sh` or `harness/dsa/build.sh`) the way the wasm
+  `harness/v8/variant.sh` or the dsa repo's `pliron-bench/build.sh`) the way the wasm
   backend runs the pipeline. The stages after CLIF (waffle, `wpeep`)
   are not covered by it. Reading a report (which step of a corpus
   function, `PLIRON_DIFFCHECK_WATCH=<address>` / `PLIRON_DIFFCHECK_PATH=1`
