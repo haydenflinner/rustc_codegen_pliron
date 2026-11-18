@@ -1245,6 +1245,22 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    cycles inside the ranges (load 10-90, a quiet run is owed). It can
    flip once `parse_block`'s loads are gone: a regalloc question
    (`history/2026-11-17-native-placement.md`).
+   **Cause, and the use gate (2026-11-17 evening).** The pre-pipeline
+   CLIF has no `i128`. `bcheck` later builds a widening overflow test
+   (`uextend.i128`, `imul.i128`, `iadd.i128`, `icmp`). `wide128b` split
+   the multiply into `imul`+`umulhi` and left the add wide, so the high
+   half stayed live: `clif-check codegen` on that one function went
+   5,115 -> 5,093 instructions but weighted spills 10,711 -> 12,398.
+   Region splitting (`PLIRON_RA2_REGION=1` `PLIRON_RA2_SPILLHOIST=1` as
+   the base) cut the dynamic loss to non-`nop` +17.6k, still all in
+   `parse_block` (load +19.3k). The pass now rewrites a producer only
+   when every use is a half-consuming fold (`ireduce`, `isplit`, a 0/64
+   shift, bitwise, `imul`), which keeps foldhash's `lo ^ hi` and the
+   sponge and leaves the overflow add whole. With that gate, `parse_block`'s
+   allocated code matches the default (5,115 instructions, weighted
+   spills 10,711). Still opt-in until a callgrind remeasure: html-rewriter's
+   -377k should remain, pulldown's +31.9k should be gone. Test
+   `imul_feeding_iadd_stays`.
 
 10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
    2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours

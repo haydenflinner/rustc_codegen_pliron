@@ -60,6 +60,25 @@ fn folded_multiply() {
     assert_eq!(live.len(), 1, "{after}");
 }
 
+/// Widening overflow check: the product is an `i128` addend. Splitting
+/// it would leave `umulhi` live across the still-wide add.
+#[test]
+fn imul_feeding_iadd_stays() {
+    let src = "function %f(i64, i64, i128) -> i128 {
+    block0(v0: i64, v1: i64, v2: i128):
+        v3 = uextend.i128 v0
+        v4 = uextend.i128 v1
+        v5 = imul v3, v4
+        v6 = iadd v5, v2
+        return v6
+    }";
+    let (after, n) = run(src);
+    assert_eq!(n, 0, "{after}");
+    assert_eq!(count(&after, Opcode::Umulhi), 0, "{after}");
+    assert_eq!(count(&after, Opcode::Uextend), 2, "{after}");
+    assert_eq!(count(&after, Opcode::Imul), 1, "{after}");
+}
+
 /// The sponge: `s = 0; s |= a << (0 & 127); s |= b << (64 & 127)`, then
 /// the halves.
 #[test]

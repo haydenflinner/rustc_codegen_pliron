@@ -688,8 +688,10 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_WIDE128=1` (opt-in) — steps `wide128`/`wide128b`: 128-bit
   operations on word halves (`u64 x u64 -> u128` as `imul`+`umulhi`
   where `Target::mulhi64`, shifts by 0/64, bitwise ops, `isplit`/
-  `ireduce` of `iconcat`). html-rewriter -0.37%, pulldown-cmark
-  +0.045% (layout, PARITY item 10).
+  `ireduce` of `iconcat`). A producer is split only when every use is
+  one of those folds, so a widening `iadd` (pulldown `parse_block`)
+  stays `i128`. html-rewriter -0.37% was measured before that gate;
+  `parse_block`'s allocated code now matches the default. PARITY item 10.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

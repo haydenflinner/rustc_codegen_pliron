@@ -24,10 +24,19 @@
 //! * `ireduce.i64 c` -> `a`; `ireduce.iN c` -> `ireduce.iN a`;
 //!   `isplit c` -> `a, b`
 //!
+//! A producer is rewritten only when every use of its result is one of
+//! those folds, transitively (`halves_consumed`). An `iadd`/`icmp`/
+//! branch keeps the value `i128`: splitting a multiply there inserts
+//! `umulhi` whose high half stays live across the still-wide add
+//! (pulldown `parse_block`'s widening overflow check, +19k loads with
+//! the split). `ireduce` and `isplit` of an `iconcat` still fold; they
+//! are the sinks the check stops at.
+//!
 //! The replaced `i128` instructions become dead and the next
 //! dead-code sweep drops them; block parameters stay `i128`.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::{Function, Inst, InstBuilder, InstructionData, Opcode, Value, types};
 
 fn def(func: &Function, v: Value) -> Option<(Inst, InstructionData)> {
@@ -85,27 +94,89 @@ pub fn run(func: &mut Function, mulhi64: bool) -> usize {
     n
 }
 
+/// `v`'s uses are all ops this pass folds into `i64` halves, transitively.
+/// `seen` is 0 unknown, 1 yes, 2 no, 3 on the stack (a cycle is not).
+fn halves_consumed(
+    func: &Function,
+    uses: &crate::uses::Uses,
+    v: Value,
+    seen: &mut [u8],
+) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    let i = v.index();
+    if i >= seen.len() {
+        return false;
+    }
+    match seen[i] {
+        1 => return true,
+        2 | 3 => return false,
+        _ => {}
+    }
+    seen[i] = 3;
+    let ok = uses.sites(v).iter().all(|&(_, inst)| {
+        if func.layout.inst_block(inst).is_none() {
+            return true;
+        }
+        let op = func.dfg.insts[inst].opcode();
+        match op {
+            Opcode::Ireduce | Opcode::Isplit => true,
+            Opcode::Ishl | Opcode::Ushr => {
+                let amt = func.dfg.inst_args(inst).get(1).copied();
+                let Some(amt) = amt else { return false };
+                let Some(k) = konst(func, amt) else { return false };
+                let k = k & 127;
+                if k != 0 && k != 64 {
+                    return false;
+                }
+                let Some(r) = func.dfg.inst_results(inst).first().copied() else {
+                    return false;
+                };
+                halves_consumed(func, uses, r, seen)
+            }
+            Opcode::Bor | Opcode::Bxor | Opcode::Band | Opcode::Imul => {
+                let Some(r) = func.dfg.inst_results(inst).first().copied() else {
+                    return false;
+                };
+                halves_consumed(func, uses, r, seen)
+            }
+            _ => false,
+        }
+    });
+    seen[i] = if ok { 1 } else { 2 };
+    ok
+}
+
 fn pass(func: &mut Function, mulhi64: bool) -> usize {
+    let uses = crate::uses::Uses::new(func);
+    let mut seen = vec![0u8; func.dfg.num_values()];
     let mut n = 0;
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
             let data = pos.func.dfg.insts[inst];
-            let results = pos.func.dfg.inst_results(inst);
-            if results.is_empty() {
-                continue;
-            }
-            let res = results[0];
+            // Copy results out so the match guards can borrow `pos.func`
+            // (`halves_consumed`) without overlapping this slice.
+            let (res, res1) = {
+                let results = pos.func.dfg.inst_results(inst);
+                if results.is_empty() {
+                    continue;
+                }
+                (results[0], results.get(1).copied())
+            };
             let rty = pos.func.dfg.value_type(res);
             match data {
                 InstructionData::Unary { opcode: Opcode::Uextend, arg }
-                    if rty == types::I128 && pos.func.dfg.value_type(arg) == types::I64 =>
+                    if rty == types::I128
+                        && pos.func.dfg.value_type(arg) == types::I64
+                        && halves_consumed(pos.func, &uses, res, &mut seen) =>
                 {
                     let z = pos.ins().iconst(types::I64, 0);
                     pos.func.replace(inst).iconcat(arg, z);
                     n += 1;
                 }
-                InstructionData::Binary { opcode: op @ (Opcode::Ishl | Opcode::Ushr), args } if rty == types::I128 => {
+                InstructionData::Binary { opcode: op @ (Opcode::Ishl | Opcode::Ushr), args }
+                    if rty == types::I128 && halves_consumed(pos.func, &uses, res, &mut seen) =>
+                {
                     let Some((a, b)) = cat(pos.func, args[0]) else { continue };
                     let Some(k) = konst(pos.func, args[1]) else { continue };
                     // CLIF masks i128 shift amounts to 7 bits.
@@ -128,7 +199,7 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
                     n += 1;
                 }
                 InstructionData::Binary { opcode: op @ (Opcode::Bor | Opcode::Bxor | Opcode::Band), args }
-                    if rty == types::I128 =>
+                    if rty == types::I128 && halves_consumed(pos.func, &uses, res, &mut seen) =>
                 {
                     let (Some((a1, b1)), Some((a2, b2))) = (cat(pos.func, args[0]), cat(pos.func, args[1])) else {
                         continue;
@@ -144,7 +215,11 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
                 // Only where `umulhi.i64` is one instruction
                 // (`Target::mulhi64`): on wasm32 it is a long sequence and
                 // the multiply stays a `__multi3` call (dragon/grisu grew).
-                InstructionData::Binary { opcode: Opcode::Imul, args } if rty == types::I128 && mulhi64 => {
+                InstructionData::Binary { opcode: Opcode::Imul, args }
+                    if rty == types::I128
+                        && mulhi64
+                        && halves_consumed(pos.func, &uses, res, &mut seen) =>
+                {
                     let (Some((a, ah)), Some((b, bh))) = (cat(pos.func, args[0]), cat(pos.func, args[1])) else {
                         continue;
                     };
@@ -171,7 +246,7 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
                 }
                 InstructionData::Unary { opcode: Opcode::Isplit, arg } => {
                     let Some((a, b)) = cat(pos.func, arg) else { continue };
-                    let (r0, r1) = (results[0], results[1]);
+                    let (r0, r1) = (res, res1.expect("isplit has two results"));
                     pos.func.dfg.clear_results(inst);
                     pos.remove_inst_and_step_back();
                     pos.func.dfg.change_to_alias(r0, a);
