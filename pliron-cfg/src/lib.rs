@@ -556,6 +556,17 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // the rest within noise, no codegen-time delta; needed the loopidiom
     // forwarder-param escape fix for the wasm leg). `=0` off.
     ("PLIRON_XCGU_INLINED", "1"),
+    // 2026-11-18: leaf callees (calls only cold / intrinsics / other small
+    // leaves) copyable up to 100 MIR stmts, with LASTCALL=20 so a single-
+    // user dep over that size stays Internal and is not promoted (the
+    // finish_grow / grow_amortized trap). Retimed on top of RA2_REGION:
+    // callgrind non-nop vs default — pulldown -0.40%, json -1.23%, html
+    // -0.42%, regex -0.08%, protobuf -0.07%, blind-sig -0.02%, blake3 flat;
+    // rust-compression +0.03% (HistogramSelfAddHistogram RA residual, was
+    // +0.23% before REGION). Plain SIZE=100 still costs protobuf +1.18%.
+    // `PLIRON_XCGU_LEAF=0` / `PLIRON_XCGU_LASTCALL=0` off.
+    ("PLIRON_XCGU_LEAF", "100"),
+    ("PLIRON_XCGU_LASTCALL", "20"),
     // Single-site free inline threshold, x the inline limit (2026-11-02:
     // pulldown's `parse_line` closure, 4,594 ops, inlines; pulldown -2%).
     ("PLIRON_INLINE_FREEMUL", "12"),

@@ -1329,7 +1329,9 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    ends every limb (two pointer IVs of equal length), where LLVM keeps
    one index.
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
-   scanners** (looked at 2026-11-17, not fixed). Exact counts
+   scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
+   `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain
+   `SIZE=50` but leaf-copyable). Exact counts
    (`irdiff.py`, callgrind with `--dump-instr=yes` for per-instruction
    counts): 52.27M against LLVM's 45.33M. The line table's top entry,
    `slice/iter/macros.rs:180` (+2.4M, `escape_html_scalar`'s `position`),
@@ -1440,7 +1442,15 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    bounds check and an emptiness test. **Flipped default-on with
    `PLIRON_RA2_SPILLHOIST` on 2026-11-18** after spillhoist stopped
    deleting `SRCVREG`-labelled block-parameter edge stores (smoke
-   `neonpair` checker).
+   `neonpair` checker). **Retimed and flipped 2026-11-18:** plain
+   `SIZE=100`+`LASTCALL=20` still not clean under REGION (protobuf
+   +1.18% non-nop; SOLO/LATE still cost pulldown). `LEAF=100`+`LASTCALL=20`
+   is: callgrind non-nop pulldown −0.40%, json −1.23%, html −0.42%,
+   regex −0.08%, protobuf −0.07%, blind-sig −0.02%, blake3 flat,
+   compression +0.03% (same +12k Histogram residual). Without LASTCALL,
+   LEAF=100 alone costs protobuf +3.2%. Defaults in `DEFAULT_VALUES`;
+   `=0` off each. Open: raise plain `SIZE` without the protobuf path,
+   peel the scanner first iteration, SOLO/LATE refinements.
    flt2dec/fmt functions, `strwork` within noise. What was left is the
    loop shape: `Iterator::cmp_by` over two `Rev` iterators carries two
    pointer IVs of equal length. (Correction: on wasm `REVCMP` already

@@ -102,19 +102,20 @@ fn copyable_as<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize, prof
             ))
 }
 
-/// `PLIRON_XCGU_LEAF=<size>` (default off, not ready): a leaf callee, one
-/// whose calls go only to `#[cold]` functions, intrinsics or (transitively)
-/// other small leaves, is copyable up to `<size>` instead of the plain
-/// limit. pulldown-cmark's scanners (`scan_closing_code_fence`, 50k calls
-/// from `parse_block` in another CGU) are past the native limit of 50 and
-/// stay calls; LLVM's thin-local LTO inlines them. Exact counts at 200
-/// (2026-11-17): rust-json -1.7%, html-rewriter -0.8%, pulldown-cmark
-/// -0.3%, but rust-protobuf +3.3% and regex +0.5%; the plain
-/// `PLIRON_XCGU_SIZE=200` gives pulldown-cmark -1.9% and rust-protobuf
-/// +1.8% (PARITY queue).
+/// `PLIRON_XCGU_LEAF=<size>` (default 100 via `DEFAULT_VALUES`; `=0` off): a
+/// leaf callee, one whose calls go only to `#[cold]` functions, intrinsics
+/// or (transitively) other small leaves, is copyable up to `<size>` instead
+/// of the plain limit. pulldown-cmark's scanners (`scan_closing_code_fence`,
+/// 50k calls from `parse_block` in another CGU) are past the native limit
+/// of 50 and stay calls without this; LLVM's thin-local LTO inlines them.
+/// Paired with `PLIRON_XCGU_LASTCALL=20` (also default): without it, leaf
+/// copies at 100 promote `finish_grow` and rust-protobuf loses +3.2%.
+/// Exact callgrind non-nop with REGION (2026-11-18): pulldown -0.40%, json
+/// -1.23%, html -0.42%, regex -0.08%, protobuf -0.07%, blind-sig -0.02%,
+/// blake3 flat, compression +0.03%.
 fn leaf_copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, size: usize) -> bool {
     static LEAF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let leaf = *LEAF.get_or_init(|| crate::env_get("PLIRON_XCGU_LEAF").and_then(|s| s.parse().ok()).unwrap_or(0));
+    let leaf = *LEAF.get_or_init(|| crate::env_get("PLIRON_XCGU_LEAF").and_then(|s| s.parse().ok()).unwrap_or(100));
     if leaf == 0 || size > leaf {
         return false;
     }
@@ -410,19 +411,20 @@ fn dep_promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
                 }
             }
         }
-        // `PLIRON_XCGU_LASTCALL=<size>` (default off): a dep of more than
-        // `<size>` (`size_estimate`) that exactly one function of the crate
-        // references stays Internal, and the copies that would need it are
-        // not made. Its home inlines it into that one caller for free (the
-        // out-of-line body dies); promoted, it is external, the inliner
-        // prices it as a `#[cold]` callee and it stays a call. rust-protobuf
-        // at `PLIRON_XCGU_SIZE=100`: `grow_amortized` became copyable, so
-        // its cold `finish_grow` was promoted, `grow_amortized` shrank to 198
-        // ops and was inlined into `do_reserve_and_handle`, and every one of
-        // 132k vector growths went through one more call
+        // `PLIRON_XCGU_LASTCALL=<size>` (default 20 via `DEFAULT_VALUES`;
+        // `=0` off): a dep of more than `<size>` (`size_estimate`) that
+        // exactly one function of the crate references stays Internal, and
+        // the copies that would need it are not made. Its home inlines it
+        // into that one caller for free (the out-of-line body dies);
+        // promoted, it is external, the inliner prices it as a `#[cold]`
+        // callee and it stays a call. rust-protobuf at `PLIRON_XCGU_SIZE`
+        // or `LEAF=100` without this: `grow_amortized` became copyable, so
+        // its cold `finish_grow` was promoted, `grow_amortized` shrank to
+        // 198 ops and was inlined into `do_reserve_and_handle`, and every
+        // one of 132k vector growths went through one more call
         // (`<RawVecInner>::finish_grow`, the `Result` returned through
-        // memory): +1.7M instructions in `raw_vec/mod.rs`.
-        let last: usize = crate::env_get("PLIRON_XCGU_LASTCALL").and_then(|s| s.parse().ok()).unwrap_or(0);
+        // memory): +1.7M..+2.1M instructions in `raw_vec` / prost paths.
+        let last: usize = crate::env_get("PLIRON_XCGU_LASTCALL").and_then(|s| s.parse().ok()).unwrap_or(20);
         if last > 0 && !out.is_empty() {
             let mut users: FxHashMap<&str, u32> = FxHashMap::default();
             for p in parts {
