@@ -1363,13 +1363,21 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                     section: None,
                 },
             );
-            if pliron_cfg::env_is("PLIRON_SEH", "0") {
+            if pliron_cfg::env_is("PLIRON_SEH", "1") {
                 // docs/seh-design.md: SEH personality named by .xdata
                 // EHANDLER. Handler data = {u32 n, {u32 begin, u32 end,
-                // u32 target}[n]}, fn-relative code offsets; claim when
-                // begin <= ControlPc-ImageBase < end. On claim, stash
-                // {exn, throwinfo, base} into __pliron_eh at +8/+16/+24,
-                // set dc->TargetIp, return ExceptionExecuteHandler(4).
+                // u32 target}[n]}, image-relative code addresses; claim when
+                // begin <= ControlPc-ImageBase < end. On claim, copy the
+                // 24-byte `panic_unwind::seh::Exception` into __pliron_eh's
+                // buffer (+16; the thrower's frame is about to be unwound),
+                // point exn (+8) at the copy, stash the ThrowInfo (SEH_TI)
+                // for a rethrow, and resume at the pad the way
+                // `__C_specific_handler` resumes an `__except`:
+                // `RtlUnwindEx(EstablisherFrame, ImageBase + target,
+                // ExceptionRecord, exn, dc->ContextRecord, dc->HistoryTable)`
+                // runs the intermediate frames' cleanups and does not
+                // return. (A handler may only return Continue/Search; the
+                // claim is the unwind itself.)
                 let i32t = cx.type_i32();
                 let ptr = cx.type_ptr();
                 let sty = cx.type_func(&[ptr, ptr, ptr, ptr], i32t);
@@ -1387,7 +1395,6 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                 let rec = bx.get_param(0);
                 let est = bx.get_param(1);
                 let dc = bx.get_param(3);
-                let _ = est;
                 let decline = bx.append_sibling_block("decline");
                 let fla = bx.gep(i8t, rec, &[bx.const_uint(isz, 4)]);
                 let fl = bx.load(i32t, fla, a1);
@@ -1438,11 +1445,19 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                 bx.cond_br(inr, hit, next);
                 bx.switch_to_block(hit);
                 let x1 = bx.gep(i8t, rec, &[bx.const_uint(isz, 40)]);
-                let exn = bx.load(isz, x1, a1);
+                let exn = bx.load(ptr, x1, a1);
                 let x2 = bx.gep(i8t, rec, &[bx.const_uint(isz, 48)]);
                 let ti = bx.load(isz, x2, a1);
                 let tls = cx.sym_addr("__pliron_eh");
-                for (o, v) in [(8u64, exn), (16, ti), (24, base)] {
+                let buf = bx.gep(i8t, tls, &[bx.const_uint(isz, 16)]);
+                for o in [0u64, 8, 16] {
+                    let s = bx.gep(i8t, exn, &[bx.const_uint(isz, o)]);
+                    let v = bx.load(isz, s, a1);
+                    let d = bx.gep(i8t, buf, &[bx.const_uint(isz, o)]);
+                    bx.store(v, d, a1);
+                }
+                let tio = pliron_clif_lower::eh::SEH_TI as u64;
+                for (o, v) in [(8u64, buf), (tio, ti)] {
                     let d = bx.gep(i8t, tls, &[bx.const_uint(isz, o)]);
                     bx.store(v, d, a1);
                 }
@@ -1450,9 +1465,12 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                 let t32 = bx.load(i32t, tp, a1);
                 let t64 = bx.zext(t32, isz);
                 let tip = bx.add(base, t64);
-                let dip = bx.gep(i8t, dc, &[bx.const_uint(isz, 32)]);
-                bx.store(tip, dip, a1);
-                bx.ret(bx.const_uint(i32t, 4));
+                let ctxp = bx.gep(i8t, dc, &[bx.const_uint(isz, 40)]);
+                let ctx = bx.load(ptr, ctxp, a1);
+                let histp = bx.gep(i8t, dc, &[bx.const_uint(isz, 64)]);
+                let hist = bx.load(ptr, histp, a1);
+                bx.call_sym("RtlUnwindEx", cx.type_void(), &[est, tip, rec, buf, ctx, hist]);
+                bx.ret(bx.const_uint(i32t, 1));
                 bx.switch_to_block(next);
                 let np = bx.gep(i8t, p, &[bx.const_uint(isz, 12)]);
                 bx.store(np, pv, a1);

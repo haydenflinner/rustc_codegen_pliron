@@ -100,6 +100,11 @@ impl CallConv {
             | CallConv::Winch
             | CallConv::PreserveAll
             | CallConv::AppleAarch64 => true,
+            // PLIRON: `try_call` to a Windows fastcall callee (`PLIRON_SEH`,
+            // rustc_codegen_pliron's real SEH catch). No payload registers:
+            // the SEH personality passes the exception through memory, and
+            // `RtlUnwindEx` restores the nonvolatile registers at the pad.
+            CallConv::WindowsFastcall => true,
             _ => false,
         }
     }

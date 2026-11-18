@@ -4489,6 +4489,27 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.cconst.clear();
     }
 
+    /// `PLIRON_SEH=1` (opt-in, docs/seh-design.md): invokes are real
+    /// `try_call`s that `__pliron_seh_personality` claims through the
+    /// `.xdata` scope table, and throws are real `_CxxThrowException`s; the
+    /// TLS slot only carries what the personality stashed (`pliron.eh.exn`
+    /// at +8, the copied `Exception` at +16, its ThrowInfo at `SEH_TI`).
+    fn seh(&self) -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_SEH", "1"));
+        self.eh_data.is_some() && !self.wasm && *ON
+    }
+
+    /// `PLIRON_SEH`: rethrow `exn` for real, with the ThrowInfo the
+    /// personality stashed, so outer frames (stock std's included) see it.
+    fn seh_rethrow(&mut self, exn: ir::Value) {
+        let pt = self.tcfg.pointer_type();
+        let tls = self.eh_tls();
+        let ti = self.b.ins().load(pt, MemFlagsData::new(), tls, crate::eh::SEH_TI);
+        self.libcall("_CxxThrowException", &[pt, pt], &[], &[exn, ti]);
+        self.b.ins().trap(TrapCode::unwrap_user(1));
+        self.terminated = true;
+    }
+
     /// Emulated throw: set `__pliron_eh.flag` and unwind by early-return.
     /// Callers that change the exception in flight store to `tls + 8` first.
     fn eh_raise(&mut self) {
@@ -7614,7 +7635,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         catch: Ptr<BasicBlock>,
         is_catch: bool,
     ) -> (ir::Inst, Vals) {
-        if self.eh_data.is_some() {
+        if self.eh_data.is_some() && !self.seh() {
             // Emulated EH: call normally, then branch to the funclet block
             // when `__pliron_eh.flag` is set (the pad reads `pliron.eh.exn`).
             let inst = match target {
@@ -7643,7 +7664,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
             .collect();
         let ncall = self.b.func.dfg.block_call(normal, &nargs);
         let pre = self.b.create_block();
-        let pcall = self.b.func.dfg.block_call(pre, &[BlockArg::TryCallExn(0)]);
+        let pt = self.tcfg.pointer_type();
+        let callee_cc = self.b.func.dfg.signatures[sr].call_conv;
+        // Windows fastcall has no payload registers: the SEH personality
+        // stashes the exception in `__pliron_eh` instead.
+        let payload = !callee_cc.exception_payload_types(pt).is_empty();
+        let pargs: &[BlockArg] = if payload { &[BlockArg::TryCallExn(0)] } else { &[] };
+        let pcall = self.b.func.dfg.block_call(pre, pargs);
         let tag = if is_catch {
             crate::eh::EXCEPTION_HANDLER_CATCH
         } else {
@@ -7668,8 +7695,12 @@ impl<'a, 'b> FnLower<'a, 'b> {
         };
         self.b.switch_to_block(pre);
         self.b.set_cold_block(pre);
-        let pt = self.tcfg.pointer_type();
-        let p = self.b.append_block_param(pre, pt);
+        let p = if payload {
+            self.b.append_block_param(pre, pt)
+        } else {
+            let tls = self.eh_tls();
+            self.b.ins().load(pt, MemFlagsData::new(), tls, 8)
+        };
         self.b.def_var(self.exn.unwrap(), p);
         let lp = self.blocks[&catch];
         self.b.ins().jump(lp, &[]);
@@ -8036,7 +8067,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     return;
                 }
             }
-            if !self.wasm && sym == "_CxxThrowException" {
+            if !self.wasm && sym == "_CxxThrowException" && !self.seh() {
                 // `panic_unwind::seh::Exception` = { canary, payload } = 24
                 // bytes; copy it into the TLS buffer so it outlives the
                 // unwound frame.
@@ -8055,6 +8086,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let bufp = self.b.ins().iadd_imm_s(tls, 16);
                 self.b.ins().store(mf, bufp, tls, 8);
                 self.eh_raise();
+                return;
+            }
+            if self.seh() && sym == "_Unwind_Resume" {
+                self.seh_rethrow(cargs[0]);
                 return;
             }
             if !self.wasm && sym == "_Unwind_Resume" {
@@ -8093,7 +8128,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 Err((addr, sr)) => self.b.ins().call_indirect(sr, addr, &cargs),
             };
             let rs: Vals = self.b.inst_results(inst).iter().copied().collect();
-            if self.eh_data.is_some() && maythrow {
+            if self.eh_data.is_some() && maythrow && !self.seh() {
                 self.eh_check(None);
             }
             (inst, rs)
@@ -9211,6 +9246,15 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     "llvm.smax" => self.b.ins().smax(x, y),
                     _ => self.b.ins().smin(x, y),
                 }
+            }
+            "pliron.eh.rethrow" if self.seh() => {
+                let pt = self.tcfg.pointer_type();
+                let tls = self.eh_tls();
+                let exn = self.b.ins().load(pt, MemFlagsData::new(), tls, 8);
+                let z = self.iconst_any(pt, 0);
+                self.set1(op, z);
+                self.seh_rethrow(exn);
+                return;
             }
             "pliron.eh.rethrow" if self.eh_data.is_some() => {
                 // Emulated rethrow (`cleanup_ret` with no unwind dest):

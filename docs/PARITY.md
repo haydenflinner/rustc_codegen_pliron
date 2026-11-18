@@ -847,7 +847,8 @@ in the scoreboard and in the linked history files.
 - **windows-msvc catch.** With stock std, `catch_unwind` in pliron-built
   code cannot catch a real SEH throw; EH is emulated and works only when
   std is backend-built. Design for real SEH catch:
-  [`seh-design.md`](seh-design.md) (not landed).
+  [`seh-design.md`](seh-design.md) (opt-in `PLIRON_SEH=1`, untested at
+  runtime).
 - **IPO on `xcgu` copies vs the wasm linker's name fold.**
   `pliron-wasm-ld` folds same-named bodies across objects and keeps the
   smallest, which is sound only if every copy keeps the generic
@@ -1838,7 +1839,10 @@ Ranked by expected card gain per effort. Each item links its evidence.
    existing `PLIRON_MEMCACHE` whole-pipeline cache measured 2026-11-11:
    9 hits / 806 lookups on regex-syntax with `codegen-units=8` (~1%) —
    its value is confined to crates whose generics duplicate across CGUs.
-10. **Correctness debt**: real SEH catch on windows-msvc; audit
+10. **Correctness debt**: real SEH catch on windows-msvc (opt-in
+   `PLIRON_SEH=1` since 2026-11-17, tables checked on cross-built
+   objects, needs a Windows run before it can go default:
+   `seh-design.md` "Status"); audit
    callee-side IPO on `xcgu` copies for wasm; serialize the remaining
    fact tables in the corpus header.
 11. **Re-measure x86-64** (Windows and Linux), native and CubeCL.

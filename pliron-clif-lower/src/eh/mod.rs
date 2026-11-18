@@ -17,6 +17,13 @@ use object::{RelocationEncoding, RelocationFlags};
 
 pub const EXCEPTION_HANDLER_CLEANUP: u32 = 0;
 pub const EXCEPTION_HANDLER_CATCH: u32 = 1;
+/// `PLIRON_SEH`: offset in the `__pliron_eh` TLS slot (`{flag, _, exn,
+/// buf[24], throwinfo}`) where the personality stashes the claimed throw's
+/// ThrowInfo for a real rethrow. The 24-byte `buf` at +16 holds the copied
+/// `panic_unwind::seh::Exception`, whose thrower's frame is gone by then.
+pub const SEH_TI: i32 = 40;
+/// `PLIRON_SEH`: the personality `.xdata` names for functions with invokes.
+pub const SEH_PERSONALITY: &str = "__pliron_seh_personality";
 
 fn address_for_func(id: FuncId) -> Address {
     Address::Symbol {
@@ -46,7 +53,22 @@ pub struct UnwindContext {
     /// COFF: per-function (FuncId, .xdata UNWIND_INFO bytes, function size).
     /// Emitted as `.pdata` RUNTIME_FUNCTION + `.xdata` records.
     coff: bool,
-    pdata: Vec<(FuncId, Vec<u8>, u64)>,
+    pdata: Vec<CoffUnwind>,
+    /// `PLIRON_SEH=1`: `.xdata` names `SEH_PERSONALITY` for functions with
+    /// invokes, declared on first use.
+    seh: bool,
+    seh_personality: Option<FuncId>,
+}
+
+/// One function's COFF unwind record.
+struct CoffUnwind {
+    func: FuncId,
+    /// Serialized UNWIND_INFO.
+    info: Vec<u8>,
+    size: u64,
+    /// `PLIRON_SEH` scope records, function-relative code offsets: the call's
+    /// return address range `[begin, end)` and its landing pad.
+    scopes: Vec<[u32; 3]>,
 }
 
 impl UnwindContext {
@@ -152,6 +174,8 @@ impl UnwindContext {
             x86_macho,
             coff,
             pdata: Vec::new(),
+            seh: coff && unwind && crate::env_is("PLIRON_SEH", "1"),
+            seh_personality: None,
         }
     }
 
@@ -163,8 +187,16 @@ impl UnwindContext {
             if let Some(UnwindInfo::WindowsX64(info)) = info {
                 let mut buf = vec![0; info.emit_size()];
                 info.emit(&mut buf);
-                self.pdata
-                    .push((func_id, buf, u64::from(code.buffer.total_size())));
+                let scopes = if self.seh { seh_scopes(code) } else { Vec::new() };
+                if !scopes.is_empty() && self.seh_personality.is_none() {
+                    self.seh_personality = Some(declare_seh_personality(module));
+                }
+                self.pdata.push(CoffUnwind {
+                    func: func_id,
+                    info: buf,
+                    size: u64::from(code.buffer.total_size()),
+                    scopes,
+                });
             }
             return;
         }
@@ -250,6 +282,10 @@ impl UnwindContext {
     /// No exception handler is registered (UNW_FLAG_NHANDLER): real SEH can
     /// unwind through our frames but cannot catch in them — catching is done
     /// by the emulated-EH path in lower.rs under panic=unwind.
+    /// `PLIRON_SEH=1`: a function with invokes gets UNW_FLAG_EHANDLER, the
+    /// personality's RVA and its scope table `{u32 n, {begin, end, target}[n]}`
+    /// (image-relative, what `__pliron_seh_personality` compares against
+    /// `ControlPc - ImageBase`).
     // r[impl native.win.pdata]
     pub fn emit_coff(self, product: &mut ObjectProduct) {
         if self.pdata.is_empty() {
@@ -258,8 +294,9 @@ impl UnwindContext {
         let fsyms: Vec<object::write::SymbolId> = self
             .pdata
             .iter()
-            .map(|(id, _, _)| product.function_symbol(*id))
+            .map(|u| product.function_symbol(u.func))
             .collect();
+        let psym = self.seh_personality.map(|id| product.function_symbol(id));
         let obj = &mut product.object;
         let xdata = obj.add_section(
             Vec::new(),
@@ -271,8 +308,29 @@ impl UnwindContext {
             b".pdata".to_vec(),
             object::SectionKind::ReadOnlyData,
         );
-        for ((func_id, bytes, size), fsym) in self.pdata.into_iter().zip(fsyms) {
+        for (u, fsym) in self.pdata.into_iter().zip(fsyms) {
+            let CoffUnwind { func: func_id, info: mut bytes, size, scopes } = u;
+            // (offset in `bytes`, symbol, addend) of each image-relative field.
+            let mut xrel: Vec<(u64, object::write::SymbolId, i64)> = Vec::new();
+            if let Some(psym) = psym.filter(|_| !scopes.is_empty()) {
+                const UNW_FLAG_EHANDLER: u8 = 1;
+                bytes[0] |= UNW_FLAG_EHANDLER << 3;
+                // The handler RVA follows the unwind codes, padded to 4 bytes.
+                bytes.resize(bytes.len().next_multiple_of(4), 0);
+                xrel.push((bytes.len() as u64, psym, 0));
+                bytes.extend_from_slice(&[0; 4]);
+                bytes.extend_from_slice(&(scopes.len() as u32).to_le_bytes());
+                for sc in &scopes {
+                    for &field in sc {
+                        xrel.push((bytes.len() as u64, fsym, i64::from(field)));
+                        bytes.extend_from_slice(&[0; 4]);
+                    }
+                }
+            }
             let xoff = obj.append_section_data(xdata, &bytes, 4);
+            for (off, sym, addend) in xrel {
+                obj.add_relocation(xdata, image_offset(xoff + off, sym, addend)).unwrap();
+            }
             let xsym = obj.add_symbol(object::write::Symbol {
                 name: format!("$unwind${}", func_id.as_u32()).into_bytes(),
                 value: xoff,
@@ -285,20 +343,7 @@ impl UnwindContext {
             });
             let poff = obj.append_section_data(pdata, &[0; 12], 4);
             for (off, sym, addend) in [(0u64, fsym, 0i64), (4, fsym, size as i64), (8, xsym, 0)] {
-                obj.add_relocation(
-                    pdata,
-                    Relocation {
-                        offset: poff + off,
-                        symbol: sym,
-                        flags: RelocationFlags::Generic {
-                            kind: object::RelocationKind::ImageOffset,
-                            encoding: RelocationEncoding::Generic,
-                            size: 32,
-                        },
-                        addend,
-                    },
-                )
-                .unwrap();
+                obj.add_relocation(pdata, image_offset(poff + off, sym, addend)).unwrap();
             }
         }
     }
@@ -451,6 +496,51 @@ impl UnwindContext {
                 .unwrap();
         }
     }
+}
+
+/// A 32-bit image-relative (`ADDR32NB`) relocation at `offset`.
+fn image_offset(offset: u64, symbol: object::write::SymbolId, addend: i64) -> Relocation {
+    Relocation {
+        offset,
+        symbol,
+        flags: RelocationFlags::Generic {
+            kind: object::RelocationKind::ImageOffset,
+            encoding: RelocationEncoding::Generic,
+            size: 32,
+        },
+        addend,
+    }
+}
+
+/// `PLIRON_SEH` scope records of `code`: one per call site with a landing
+/// pad, covering its return address (the frame's `ControlPc` while the
+/// exception is dispatched).
+fn seh_scopes(code: &CompiledCode) -> Vec<[u32; 3]> {
+    let mut out = Vec::new();
+    for cs in code.buffer.call_sites() {
+        for &h in cs.exception_handlers {
+            if let FinalizedMachExceptionHandler::Tag(_, lp) = h {
+                out.push([cs.ret_addr - 1, cs.ret_addr + 1, lp]);
+            }
+        }
+    }
+    out
+}
+
+/// `SEH_PERSONALITY(ExceptionRecord*, EstablisherFrame, ContextRecord*,
+/// DispatcherContext*) -> EXCEPTION_DISPOSITION`, defined by the allocator
+/// module.
+fn declare_seh_personality(module: &mut dyn Module) -> FuncId {
+    if let Some(FuncOrDataId::Func(id)) = module.get_name(SEH_PERSONALITY) {
+        return id;
+    }
+    let pt = module.target_config().pointer_type();
+    let sig = Signature {
+        params: vec![AbiParam::new(pt); 4],
+        returns: vec![AbiParam::new(types::I32)],
+        call_conv: module.target_config().default_call_conv,
+    };
+    module.declare_function(SEH_PERSONALITY, Linkage::Import, &sig).unwrap()
 }
 
 #[derive(Clone)]

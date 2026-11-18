@@ -2121,3 +2121,17 @@ trap on `vall_true x` uses `uminv; fmov` and a `cbz`/`cbnz` on the result;
 on `vany_true x`, the `vanytrue` flags. The default materializes the
 bool first (`cmp; cset`) and then tests it (`tst; b.eq`), three extra
 instructions on every iteration of a vectorized search loop.
+
+## `try_call` to a Windows fastcall callee (2026-11-17)
+
+`src/isa/call_conv.rs` (`supports_exceptions`): `WindowsFastcall` is
+accepted, with no exception payload values (`exception_payload_types` and
+the x64 `exception_payload_regs` stay empty). Only rustc_codegen_pliron's
+`PLIRON_SEH=1` emits such a call: its personality claims the call site
+through the `.xdata` scope table and resumes at the landing pad with
+`RtlUnwindEx`, which restores the nonvolatile registers; the exception
+travels through a TLS slot. Without the knob nothing changes.
+`src/isa/x64/abi.rs` (`get_regs_clobbered_by_call`): the exceptional
+edge of such a call clobbers what a normal fastcall call does
+(`WINDOWS_CLOBBERS`; `RtlUnwindEx` restores nonvolatiles); it panicked
+before.

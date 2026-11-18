@@ -982,6 +982,13 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             // Wasmtime).
             (isa::CallConv::PreserveAll, true) => ALL_CLOBBERS,
             (isa::CallConv::Winch, _) => ALL_CLOBBERS,
+            // PLIRON: `try_call` to a fastcall callee (`PLIRON_SEH`). The SEH
+            // personality resumes at the pad through `RtlUnwindEx`, which
+            // restores the frame's nonvolatiles from the unwind codes (the
+            // `__except` contract), so the edge clobbers what a normal call
+            // does. `ALL_CLOBBERS` would make every such function save all
+            // of rbx..r15 and xmm6-15.
+            (isa::CallConv::WindowsFastcall, true) => WINDOWS_CLOBBERS,
             (isa::CallConv::SystemV, _) => SYSV_CLOBBERS,
             (isa::CallConv::WindowsFastcall, false) => WINDOWS_CLOBBERS,
             (isa::CallConv::PreserveAll, _) => NO_CLOBBERS,

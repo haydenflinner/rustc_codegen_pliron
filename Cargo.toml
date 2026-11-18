@@ -34,6 +34,11 @@ rustc-hash = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[features]
+# Also emit x86-64 from an aarch64 host (windows-msvc SEH tables, Rosetta
+# runs): `cargo build --features cross-x86`, best in its own target dir.
+cross-x86 = ["cranelift-codegen/x86"]
+
 [workspace]
 members = ["pliron-clif-opt", "pliron-clif-lower", "pliron-clif-check", "pliron-ir-opt", "pliron-cfg", "pliron-hack", "bench", "pliron-wasm"]
 exclude = ["vendor"]

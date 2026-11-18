@@ -58,7 +58,7 @@ Read it before picking a task.
 | `harness/` | gate, corpus, live dashboard, bisectors, compile-time and disk tools |
 | `bench/` | runtime kernels (benchfmt/benchstat native, `bench/wasm/` node) |
 | `tests/` | `test.sh` programs (one dir per stanza) |
-| `docs/` | `PARITY.md` (start here), `miscompile-triage.md`, `test-harness.md`, `audit.md` (audited wasm rewrites), `determinism.md`, `pgo.md`, `phi-web.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `backend-path.md` (cargo/sccache and the keyed `-Zcodegen-backend` path), `seh-design.md` (planned real SEH catch), `lutcorr.md`, `rustc-thorns.md`, `cubecl-burn.md`/`cubecl-burn-host.md`, `performance.md` (narrative history of the perf work), `history/` (dated logs) |
+| `docs/` | `PARITY.md` (start here), `miscompile-triage.md`, `test-harness.md`, `audit.md` (audited wasm rewrites), `determinism.md`, `pgo.md`, `phi-web.md`, `platforms.md` (Windows/CRT-free, cross targets, self-host), `backend-path.md` (cargo/sccache and the keyed `-Zcodegen-backend` path), `seh-design.md` (real SEH catch, opt-in `PLIRON_SEH=1`), `lutcorr.md`, `rustc-thorns.md`, `cubecl-burn.md`/`cubecl-burn-host.md`, `performance.md` (narrative history of the perf work), `history/` (dated logs) |
 
 **Target facts.** A pass asks `Target` (`pliron-cfg/src/target.rs`):
 architecture family (`is_wasm`/`is_aarch64`/`is_x64`), pointer width
@@ -732,6 +732,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to
   find the function one step breaks in a crate too big for the serial
   `PLIRON_OPT_BISECT` paths; set `PLIRON_MEMCACHE=0` with it.
+- `PLIRON_SEH=1` (opt-in, windows-msvc x64, 2026-11-17) — real SEH
+ catch: `try_call` with `.xdata` `UNW_FLAG_EHANDLER` scope tables and
+ `__pliron_seh_personality` claiming via `RtlUnwindEx`, instead of the
+ emulated TLS-flag EH; `catch_unwind` then catches stock std's throws.
+ Statically checked only (`docs/seh-design.md` "Status"; cross build:
+ `docs/platforms.md`).
 - `PLIRON_PAR=0|N` — lowering threads.
 - `PLIRON_VERIFY=1|full` — Cranelift verifier after the pipeline / each step.
   On wasm the verifier runs once after the pipeline by default (nothing

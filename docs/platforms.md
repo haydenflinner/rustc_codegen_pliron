@@ -43,8 +43,17 @@ builds and runs with zero VS inputs.
   `test.sh --sysroot`); with stock std, real SEH throws unwind *through* our
   frames (correct `.pdata`) but our `catch_unwind` can't intercept them —
   `tests/std/main.rs` gates those asserts on `--cfg pliron_stock_seh`.
-  The planned fix, a real SEH personality with scope tables (not landed),
-  is in `docs/seh-design.md`.
+  The fix, a real SEH personality with scope tables, is opt-in as
+  `PLIRON_SEH=1` (2026-11-17, checked statically only, no runtime test
+  yet): `docs/seh-design.md`.
+
+  Cross-compiling from an aarch64 host: the default build has only the
+  host's Cranelift ISA. `CARGO_TARGET_DIR=target/xwin cargo build
+  --features cross-x86` adds x86-64 (`rustup target add
+  x86_64-pc-windows-msvc` for the sysroot metadata), then
+  `rustc --target x86_64-pc-windows-msvc --emit obj -Zcodegen-backend=
+  $PWD/target/xwin/debug/librustc_codegen_pliron.dylib` and
+  `llvm-readobj --unwind` read the tables.
 
   MSVC i128/f128 libcall ABI: args byval through pointers, return in xmm0 —
   `libcall()` in `pliron-clif-lower/src/lower.rs` adapts (`__udivti3`, `__floattisf`, `__rust_i128_*`).

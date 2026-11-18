@@ -19,8 +19,9 @@ LLVM needs funclets because MSVC C++ EH *calls* pad code on the
 unwinder's stack (`RtlpExecuteHandlerFor*`) — locals must be rebuilt via
 the establisher frame in `rdx`. Our pads are mid-function blocks, so we
 use the `__except`/`JumpTarget` mechanism instead: our own personality
-claims in phase 1, sets `DispatcherContext->TargetIp`, and the
-dispatcher resumes the frame's *own* context at the call site — exactly
+claims in phase 1 by calling `RtlUnwindEx` with the pad as target (an
+earlier draft said "set `DispatcherContext->TargetIp` and return 4"; that
+is wrong, see Status), and the unwinder resumes the frame's *own* context at the call site — exactly
 what a post-call landing block expects. No funclets, no FuncInfo/UnwindMap
 tables, no state machine.
 
@@ -34,15 +35,43 @@ semantics, fine for Rust.
 
 ## Pieces
 
-Status (checked against the code 2026-10-30): only piece 2 exists.
-`__pliron_seh_personality` (0ffd64e) is built in pliron IR in
-`codegen_allocator` (`src/lib.rs`), not as an asm stub. Nothing
-references it. Note the gate: the code builds it only when `PLIRON_SEH=0`
-is set explicitly (`env_is("PLIRON_SEH", "0")`), not under `PLIRON_SEH=1`
-as first written; the rest of the plan below still says `PLIRON_SEH=1`.
-Pieces 1, 3, 4 and 5 are not started. The 2026-10-23 pick-up notes, with
-line-level pointers, are in `history/2026-10-23-seh-handoff.md`.
-Remaining:
+Status (2026-11-17): pieces 1-4 are implemented behind `PLIRON_SEH=1`
+(opt-in, windows-msvc x64 only) and checked statically on cross-compiled
+objects (`--features cross-x86`, see `platforms.md`); **no runtime test
+yet** (no Windows box or wine on the dev machine). Piece 5 waits on one.
+What landed, and where it departs from the plan below:
+
+- The personality is built in pliron IR in `codegen_allocator`
+  (`src/lib.rs`), not an asm stub; gated on `PLIRON_SEH=1` (it read `=0`
+  until 2026-11-17).
+- **Claim = `RtlUnwindEx`, not "return 4".** A language handler may not
+  return `ExceptionExecuteHandler`; that value means something only to
+  `__C_specific_handler`'s filters. Claiming is what
+  `__C_specific_handler` does for an `__except`: `RtlUnwindEx(
+  EstablisherFrame, ImageBase + target, ExceptionRecord, ReturnValue,
+  dc->ContextRecord, dc->HistoryTable)`, which runs every intermediate
+  frame's handler in the unwind phase (ours return ContinueSearch, flags
+  `& 0x26`) and resumes at the pad with that frame's nonvolatile registers.
+- **TLS channel, with a copy.** The thrown object
+  (`panic_unwind::seh::Exception`, 24 bytes) lives in the throwing
+  frame, which `RtlUnwindEx` pops. The personality copies it into
+  `__pliron_eh`'s buffer (+16..+40), points `exn` (+8) at the copy and
+  keeps the ThrowInfo at +40 (`eh::SEH_TI`) for rethrows. The pad reads
+  `exn` from TLS (no payload registers on fastcall). `try_call` needs
+  fastcall in `supports_exceptions` (vendored Cranelift, `PLIRON:`).
+- Records are 12 bytes `{begin, end, target}`, image-relative
+  (`ImageOffset` relocs against the function symbol), not 16 with an
+  `exn_delta`.
+- Cleanup pads rethrow with `_CxxThrowException(exn, SEH_TI)`; `std`'s
+  `r#try` reads the payload pointer out of the copy, which stays valid
+  until the next throw on the thread.
+- Not done: the `RustPanic` catchable-type filter (foreign C++ throws
+  are claimed too), and nested throws from a cleanup pad while the copy
+  is live (the second throw's copy overwrites the first; MSVC semantics
+  would terminate there anyway).
+
+The 2026-10-23 pick-up notes are in `history/2026-10-23-seh-handoff.md`.
+The original plan:
 
 1. **`.xdata` EHANDLER + scope table** (`pliron-clif-lower/src/eh/mod.rs`,
    `emit_coff`): for functions whose `code.buffer.call_sites()` have
