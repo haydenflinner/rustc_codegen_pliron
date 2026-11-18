@@ -350,7 +350,8 @@ impl<'a, F: Function> Env<'a, F> {
         // caller-saved registers, probed first, filled `K` and a callee-saved
         // one free across a loop was never cut (blake3's
         // `compress_chunks_parallel` reloaded two values on a loop exit).
-        // `PLIRON_RA2_REGION_TIE=0`: traversal order.
+        // `PLIRON_RA2_REGION_TIE=1` (opt-in; off: traversal order). On, smoke's
+        // `o0std` `seqs` fails the regalloc checker.
         if crate::region_tie() {
             cands.sort_by(|a, b| {
                 b.0.partial_cmp(&a.0)

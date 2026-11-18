@@ -2081,7 +2081,7 @@ it). Static: `=1` html corpus -571 instructions, std -267, loop-weighted
 about even; `=2` html +1.2k (weighted +25k), std weighted -28k.
 `pliron-clif-opt/tests/edge_consts.rs` `forwarded_params_one_parallel_move`.
 
-## `PLIRON_LUCARRY=1` (opt-in): last-use scheduling keeps loop-carried updates late (2026-11-17)
+## `PLIRON_LUCARRY` (default on, `=0` off): last-use scheduling keeps loop-carried updates late (2026-11-17)
 
 `Context::lastuse_schedule` (`context.rs`) moves later uses of an RMW
 op's operand, with their pure producers, ahead of the op so it is the

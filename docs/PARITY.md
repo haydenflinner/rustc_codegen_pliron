@@ -333,7 +333,7 @@ extends LLVM's demanded-bits avoids, a structural gap). Counted with
 LLVM's `and w, w, #0xff`/`#0xffff` (its spelling of the same
 extension) the linux-musl build's gap is 854 against 521, most of ours
 in front of compares, `madd`, `lsr` and `ucvtf`, where LLVM has its
-`and`. `PLIRON_DEMANDED=1` (opt-in, with `PLIRON_LUCARRY=1`) takes the
+`and`. `PLIRON_DEMANDED` (default on, with `PLIRON_LUCARRY`; `=0` off) takes the
 part demanded bits can: html 637 -> 542 `uxtb`/`uxth`, rust-compression
 1,805 -> 1,497; exact counts better on all eight programs (regex
 -0.34%, pulldown-cmark -0.22%, html -0.12%, blind-sig -0.78% mostly

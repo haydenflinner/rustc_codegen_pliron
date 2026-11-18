@@ -1,6 +1,7 @@
-# 2026-11-17: demanded bits (`PLIRON_DEMANDED=1`) and `PLIRON_LUCARRY=1`
+# 2026-11-17: demanded bits (`PLIRON_DEMANDED`) and `PLIRON_LUCARRY`
 
-Both opt-in. `pliron-clif-opt/src/demanded.rs`, step `demanded` right
+Default on since the merge onto main (`=0` off). They flip together:
+`DEMANDED` alone made regex worse. `pliron-clif-opt/src/demanded.rs`, step `demanded` right
 after `egraph2`; `vendor/cranelift-codegen/src/context.rs`
 `lastuse_schedule`.
 

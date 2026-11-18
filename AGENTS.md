@@ -661,13 +661,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   wasm `i32.load8_u` instead of `i32.load` + `&255`, aarch64 `ldrb`).
   Native exact counts: pulldown-cmark -0.28%, html-rewriter -0.14%,
   protobuf -0.09%, none worse (PARITY item 8).
-- `PLIRON_DEMANDED=1` (opt-in, 2026-11-17) — step `demanded` after
+- `PLIRON_DEMANDED` (default on since 2026-11-17, `=0` off) — step `demanded` after
   `egraph2` (`pliron-clif-opt/src/demanded.rs`): a demanded-bits
   analysis (LLVM's `DemandedBits`); constant `band`/`bor`/`bxor` on bits
   nobody reads drop, and `i8`/`i16` webs that are only extended or
   stored narrow are rebuilt at 32/64 bits when a per-target count says
   so (`Target::narrow_masked`: wasm masks every narrow op). Measure it
-  with `PLIRON_LUCARRY=1` (vendored Cranelift, opt-in): `lastuse_schedule`
+  with `PLIRON_LUCARRY` (vendored Cranelift, default on, `=0` off): `lastuse_schedule`
   no longer computes a block parameter's next value ahead of a read of
   it (regex's varint loop paid a back-edge `mov` without it). Both:
   exact counts better on all eight held-out programs, html `uxtb`/`uxth`
@@ -917,9 +917,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   (`spillhoist.rs`). Together, exact counts: compression -3.14%, pulldown
   -1.04%, regex -0.87%, html-rewriter -0.67%, protobuf -0.54%, json
   -0.20%, blake3 +0.012% (two reloads on a loop exit in
-  `compress_chunks_parallel`). `PLIRON_RA2_REGION_TIE` (default on while
-  the split runs, `=0` off) prefers, among equal gains, the register
-  free in more blocks. `PLIRON_RA_EXPLAIN` prints `region` lines;
+  `compress_chunks_parallel`). `PLIRON_RA2_REGION_TIE=1` (opt-in) prefers,
+  among equal gains, the register free in more blocks. Off by default:
+  on, smoke's `o0std` `seqs` fails the regalloc checker. `PLIRON_RA_EXPLAIN` prints `region` lines;
   `clif-check vcode` honours it, `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`
   matches irdiff's target. Stanza `regionsplit`.
 - `PLIRON_X30=1|2` (opt-in, aarch64) — the link register is allocatable.

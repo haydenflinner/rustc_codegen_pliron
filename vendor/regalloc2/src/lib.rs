@@ -231,16 +231,20 @@ pub(crate) fn slotlive_probes() -> usize {
     32
 }
 
-/// PLIRON: `PLIRON_RA2_REGION_TIE` (default on, `=0` off): among region
-/// split candidates of equal gain, the register free in more blocks first.
+/// PLIRON: `PLIRON_RA2_REGION_TIE=1` (opt-in): among region split
+/// candidates of equal gain, the register free in more blocks first.
+/// Off by default. On, `clif-check codegen` of smoke's `o0std` `seqs`
+/// fails regalloc2's checker (`p28`/`p26` hold the wrong vreg); without
+/// the tie that function checks. The blake3 loop-exit reloads it was
+/// written for are not remeasured.
 pub(crate) fn region_tie() -> bool {
     #[cfg(feature = "std")]
     {
         static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        env_f32("PLIRON_RA2_REGION_TIE", &C, 1.0) != 0.0
+        env_f32("PLIRON_RA2_REGION_TIE", &C, 0.0) != 0.0
     }
     #[cfg(not(feature = "std"))]
-    true
+    false
 }
 
 /// PLIRON: `PLIRON_RA2_REGION_K` (default 8): registers whose cut is

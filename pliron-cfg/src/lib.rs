@@ -430,6 +430,18 @@ pub const DEFAULT_ON: &[&str] = &[
     // geomean 0.889 -> 0.884 with no kernel outside its `--perturb=4`
     // range. Corpus replays clean. `=0` off.
     "PLIRON_IVMERGE",
+    // 2026-11-17: demanded bits, and the last-use scheduling refusal it
+    // needs (`PLIRON_LUCARRY`, also default on in cranelift's
+    // `lastuse_schedule`: that read is `std::env`, not this list).
+    // Exact counts, both together: better on all eight held-out programs
+    // (regex -0.34%, pulldown-cmark -0.22%, html-rewriter -0.12%,
+    // compression -0.08%; `DEMANDED` alone made regex worse). html
+    // `uxtb`/`uxth` 637 -> 542, wasm kernel module -444 B. Corpus
+    // `--check` with `PLIRON_VERIFY=full` after the merge: smoke 2,979,
+    // std every 8th, wasm-bench every 8th, no mismatch. `=0` off.
+    // `docs/history/2026-11-17-demanded-bits.md`.
+    "PLIRON_DEMANDED",
+    "PLIRON_LUCARRY",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.

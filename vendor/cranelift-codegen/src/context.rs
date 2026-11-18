@@ -357,7 +357,7 @@ impl Context {
         let nocallx =
             *NOCALLX.get_or_init(|| std::env::var("PLIRON_LUCALLX").as_deref() != Ok("0"));
         let mut call_pre: Vec<u32> = Vec::new();
-        // PLIRON_LUCARRY=1 (opt-in): a move that would compute a block
+        // PLIRON_LUCARRY (default on, `=0` off): a move that would compute a block
         // parameter's next value (an edge argument into that parameter)
         // ahead of the parameter's own last read makes the two overlap,
         // and the back edge needs a copy — the in-place op the move was
@@ -366,7 +366,10 @@ impl Context {
         // moves are refused. `carried[p]`: the arguments of every edge
         // into parameter `p`.
         static LUCARRY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let lucarry = *LUCARRY.get_or_init(|| std::env::var("PLIRON_LUCARRY").as_deref() == Ok("1"));
+        // Default on (with `PLIRON_DEMANDED`). `PLIRON_LUCARRY=0` restores
+        // the old hoist. Cranelift reads the environment directly, so the
+        // default lives here; `DEFAULT_ON` lists the name for the off switch.
+        let lucarry = *LUCARRY.get_or_init(|| std::env::var("PLIRON_LUCARRY").as_deref() != Ok("0"));
         let mut carried: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
         if lucarry {
             for b in self.func.layout.blocks() {

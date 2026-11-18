@@ -5874,6 +5874,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `ireduce` `uxtb`s and the root extend on aarch64, the per-op
         // `& 255` on wasm). After egraph2, whose `ireduce` push-down
         // would undo the widening.
+        // Default on (`DEFAULT_ON`); `PLIRON_DEMANDED=0` off. Needs
+        // `PLIRON_LUCARRY` (also default on) or regex's varint loop
+        // pays a back-edge copy.
         step("demanded", "demanded", Gate::OptIn("PLIRON_DEMANDED"), s_demanded),
         // Clone a small merge block for the pred edge whose arm fact +
         // arg ranges decide insts the join cannot (UTF-8 decode `c <
