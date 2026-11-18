@@ -142,10 +142,11 @@ pub fn run<F: Function>(
     }
 
     ctx.output.edit_vregs = edits.take_vregs();
+    let edit_blockparam = edits.take_blockparam();
     ctx.output.edits.extend(edits.drain_edits());
 
     // PLIRON: one spill store at the definition (`PLIRON_RA2_SPILLHOIST`).
-    spillhoist::run(func, ctx);
+    spillhoist::run(func, ctx, &edit_blockparam);
 
     // PLIRON: drop redundant reloads and spill stores (`PLIRON_RA2_POSTOPT`).
     postopt::run(func, ctx);

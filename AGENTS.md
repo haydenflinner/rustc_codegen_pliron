@@ -935,20 +935,20 @@ time, memory, code size, stack frames) in ~20 min and writes
   with the branch argument's vreg, so a constant passed to a spilled
   parameter is rematerialized instead of loaded from its own spill
   slot (stack loads -3.5..-4.3% on three held-out binaries).
-- `PLIRON_RA2_REGION=1|2` and `PLIRON_RA2_SPILLHOIST=1` (opt-in,
-  2026-11-17, flip candidates) — regalloc2 region splitting by an exact
-  min-cut over the bundle's blocks per candidate register (LLVM's
-  `tryRegionSplit`/`SpillPlacement`; `vendor/regalloc2/src/ion/
-  regionsplit.rs`, knobs `_CAP`, `_K`, `_RATIO`, `_MAX`, `_MAXB`), and one
-  spill store at the definition instead of one per split point
-  (`spillhoist.rs`). Together, exact counts: compression -3.14%, pulldown
-  -1.04%, regex -0.87%, html-rewriter -0.67%, protobuf -0.54%, json
-  -0.20%, blake3 +0.012% (two reloads on a loop exit in
-  `compress_chunks_parallel`). `PLIRON_RA2_REGION_TIE=1` (opt-in) prefers,
-  among equal gains, the register free in more blocks. Off by default:
-  on, smoke's `o0std` `seqs` fails the regalloc checker. `PLIRON_RA_EXPLAIN` prints `region` lines;
-  `clif-check vcode` honours it, `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`
-  matches irdiff's target. Stanza `regionsplit`.
+- `PLIRON_RA2_REGION` (default `1` since 2026-11-18, `=0` off) and
+  `PLIRON_RA2_SPILLHOIST` (default on, `=0` off) — regalloc2 region
+  splitting by an exact min-cut over the bundle's blocks per candidate
+  register (LLVM's `tryRegionSplit`/`SpillPlacement`; `vendor/regalloc2/
+  src/ion/regionsplit.rs`, knobs `_CAP`, `_K`, `_RATIO`, `_MAX`, `_MAXB`),
+  and one spill store at the definition instead of one per split point
+  (`spillhoist.rs`). Exact counts of the flip: compression -3.14%,
+  pulldown -1.04%, regex -0.87%, html-rewriter -0.67%, protobuf -0.54%,
+  json -0.20%, blake3 +0.012%. Spillhoist skips block-parameter edge
+  stores (with `SRCVREG` those are labelled with the branch argument;
+  deleting them failed smoke's `neonpair` checker). `PLIRON_RA2_REGION_TIE=1`
+  (opt-in) prefers, among equal gains, the register free in more blocks.
+  `PLIRON_RA_EXPLAIN` prints `region` lines; `clif-check vcode` honours
+  it. Stanzas `regionsplit`, `neonpair` (with `PLIRON_RA_CHECK=1`).
 - `PLIRON_X30=1|2` (opt-in, aarch64) — the link register is allocatable.
   `=1` everywhere (a frameless leaf grows a frame record). `=2` only in
   a function that already makes a regular call, or when frame pointers

@@ -858,6 +858,10 @@ pub struct InsertedMove {
     pub to_vreg: VReg,
     /// PLIRON (`PLIRON_RA2_MOVESTATS`): why the move exists (`MV_NAMES`).
     pub kind: u8,
+    /// PLIRON: a block-parameter edge transfer. Spillhoist must not treat
+    /// these as spill stores of the labelled vreg (`PLIRON_RA2_SRCVREG`
+    /// names the branch argument, whose home is not this destination).
+    pub blockparam: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -875,6 +879,8 @@ pub struct InsertedMoves {
     pub moves: Vec<InsertedMove>,
     /// PLIRON (`PLIRON_RA2_MOVESTATS`): the kind `push` records.
     pub kind: u8,
+    /// PLIRON: the next `push` is a block-parameter edge transfer.
+    pub blockparam: bool,
 }
 
 impl InsertedMoves {
@@ -913,7 +919,9 @@ impl InsertedMoves {
             to_alloc,
             to_vreg,
             kind: self.kind,
+            blockparam: self.blockparam,
         });
+        self.blockparam = false;
     }
 }
 
@@ -922,6 +930,9 @@ pub struct Edits {
     edits: Vec<(PosWithPrio, Edit)>,
     /// PLIRON: the vreg each edit's destination holds (`Output::edit_vregs`).
     vregs: Vec<Option<VReg>>,
+    /// PLIRON: parallel to `edits`/`vregs`; true for block-parameter edge
+    /// transfers (see `InsertedMove::blockparam`).
+    blockparam: Vec<bool>,
 }
 
 impl Edits {
@@ -930,6 +941,7 @@ impl Edits {
         Self {
             edits: Vec::with_capacity(n),
             vregs: Vec::with_capacity(n),
+            blockparam: Vec::with_capacity(n),
         }
     }
 
@@ -953,31 +965,46 @@ impl Edits {
         core::mem::take(&mut self.vregs)
     }
 
+    /// PLIRON: block-parameter flags, in edit order (take before draining).
+    pub fn take_blockparam(&mut self) -> Vec<bool> {
+        core::mem::take(&mut self.blockparam)
+    }
+
     /// Sort edits by the combination of their program position and priority. This is a stable sort
     /// to preserve the order of the moves the parallel move resolver inserts.
     #[inline(always)]
     pub fn sort(&mut self) {
-        // Keep `vregs` paired: sort indices (stable), then permute both.
+        // Keep `vregs` / `blockparam` paired: sort indices (stable), then permute.
         let mut idx: Vec<usize> = (0..self.edits.len()).collect();
         idx.sort_by_key(|&i| self.edits[i].0.key());
         let edits: Vec<_> = idx.iter().map(|&i| self.edits[i].clone()).collect();
         let vregs: Vec<_> = idx.iter().map(|&i| self.vregs.get(i).copied().flatten()).collect();
+        let blockparam: Vec<_> = idx.iter().map(|&i| self.blockparam.get(i).copied().unwrap_or(false)).collect();
         self.edits = edits;
         self.vregs = vregs;
+        self.blockparam = blockparam;
     }
 
     pub fn add(&mut self, pos_prio: PosWithPrio, from: Allocation, to: Allocation) {
-        self.add_for(pos_prio, from, to, None);
+        self.add_for(pos_prio, from, to, None, false);
     }
 
     /// PLIRON: `add`, recording the vreg the destination holds.
-    pub fn add_for(&mut self, pos_prio: PosWithPrio, from: Allocation, to: Allocation, vreg: Option<VReg>) {
+    pub fn add_for(
+        &mut self,
+        pos_prio: PosWithPrio,
+        from: Allocation,
+        to: Allocation,
+        vreg: Option<VReg>,
+        blockparam: bool,
+    ) {
         if from != to {
             if from.is_reg() && to.is_reg() {
                 debug_assert_eq!(from.as_reg().unwrap().class(), to.as_reg().unwrap().class());
             }
             self.edits.push((pos_prio, Edit::Move { from, to }));
             self.vregs.push(vreg);
+            self.blockparam.push(blockparam);
         }
     }
 }

@@ -361,7 +361,7 @@ moves such a reload two edges ahead of it; only instruction results are
 rematerializable. `PLIRON_RA_CHECK_LABELS=0` turns the check off. It runs
 wherever the checker runs (`PLIRON_RA_CHECK=1`, `PLIRON_RELOADPRE_CHECK=1`,
 the fuzzer).
-## `PLIRON_RA2_REGION=1|2` (runtime, opt-in): min-cut region splitting
+## `PLIRON_RA2_REGION=1|2` (runtime, default 1 since 2026-11-18): min-cut region splitting
 
 `src/ion/regionsplit.rs` (new), the hook in `process_bundle`
 (`src/ion/process.rs`, ahead of the conflict-point split),
@@ -425,10 +425,11 @@ compression -18k, html -6k (now the defaults). `RATIO` 0.8 (skip cuts that
 save under 20% of all-stack) gives blake3 back its 6k but costs
 compression +452k: stays 1.0.
 
-**Flip candidate, `PLIRON_RA2_REGION=1 PLIRON_RA2_SPILLHOIST=1`** (CAP 1,
-K 8), default -> both, exact counts:
+**Default on since 2026-11-18** (`PLIRON_RA2_REGION` default `1`,
+`PLIRON_RA2_SPILLHOIST` on unless `=0`; CAP 1, K 8). Exact counts of the
+flip (previous default -> both):
 
-| program | default | region + hoist | change |
+| program | previous | region + hoist | change |
 |---|---|---|---|
 | rust-compression | 44,095,655 | 42,710,634 | -3.14% |
 | rust-html-rewriter | 101,452,418 | 100,768,438 | -0.67% |
@@ -441,20 +442,32 @@ K 8), default -> both, exact counts:
 
 blake3's +6,054 is `compress_chunks_parallel`, two reloads at the outer
 loop's exit edge per call (3,032 calls): two values the cut puts on the
-stack inside the loop and back in a register after it, where the default
-kept one in `x23` throughout. `PLIRON_RA2_REGION_TIE=1` (opt-in;
+stack inside the loop and back in a register after it, where the previous
+default kept one in `x23` throughout. `PLIRON_RA2_REGION_TIE=1` (opt-in;
 `region_tie` in `src/lib.rs`, the sort in `regionsplit.rs`) breaks
 ties of equal gain toward the register free in more blocks, so a
 callee-saved register free across the loop would be cut instead of the
-caller-saved ones probed first. Off by default: with it on, smoke's
-`o0std` `seqs` fails regalloc2's checker. Not remeasured on blake3.
+caller-saved ones probed first. Stays opt-in (not remeasured on blake3).
 Checker: `clif-check codegen` with
-`PLIRON_RA_CHECK=1` over the eight held-out corpora, `compression-xc`, std
-and clcg (every 4th), macOS and `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`,
-modes 1 and 2: the same failures as the default (pre-existing compile
-errors), none from the checker.
+`PLIRON_RA_CHECK=1` over smoke (0 failures after the spillhoist fix
+below), std every 4th (same pre-existing compile error as without),
+modes 1 and 2.
 
-## `PLIRON_RA2_SPILLHOIST=1` (runtime, opt-in): one spill store at the definition
+**2026-11-18 spillhoist fixes (two).** (1) With `PLIRON_RA2_SRCVREG`
+(default on), block-parameter edge moves are labelled with the branch
+argument. Spillhoist treated those `reg → param-home` stores as spill
+stores of the argument and deleted them, so smoke's `neonpair` `main`
+failed the checker (`IncorrectValuesInAllocation` at Inst 128: `p1i`
+held `v569` instead of `v332`). Fix: mark block-parameter edits
+(`InsertedMove::blockparam` / `Edits::blockparam`) and skip them in
+spillhoist. Stanza `neonpair` builds with `PLIRON_RA_CHECK=1`. (2) A
+definition allocated to a "stack preg" (the fuzzer's memory placeholder)
+must not become the `from` of a hoisted store: that is a stack-to-stack
+move. Spillhoist now uses the same `is_reg` test as `moves.rs` (preg and
+not `pregs[i].is_stack`). `rafuzz` seeds 1000000..1000500: 19
+`StackToStackMove` failures under hoist alone -> 0.
+
+## `PLIRON_RA2_SPILLHOIST` (runtime, default on since 2026-11-18): one spill store at the definition
 
 `src/ion/spillhoist.rs` (new), called from `ion::run` before `postopt`;
 `src/lib.rs` (`spillhoist_on`). regalloc2 stores a value to its slot at
@@ -462,20 +475,22 @@ every register-to-stack boundary: every split point, every edge from a
 register region into a stack region (the region split stores on each
 entry into a call-heavy loop, inside an outer loop on every trip). The
 values are SSA, so per vreg the stores to its slot (register-to-stack
-edits whose `edit_vregs` entry names it) are summed by block frequency
-and, when 1.5 x the defining block's frequency is below that (the margin:
-split-point stores often pair into `stp`, a lone store at the definition
-does not), replaced by one store at `After(def)`, ahead of the other edits
-there. Sound because the definition dominates every point the vreg is
-live at, a slot is shared only between spillsets with disjoint extents
-(an extent covers every path the vreg is live along) and the vregs of one
-spillset never overlap. Block parameters and definitions on a block's
-last instruction are left alone. Static, region split on: html-rewriter
-corpus weighted stack accesses -1.6%, compression -0.9%; in
+edits whose `edit_vregs` entry names it, excluding block-parameter edge
+transfers) are summed by block frequency and, when 1.5 x the defining
+block's frequency is below that (the margin: split-point stores often
+pair into `stp`, a lone store at the definition does not), replaced by
+one store at `After(def)`, ahead of the other edits there. Sound because
+the definition dominates every point the vreg is live at, a slot is
+shared only between spillsets with disjoint extents (an extent covers
+every path the vreg is live along) and the vregs of one spillset never
+overlap. Block parameters and definitions on a block's last instruction
+are left alone. Static, region split on: html-rewriter corpus weighted
+stack accesses -1.6%, compression -0.9%; in
 `BrotliCreateHqZopfliBackwardReferences` 5 stores replace 39. Exact counts
-alone (default allocator + hoist): compression -29k, pulldown -12k, the
-others within +-3k (blind-sig noise). With the region split: compression
--15k, pulldown -24k. `PLIRON_RA_CHECK=1` clean (same runs as above).
+alone (allocator without region + hoist): compression -29k, pulldown
+-12k, the others within +-3k (blind-sig noise). With the region split:
+compression -15k, pulldown -24k. `PLIRON_RA_CHECK=1` clean (same runs as
+above, after the SRCVREG fix).
 
 ## `PLIRON_RA2_MOVESTATS=1` (reporting only): the allocator's moves by cause
 

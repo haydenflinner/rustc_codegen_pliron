@@ -1437,7 +1437,10 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    can be retimed on top of it. Small, real,
    per call in `scan_closing_code_fence`: a peeled first iteration in
    each `scan_ch_repeat` and two compares where LLVM's `subs` serves a
-   bounds check and an emptiness test.
+   bounds check and an emptiness test. **Flipped default-on with
+   `PLIRON_RA2_SPILLHOIST` on 2026-11-18** after spillhoist stopped
+   deleting `SRCVREG`-labelled block-parameter edge stores (smoke
+   `neonpair` checker).
    flt2dec/fmt functions, `strwork` within noise. What was left is the
    loop shape: `Iterator::cmp_by` over two `Rev` iterators carries two
    pointer IVs of equal length. (Correction: on wasm `REVCMP` already

@@ -1,5 +1,6 @@
-//! PLIRON (`PLIRON_RA2_SPILLHOIST=1`, default off): one spill store at the
-//! definition instead of one at every place the value moves to its slot.
+//! PLIRON (`PLIRON_RA2_SPILLHOIST`, default on since 2026-11-18, `=0` off):
+//! one spill store at the definition instead of one at every place the
+//! value moves to its slot.
 //!
 //! regalloc2 writes a value to its spill slot wherever a piece of it in a
 //! register is followed by a piece on the stack: at every split boundary,
@@ -25,28 +26,41 @@
 //! by vregs live there, which this one is (bundle ranges never overlap).
 //! Block parameters (no defining instruction) and definitions on a block's
 //! last instruction (a call terminator: nothing runs after it in the
-//! block) are left alone. The checker (`PLIRON_RA_CHECK=1`) runs on the
-//! result.
+//! block) are left alone. Block-parameter edge transfers are also left
+//! alone: with `PLIRON_RA2_SRCVREG` they are labelled with the branch
+//! argument, whose spill home is not the destination, and deleting them
+//! left the parameter's stack slot cold (smoke `neonpair` failed the
+//! checker). The checker (`PLIRON_RA_CHECK=1`) runs on the result.
 
 use super::data_structures::Ctx;
 use crate::{Allocation, Edit, Function, FxHashMap, InstPosition, OperandKind, ProgPoint};
 use alloc::vec::Vec;
 
-pub(crate) fn run<F: Function>(func: &F, ctx: &mut Ctx) {
+pub(crate) fn run<F: Function>(func: &F, ctx: &mut Ctx, edit_blockparam: &[bool]) {
     if !crate::spillhoist_on() {
         return;
     }
+    // Real registers only: a "stack preg" (MachineEnv placeholder the
+    // fuzzer uses for memory) is not a legal `from` for a spill store —
+    // writing it into a SpillSlot is a stack-to-stack move.
+    let stack_preg: Vec<bool> = ctx.pregs.iter().map(|p| p.is_stack).collect();
+    let is_reg = |a: Allocation| {
+        a.as_reg().is_some_and(|r| !stack_preg.get(r.index()).copied().unwrap_or(false))
+    };
     let out = &mut ctx.output;
     let n = out.edits.len();
     if n == 0 || out.edit_vregs.len() != n {
         return;
     }
     // Stores per vreg: (slot, edit indices); a vreg stored to two slots is
-    // skipped.
+    // skipped. Block-parameter edge transfers are not spill stores.
     let mut stores: FxHashMap<u32, (Allocation, Vec<u32>, bool)> = FxHashMap::default();
     for (i, (_, e)) in out.edits.iter().enumerate() {
         let Edit::Move { from, to } = *e;
-        if !(from.is_reg() && to.is_stack()) {
+        if !(is_reg(from) && to.is_stack()) {
+            continue;
+        }
+        if edit_blockparam.get(i).copied().unwrap_or(false) {
             continue;
         }
         let Some(v) = out.edit_vregs[i] else { continue };
@@ -87,7 +101,7 @@ pub(crate) fn run<F: Function>(func: &F, ctx: &mut Ctx) {
                     continue;
                 }
                 let a = out.allocs[base + k];
-                if !a.is_reg() {
+                if !is_reg(a) {
                     continue;
                 }
                 let at = ProgPoint::new(inst, InstPosition::After);

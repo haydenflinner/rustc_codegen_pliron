@@ -158,28 +158,29 @@ fn env_f32(name: &str, cell: &'static std::sync::OnceLock<f32>, default: f32) ->
     })
 }
 
-/// PLIRON: `PLIRON_RA2_REGION=1` (opt-in): min-cut region splitting
-/// (`ion/regionsplit.rs`) before the split at the first conflict.
+/// PLIRON: `PLIRON_RA2_REGION` (default `1` since 2026-11-18, `=0` off):
+/// min-cut region splitting (`ion/regionsplit.rs`) before the split at
+/// the first conflict. Mode 2 requeues multi-block stack components whole.
 pub(crate) fn region_on() -> bool {
     #[cfg(feature = "std")]
     {
         static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        env_f32("PLIRON_RA2_REGION", &C, 0.0) != 0.0
+        env_f32("PLIRON_RA2_REGION", &C, 1.0) != 0.0
     }
     #[cfg(not(feature = "std"))]
     false
 }
 
 /// PLIRON: the `PLIRON_RA2_REGION` mode: 1 block-local stack pieces, 2
-/// stack components of several blocks requeued whole.
+/// stack components of several blocks requeued whole. Default 1.
 pub(crate) fn region_mode() -> u32 {
     #[cfg(feature = "std")]
     {
         static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        env_f32("PLIRON_RA2_REGION", &C, 0.0) as u32
+        env_f32("PLIRON_RA2_REGION", &C, 1.0) as u32
     }
     #[cfg(not(feature = "std"))]
-    0
+    1
 }
 
 /// PLIRON: `PLIRON_RA2_REGION_MAX` (default 4): region splits per
@@ -194,14 +195,14 @@ pub(crate) fn region_max() -> u8 {
     4
 }
 
-/// PLIRON: `PLIRON_RA2_SPILLHOIST=1` (opt-in): one spill store at the
-/// definition replaces a vreg's stores when that is cheaper
-/// (`ion/spillhoist.rs`).
+/// PLIRON: `PLIRON_RA2_SPILLHOIST` (default on since 2026-11-18, `=0`
+/// off): one spill store at the definition replaces a vreg's stores when
+/// that is cheaper (`ion/spillhoist.rs`).
 pub(crate) fn spillhoist_on() -> bool {
     #[cfg(feature = "std")]
     {
-        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        env_f32("PLIRON_RA2_SPILLHOIST", &C, 0.0) != 0.0
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_SPILLHOIST").as_deref() != Ok("0"))
     }
     #[cfg(not(feature = "std"))]
     false
@@ -233,10 +234,8 @@ pub(crate) fn slotlive_probes() -> usize {
 
 /// PLIRON: `PLIRON_RA2_REGION_TIE=1` (opt-in): among region split
 /// candidates of equal gain, the register free in more blocks first.
-/// Off by default. On, `clif-check codegen` of smoke's `o0std` `seqs`
-/// fails regalloc2's checker (`p28`/`p26` hold the wrong vreg); without
-/// the tie that function checks. The blake3 loop-exit reloads it was
-/// written for are not remeasured.
+/// Off by default. Written for blake3's loop-exit reloads; not yet
+/// remeasured after the 2026-11-18 spillhoist / SRCVREG fix.
 pub(crate) fn region_tie() -> bool {
     #[cfg(feature = "std")]
     {

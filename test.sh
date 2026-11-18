@@ -228,9 +228,12 @@ t_neonpair() {
   # PLIRON_VTRUNC_UZP): the program checks every op against a scalar model
   # and its output matches stock rustc's, with the lowerings on and off; with
   # them on no call to a `__pliron_llvm_aarch64_neon_*` stub is left.
+  # `PLIRON_RA_CHECK=1` pins the 2026-11-18 spillhoist fix: with SRCVREG,
+  # spillhoist must not delete block-parameter edge stores labelled with
+  # the branch argument (smoke `neonpair` `main` failed the checker).
   case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
   rustc --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair-stock$exe || return 1
-  PLIRON_VTRUNC_UZP=1 rustc $BE --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair$exe || return 1
+  PLIRON_VTRUNC_UZP=1 PLIRON_RA_CHECK=1 rustc $BE --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair$exe || return 1
   PLIRON_NEON_PAIRWISE=0 PLIRON_VTRUNC_UZP=0 rustc $BE --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair-off$exe || return 1
   diff <($out/neonpair-stock$exe) <($out/neonpair$exe) || { echo "neonpair: output differs" >&2; return 1; }
   diff <($out/neonpair-stock$exe) <($out/neonpair-off$exe) || { echo "neonpair: output differs (lowerings off)" >&2; return 1; }
@@ -422,10 +425,14 @@ t_slotpromlt() {
   # `LF_TRIVPHI` (default on since 2026-11-13), which no longer creates
   # the single-value block params whose edge moves these were. And
   # `PLIRON_RA2_POSTOPT` (default 15 since 2026-11-17), whose redundant
-  # spill-store bit removes the same store-backs after allocation.
-  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_POSTOPT=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
-  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_POSTOPT=0 PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
-  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_POSTOPT=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
+  # spill-store bit removes the same store-backs after allocation. And
+  # `PLIRON_RA2_REGION` / `PLIRON_RA2_SPILLHOIST` (default on since
+  # 2026-11-18): region splitting plus a store at the definition also
+  # remove the traffic XBLOCK was measured on (1500 -> 1500 with them).
+  local _ra_off="PLIRON_RA2_REGION=0 PLIRON_RA2_SPILLHOIST=0 PLIRON_RA2_POSTOPT=0 PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0"
+  env $_ra_off PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
+  env $_ra_off PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
+  env $_ra_off PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
   local z0 z3 z4
   if [[ -x "$llvmod" ]]; then
     z0=$("$llvmod" -d --no-show-raw-insn $out/spl0.o | grep -E '^ *[0-9a-f]+:' | grep -vcw nop)
@@ -959,17 +966,19 @@ t_shrinkwrap() {
 }
 
 t_regionsplit() {
-  # PLIRON_RA2_REGION (opt-in, vendored regalloc2): min-cut region
-  # splitting. Values live through a function and used in one loop, live
-  # across a call-heavy loop elsewhere (brotli's BrotliHistogramCombine),
-  # and entry-to-exit values across calls (html-rewriter's build_state).
-  # Output must match stock rustc in every mode, and the regalloc2 checker
-  # must accept every function.
+  # PLIRON_RA2_REGION (default 1, vendored regalloc2) and
+  # PLIRON_RA2_SPILLHOIST (default on): min-cut region splitting plus one
+  # spill store at the definition. Values live through a function and used
+  # in one loop, live across a call-heavy loop elsewhere (brotli's
+  # BrotliHistogramCombine), and entry-to-exit values across calls
+  # (html-rewriter's build_state). Output must match stock rustc in every
+  # mode, and the regalloc2 checker must accept every function.
   rustc --edition 2021 -O tests/regionsplit/main.rs -o $out/regionsplit-stock$exe || return 1
   local want m
   want=$($out/regionsplit-stock$exe) || return 1
   for m in 0 1 2; do
-    PLIRON_RA2_REGION=$m PLIRON_RA_CHECK=1 rustc $BE --edition 2021 -O tests/regionsplit/main.rs -o $out/regionsplit$m$exe || return 1
+    PLIRON_RA2_REGION=$m PLIRON_RA2_SPILLHOIST=1 PLIRON_RA_CHECK=1 \
+      rustc $BE --edition 2021 -O tests/regionsplit/main.rs -o $out/regionsplit$m$exe || return 1
     [[ "$($out/regionsplit$m$exe)" == "$want" ]] || { echo "regionsplit: output differs (PLIRON_RA2_REGION=$m)" >&2; return 1; }
   done
 }

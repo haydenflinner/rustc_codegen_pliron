@@ -695,6 +695,10 @@ impl<'a, F: Function> Env<'a, F> {
                 } else {
                     3
                 };
+                // Spillhoist must not treat this as a spill store of `label`
+                // when SRCVREG names the branch argument (destination is the
+                // parameter's home).
+                inserted_moves.blockparam = true;
                 inserted_moves.push(pos, prio, *src_alloc, dest.alloc, self.vreg(label));
             }
         }
@@ -975,6 +979,11 @@ impl<'a, F: Function> Env<'a, F> {
                 let kind_of = |dst: Allocation| -> u8 {
                     moves.iter().find(|m| m.to_alloc == dst).map_or(9, |m| m.kind)
                 };
+                // PLIRON: a resolved write to a block-parameter destination
+                // stays marked so spillhoist skips it.
+                let bp_of = |dst: Allocation| -> bool {
+                    moves.iter().any(|m| m.to_alloc == dst && m.blockparam)
+                };
 
                 let resolved = parallel_moves.resolve();
                 let mut scratch_iter = RegTraversalIter::new(
@@ -1066,7 +1075,7 @@ impl<'a, F: Function> Env<'a, F> {
                         self.tally_move(pos_prio.pos, src, dst, kind_of(dst));
                     }
                     if !action.elide {
-                        edits.add_for(pos_prio, src, dst, to_vreg);
+                        edits.add_for(pos_prio, src, dst, to_vreg, bp_of(dst));
                     } else {
                         trace!("    -> redundant move elided");
                     }
