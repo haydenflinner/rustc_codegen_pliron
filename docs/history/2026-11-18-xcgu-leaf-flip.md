@@ -44,3 +44,8 @@ at +12k vs the old +101k.
 
 Defaults: `pliron-cfg` `DEFAULT_VALUES`; off with `PLIRON_XCGU_LEAF=0`
 and `PLIRON_XCGU_LASTCALL=0`.
+
+## LEAF=150 rejected
+
+Same LASTCALL. compression −0.25% and json −1.54%, but regex +0.53%
+and blind-sig +0.34% (SmallVec / Matches fan-in). Stay at 100.
