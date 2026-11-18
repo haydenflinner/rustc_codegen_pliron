@@ -1317,21 +1317,37 @@ impl ABIMachineSpec for AArch64MachineDeps {
         }
     }
 
-    fn get_machine_env(flags: &settings::Flags, _call_conv: isa::CallConv) -> &MachineEnv {
-        if x17_allocatable() || x30_allocatable() {
-            static EXTRA_PINNED: std::sync::OnceLock<MachineEnv> = std::sync::OnceLock::new();
-            static EXTRA: std::sync::OnceLock<MachineEnv> = std::sync::OnceLock::new();
-            let (cell, pinned) = if flags.enable_pinned_reg() {
-                (&EXTRA_PINNED, true)
-            } else {
-                (&EXTRA, false)
-            };
-            return cell.get_or_init(|| {
+    fn get_machine_env(flags: &settings::Flags, call_conv: isa::CallConv) -> &MachineEnv {
+        Self::get_machine_env_calls(false, true, flags, call_conv)
+    }
+
+    /// PLIRON: x17 (`PLIRON_X17`) and the link register (`PLIRON_X30`) join
+    /// the allocatable set. Under `PLIRON_X30=2` the link register only
+    /// in a function that sets up a frame record anyway (it makes a
+    /// regular call, or frame pointers are preserved): in a frameless leaf
+    /// it would add the frame record (rust-json +46k executed instructions
+    /// in one `Deserialize` leaf under `=1`).
+    fn get_machine_env_calls(
+        _has_wide: bool,
+        has_calls: bool,
+        flags: &settings::Flags,
+        _call_conv: isa::CallConv,
+    ) -> &MachineEnv {
+        let lr = match x30_mode() {
+            1 => true,
+            2 => has_calls || flags.preserve_frame_pointers(),
+            _ => false,
+        };
+        if x17_allocatable() || lr {
+            static ENVS: [std::sync::OnceLock<MachineEnv>; 4] =
+                [const { std::sync::OnceLock::new() }; 4];
+            let pinned = flags.enable_pinned_reg();
+            return ENVS[usize::from(pinned) * 2 + usize::from(lr)].get_or_init(|| {
                 let mut env = create_reg_env(pinned);
                 if x17_allocatable() {
                     env.preferred_regs_by_class[0].add(xreg_preg(17));
                 }
-                if x30_allocatable() {
+                if lr {
                     env.preferred_regs_by_class[0].add(xreg_preg(30));
                 }
                 env

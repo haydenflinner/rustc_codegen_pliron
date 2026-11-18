@@ -3576,6 +3576,79 @@ impl<I: VCodeInst> VCode<I> {
             t_fuse += ti.elapsed();
             // PLIRON: code follows this block, so a call that cannot
             // return needs no trap after it (`TrapCode::NORETURN_CALL`).
+            // PLIRON (`PLIRON_DEADCONST=1`, opt-in): a constant or
+            // address definition whose register nothing reads before it is
+            // overwritten is not emitted. A spilled constant is
+            // rematerialized at every reload and its spill store is dropped
+            // (`dead_slots`), which leaves the definition itself dead:
+            // pulldown-cmark's `parse_block` ran `mov x22, #0x12; mov x22,
+            // #0x19` and a dozen such pairs on every call. Backward liveness
+            // of physical registers over the block's instructions and edits
+            // (every register live at the block's end); a spill into a dead
+            // slot reads nothing, a rematerialized reload writes its
+            // register.
+            if let Some(m) = &remat_def
+                && deadconst_on()
+            {
+                let mut live = [!0u64; 4];
+                let bit = |r: regalloc2::PReg| (r.index() / 64, 1u64 << (r.index() % 64));
+                for it in items.iter().rev() {
+                    match it {
+                        InstOrEdit::Edit(Edit::Move { from, to }) => {
+                            if from.is_reg() && to.as_stack().is_some_and(|sl| dead_slots.contains(&sl.index())) {
+                                continue;
+                            }
+                            if let Some(r) = to.as_reg() {
+                                let (w, b) = bit(r);
+                                live[w] &= !b;
+                            }
+                            if let Some(r) = from.as_reg() {
+                                let (w, b) = bit(r);
+                                live[w] |= b;
+                            }
+                        }
+                        InstOrEdit::Inst(iix) => {
+                            let ops = &self.operands[self.operand_ranges.get(iix.index())];
+                            let allocs = regalloc.inst_allocs(*iix);
+                            if let ([op], [a]) = (ops, allocs)
+                                && op.kind() == regalloc2::OperandKind::Def
+                                && m.get(&op.vreg().vreg()) == Some(&iix.index())
+                                && !squashed[iix.index()]
+                                && let Some(r) = a.as_reg()
+                            {
+                                let (w, b) = bit(r);
+                                if live[w] & b == 0 {
+                                    squashed[iix.index()] = true;
+                                }
+                                live[w] &= !b;
+                                continue;
+                            }
+                            for (op, a) in ops.iter().zip(allocs) {
+                                if op.kind() == regalloc2::OperandKind::Def
+                                    && let Some(r) = a.as_reg()
+                                {
+                                    let (w, b) = bit(r);
+                                    live[w] &= !b;
+                                }
+                            }
+                            if let Some(cl) = self.clobbers.get(iix) {
+                                for r in *cl {
+                                    let (w, b) = bit(r);
+                                    live[w] &= !b;
+                                }
+                            }
+                            for (op, a) in ops.iter().zip(allocs) {
+                                if op.kind() == regalloc2::OperandKind::Use
+                                    && let Some(r) = a.as_reg()
+                                {
+                                    let (w, b) = bit(r);
+                                    live[w] |= b;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let code_follows = oi + 1 < final_order.len();
             let brange = self.block_ranges.get(block.index());
             let mut k = 0usize;
@@ -5407,4 +5480,11 @@ mod test {
         // With certain versions of Rust, each `HashMap` in `VCodeConstants` occupied at
         // least 48 bytes, making an empty `VCodeConstants` cost 120 bytes.
     }
+}
+
+/// PLIRON (`PLIRON_DEADCONST=1`, opt-in): drop dead rematerializable defs
+/// at emission (see the emission loop).
+fn deadconst_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_DEADCONST").as_deref() == Ok("1"))
 }

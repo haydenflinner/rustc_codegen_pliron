@@ -140,9 +140,21 @@ pub fn x17_allocatable() -> bool {
 /// `PLIRON_X30`: the link register is allocatable, as in LLVM. Every call
 /// clobbers it, and a function that allocates it sets up a frame record,
 /// which saves and restores it around the body.
+///
+/// `PLIRON_X30=2`: only in functions that set up a frame record anyway
+/// (see `get_machine_env_calls` in `abi.rs`).
 pub fn x30_allocatable() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_X30").as_deref() == Ok("1"))
+    x30_mode() != 0
+}
+
+/// `PLIRON_X30`: 0 (unset) off, 1 everywhere, 2 where a frame record exists anyway.
+pub fn x30_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("PLIRON_X30").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Get a reference to the second temp register. We need this in some edge cases

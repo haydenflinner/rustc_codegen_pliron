@@ -442,7 +442,11 @@ K 8), default -> both, exact counts:
 blake3's +6,054 is `compress_chunks_parallel`, two reloads at the outer
 loop's exit edge per call (3,032 calls): two values the cut puts on the
 stack inside the loop and back in a register after it, where the default
-kept one in `x23` throughout. Checker: `clif-check codegen` with
+kept one in `x23` throughout. `PLIRON_RA2_REGION_TIE` (default on, `=0`
+off; `region_tie` in `src/lib.rs`, the sort in `regionsplit.rs`) breaks
+ties of equal gain toward the register free in more blocks, so a
+callee-saved register free across the loop is cut instead of the
+caller-saved ones probed first. Not yet remeasured. Checker: `clif-check codegen` with
 `PLIRON_RA_CHECK=1` over the eight held-out corpora, `compression-xc`, std
 and clcg (every 4th), macOS and `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`,
 modes 1 and 2: the same failures as the default (pre-existing compile

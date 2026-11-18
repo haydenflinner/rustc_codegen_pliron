@@ -231,6 +231,18 @@ pub(crate) fn slotlive_probes() -> usize {
     32
 }
 
+/// PLIRON: `PLIRON_RA2_REGION_TIE` (default on, `=0` off): among region
+/// split candidates of equal gain, the register free in more blocks first.
+pub(crate) fn region_tie() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        env_f32("PLIRON_RA2_REGION_TIE", &C, 1.0) != 0.0
+    }
+    #[cfg(not(feature = "std"))]
+    true
+}
+
 /// PLIRON: `PLIRON_RA2_REGION_K` (default 8): registers whose cut is
 /// solved, the ones with the largest possible gain.
 pub(crate) fn region_k() -> usize {

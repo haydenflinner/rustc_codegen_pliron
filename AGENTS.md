@@ -916,9 +916,18 @@ time, memory, code size, stack frames) in ~20 min and writes
   spill store at the definition instead of one per split point
   (`spillhoist.rs`). Together, exact counts: compression -3.14%, pulldown
   -1.04%, regex -0.87%, html-rewriter -0.67%, protobuf -0.54%, json
-  -0.20%, blake3 +0.012%. `PLIRON_RA_EXPLAIN` prints `region` lines;
+  -0.20%, blake3 +0.012% (two reloads on a loop exit in
+  `compress_chunks_parallel`). `PLIRON_RA2_REGION_TIE` (default on while
+  the split runs, `=0` off) prefers, among equal gains, the register
+  free in more blocks. `PLIRON_RA_EXPLAIN` prints `region` lines;
   `clif-check vcode` honours it, `CLIF_CHECK_TRIPLE=aarch64-unknown-linux-musl`
   matches irdiff's target. Stanza `regionsplit`.
+- `PLIRON_X30=1|2` (opt-in, aarch64) — the link register is allocatable.
+  `=1` everywhere (a frameless leaf grows a frame record). `=2` only in
+  a function that already makes a regular call, or when frame pointers
+  are kept.
+- `PLIRON_DEADCONST=1` (opt-in) — at emission, drop a rematerializable
+  definition whose register is overwritten before it is read.
 - `PLIRON_ELABLOOPS=2` (opt-in) — `=1`'s egraph loop hoisting, but
   cheap invariants stay inside loops that contain a call.
 - `PLIRON_HOT_LAYOUT=1` — type-layout table in each object for the

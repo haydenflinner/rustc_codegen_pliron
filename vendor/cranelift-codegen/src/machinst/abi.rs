@@ -596,6 +596,18 @@ pub trait ABIMachineSpec {
         Self::get_machine_env(flags, call_conv)
     }
 
+    /// PLIRON: `get_machine_env_for` that also knows whether the function
+    /// makes a regular (non-tail) call, so it sets up a frame record anyway
+    /// (aarch64 `PLIRON_X30=2`). Default: ignore it.
+    fn get_machine_env_calls(
+        has_wide: bool,
+        _has_calls: bool,
+        flags: &settings::Flags,
+        call_conv: isa::CallConv,
+    ) -> &MachineEnv {
+        Self::get_machine_env_for(has_wide, flags, call_conv)
+    }
+
     /// Get all caller-save registers, that is, registers that we expect
     /// not to be saved across a call to a callee with the given ABI.
     fn get_regs_clobbered_by_call(
@@ -1325,6 +1337,8 @@ pub struct Callee<M: ABIMachineSpec> {
     /// than 256 bits (a 512-bit value); used by `machine_env` for
     /// per-function register-env selection.
     has_wide_vector: bool,
+    /// PLIRON: the body makes a regular call (see `get_machine_env_calls`).
+    has_calls: bool,
 
     _mach: PhantomData<M>,
 }
@@ -1379,6 +1393,20 @@ impl<M: ABIMachineSpec> Callee<M> {
             .dfg
             .values()
             .any(|v| f.dfg.value_type(v).is_vector() && f.dfg.value_type(v).bits() > 256);
+        // PLIRON: whether the body makes a regular call (aarch64
+        // `PLIRON_X30=2`: then the frame record saves the link register
+        // anyway, and allocating it costs nothing more).
+        let has_calls = f.layout.blocks().any(|b| {
+            f.layout.block_insts(b).any(|i| {
+                matches!(
+                    f.dfg.insts[i].opcode(),
+                    crate::ir::Opcode::Call
+                        | crate::ir::Opcode::CallIndirect
+                        | crate::ir::Opcode::TryCall
+                        | crate::ir::Opcode::TryCallIndirect
+                )
+            })
+        });
 
         {
             static FN_DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1515,6 +1543,7 @@ impl<M: ABIMachineSpec> Callee<M> {
             isa_flags: isa_flags.clone(),
             stack_limit,
             has_wide_vector,
+            has_calls,
             _mach: PhantomData,
         })
     }
@@ -1735,7 +1764,7 @@ impl<M: ABIMachineSpec> Callee<M> {
     pub fn machine_env(&self) -> &MachineEnv {
         // PLIRON: pass the per-function wide-vector signal so backends can
         // narrow the env (see `get_machine_env_for`).
-        M::get_machine_env_for(self.has_wide_vector, &self.flags, self.call_conv)
+        M::get_machine_env_calls(self.has_wide_vector, self.has_calls, &self.flags, self.call_conv)
     }
 
     /// The offsets of all sized stack slots (not spill slots) for debuginfo purposes.

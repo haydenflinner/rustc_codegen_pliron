@@ -2093,3 +2093,22 @@ three-address ops anyway). regex's varint writer with the byte computed
 wide (`PLIRON_DEMANDED=1`): the `lsr` was hoisted above `orr x, #0x80` to
 make the `orr` the last use of the shared constant 128, costing a `mov`
 and a `b` per byte. Test `pliron-clif-opt/tests/lucarry.rs`.
+
+## `PLIRON_X30=2` (opt-in): the link register only where a frame record already exists (2026-11-17)
+
+`src/isa/aarch64/inst/regs.rs` (`x30_mode`), `src/machinst/abi.rs`
+(`get_machine_env_calls`, `Callee::has_calls`), `src/isa/aarch64/abi.rs`.
+`=1` allocates x30 in every function, and a frameless leaf then grows a
+frame record to save it (rust-json +46k executed instructions in one
+`Deserialize` leaf). `=2` allocates it only when the body already makes
+a regular call, or frame pointers are preserved. `=0` off.
+
+## `PLIRON_DEADCONST=1` (opt-in): drop dead rematerializable definitions (2026-11-17)
+
+`src/machinst/vcode.rs` (`deadconst_on`, the emission walk): a constant
+or address definition whose register is overwritten before anything
+reads it is not emitted. A spilled constant is rematerialized at every
+reload, so its spill store is already dropped and the definition itself
+is dead (`parse_block`'s `mov x22, #0x12; mov x22, #0x19`). Backward
+liveness starts with every register live at the block end, so a value
+live into a successor stays. `=0` is the default.

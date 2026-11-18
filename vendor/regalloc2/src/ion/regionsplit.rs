@@ -329,6 +329,12 @@ impl<'a, F: Function> Env<'a, F> {
                     any_busy = true;
                 }
             }
+            explain!(
+                "    region-cand {:?}: gain {gain} free {}/{} busy {any_busy}",
+                preg,
+                free.iter().filter(|&&f| f).count(),
+                free.len()
+            );
             if !any_busy || !(gain > 0.0) {
                 // Free everywhere: the probe would have taken it.
                 continue;
@@ -338,7 +344,26 @@ impl<'a, F: Function> Env<'a, F> {
         if cands.is_empty() {
             return false;
         }
-        cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+        // Largest possible gain first; among equal gains (free in every use
+        // block), the register free in the most blocks: fewer blocks forced
+        // to the stack, fewer transitions. Without the tie-break the
+        // caller-saved registers, probed first, filled `K` and a callee-saved
+        // one free across a loop was never cut (blake3's
+        // `compress_chunks_parallel` reloaded two values on a loop exit).
+        // `PLIRON_RA2_REGION_TIE=0`: traversal order.
+        if crate::region_tie() {
+            cands.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(core::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        let fa = a.2.iter().filter(|&&f| f).count();
+                        let fb = b.2.iter().filter(|&&f| f).count();
+                        fb.cmp(&fa)
+                    })
+            });
+        } else {
+            cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+        }
         cands.truncate(crate::region_k());
 
         let n = infos.len();
