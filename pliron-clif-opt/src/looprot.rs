@@ -47,7 +47,8 @@ pub fn run_with(
     // `PLIRON_LOOPROT_COLD` (opt-in): skip loops a cold mark or a zero
     // PGO count flags — rotating them duplicates the exit test for a
     // path that never runs hot.
-    let cold = pliron_cfg::env_is("PLIRON_LOOPROT_COLD", "1");
+    // `PLIRON_COLDMARK=1` turns it on too: the marks then cover panic paths.
+    let cold = pliron_cfg::env_is("PLIRON_LOOPROT_COLD", "1") || pliron_cfg::env_is("PLIRON_COLDMARK", "1");
     let reducible = crate::jumpthread::keep_reducible();
     let merge = pliron_cfg::env_is("PLIRON_LOOPROT_MERGE", "1");
     let mut n = 0;

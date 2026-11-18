@@ -2335,6 +2335,14 @@ fn s_jtround(p: &mut Pipe, _an: &mut Analysis) -> usize {
     total
 }
 
+fn s_coldmark(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::coldmark::run(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("coldmark");
+    }
+    k
+}
+
 fn s_mergejump(p: &mut Pipe, an: &mut Analysis) -> usize {
     // Static block regions (no per-inst map): only merge within one; live
     // regions recompute from the instructions, which is conservative.
@@ -4993,6 +5001,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Straight-line `jump` pairs merge first, so jumpthread sees a
         // param block and the `brif` it feeds as one (see `mergejump`).
         step("mergejump", "mergejump", Gate::OptIn("PLIRON_MERGEJUMP"), s_mergejump).needs(shape::MULTI),
+        // Code that can only end in a trap is cold before anything copies
+        // it (`PLIRON_COLDMARK=1`, see `coldmark`).
+        step("coldmark", "coldmark", Gate::OptIn("PLIRON_COLDMARK"), s_coldmark).needs(shape::MULTI),
         Step {
             name: "jumpthread",
             bisect: Some("jumpthread"),
@@ -5225,6 +5236,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `fold_inc_overflow` needs only a `brif`; loop deletion needs
         // the back edge.
         .needs_any(shape::LOOPS | shape::CONDBR),
+        // Again ahead of the loop duplicators: blocks cloned since the first
+        // run do not always carry the mark.
+        step("coldmark2", "coldmark", Gate::OptIn("PLIRON_COLDMARK"), s_coldmark).needs(shape::LOOPS),
         cstep("looprot", "", Gate::Env("PLIRON_LOOPROT"), s_looprot).needs(shape::LOOPS),
         // Post-rotation dead-loop idioms (`PLIRON_LOOPDEL`): `looprot`
         // produces the post-tested single-latch shape `plan_dead` folds —

@@ -1399,8 +1399,16 @@ pub fn run(
     } else {
         0
     };
+    let budget = growth_budget(func);
+    let start = func.dfg.num_insts();
     let mut n = 0;
     while n < max {
+        if budget.is_some_and(|b| func.dfg.num_insts() - start > b) {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::punroll", "punroll {name}: growth budget spent after {n}");
+            }
+            break;
+        }
         let mut hit = false;
         {
             let crate::pipeline::CfgDtLa { cfg, dt, la } = an.cfg_dt_la(func);
@@ -1549,6 +1557,24 @@ pub fn run(
         an.invalidate(func);
     }
     n + half
+}
+
+/// `PLIRON_PUNROLL_GROWTH=<pct>` (opt-in): stop unrolling, peeling and
+/// jamming once the instructions created exceed `pct`% of the function's
+/// size, and at least `PLIRON_PUNROLL_GROWTH_MIN` (default 256), so a small
+/// function keeps every copy. Loops go innermost first, so what a big
+/// function loses is outer and straight-line loops (brotli's HqZopfli
+/// carried ~400 instructions of copies that never ran,
+/// `docs/history/2026-11-09-hqzopfli-insn-bloat.md`).
+fn growth_budget(func: &Function) -> Option<usize> {
+    static CFG: std::sync::LazyLock<Option<(usize, usize)>> = std::sync::LazyLock::new(|| {
+        let pct = pliron_cfg::env_get("PLIRON_PUNROLL_GROWTH")?.parse::<usize>().ok().filter(|&p| p > 0)?;
+        let min = pliron_cfg::env_get("PLIRON_PUNROLL_GROWTH_MIN").and_then(|s| s.parse().ok()).unwrap_or(256);
+        Some((pct, min))
+    });
+    let (pct, min) = (*CFG)?;
+    let size = func.layout.blocks().map(|b| func.layout.block_insts(b).count()).sum::<usize>();
+    Some((size * pct / 100).max(min))
 }
 
 /// `PLIRON_PUNROLL_SEARCH=1`: unroll search loops too (see `warm_exit`).

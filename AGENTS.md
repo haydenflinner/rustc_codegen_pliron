@@ -710,6 +710,13 @@ time, memory, code size, stack frames) in ~20 min and writes
  instructions, a hit at byte 0 19 -> 85 (no scalar prologue yet).
  `loopvec` now treats `select`s of masks as masks by default
  (`docs/history/2026-11-17-search-vec.md`, tests `search_vec.rs`).
+- `PLIRON_COLDMARK=1`, `PLIRON_PUNROLL_GROWTH=<pct>` (opt-in,
+ 2026-11-17, measured, no default): mark cold every block that cannot
+ reach a `return` (steps `coldmark`/`coldmark2`, `looprot` honours the
+ marks), and stop `punroll` once its copies exceed `pct`% of the function
+ (`_MIN`, default 256). Size -0.06% / -0.32%, retired instructions
+ +0.1..0.7% on two held-out programs
+ (`docs/history/2026-11-17-cold-gates.md`).
 - `PLIRON_I128ID=1` (opt-in) — step `i128id` before the egraph: `x | 0`,
   `x ^ 0`, `x + 0`, `x - 0`, `x & 0` on `i128` with `iconcat` constants
   (foldhash's `u128` sponge). Neutral on the held-out programs.

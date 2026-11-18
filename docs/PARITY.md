@@ -1805,7 +1805,12 @@ Ranked by expected card gain per effort. Each item links its evidence.
 3. **Size/cold gates on duplicating passes**: `punroll`, peeling,
    `jumpthread`, `looprot` and the `MEMFAST` fast path, gated on cold
    loops (bodies that lead to a panic) or huge functions. Bench every
-   kernel.
+   kernel. 2026-11-17: measured, no default. `PLIRON_COLDMARK=1` (blocks
+   that cannot reach a return go cold) saves 0.06% of std's code,
+   `PLIRON_PUNROLL_GROWTH=10` 0.32% of clcg's, `PLIRON_PUNROLL_FNMAX=2000`
+   1.25%; each costs +0.1..0.7% retired instructions on rust-compression
+   or pulldown-cmark (`history/2026-11-17-cold-gates.md`). What is left
+   needs a profile, which `punroll` already reads.
 4. **Aggregate copies as memcpy**: a principled "do not split an alloca
    whose only accesses are whole-object copies" rule in place of the
    `SROA_MAXSLICES` threshold. The forwarding side is done: `memcpyopt`
