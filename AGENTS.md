@@ -949,10 +949,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   (opt-in) prefers, among equal gains, the register free in more blocks.
   `PLIRON_RA_EXPLAIN` prints `region` lines; `clif-check vcode` honours
   it. Stanzas `regionsplit`, `neonpair` (with `PLIRON_RA_CHECK=1`).
+- `PLIRON_X17` (default on since 2026-11-18, aarch64; `=0` off) — x17
+  allocatable. Callgrind non-nop: blind-sig −0.16%, pulldown −0.10%,
+  protobuf −0.08%, compression +0.004%.
 - `PLIRON_X30=1|2` (opt-in, aarch64) — the link register is allocatable.
   `=1` everywhere (a frameless leaf grows a frame record). `=2` only in
   a function that already makes a regular call, or when frame pointers
-  are kept.
+  are kept. With X17, `=1` is blake3 `compress_in_place` −669k but
+  pulldown +0.42%; `=2` helps pulldown, costs blind-sig.
 - `PLIRON_DEADCONST=1` (opt-in) — at emission, drop a rematerializable
   definition whose register is overwritten before it is read.
 - `PLIRON_ELABLOOPS=2` (opt-in) — `=1`'s egraph loop hoisting, but

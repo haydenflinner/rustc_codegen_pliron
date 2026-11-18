@@ -1250,8 +1250,7 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     (`PLIRON_INLINE_FREEMUL=12`): the special-byte scan loop reloaded a
     loop invariant and stored it straight back every iteration. pulldown:
     394 spill stores dropped (2,936 -> 2,542); checker clean.
-95. Extra allocatable integer registers (opt-in, measured neutral;
-    `PLIRON_X17=1`, `PLIRON_X30=1`; `aarch64/inst/regs.rs`
+95. Extra allocatable integer registers (`aarch64/inst/regs.rs`
     `x17_allocatable`/`x30_allocatable`, `aarch64/abi.rs`
     `get_machine_env`/`get_regs_clobbered_by_call`/`compute_frame_layout`,
     `aarch64/inst/emit.rs` `LoadAddr`, `aarch64/inst/mod.rs` veneers).
@@ -1264,8 +1263,11 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     call, and a function that allocates it sets up the frame record so the
     prologue saves it and the epilogue restores it before `ret`. Not
     safe with `get_return_address`, which pliron emits only for wasm.
-    Tuning geomean: x17 1.006, x30 1.007, both 1.001 (montgomery loses
-    one spill pair; register count is not what limits these benches).
+    **`PLIRON_X17` default on since 2026-11-18** (`=0` off): callgrind
+    non-nop blind-sig -0.16%, pulldown -0.10%, protobuf -0.08%,
+    compression +0.004%, the rest within 0.02%. `PLIRON_X30=1|2` stays
+    opt-in: with X17, `=1` takes blake3 `compress_in_place` -669k but
+    costs pulldown +0.42%; `=2` helps pulldown but costs blind-sig.
 96. Alignment knobs (opt-in, measured neutral or worse): `PLIRON_LOOPALIGN=<bytes>`
     (power of two, default 16; `machinst/vcode.rs` loop heads, which ask
     the function for that alignment above 32) and `PLIRON_FNALIGN=<bytes>`

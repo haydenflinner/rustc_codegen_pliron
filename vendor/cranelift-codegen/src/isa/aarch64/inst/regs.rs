@@ -128,13 +128,16 @@ pub fn writable_spilltmp_reg() -> Writable<Reg> {
     Writable::from_reg(spilltmp_reg())
 }
 
-/// `PLIRON_X17`: x17 is allocatable (LLVM allocates both IP registers).
-/// Its post-regalloc uses are all in the prologue (stack-limit check,
-/// probestack loop) where it holds nothing, or in a long-branch veneer,
-/// which then saves and restores it. x16 stays the emit scratch.
+/// `PLIRON_X17` (default on since 2026-11-18; `=0` off): x17 is
+/// allocatable (LLVM allocates both IP registers). Its post-regalloc
+/// uses are all in the prologue (stack-limit check, probestack loop)
+/// where it holds nothing, or in a long-branch veneer, which then saves
+/// and restores it. x16 stays the emit scratch. Callgrind non-nop
+/// against the prior default: blind-sig -0.16%, pulldown -0.10%,
+/// protobuf -0.08%, the rest within 0.02%; compression +0.004%.
 pub fn x17_allocatable() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_X17").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_X17").as_deref() != Ok("0"))
 }
 
 /// `PLIRON_X30`: the link register is allocatable, as in LLVM. Every call

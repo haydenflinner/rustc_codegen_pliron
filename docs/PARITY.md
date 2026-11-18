@@ -371,7 +371,12 @@ in the scoreboard and in the linked history files.
   (moves the largest excess class in five). `PLIRON_RA2_POSTOPT=15` and
   `PLIRON_RA2_SRCVREG` are default on: seven programs fewer executed
   instructions (pulldown -202k, html -90k, protobuf -81k, blind-sig
-  -74k), blake3 +2. Fuzzing: `harness/rafuzz.py`.
+  -74k), blake3 +2. `PLIRON_RA2_REGION` + `SPILLHOIST` default on
+  2026-11-18; `PLIRON_X17` default on the same night (blind-sig -0.16%,
+  pulldown -0.10%). Open: `X30` (blake3 wants it with X17; pulldown /
+  blind-sig disagree on `=1` vs `=2`), `WIDE128` (pulldown flat after the
+  use gate, but blind-sig `montgomery` +2.9%), narrower `REMATW`.
+  Fuzzing: `harness/rafuzz.py`.
 
 - **Held-out programs: 1.08x** (was 1.57x on 2026-10-31). The livelock
   behind blind-sig's 2.1x is fixed

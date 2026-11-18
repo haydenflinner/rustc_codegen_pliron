@@ -75,13 +75,17 @@ KNOBS = [
     ("PLIRON_SPILLCSE", "1", ["0"], "clif", "1"),
     ("PLIRON_EDITPAIR", "1", ["0"], "clif", "1"),
     ("PLIRON_SHRINKWRAP", "1", ["0"], "clif", "1"),
-    ("PLIRON_X17", "0", ["1"], "clif", "1"),
+    ("PLIRON_X17", "1", ["0"], "clif", "1"),
     ("PLIRON_X30", "0", ["1"], "clif", "1"),
 ]
 # Names the sources read that are reports or debugging aids, not behaviour.
 IGNORED = {"PLIRON_RA2_STATS", "PLIRON_RA2_VERBOSE", "PLIRON_RA2_EDITS", "PLIRON_RA2_ALLOC",
            "PLIRON_RA2_POSTOPT_STATS", "PLIRON_RA_CHECK", "PLIRON_RA_CHECK_LABELS", "PLIRON_RA_EXPLAIN",
-           "PLIRON_RA_ALGO", "PLIRON_RA2_"}
+           "PLIRON_RA_ALGO", "PLIRON_RA2_",
+           # REGION / spill tuners and probes (behaviour only via REGION=1)
+           "PLIRON_RA2_COPYHINT", "PLIRON_RA2_MOVESTATS", "PLIRON_RA2_REGION_CAP",
+           "PLIRON_RA2_REGION_K", "PLIRON_RA2_REGION_MAX", "PLIRON_RA2_REGION_MAXB",
+           "PLIRON_RA2_REGION_RATIO", "PLIRON_RA2_SLOTLIVE", "PLIRON_RA2_SLOTLIVE_PROBES"}
 SOURCES = ["vendor/regalloc2/src", "vendor/cranelift-codegen/src/machinst"]
 # Seeds that once failed (ra2 leg), replayed by `quick` under every quick combination.
 REGRESS = []
