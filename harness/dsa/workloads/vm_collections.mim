@@ -1,0 +1,30 @@
+// Array push/index and a dict keyed by strings (hashing, `in`, update).
+// After mimas/benchmarks/collections.
+const N = 400000;
+const K = 256;
+
+let keys: [str] = array::new();
+for j in K {
+    keys.push(f"k{j}");
+}
+
+let data: [int] = array::new();
+for i in N {
+    data.push(i mod K);
+}
+
+let hist: {int} = dict::new();
+for x in data {
+    let key = keys[x];
+    if key in hist {
+        hist[key] = hist[key]! + 1;
+    } else {
+        hist[key] = 1;
+    }
+}
+
+let total = 0;
+for (_, v) in hist {
+    total += v;
+}
+print(total);

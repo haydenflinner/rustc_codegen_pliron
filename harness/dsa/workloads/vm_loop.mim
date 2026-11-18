@@ -1,0 +1,17 @@
+// Flat counted loop: add, mod, three local stores per iteration
+// (bytecode dispatch). After mimas/benchmarks/fib_iter.
+const N = 3000000;
+const MOD = 1000000007;
+
+fn fib_iter(n: int) -> int {
+    let a = 0;
+    let b = 1;
+    for i in n {
+        let t = (a + b) mod MOD;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+print(fib_iter(N));

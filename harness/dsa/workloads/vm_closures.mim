@@ -1,0 +1,19 @@
+// Closures and array combinators: map / filter / fold with captured
+// variables, plus a sort.
+const N = 150;
+
+let xs: [int] = array::new();
+let s = 42;
+for i in 2000 {
+    s = (1103515245 * s + 12345) mod 2147483648;
+    xs.push(s mod 1000);
+}
+
+let total = 0;
+for round in N {
+    let k = round mod 7 + 1;
+    let ys = xs.map(|x| x * k + round);
+    let zs = ys.filter(|y| y mod 3 != 0);
+    total += zs.fold(0, |acc, z| (acc + z) mod 1000003);
+}
+print(total);

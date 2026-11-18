@@ -1,0 +1,1306 @@
+use game;
+use music;
+```
+game-kit. The shared scaffold for `use game` pages. Include it with
+`use "game-kit";` (the host splices this page's source in, like
+`use "img";`).
+
+Two things every game page kept repeating:
+  · the frame loop at the bottom (`game_loop`/`time_loop` say it once
+  · the palette) every page spelled the same hexes out by hand
+
+Directions and changes are opps (`!LEFT` is `RIGHT`, `!add(3)`
+is `remove(3)`), so the kit includes the pact.
+```
+
+```
+opp-kit. Two ends, a flip, and the honest reading in between.
+Include it with `use "opp-kit";` (game-kit does: `Dir` and
+`Change` are opps).
+
+A dichotomy is as basic as an enum: up/down, left/right, add/remove,
+sun/moon, parallel/sequential. It is a type with two ends and one
+operation, `!x`, the other end, and one law: flip twice and you are
+back. Mimas spells it `opp Sky { Sun, Moon }` (the built-in `Opp`
+pact; `inv` is `!`'s method name), and `bool` is the first opp.
+
+What we usually *know* about a dichotomy is not an end, though. "Good
+vs evil" is rarely 100 : 0; the most confident honest reading is more
+like 95 : 5, and rounding it to a `bool` throws the 5 away. A `Dial`
+keeps it: two weights, one per end, read as odds. `!` swaps them,
+exactly, so the law holds bit for bit. Evidence multiplies them
+(`prior * likelihood`, Bayes in odds form), and `snap()` is the lossy
+step to a `bool`. A certain dial (one weight 0) is a `bool` with names
+on: no finite evidence moves it, which is the information 100 : 0
+threw away.
+
+A dial draws itself beside its `let` (`Draw`) as a bar split between
+its ends, and the needle drags (`Respond`): the drag writes the new
+weights back into the source.
+```
+
+/// img. The scene vocabulary. A page draws *values*: `game::draw`,
+/// `game::bounds`, the `live_*` fns, and the debugger's hover-draw all
+/// walk a returned tree into vector prims by reading each node's
+/// variant name (`Img::Rect` is the "rect" kind) and fields, so this
+/// enum is the checked spelling of that contract: a typo'd field or
+/// variant name is a compile error here, not a silent no-op. Include
+/// it with `use "img";`.
+///
+/// `stroke = ""` means none. `Group`'s `at` translates its children
+/// (and is the only `at`-carrying node). The enum is the typed path,
+/// not the only one: the walk is structural, so your own
+/// identically-named struct or enum walks the same way.
+///
+/// Every geometric field is `px`. The renderer works in pixel space,
+/// so passing a quantity (or a bare literal suffixed `px`) is checked
+/// rather than silently rescaled. A `float` helper can put the unit
+/// on at the boundary with `v * 1.0px`.
+///
+/// Coordinates are y-up: the origin is the picture's lower-left, +y
+/// rises, and an extent node's `y` is its LOWER edge — a `Rect`'s box
+/// covers `[y, y + h]`, a `Text`'s baseline rides near the bottom of
+/// its `size`-tall box. Points (`Line`, `Path`, `Arrow`) and `at`
+/// translations are just coordinates in the same space.
+///
+/// `Sprite`'s name carries the sheet-frame ref, "deck" is the whole
+/// `sprite` cell, "deck#7" is frame 7 of a `grid 13x4` one, so a single
+/// painted sheet supplies every piece. `w`/`h` ≤ 0 asks for the
+/// bitmap's natural size (one axis set keeps the aspect); `angle` is
+/// radians, counter-clockwise positive. `Tile` repeats the image
+/// across its rect in `tile`-wide cells.
+enum Img {
+    Rect { x: px↔, y: px↕, w: px↔, h: px↕, fill: str, stroke: str, stroke_w: px },
+    Ellipse { x: px↔, y: px↕, w: px↔, h: px↕, fill: str, stroke: str, stroke_w: px },
+    Line { x: px↔, y: px↕, x2: px↔, y2: px↕, stroke: str, stroke_w: px },
+    // A line with an arrowhead of length `head` at `(x2, y2)`, a
+    // normal, a ray, a direction.
+    Arrow { x: px↔, y: px↕, x2: px↔, y2: px↕, stroke: str, stroke_w: px, head: px },
+    Path { points: [(px↔, px↕)], closed: bool, fill: str, stroke: str, stroke_w: px },
+    // A `Path` stroked `dash` on, `gap` off (a `gap` ≤ 0 repeats `dash`).
+    // Unfilled: a dashed outline is a boundary kind, not a shape.
+    Dashed { points: [(px↔, px↕)], closed: bool, stroke: str, stroke_w: px, dash: px, gap: px },
+    Text { x: px↔, y: px↕, text: str, size: px, fill: str },
+    // `Text` centred on `x`, a caption under a court, a label on a tile.
+    Ctext { x: px↔, y: px↕, text: str, size: px, fill: str },
+    Prose { x: px↔, y: px↕, w: px↔, text: str },
+    // One inline Typst equation (`text` is the math source, not markup):
+    // `Img::Math { x = .., y = .., text = "E = m c^2", size = 12px }`.
+    // `size` 0 follows the page's type size.
+    Math { x: px↔, y: px↕, text: str, size: px },
+    Sprite { name: str, x: px↔, y: px↕, w: px↔, h: px↕, angle: rad },
+    Tile { name: str, x: px↔, y: px↕, w: px↔, h: px↕, tile: px },
+    Group { at: (px↔, px↕), children: [Img] },
+    ```
+    A posed subtree: `at` moves the local origin, `spin` (radians,
+    `Sprite.angle`'s unit, counter-clockwise positive) rotates about
+    it, `zoom` scales it.
+    `children` draw in local space — a subscene composes into the
+    parent without any coordinate threading. `spin` 0 and `zoom` 1
+    make it a `Group`; `Poke` regions inside hit-test correctly.
+    ```
+    Pose { at: (px↔, px↕), spin: rad, zoom: float, children: [Img] },
+    ```
+    A hit region, not a shape: `children` draw as usual, and the rect
+    covering them answers to `on`, a pointer event there calls the
+    binding's `respond` (see the `Respond` pact). `at` translates like
+    `Group`'s; a nested Poke's region wins over its ancestor's.
+    ```
+    Poke { on: str, at: (px↔, px↕), children: [Img] },
+}
+
+// ---- constructors ---------------------------------------------------
+```
+The positional spellings of the common nodes, so a scene reads as a
+list of calls rather than a column of field names; `stroke` and
+`stroke_w` default to none. `rect(x, y, w, h, G_CYAN)` is the filled
+box, `rect(x, y, w, h, "", G_EDGE, 2.0px)` the outline.
+```
+fn rect(x: px↔, y: px↕, w: px↔, h: px↕, fill: str, stroke: str = "", stroke_w: px = 0.0px) -> Img {
+    Img::Rect { x, y, w, h, fill, stroke, stroke_w }
+}
+fn ellipse(x: px↔, y: px↕, w: px↔, h: px↕, fill: str, stroke: str = "", stroke_w: px = 0.0px) -> Img {
+    Img::Ellipse { x, y, w, h, fill, stroke, stroke_w }
+}
+fn line(x: px↔, y: px↕, x2: px↔, y2: px↕, stroke: str, stroke_w: px) -> Img {
+    Img::Line { x, y, x2, y2, stroke, stroke_w }
+}
+/// An open dashed polyline: `dash` on, `gap` off.
+fn dashed(points: [(px↔, px↕)], stroke: str, stroke_w: px, dash: px, gap: px) -> Img {
+    Img::Dashed { points, closed = false, stroke, stroke_w, dash, gap }
+}
+fn text(x: px↔, y: px↕, text: str, size: px, fill: str) -> Img {
+    Img::Text { x, y, text, size, fill }
+}
+fn ctext(x: px↔, y: px↕, text: str, size: px, fill: str) -> Img {
+    Img::Ctext { x, y, text, size, fill }
+}
+/// `children` drawn translated by `(x, y)`.
+fn group(x: px↔, y: px↕, children: [Img]) -> Img {
+    // `at` is a tuple, not a list: each slot keeps its own axis
+    Img::Group { at = (x, y), children }
+}
+/// `children` drawn in a local space: origin at `(x, y)`, spun `spin`
+/// radians counter-clockwise, zoomed `zoom`. `pose(x, y, kids)` is
+/// `group`'s spelling.
+fn pose(x: px↔, y: px↕, children: [Img], spin: rad = 0.0, zoom: float = 1.0) -> Img {
+    Img::Pose { at = (x, y), spin, zoom, children }
+}
+
+/// One pointer gesture a `Poke` region heard: `on` is the node's key,
+/// `kind` is "down" | "drag" | "up", `x`/`y` the point in the picture's
+/// own coordinate space (y up, like every scene coordinate), `dx`/`dy`
+/// the movement since the last event (0 on "down"), so `dy > 0` is the
+/// pointer having risen.
+struct LitEv { on: str, kind: str, x: px↔, y: px↕, dx: px↔, dy: px↕ }
+
+/// The debugger's draw pact: hover a value and the inspector calls its
+/// `draw` for the scene, `impl Draw for W` makes that checked.
+pact Draw {
+    /// The picture of this value, as scene nodes.
+    fn draw(self) -> [Img];
+}
+
+/// The livelit pact: a value drawn with `Poke` regions is interactive,
+/// the host calls `respond` with the `LitEv` a pointer fired and writes
+/// the returned value back into the `let` that binds it (a computed
+/// binding bakes to the literal). Dispatch is by name like `draw`: an
+/// inherent `fn respond(self, ev) -> Self` answers too, but `impl
+/// Respond` keeps the signature checked.
+pact Respond {
+    /// This value after the pointer event `ev`, written back into its `let`.
+    fn respond(self, ev: LitEv) -> Self;
+}
+
+// ---- declarative dragging ----------------------------------------------
+
+```
+A livelit's drag is declared by where it may end, after Joshua
+Horowitz, Andrew Blinn & Jeffrey Heer, "Declarative Dragging", UIST 2026
+(https://declarative-dragging.github.io/). `drag(self, ev)` returns a
+`DragSpec` naming the states the pointer may reach; the host draws every
+one of them (`drag_frames`), reads where the grabbed `Poke` region lands
+in each, and runs the gesture from those positions: the preview snaps,
+floats or slides between the drawn states, and the drop writes the chosen
+state back into the `let`, as `respond` would. The author writes no
+pointer geometry. Only which states are reachable.
+```
+
+/// Where a drag may end.
+enum DragSpec<T> {
+    /// One state the drag may end in.
+    To(T),
+    /// Whichever of these the pointer is nearest to; the preview jumps there.
+    Closest([DragSpec<T>]),
+    /// Slide among these: the preview interpolates by where the pointer sits
+    /// between their targets, and the drop is the nearest one.
+    Between([DragSpec<T>]),
+    /// Vary numbers continuously (up to three): `at` is where they start,
+    /// `lo`/`hi` box them, and `from.vary(VaryAt { on, p })` builds the
+    /// state for a `p`, the host searches for the `p` that puts the
+    /// grabbed region under the pointer.
+    Vary { from: T, on: str, at: [float], lo: [float], hi: [float] },
+    /// The grabbed region follows the pointer while the rest previews the
+    /// target it would drop on.
+    Floating(DragSpec<T>),
+    /// `near` while the pointer is within `px` of one of its targets, `far`
+    /// beyond that, a snap zone around a free move.
+    WhenFar { near: DragSpec<T>, far: DragSpec<T>, px: px },
+    /// Within `px` of a target the preview settles onto it exactly (a
+    /// floating region lands before the drop).
+    Snap(DragSpec<T>, px),
+}
+
+/// The numbers a `Vary` leaf is at: `on` is the region being dragged, `p`
+/// the current values (as many as the leaf's `at`).
+struct VaryAt { on: str, p: [float] }
+
+/// The declarative-drag pact: a value drawn with `Poke` regions says where a
+/// drag of one of them may end. The host asks `drag` once at pointer-down
+/// and writes the dropped state back into the `let` that binds the value.
+/// Alongside `Respond`, a press that never moves still reaches `respond`.
+pact Drag {
+    fn drag(self, ev: LitEv) -> DragSpec<Self>;
+    /// The state a `Vary` leaf's numbers describe. Only continuous drags
+    /// need one; the default keeps the value as it is.
+    fn vary(self, _v: VaryAt) -> Self { self }
+}
+
+/// A drop state drawn: the value (what a drop writes back) and its picture.
+struct DragFrame<T> { state: T, img: [Img] }
+
+/// Every state of a spec drawn, what the host measures for drop zones and
+/// previews between. A `Vary` leaf draws its `from` at `at`.
+fn drag_frames<T: Draw + Drag>(spec: DragSpec<T>) -> DragSpec<DragFrame<T>> {
+    match spec {
+        DragSpec::To(s) => DragSpec::To(DragFrame { state = s, img = s.draw() }),
+        DragSpec::Closest(xs) => DragSpec::Closest([drag_frames(x) for x in xs]),
+        DragSpec::Between(xs) => DragSpec::Between([drag_frames(x) for x in xs]),
+        DragSpec::Vary { from, on, at, lo, hi } => {
+            let s = from.vary(VaryAt { on, p = at })
+            DragSpec::Vary { from = DragFrame { state = s, img = s.draw() }, on, at, lo, hi }
+        }
+        DragSpec::Floating(x) => DragSpec::Floating(drag_frames(x)),
+        DragSpec::WhenFar { near, far, px } => DragSpec::WhenFar { near = drag_frames(near), far = drag_frames(far), px },
+        DragSpec::Snap(x, px) => DragSpec::Snap(drag_frames(x), px),
+    }
+}
+
+/// One `Vary` leaf lifted out of a spec.
+struct VaryLeaf<T> { from: T, on: str, at: [float], lo: [float], hi: [float] }
+
+/// The `Vary` leaves of a spec, in spec order. The index the host's `VaryQ`
+/// counts by.
+fn vary_leaves<T>(spec: DragSpec<T>, out: [VaryLeaf<T>]) -> [VaryLeaf<T>] {
+    match spec {
+        DragSpec::To(_) => out,
+        DragSpec::Closest(xs) => {
+            let acc = out
+            for x in xs { acc = vary_leaves(x, acc) }
+            acc
+        }
+        DragSpec::Between(xs) => {
+            let acc = out
+            for x in xs { acc = vary_leaves(x, acc) }
+            acc
+        }
+        DragSpec::Vary { from, on, at, lo, hi } => {
+            out.push(VaryLeaf { from, on, at, lo, hi })
+            out
+        }
+        DragSpec::Floating(x) => vary_leaves(x, out),
+        DragSpec::WhenFar { near, far, .. } => vary_leaves(far, vary_leaves(near, out)),
+        DragSpec::Snap(x, _) => vary_leaves(x, out),
+    }
+}
+
+/// A `Vary` query from the host: leaf `i` (counting `Vary` leaves in spec
+/// order) at the numbers `p0 p1 p2`, as many as the leaf's `at` has.
+struct VaryQ { i: int, p0: float, p1: float, p2: float }
+
+/// A drag in progress: the spec the binding declared, kept live so the host
+/// can ask any `Vary` leaf for its state and picture at a point of its box.
+struct DragSess<T: Draw + Drag> { spec: DragSpec<T> }
+
+impl DragSess {
+    /// The `i`th `Vary` leaf's state at `q`, what a drop writes back.
+    fn at(self, q: VaryQ) -> T {
+        let l = vary_leaves(self.spec, [])[q.i]
+        let p = [q.p0, q.p1, q.p2]
+        l.from.vary(VaryAt { on = l.on, p = [p[k] for k in 0 .. l.at.len().min(3)] })
+    }
+    /// The `i`th `Vary` leaf's picture at `q`, the host measures the
+    /// grabbed region in it and steers `q` under the pointer.
+    fn probe(self, q: VaryQ) -> [Img] { self.at(q).draw() }
+}
+
+// ---- splines ---------------------------------------------------------------
+// r[impl program.livelit.spline]
+
+```
+A `Spline` (the S9 game value) draws as its solved curve with a `Poke`
+handle on every knot, `use "img"` makes each one a knot-drag livelit
+for free: grab a handle, the curve re-solves live under the pointer,
+and the drop writes the moved knot back into the `let`. Knots carry no
+unit, so `k.x * 1.0px` puts `px` on at the draw boundary.
+```
+
+/// The spline's picture: the curve stroked in white through its solved
+/// samples, and a handle per knot named `knot{i}`. The name `drag`/`vary`
+/// dispatch on. `Curve` draws one in another colour.
+fn spline_img(s: Spline) -> [Img] { spline_drawn(s, "#ffffff", 2.0px) }
+
+/// The spline's picture with its curve in `color`, `width` thick.
+fn spline_drawn(s: Spline, color: str, width: px) -> [Img] {
+    let out = [Img::Path {
+        points = s.pts(48),
+        closed = s.closed, fill = "", stroke = color, stroke_w = width,
+    }]
+    for (i, k) in s.knots.enumerate() {
+        out.push(Img::Poke {
+            on = f"knot{i}",
+            at = (k.x * 1.0px, k.y * 1.0px),
+            children = [Img::Ellipse {
+                x = -5.0px, y = -5.0px, w = 10.0px, h = 10.0px,
+                fill = "#ffffff", stroke = "#000000", stroke_w = 1.0px,
+            }],
+        })
+    }
+    out
+}
+
+impl Draw for Spline {
+    fn draw(self) -> [Img] { spline_img(self) }
+}
+
+impl Drag for Spline {
+    /// A press on `knot{i}` varies that knot's position inside a wide
+    /// box; a press anywhere else leaves the value as it is.
+    fn drag(self, ev: LitEv) -> DragSpec<Spline> {
+        for (i, k) in self.knots.enumerate() {
+            if ev.on == f"knot{i}" {
+                return DragSpec::Vary {
+                    from = self, on = ev.on,
+                    at = [k.x, k.y], lo = [-1.0e4, -1.0e4], hi = [1.0e4, 1.0e4],
+                }
+            }
+        }
+        DragSpec::To(self)
+    }
+
+    /// The state `knot{i}` at `v.p` describes: that knot moved to the
+    /// point, the list otherwise untouched, the solve re-fits the curve.
+    fn vary(self, v: VaryAt) -> Spline {
+        for (i, _k) in self.knots.enumerate() {
+            if v.on == f"knot{i}" {
+                return Spline {
+                    knots = [if j == i { Vec2::new(v.p[0], v.p[1]) } else { self.knots[j] } for j in 0 .. self.knots.len()],
+                    closed = self.closed,
+                }
+            }
+        }
+        self
+    }
+}
+
+/// A spline drawn in a colour and width you choose. It drags like a
+/// `Spline`: a press on a knot moves it, and the drop writes the whole
+/// `Curve` back into its `let`, colour and width kept.
+/// r[impl program.livelit.spline.color]
+struct Curve { spline: Spline, color: str, width: px }
+
+impl Draw for Curve {
+    fn draw(self) -> [Img] { spline_drawn(self.spline, self.color, self.width) }
+}
+
+impl Drag for Curve {
+    /// The spline's own drag, holding this curve instead of the bare spline.
+    fn drag(self, ev: LitEv) -> DragSpec<Curve> {
+        match self.spline.drag(ev) {
+            DragSpec::Vary { on, at, lo, hi, .. } =>
+                DragSpec::Vary { from = self, on, at, lo, hi },
+            _ => DragSpec::To(self),
+        }
+    }
+
+    fn vary(self, v: VaryAt) -> Curve {
+        Curve { spline = self.spline.vary(v), color = self.color, width = self.width }
+    }
+}
+
+// ---- the frame loop ---------------------------------------------------
+
+```
+A `use game` page's checked entry point: `impl Game for W` says `W`
+is the world, and the host splices the canonical loop — `init` seeds
+it (a `pack` card when there's no `init`), then every frame `tick`
+steps it on the input and events, `update` on the elapsed `dt`, and
+`paint` renders it. The world is a `Draw`, so `paint`'s default
+walks the same tree the debugger shows: a game of only data still
+paints. The free-fn `init`/`tick`/`draw` spellings keep working —
+this pact is the checked version of them.
+```
+
+/// A game world: `impl Game for W` opts the page into the frame loop.
+/// The required `Draw` is the debugger's scene protocol — hover a `W`
+/// and its `draw` paints it — and doubles as `paint`'s default.
+pact Game: Draw {
+    /// The world after this frame's input and edge-triggered events.
+    fn tick(self, inp: Input, evs: [Ev]) -> Self;
+    /// The world after `dt` seconds — a step that needs no input. The
+    /// default leaves it untouched.
+    fn update(self, _dt: s) -> Self { self }
+    /// Render the world into the frame's prims. The default draws the
+    /// `draw` tree — write `draw` alone and the game still paints.
+    fn paint(self) { game::draw(self.draw()) }
+}
+
+
+// `Opp` itself is built into mimas, `pact Opp { fn inv(self)
+// -> Self; }`, the pact an `opp Sky { Sun, Moon }` declaration implements
+// (`!Sky::Sun == Sky::Moon`). This kit adds the law and the reading.
+
+/// The law, for any dichotomy. A `check` line per instance.
+fn involutive(x: Opp) -> bool { !(!x) == x }
+
+// ---- dials ----------------------------------------------------------
+
+/// A reading between the two ends `lo` and `hi`, as weights: `wlo : whi`.
+/// Only the ratio means anything (`5 : 95` and `1 : 19` are the same
+/// confidence) but the weights are kept as written, so a dial in source
+/// reads the way you'd say it.
+struct Dial { lo: str, hi: str, wlo: float, whi: float }
+
+/// `odds("evil", "good", 5.0, 95.0)`. 95 : 5 toward good.
+fn odds(lo: str, hi: str, wlo: float, whi: float) -> Dial {
+    Dial { lo, hi, wlo, whi }
+}
+
+/// The label an opp's end reads by: its glyph when the opp has them
+/// (`LightDark::Light` reads "☀"), else its name (`Sky::Sun` reads "Sun").
+fn end_name(x: Opp) -> str {
+    let g = x.glyph();
+    if g != "" { return g; }
+    let parts = f"{x}".split("::");
+    parts[parts.len() - 1]
+}
+
+/// A dial between an opp's two ends, labelled from the type. 95 : 5
+/// toward light is `odds_toward(LightDark::Light, 5.0, 95.0)`, reading
+/// "Dark 5 : 95 Light".
+fn odds_toward(end: Opp, against: float, toward: float) -> Dial {
+    odds(end_name(!end), end_name(end), against, toward)
+}
+
+/// No information yet: 1 : 1.
+fn even(lo: str, hi: str) -> Dial { odds(lo, hi, 1.0, 1.0) }
+
+/// A `bool` with names on. The 100 : 0 corner.
+fn sure(lo: str, hi: str, at_hi: bool) -> Dial {
+    if at_hi { odds(lo, hi, 0.0, 1.0) } else { odds(lo, hi, 1.0, 0.0) }
+}
+
+impl Opp for Dial {
+    /// The other end's reading: `!(5 : 95)` is `95 : 5`.
+    fn inv(self) -> Dial { Dial { wlo = self.whi, whi = self.wlo, ..self } }
+}
+
+impl Dial {
+    /// The share toward `hi`, 0..1 (1 : 1 when both weights are 0, no
+    /// evidence either way reads as even).
+    fn p(self) -> float {
+        let t = self.wlo + self.whi;
+        if t <= 0.0 { 0.5 } else { self.whi / t }
+    }
+    /// The name of the end it leans to, or "even".
+    fn lean(self) -> str {
+        if self.whi > self.wlo { self.hi } else if self.wlo > self.whi { self.lo } else { "even" }
+    }
+    /// At an end: one weight is 0.
+    fn certain(self) -> bool { (self.wlo == 0.0) != (self.whi == 0.0) }
+    /// Measure: round to the nearer end. Lossy, `snap` forgets how sure.
+    fn snap(self) -> bool { self.whi > self.wlo }
+    /// The same confidence with weights summing to `total` (100 reads as
+    /// percent).
+    fn scaled(self, total: float) -> Dial {
+        let p = self.p();
+        Dial { wlo = total * (1.0 - p), whi = total * p, ..self }
+    }
+    /// Combine independent evidence: odds multiply (`prior * likelihood`).
+    /// The ends are `self`'s.
+    fn mul(self, o: Dial) -> Dial {
+        Dial { wlo = self.wlo * o.wlo, whi = self.whi * o.whi, ..self }
+    }
+    fn show(self) -> str { f"{self.lo} {self.wlo} : {self.whi} {self.hi}" }
+}
+
+// the law, and what the weights buy
+check involutive(odds("evil", "good", 5.0, 95.0))
+check !(!odds("evil", "good", 5.0, 95.0)) == odds("evil", "good", 5.0, 95.0)
+check (!odds("evil", "good", 5.0, 95.0)).lean() == "evil"
+check odds("evil", "good", 5.0, 95.0).p() == 0.95
+check odds("evil", "good", 1.0, 19.0).p() == odds("evil", "good", 5.0, 95.0).p()   // only the ratio
+check odds("evil", "good", 5.0, 95.0).snap()                        // measuring keeps the lean…
+check !odds("evil", "good", 5.0, 95.0).certain()                    // …and drops how sure
+check sure("evil", "good", true).certain()
+check (even("tails", "heads") * odds("tails", "heads", 1.0, 3.0)).p() == 0.75   // evidence moves an even prior
+check (odds("no", "yes", 1.0, 4.0) * odds("no", "yes", 1.0, 4.0)).p() > 0.94    // twice the evidence, surer
+check (sure("no", "yes", true) * odds("no", "yes", 1000.0, 1.0)).p() == 1.0      // certainty can't be talked down
+check (odds("a", "b", 2.0, 3.0) * even("a", "b")) == odds("a", "b", 2.0, 3.0)    // even is the identity
+check odds("evil", "good", 1.0, 3.0).scaled(100.0) == odds("evil", "good", 25.0, 75.0)
+check even("lo", "hi").lean() == "even"
+check odds_toward(LightDark::Light, 5.0, 95.0) == odds("☾", "☀", 5.0, 95.0)   // labels from the opp's glyphs
+check odds_toward(PosNeg::Neg, 1.0, 3.0).lean() == "➖"
+check odds_toward(BigSmall::Big, 1.0, 9.0).lean() == odds_toward(BigSmall::Small, 9.0, 1.0).lean()   // one reading, told from either end
+
+// ---- drawing --------------------------------------------------------
+
+```
+A bar from `lo` (left) to `hi` (right), each end's share filled in its
+own colour, the needle at the split. The bar is a `Poke` region: drag
+anywhere on it and the needle follows, keeping the weights' total (100
+when they were both 0).
+```
+
+/// its own palette: game-kit `use`s this kit, not the other way round
+const DIAL_(INK, DIM, EDGE) = ("#e2e8f0", "#94a3b8", "#334155");
+const DIAL_(LO_FILL, HI_FILL) = ("#f0a03c88", "#22d3ee88");
+const DIAL_W = 280.0px;
+const DIAL_H = 22.0px;
+const DIAL_X = 8.0px;
+const DIAL_Y = 26.0px;
+
+impl Draw for Dial {
+    fn draw(self) -> [Img] {
+        let split = DIAL_X + DIAL_W * self.p();
+        let lo_ink = if self.whi > self.wlo { DIAL_DIM } else { DIAL_INK };
+        let hi_ink = if self.wlo > self.whi { DIAL_DIM } else { DIAL_INK };
+        [
+            Img::Poke { on = "dial", at = (0.0px, 0.0px), children = [
+                Img::Rect { x = DIAL_X, y = DIAL_Y, w = split - DIAL_X, h = DIAL_H,
+                            fill = DIAL_LO_FILL, stroke = "", stroke_w = 0.0px },
+                Img::Rect { x = split, y = DIAL_Y, w = DIAL_X + DIAL_W - split, h = DIAL_H,
+                            fill = DIAL_HI_FILL, stroke = "", stroke_w = 0.0px },
+                Img::Rect { x = DIAL_X, y = DIAL_Y, w = DIAL_W, h = DIAL_H,
+                            fill = "", stroke = DIAL_EDGE, stroke_w = 1.0px },
+                Img::Line { x = split, y = DIAL_Y - 6.0px, x2 = split, y2 = DIAL_Y + DIAL_H + 6.0px,
+                            stroke = DIAL_INK, stroke_w = 3.0px },
+            ] },
+            // the labels ride above the dial's band, the share line below it
+            Img::Text { x = DIAL_X, y = DIAL_Y + DIAL_H - 6.0px, text = self.lo, size = 14.0px, fill = lo_ink },
+            Img::Text { x = DIAL_X + DIAL_W - 8.0px * self.hi.len().to_float(), y = DIAL_Y + DIAL_H - 6.0px,
+                        text = self.hi, size = 14.0px, fill = hi_ink },
+            Img::Text { x = DIAL_X, y = DIAL_Y - 31.0px,
+                        text = f"{self.wlo} : {self.whi}", size = 13.0px, fill = DIAL_DIM },
+        ]
+    }
+}
+
+impl Respond for Dial {
+    /// Drag the needle: the share toward `hi` follows the pointer, rounded
+    /// to a whole percent of the weights' total.
+    fn respond(self, ev: LitEv) -> Dial {
+        if ev.on != "dial" { return self }
+        let t = if self.wlo + self.whi > 0.0 { self.wlo + self.whi } else { 100.0 };
+        let p = ((ev.x - DIAL_X) / DIAL_W).max(0.0).min(1.0);
+        let whi = (p * 100.0).round() / 100.0 * t;
+        Dial { wlo = t - whi, whi, ..self }
+    }
+}
+
+
+// ---- the loop -------------------------------------------------------
+
+```
+A game is three pieces: `init` makes the starting world, `tick`
+steps it on the frame's input and events, `draw` paints it. The
+loop that turns those into a running game is always the same. One
+`yield_frame` per pass until the host quits, so say it once and
+hand the pieces in: `game_loop(init(), tick, draw)`, or skip the
+init fn and pass the literal, `game_loop(W { t = 0.0 }, tick, draw)`.
+`W` is the game's own state type; generic, so the kit doesn't pin it.
+Note `tick` *gets* the frame's events, `game::events()` drains its
+queue on read, so take `evs` as a param rather than re-reading it.
+```
+fn game_loop<W>(world: W, tick: (W, Input, [Ev]) -> W, draw: (W) -> ()) {
+    let w = world;
+    while !game::quitting() {
+        w = tick(w, game::input(), game::events());
+        draw(w);
+        game::yield_frame();
+    }
+}
+
+/// The animation flavor for pages that only need the frame's `dt`.
+/// NOT `game_loop` underneath, `game::events()` drains its queue when
+/// read, so fetching it here would starve a `tick` that reads events
+/// itself. Input snapshots are safe to double-read; events are not.
+fn time_loop<W>(world: W, tick: (W, s) -> W, draw: (W) -> ()) {
+    let w = world;
+    while !game::quitting() {
+        w = tick(w, game::input().dt);
+        draw(w);
+        game::yield_frame();
+    }
+}
+
+// ---- geometry -------------------------------------------------------
+
+```
+`Rect<T>` is a plain positioned box, generic over the unit: `Rect<px>`
+is a screen-space region (hit tests, layout), but `Rect<inch>` in a
+carpentry spec or `Rect<float>` on a dimless field work the same way,
+the methods only need `T + T` and `T <= T`, which unify when every
+side is the same param. (Distinct units in one rect. `Rect{ x: px,
+w: inch }`, are a type error: the methods would be unsound.)
+```
+struct Rect<T> {
+    x: T,
+    y: T,
+    w: T,
+    h: T,
+}
+impl Rect {
+    fn right(self) -> T { self.x + self.w }
+    /// the high edge: `y` is the lower edge (y up), so `y + h` is the top
+    fn top(self) -> T { self.y + self.h }
+    fn cx(self) -> float { (self.x + self.x + self.w) / 2.0 }
+    fn cy(self) -> float { (self.y + self.y + self.h) / 2.0 }
+    fn contains(self, x: T, y: T) -> bool {
+        x >= self.x && x <= self.right() && y >= self.y && y <= self.top()
+    }
+    fn inflate(self, d: T) -> Rect<T> {
+        Rect { x = self.x - d, y = self.y - d,
+            w = self.w + d + d, h = self.h + d + d }
+    }
+    fn move_to(self, x: T, y: T) -> Rect<T> {
+        Rect { x, y, w = self.w, h = self.h }
+    }
+    fn intersects(self, r: Rect<T>) -> bool {
+        self.x < r.right() && r.x < self.right() && self.y < r.top() && r.y < self.top()
+    }
+}
+
+// ---- directions and moves -------------------------------------------
+
+```
+(docs/axes.md.) A direction is a unit step on the screen's axes,
+y up: `RIGHT` is (1, 0), `UP` is (0, 1). Measuring a quantity
+"along" a direction is a sign (`x * LEFT.dx` is `x` counted positive
+leftward) so code written for one side of a field serves the other
+side with the direction as the argument (pong's `paddle_hit`). Until
+the compiler carries axes on quantities (`px↔`, `3px←`), this is the
+value half of that design. A `space`, since every field is an axis
+and `!d` is the flip (`Dir { -dx, -dy }`, written `d.neg()` too).
+```
+space Dir { dx: float, dy: float }
+const RIGHT = Dir { dx = 1.0, dy = 0.0 };    // →  the unmarked direction: reading order
+const LEFT = Dir { dx = -1.0, dy = 0.0 };    // ←
+const UP = Dir { dx = 0.0, dy = 1.0 };       // ↑  +y on a screen
+const DOWN = Dir { dx = 0.0, dy = -1.0 };    // ↓
+const DIRS4 = [RIGHT DOWN LEFT UP];        // clockwise: each is the one before turned by ↻
+const STILL = Dir { dx = 0.0, dy = 0.0 };  // the zero direction: no move, no facing
+impl Dir {
+    fn neg(self) -> Dir { Dir { dx = -self.dx, dy = -self.dy } }
+    fn same(self, o: Dir) -> bool { self.dx == o.dx && self.dy == o.dy }
+    /// the component of (x, y) measured positive in this direction
+    fn along(self, x: float, y: float) -> float { x * self.dx + y * self.dy }
+    fn vec(self, len: float) -> Vec2 { Vec2 { x = self.dx * len, y = self.dy * len } }
+}
+
+```
+A move is a symmetry of the square. A signed swap of the axes,
+(x, y) -> (a·x + b·y, c·x + d·y). There are eight: four turns and
+four mirrors, and `↻` with `⇄` generate the rest. The moves are named
+by their glyphs (type `@cw`, `@flipx`, … in a code card). A move on a
+direction is a move on anything made of directions (`dir`, `vec`,
+`Grid.turn`); `Turnable` below states the group's laws once and every
+impl is checked against them. `*` composes left to right. `↻ * ⇄` is
+`↻` then `⇄`. and carries a direction or a vector: `RIGHT * ↻ == DOWN`,
+`v * ⇄` is `v` mirrored. A space too: `!m` is the move a half-turn
+away. `!⇄` is `⇅`, `!↻` is `↺`, `!MOVE_ID` is `ROT_HALF`.
+```
+space Move { a: float, b: float, c: float, d: float }
+const MOVE_ID = Move { a = 1.0, b = 0.0, c = 0.0, d = 1.0 };
+// y up, so on screen a clockwise quarter turn is (x, y) -> (y, -x)
+const ↻ = Move { a = 0.0, b = 1.0, c = -1.0, d = 0.0 };    // clockwise: (x, y) -> (y, -x), RIGHT -> DOWN
+const ↺ = Move { a = 0.0, b = -1.0, c = 1.0, d = 0.0 };    // counter-clockwise: (x, y) -> (-y, x)
+const ROT_HALF = Move { a = -1.0, b = 0.0, c = 0.0, d = -1.0 }; // ↻ * ↻
+const ⇄ = Move { a = -1.0, b = 0.0, c = 0.0, d = 1.0 };    // swap left and right
+const ⇅ = Move { a = 1.0, b = 0.0, c = 0.0, d = -1.0 };    // swap up and down
+// y up makes the screen's `\` diagonal the line y = -x, so the ↘ arrow
+// mirrors across it: (x, y) -> (-y, -x)
+const ⤡ = Move { a = 0.0, b = -1.0, c = -1.0, d = 0.0 };
+/// all eight; the last is the other diagonal mirror, `ROT_HALF * ⤡`
+const MOVES = [MOVE_ID ↻ ROT_HALF ↺ ⇄ ⇅ ⤡ Move { a = 0.0, b = 1.0, c = 1.0, d = 0.0 }];
+impl Move {
+    fn dir(self, d: Dir) -> Dir {
+        Dir { dx = self.a * d.dx + self.b * d.dy, dy = self.c * d.dx + self.d * d.dy }
+    }
+    fn vec(self, v: Vec2) -> Vec2 {
+        Vec2 { x = self.a * v.x + self.b * v.y, y = self.c * v.x + self.d * v.y }
+    }
+    /// `self` first, then `m`
+    fn then(self, m: Move) -> Move {
+        Move { a = m.a * self.a + m.b * self.c, b = m.a * self.b + m.b * self.d,
+               c = m.c * self.a + m.d * self.c, d = m.c * self.b + m.d * self.d }
+    }
+    fn same(self, m: Move) -> bool {
+        self.a == m.a && self.b == m.b && self.c == m.c && self.d == m.d
+    }
+    /// a move on a point pair, axis-tagged: `p * ↻` turns it a quarter
+    /// clockwise, `p * ⇄` mirrors it. The map mixes the coordinates, so
+    /// the slots are stripped for the affine sum and the result reads
+    /// back as (x, y) — the axes are positional, not provenance.
+    fn pair(self, p: (px↔, px↕)) -> (px↔, px↕) {
+        ((p.0.to(1px) * self.a + p.1.to(1px) * self.b) * 1.0px,
+         (p.0.to(1px) * self.c + p.1.to(1px) * self.d) * 1.0px)
+    }
+    /// `m * n` is `m` then `n`; `d * m` and `v * m` carry a direction or a vector
+    fn mul(self, m: Move) -> Move { self.then(m) }
+    fn rmul(self, d: Dir) -> Dir { self.dir(d) }
+    fn rmul(self, v: Vec2) -> Vec2 { self.vec(v) }
+    fn rmul(self, p: (px↔, px↕)) -> (px↔, px↕) { self.pair(p) }
+}
+
+/// Anything a move carries. The laws are the square's: four quarter turns
+/// are no move, a mirror undoes itself, and a turn then a mirror is the
+/// transpose. Each impl is checked against them over its type's samples.
+pact Turnable {
+    fn turned(self, m: Move) -> Self;
+    check |x| x.turned(↻).turned(↻).turned(↻).turned(↻) == x
+    check |x| x.turned(⇄).turned(⇄) == x
+    check |x| x.turned(↻).turned(⇄) == x.turned(⤡)
+}
+impl Dir { fn samples() -> [Dir] { DIRS4 } }
+impl Turnable for Dir { fn turned(self, m: Move) -> Dir { self * m } }
+impl Move { fn samples() -> [Move] { MOVES } }
+impl Turnable for Move { fn turned(self, m: Move) -> Move { self * m } }
+
+check ↻ * ↻ * ↻ * ↻ == MOVE_ID
+check ↻ * ↻ == ROT_HALF
+check ↻ * ↺ == MOVE_ID
+check RIGHT * ↻ == DOWN                     // clockwise carries right to down (y is up)
+check Vec2 { x = 3.0, y = 4.0 } * ⇄ == Vec2 { x = -3.0, y = 4.0 }
+// a point pair turns too — the slots keep their (x, y) axes through
+// the map, so a quarter-turn on screen coords stays `(px↔, px↕)`
+check (30.0px, 10.0px) * ↻ == (10.0px, -30.0px)   // y up: clockwise sends +y to +x
+check (30.0px, 10.0px) * ⇄ == (-30.0px, 10.0px)
+check (30.0px, 10.0px) * ↻ * ↻ * ↻ * ↻ == (30.0px, 10.0px)
+check (30.0px, 10.0px) * ⤡ == (-10.0px, -30.0px)  // y up: ⤡ mirrors across y = -x
+check !LEFT == RIGHT                        // the space's flip
+check (!UP).same(DOWN)
+check !⇄ == ⇅                               // `!` on a move is the half-turn away
+check !↻ == ↺
+check !MOVE_ID == ROT_HALF
+check !(!⤡) == ⤡
+check ROT_HALF * ⤡ == MOVES[7]
+
+/// A vector is an axis too. `!v` is `-v`, and a `Vec2`/`Vec3` field can
+/// be one axis of a larger `space`.
+impl Opp for Vec2 {
+    fn inv(self) -> Vec2 { Vec2 { x = -self.x, y = -self.y } }
+}
+impl Opp for Vec3 {
+    fn inv(self) -> Vec3 { Vec3 { x = -self.x, y = -self.y, z = -self.z } }
+}
+check !Vec2 { x = 3.0, y = -1.0 } == Vec2 { x = -3.0, y = 1.0 }
+check ↻.dir(RIGHT).same(DOWN)
+check DOWN * ↻ == LEFT
+check ↻ * ⇄ == ⇄ * ↺                       // a turn then a mirror is the mirror then the other turn
+check UP.neg().same(DOWN)
+check !UP == DOWN                   // `!d` is `d.inv()`. The `!` overload
+check not UP == DOWN                // `not d` spells the same inversion
+check -UP == DOWN                   // and a direction's flip is its negation
+check involutive(LEFT)              // the dichotomy law, through the pact
+check LEFT.along(3.0, 7.0) == -3.0
+
+// ---- grids ----------------------------------------------------------
+
+```
+A 2-D arrangement is a 1-D one with a period, `cols`. `at(r, c)` is
+the one place the flat index `r * cols + c` is written. Rows count
+in READING order — row 0 is the top row — which is a data order, not
+a screen coordinate: `step` takes a screen `Dir` (y up) and maps it
+to a row delta, so `DOWN` is still `+cols`. Stepping a flat index
+needs the period, which is why the cursor verbs, `step`, `newline`,
+live here and not on `Dir`: a newline is a carry, not a direction.
+`turn` is a move with a pivot, the grid's own box (tetris's
+"quarter-turn inside the CURRENT box").
+```
+struct Grid<T> { rows: int, cols: int, cells: [T] }
+fn grid_filled<T>(rows: int, cols: int, v: T) -> Grid<T> {
+    let cells: [T] = [v for _i in rows * cols]
+    Grid { rows, cols, cells }
+}
+impl Grid {
+    fn inside(self, r: int, c: int) -> bool {
+        r >= 0 && r < self.rows && c >= 0 && c < self.cols
+    }
+    fn at(self, r: int, c: int) -> T { self.cells[r * self.cols + c] }
+    fn set(self, r: int, c: int, v: T) -> Grid<T> {
+        let cells = self.cells;
+        cells[r * self.cols + c] = v;
+        Grid { cells, ..self }
+    }
+    /// the flat index one screen step in `d`, or null off the edge.
+    /// `d.dy` is up-positive (screen), rows count down from the top
+    /// (reading order), so a screen step maps to `-d.dy` rows.
+    fn step(self, i: int, d: Dir) -> int? {
+        let r = i ~/ self.cols - d.dy.to_int();
+        let c = i mod self.cols + d.dx.to_int();
+        if !self.inside(r, c) { return null; }
+        r * self.cols + c
+    }
+    /// `\r\n`: back to the row start, then down one, or null past the last row
+    fn newline(self, i: int) -> int? {
+        let r = i ~/ self.cols + 1;
+        if r >= self.rows { return null; }
+        r * self.cols
+    }
+    /// a quarter turn clockwise about the grid's own box: rows become cols
+    fn turn(self) -> Grid<T> {
+        if self.cells.len() == 0 { return Grid { rows = self.cols, cols = self.rows, cells = self.cells }; }
+        let out: [T] = [self.cells[0] for _i in self.rows * self.cols]
+        for r in self.rows {
+            for c in self.cols {
+                // (r, c) -> (c, rows - 1 - r)
+                out[c * self.rows + (self.rows - 1 - r)] = self.at(r, c);
+            }
+        }
+        Grid { rows = self.cols, cols = self.rows, cells = out }
+    }
+    /// the mirror across the diagonal: (r, c) -> (c, r)
+    fn transpose(self) -> Grid<T> {
+        if self.cells.len() == 0 { return Grid { rows = self.cols, cols = self.rows, cells = self.cells }; }
+        let out: [T] = [self.cells[0] for _i in self.rows * self.cols]
+        for r in self.rows {
+            for c in self.cols { out[c * self.rows + r] = self.at(r, c); }
+        }
+        Grid { rows = self.cols, cols = self.rows, cells = out }
+    }
+}
+/// a 2×3 grid 0 1 2 / 3 4 5 turned clockwise reads 3 0 / 4 1 / 5 2
+fn grid_sample() -> Grid<int> {
+    let g = grid_filled(2, 3, 0);
+    for i in 6 { g = g.set(i ~/ 3, i mod 3, i); }
+    g
+}
+check grid_sample().at(1, 2) == 5
+check grid_sample().turn().rows == 3
+check grid_sample().turn().at(0, 0) == 3
+check grid_sample().turn().at(2, 1) == 2
+check grid_sample().turn().turn().turn().turn().at(1, 2) == 5
+check grid_sample().transpose().at(2, 1) == 5
+check grid_sample().step(0, RIGHT)! == 1
+check grid_sample().step(0, DOWN)! == 3
+check grid_sample().step(2, RIGHT) == null
+check grid_sample().newline(1)! == 3
+check grid_sample().newline(4) == null
+
+// ---- boards ---------------------------------------------------------
+
+```
+A lattice is a grid of cells placed on the screen: an origin, a cell
+size, and how many rows and cols. tetris's `OX OY CS COLS ROWS` and
+brickbreaker's wall were this, as five loose constants each. Every
+method is 1-D on purpose, `col_at(x)` is a question along ↔ and
+`row_at(y)` one along ↕, because a lattice is two 1-D arrangements
+side by side, and the axis says which one a value belongs to.
+
+`(x, y)` is the lattice's LOWER-left corner (y up). Rows still count
+in reading order — row 0 is the TOP row, covering the lattice's
+highest `ch` — so `cell_y(r)` descends as `r` grows and `row_at`
+un-inverts the same map.
+```
+struct Lattice { x: px↔, y: px↕, cw: px↔, ch: px↕, rows: int, cols: int }
+impl Lattice {
+    fn w(self) -> px↔ { self.cols.to_float() * self.cw }
+    fn h(self) -> px↕ { self.rows.to_float() * self.ch }
+    fn rect(self) -> Rect<px> { Rect { x = self.x, y = self.y, w = self.w(), h = self.h() } }
+    fn cell_x(self, c: int) -> px↔ { self.x + c.to_float() * self.cw }
+    /// the lower edge of row `r`: row 0 sits highest
+    fn cell_y(self, r: int) -> px↕ { self.y + (self.rows - 1 - r).to_float() * self.ch }
+    fn cell_rect(self, r: int, c: int) -> Rect<px> {
+        Rect { x = self.cell_x(c), y = self.cell_y(r), w = self.cw, h = self.ch }
+    }
+    /// which column holds screen x (may be off the board: check `inside`)
+    fn col_at(self, x: px↔) -> int { ((x - self.x) / self.cw).floor().to_int() }
+    /// which row holds screen y (may be off the board): y measured up
+    /// from the lattice's lower edge, row 0 the top, so a y below the
+    /// lattice lands on row `rows` and one above its top on row -1
+    fn row_at(self, y: px↕) -> int { self.rows - 1 - ((y - self.y) / self.ch).floor().to_int() }
+    fn inside(self, r: int, c: int) -> bool {
+        r >= 0 && r < self.rows && c >= 0 && c < self.cols
+    }
+}
+fn lattice_sample() -> Lattice { Lattice { x = 100.0px, y = 50.0px, cw = 20.0px, ch = 10.0px, rows = 3, cols = 4 } }
+check lattice_sample().w() == 80.0px
+check lattice_sample().rect().top() == 80.0px
+check lattice_sample().col_at(139.0px) == 1
+check lattice_sample().row_at(49.0px) == 3   // just below the lower edge → row `rows`
+check lattice_sample().row_at(75.0px) == 0   // near the top → row 0
+check lattice_sample().cell_y(0) == 70.0px   // row 0's lower edge is the highest band
+check lattice_sample().cell_rect(2, 3).x == 160.0px
+check lattice_sample().inside(2, 3)
+check !(lattice_sample().inside(3, 0))
+
+// ---- changes --------------------------------------------------------
+```
+The third kind of direction. A `Dir` is sign × magnitude, it moves
+a position along an axis. A cursor verb maps a position to a
+position. A *change* is sign × element, `add x` is `x` at weight
++1, `remove x` is `x` at weight −1. A stream of changes summed per
+element is a Z-set (Feldera's word for what diffs, undo lists, and
+sync ops all are); the weight is what makes `add a + remove a` a
+real noop and `-change` a real undo.
+```
+struct Change<T> { x: T, w: int }
+fn add<T>(x: T) -> Change<T> { Change { x, w = 1 } }
+fn remove<T>(x: T) -> Change<T> { Change { x, w = -1 } }
+impl Change {
+    /// The undo: `(add 3).neg()` is `remove 3`. `!c` spells it too.
+    fn neg(self) -> Change<T> { Change { x = self.x, w = -self.w } }
+    fn is_add(self) -> bool { self.w > 0 }
+    /// Where a change lands: `(add 4).on(xs)` pushes a copy, `(remove
+    /// 2).on(xs)` drops the first match, arrays have no remove-at, so
+    /// the removal rebuilds (derby.mimas says this out loud).
+    fn on(self, xs: [T]) -> [T] {
+        let out: [T] = [];
+        let skip = self.w < 0;
+        for v in xs {
+            if skip && v == self.x { skip = false } else { out.push(v) }
+        }
+        if self.w > 0 { out.push(self.x) }
+        out
+    }
+    /// `xs + c` applies `c`; `xs - c` applies `c`'s undo. `[1 2] - remove 2`
+    /// is `[1 2 2]`, since `-remove` is `add`. The collection owns the left
+    /// side, so the `r`-names carry the dispatch.
+    fn radd(self, xs: [T]) -> [T] { self.on(xs) }
+    fn rsub(self, xs: [T]) -> [T] { self.neg().on(xs) }
+}
+/// A change and its undo are a dichotomy: `!add(3)` is `remove(3)`.
+impl Opp for Change {
+    fn inv(self) -> Change<T> { self.neg() }
+}
+/// A `{int}` *is* a Z-set. One weight per element. `tally`
+/// banks a change's weight onto the key; zero drops it.
+fn tally(z: {int}, c: Change<str>) -> {int} {
+    let w = (z[c.x] ?? 0) + c.w;
+    if w == 0 { z.remove(c.x); } else { z.insert(c.x, w); }
+    z
+}
+check add(3).w == 1
+check remove("k").w == -1
+check add(3).neg() == remove(3)
+check add(3).on([1 2]) == [1 2 3]
+check remove(2).on([2 2 3]) == [2 3]
+check remove(9).on([1 2]) == [1 2]
+check remove("k").on(["a" "k"]) == ["a"]
+check tally(dict::new(), add("a"))["a"]! == 1
+check tally(tally(dict::new(), add("a")), add("a"))["a"]! == 2
+check tally(tally(dict::new(), add("a")), remove("a"))["a"] == null
+/// `check` can't lead with `[`, `check [` reads as indexing, so the
+/// operator-dispatch lines live behind fns.
+fn _ops_infix() -> bool {
+    [1 2] + add(3) == [1 2 3] && [1 2] + remove(1) == [2] && [1 2] - remove(2) == [1 2 2]
+}
+check _ops_infix()
+fn _ops_compound() -> bool {
+    let xs = [1 2]; xs += add(3);
+    let ys = [1 2 3]; ys += remove(2);
+    xs == [1 2 3] && ys == [1 3]
+}
+check _ops_compound()
+fn _ops_inv() -> bool {
+    // `!c` is `c.inv()` (the undo) so `xs + !remove(k)` appends k back
+    [1 2] + !(remove(1)) == [1 2 1] && (!add(9)).on([9 8]) == [8]
+}
+check _ops_inv()
+check involutive(add(3))            // a change and its undo: the law, through the pact
+/// `+`/`-` on a list *is* the Z-set step itself, `xs + add(3)` and
+/// `xs + 3` agree now; `Change` stays for the weighted and the undo.
+fn _ops_zset() -> bool {
+    let xs = [1 2] + 3 - 1;         // append then drop-first
+    let ys = [1 2] + [3 4] - [4 9]; // union then remove-each
+    xs == [2 3] && ys == [1 2 3]
+}
+check _ops_zset()
+
+// ---- small arithmetic -----------------------------------------------
+// Wrap `v` into `lo..hi` by one period, a ship off the right edge
+// comes back on the left, an angle past π comes back past -π.
+fn wrap<T>(v: T, lo: T, hi: T) -> T {
+    if v < lo { return hi - (lo - v); }
+    if v > hi { return lo + (v - hi); }
+    v
+}
+check wrap(11.0, 0.0, 10.0) == 1.0
+check wrap(-1.0, 0.0, 10.0) == 9.0
+check wrap(5.0, 0.0, 10.0) == 5.0
+
+/// The signed shortest turn from heading `have` to heading `want`, in
+/// radians: `-π..π`, so a controller steers the short way round.
+fn ang_diff(want: float, have: float) -> float {
+    wrap(want - have, -std::math::PI, std::math::PI)
+}
+check (ang_diff(0.1, 6.2) - (0.1 - 6.2 + std::math::TAU)).abs() < 1.0e-9
+
+/// A uniform float in `lo..hi`.
+fn rrand(lo: float, hi: float) -> float { lo + float::random(hi - lo) }
+
+/// `v` rounded to `places` decimals, for a readout, not for math.
+fn round_to(v: float, places: int) -> float {
+    let k = 10.0.pow(places.to_float());
+    (v * k).round() / k
+}
+check round_to(3.14159, 2) == 3.14
+check round_to(2.0, 3) == 2.0
+
+// ---- the palette ----------------------------------------------------
+```
+The slate ramp for surfaces and text (deep → ink), then the accent
+hues. `G_` keeps them out of the way of a game's own COLOR_* roles:
+name the role in your page, point it at the shared hue,
+    const COLOR_(LEFT, RIGHT) = (G_CYAN, G_PINK);
+A soft halo is the hue plus an alpha tail. `G_CYAN + "2a"`.
+```
+const G_(DEEP, BG, PANEL) = ("#0b1020", "#0f172a", "#1e293b");
+const G_(EDGE, MID) = ("#334155", "#475569");
+const G_(FAINT, DIM, INK) = ("#64748b", "#94a3b8", "#e2e8f0");
+const G_WHITE = "#ffffff";
+const G_(CYAN, SKY, BLUE) = ("#22d3ee", "#38bdf8", "#60a5fa");
+const G_(VIOLET, PINK) = ("#a78bfa", "#f472b6");
+const G_(RED, ROSE) = ("#f43f5e", "#f87171");
+const G_(ORANGE, AMBER) = ("#f0a03c", "#fbbf24");
+const G_(GOLD, YELLOW) = ("#facc15", "#fde047");
+const G_GREEN = "#4ade80";
+
+// ---- the stage ------------------------------------------------------
+// The 960×720 panel a page paints first, with its title in the corner
+// (none for ""). Dark pages take the defaults; a light page passes its
+// paper and ink — `panel("n2t · 1 — gates", PAPER, DIM)`.
+fn panel(title: str, fill: str = G_DEEP, ink: str = G_DIM) {
+    game::rect(40.0px, 40.0px, 960.0px, 720.0px, fill, "", 0.0px);
+    if title != "" { game::text(60.0px, 708.0px, title, 26.0px, ink); }
+}
+
+
+// Tetris. Arrowleft/right move, arrowdown soft-drops, arrowup or space
+// rotates, r restarts. A filled row clears and scores 100.
+
+// §board. Field geometry --------------------------------------------------------------------
+// the well: 10 columns by 20 rows of 33px cells, placed on the canvas.
+// One shape where there were five constants, docs/axes.md.
+const WELL = Lattice { x = 330.0px, y = 60.0px, cw = 33.0px, ch = 33.0px, rows = 20, cols = 10 };
+
+const COLORS = [G_SKY G_GOLD "#c084fc" G_GREEN G_ROSE G_BLUE "#fb923c"];
+
+// §sfx (ZzFX tables -------------------------------------------------------------------------
+// zzfx voices) lock drops dive, line clears rise
+fn sfxMove() -> Voice {
+    music::synth(0.0, 0.0, 0s, 0.01s, 1.0, 0.04s, 0Hz)
+        .vol(0.3).jitter(0.03).freq(260Hz)
+}
+fn sfxRot() -> Voice {
+    music::synth(1.0, 1.5, 0s, 0.02s, 1.0, 0.07s, 0Hz)
+        .vol(0.4).jitter(0.05).freq(300Hz)
+}
+fn sfxLock() -> Voice {
+    music::synth(4.0, 0.0, 0s, 0.03s, 1.0, 0.1s, 0Hz)
+        .vol(0.6).jitter(0.1).freq(130Hz).slide(-0.3)
+}
+fn sfxLine() -> Voice {
+    music::synth(0.0, 0.0, 0s, 0.06s, 1.0, 0.2s, 0Hz)
+        .vol(0.7).jitter(0.15).freq(520Hz).slide(0.4)
+}
+fn sfxOver() -> Voice {
+    music::synth(3.0, 0.0, 0s, 0.2s, 1.0, 0.5s, 0Hz)
+        .vol(0.8).jitter(0.1).freq(110Hz).slide(-0.2)
+}
+
+/// 7 pieces as [x,y] cells in their rotation-0 bounding box.
+fn shapes() -> [[[int]]] {
+    [
+        [[0, 0], [1, 0], [2, 0], [3, 0]],
+        [[0, 0], [1, 0], [0, 1], [1, 1]],
+        [[1, 0], [0, 1], [1, 1], [2, 1]],
+        [[0, 0], [1, 0], [1, 1], [2, 1]],
+        [[1, 0], [2, 0], [0, 1], [1, 1]],
+        [[0, 0], [0, 1], [1, 1], [2, 1]],
+        [[2, 0], [0, 1], [1, 1], [2, 1]],
+    ]
+}
+
+const DIMS = [[4, 1], [2, 2], [3, 2], [3, 2], [3, 2], [3, 2], [3, 2]];
+
+/// (x, y) -> (y, w - 1 - x): the same on-screen quarter-turn as before,
+/// written for y-up cells (row 0 sits high again via Lattice.cell_y).
+fn rotate(cells: [[int]], w: int, _h: int) -> [[int]] {
+    let out: [[int]] = [[c[1], w - 1 - c[0]] for c in cells]
+    out
+}
+
+fn piece_cells(kind: int, rot: int) -> [[int]] {
+    let cells = shapes()[kind];
+    let d = DIMS[kind];
+    let w = d[0];
+    let h = d[1];
+    let r = rot mod 4;
+    while r > 0 {
+        cells = rotate(cells, w, h);
+        let t = w;
+        w = h;
+        h = t;
+        r -= 1;
+    }
+    cells
+}
+
+fn fits(grid: Grid<int>, cells: [[int]], px: int, py: int) -> bool {
+    for c in cells {
+        let x = px + c[0];
+        let y = py + c[1];
+        if x < 0 || x >= grid.cols || y >= grid.rows { return false; }
+        if y >= 0 && grid.at(y, x) != 0 { return false; }
+    }
+    true
+}
+
+fn spawn(grid: Grid<int>) -> W {
+    let kind = int::random(7);
+    if fits(grid, piece_cells(kind, 0), 3, 0) {
+        W { grid, kind, rot = 0, px = 3, py = 0,
+            fall = 0.0s, score = 0, over = 0, lines = 0 }
+    } else {
+        W { grid, kind, rot = 0, px = 3, py = 0,
+            fall = 0.0s, score = 0, over = 1, lines = 0 }
+    }
+}
+
+struct W {
+    grid: Grid<int>,   // 0 empty, else piece kind + 1
+    kind: int, rot: int, px: int, py: int,
+    fall: s, score: int, lines: int, over: int,
+}
+
+fn init() -> W {
+    spawn(grid_filled(WELL.rows, WELL.cols, 0))
+}
+
+/// Lock the piece into the grid, clear full rows, respawn.
+fn lock(w: W) -> W {
+    let grid = w.grid;
+    for c in piece_cells(w.kind, w.rot) {
+        let y = w.py + c[1];
+        if y >= 0 { grid = grid.set(y, w.px + c[0], w.kind + 1); }
+    }
+    music::sfx(sfxLock());
+    let kept: [int] = [];
+    let cleared = 0;
+    for r in grid.rows {
+        let full = true;
+        for x in grid.cols {
+            if grid.at(r, x) == 0 { full = false; }
+        }
+        if full {
+            cleared += 1;
+            // the cleared row dissolves into a colour wash
+            game::burst(WELL.x + WELL.w() / 2.0,
+                WELL.cell_y(r) + WELL.ch / 2.0,
+                36.0, 220.0px/s, 4.0px, 0.8s, 260.0px/s^2, COLORS);
+        }
+        else { kept.extend([grid.at(r, x) for x in grid.cols]) }
+    }
+    if cleared > 0 { music::sfx(sfxLine()); }
+    // the kept rows slide down: `cleared` empty rows go on top
+    let next: [int] = [];
+    let pad = cleared * grid.cols;
+    while pad > 0 { next.push(0); pad -= 1; }
+    next.extend(kept)
+    let nw = spawn(Grid { cells = next, ..grid });
+    if nw.over != 0 { music::sfx(sfxOver()); }
+    W { fall = 0.0s, score = w.score + cleared * 100,
+        lines = w.lines + cleared, ..nw }
+}
+
+fn tick(w: W, inp: Input, evs: [Ev]) -> W {
+    if w.over != 0 {
+        for ev in evs {
+            match ev {
+                Ev::KeyDown { key } => { if key == "r" { return init(); } },
+                Ev::MouseDown { x = _x, y = _y } => { return init(); },
+                _ => {},
+            }
+        }
+        return w;
+    }
+    let px = w.px;
+    let rot = w.rot;
+    let well = WELL.rect();
+    for ev in evs {
+        match ev {
+            Ev::KeyDown { key } => {
+                if key == "arrowleft" && fits(w.grid, piece_cells(w.kind, rot), px - 1, w.py) {
+                    px -= 1;
+                    music::sfx(sfxMove());
+                }
+                if key == "arrowright" && fits(w.grid, piece_cells(w.kind, rot), px + 1, w.py) {
+                    px += 1;
+                    music::sfx(sfxMove());
+                }
+                if (key == "arrowup" || key == " ") && fits(w.grid, piece_cells(w.kind, rot + 1), px, w.py) {
+                    rot += 1;
+                    music::sfx(sfxRot());
+                }
+                if key == "r" { return init(); }
+            },
+            // tap zones, for touch + mouse: the well's left/right thirds
+            // step the piece, its middle third rotates. A tap beside the
+            // well steps toward that side. A held press soft-drops below.
+            Ev::MouseDown { x, y } => {
+                if y >= well.y - 16.0px && y <= well.top() + 16.0px {
+                    if x < well.x + well.w / 3.0 {
+                        if fits(w.grid, piece_cells(w.kind, rot), px - 1, w.py) {
+                            px -= 1;
+                            music::sfx(sfxMove());
+                        }
+                    } else if x > well.x + well.w * 2.0 / 3.0 {
+                        if fits(w.grid, piece_cells(w.kind, rot), px + 1, w.py) {
+                            px += 1;
+                            music::sfx(sfxMove());
+                        }
+                    } else if x <= well.right() + 16.0px && fits(w.grid, piece_cells(w.kind, rot + 1), px, w.py) {
+                        rot += 1;
+                        music::sfx(sfxRot());
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    let dt = inp.dt;
+    if dt > 0.05s { dt = 0.05s; }
+    let speed = if inp.held.contains("arrowdown") || inp.mouse_down { 0.05s } else { 0.6s - w.lines.to_float() * 0.02s };
+    let fall = w.fall + dt;
+    let py = w.py;
+    let cells = piece_cells(w.kind, rot);
+    if fall > speed {
+        fall = 0.0s;
+        if fits(w.grid, cells, px, py + 1) { py += 1; }
+        else {
+            let nw = lock(W { rot, px, py, fall = 0.0s, ..w });
+            return nw;
+        }
+    }
+    W { rot, px, py, fall, ..w }
+}
+
+/// one bevelled block: a light edge on top, a dark one underneath
+fn block(cx: px↔, cy: px↕, color: str) {
+    game::rect(cx + 1.0px, cy + 1.0px, WELL.cw - 2.0px, WELL.ch - 2.0px, color, "", 0.0px);
+    game::rect(cx + 1.0px, cy + WELL.ch - 6.0px, WELL.cw - 2.0px, 5.0px, G_WHITE + "55", "", 0.0px);
+    game::rect(cx + 1.0px, cy + 1.0px, WELL.cw - 2.0px, 5.0px, "#00000040", "", 0.0px);
+}
+
+fn draw(w: W) {
+    let well = WELL.rect().inflate(8.0px);
+    // the well, with a faint grid
+    game::rect(well.x, well.y, well.w, well.h, G_DEEP, "#3b4a7a", 3.0px);
+    for k in 1 .. WELL.cols {
+        game::line(WELL.cell_x(k), WELL.y, WELL.cell_x(k), WELL.y + WELL.h(), G_WHITE + "10", 1.0px);
+    }
+    for k in 1 .. WELL.rows {
+        game::line(WELL.x, WELL.cell_y(k), WELL.x + WELL.w(), WELL.cell_y(k), G_WHITE + "10", 1.0px);
+    }
+    for r in w.grid.rows {
+        for c in w.grid.cols {
+            let v = w.grid.at(r, c);
+            if v != 0 { block(WELL.cell_x(c), WELL.cell_y(r), COLORS[v - 1]); }
+        }
+    }
+    for c in piece_cells(w.kind, w.rot) {
+        let y = w.py + c[1];
+        if y >= 0 { block(WELL.cell_x(w.px + c[0]), WELL.cell_y(y), COLORS[w.kind]); }
+    }
+    // the side panel: title, score, controls — it reads top-down from
+    // the well's top edge, which is `WELL.y + WELL.h()` under y-up
+    let s = w.score;
+    let panel_x = WELL.x + WELL.w() + 40.0px;
+    let wt = WELL.y + WELL.h();
+    game::text(panel_x, wt - 50.0px, "TETRIS", 40.0px, G_SKY);
+    game::text(panel_x, wt - 100.0px, "score", 20.0px, G_DIM);
+    game::text(panel_x, wt - 154.0px, f"{s}", 44.0px, G_GOLD);
+    game::text(panel_x, wt - 220.0px, "← →   move", 20.0px, G_DIM);
+    game::text(panel_x, wt - 250.0px, "↓     drop", 20.0px, G_DIM);
+    game::text(panel_x, wt - 280.0px, "↑ ␣   rotate", 20.0px, G_DIM);
+    game::text(panel_x, wt - 310.0px, "r     restart", 20.0px, G_DIM);
+    game::text(panel_x, wt - 360.0px, "tap well sides  move", 20.0px, G_FAINT);
+    game::text(panel_x, wt - 390.0px, "tap middle     rotate", 20.0px, G_FAINT);
+    game::text(panel_x, wt - 420.0px, "hold           drop", 20.0px, G_FAINT);
+    if w.over != 0 { game::ctext(WELL.x + WELL.w() / 2.0, wt - 274.0px, "stacked out — tap or r", 34.0px, G_RED); }
+}
+
+// corpus:init
+game_loop(init(), tick, draw);

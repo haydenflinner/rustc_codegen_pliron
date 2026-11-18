@@ -54,6 +54,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+// Vendored copies of the dsa pages and VM programs this bench feeds the
+// module. Kept here so a clone can run the bench without a dsa checkout.
+// 13 files, about 190 KB. The dsa tree remains the source of the compiler.
 const W = join(HERE, "workloads");
 const argv = process.argv.slice(2);
 const opt = (k, d) => argv.find((a) => a.startsWith(`--${k}=`))?.slice(k.length + 3) ?? d;
