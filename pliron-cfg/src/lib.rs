@@ -442,6 +442,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // `docs/history/2026-11-17-demanded-bits.md`.
     "PLIRON_DEMANDED",
     "PLIRON_LUCARRY",
+    // 2026-11-18: 128-bit ops on word halves (`wide128`/`wide128b`). Use
+    // gate + FNMAX=512 keep montgomery out (was +2.9% blind-sig). Callgrind
+    // non-nop: html −0.043%, blind-sig −0.12%, no program worse. `=0` off.
+    "PLIRON_WIDE128",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
@@ -567,6 +571,10 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // `PLIRON_XCGU_LEAF=0` / `PLIRON_XCGU_LASTCALL=0` off.
     ("PLIRON_XCGU_LEAF", "100"),
     ("PLIRON_XCGU_LASTCALL", "20"),
+    // 2026-11-18: wide128 skips functions over this many CLIF instructions
+    // (montgomery ~1.7k). `=0` no size cap. Foldhash `build_state` is a
+    // few hundred.
+    ("PLIRON_WIDE128_FNMAX", "512"),
     // Single-site free inline threshold, x the inline limit (2026-11-02:
     // pulldown's `parse_line` closure, 4,594 ops, inlines; pulldown -2%).
     ("PLIRON_INLINE_FREEMUL", "12"),

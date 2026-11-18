@@ -1,4 +1,5 @@
-//! 128-bit integer operations on word halves (`PLIRON_WIDE128=1`, opt-in).
+//! 128-bit integer operations on word halves (`PLIRON_WIDE128`, default on
+//! since 2026-11-18; `=0` off).
 //!
 //! `u64 x u64 -> u128` multiplies (foldhash's and ahash's
 //! `folded_multiply`, `wyhash`), `(x >> 64) as u64` and `a | (b << 64)`
@@ -31,6 +32,13 @@
 //! (pulldown `parse_block`'s widening overflow check, +19k loads with
 //! the split). `ireduce` and `isplit` of an `iconcat` still fold; they
 //! are the sinks the check stops at.
+//!
+//! An `imul` has an extra profitability gate (`hi_uses_light`): the
+//! high half must be used at most twice after the split. foldhash's
+//! `folded_multiply` takes `lo ^ hi` (one hi use); montgomery's
+//! `mac_digit` loop isplits the product and reads both halves many
+//! times, and the split there grew the function 680 → 789 instructions
+//! with +9 weighted spills (blind-sig +2.9% with the ungated split).
 //!
 //! The replaced `i128` instructions become dead and the next
 //! dead-code sweep drops them; block parameters stay `i128`.
@@ -83,6 +91,22 @@ fn is_zero(func: &Function, v: Value) -> bool {
 /// a later-visited block uses), so the pass repeats while it changes
 /// something, at most four times.
 pub fn run(func: &mut Function, mulhi64: bool) -> usize {
+    // montgomery is ~1.7k CLIF insts; foldhash's `build_state` is a few
+    // hundred. Two uextend rewrites in montgomery cascade into +109
+    // allocated instructions / +2.9% blind-sig. Skip big bodies.
+    let fnmax: usize = crate::env_get("PLIRON_WIDE128_FNMAX")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    if fnmax > 0 {
+        let insts = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .count();
+        if insts > fnmax {
+            return 0;
+        }
+    }
     let mut n = 0;
     for _ in 0..4 {
         let k = pass(func, mulhi64);
@@ -90,6 +114,10 @@ pub fn run(func: &mut Function, mulhi64: bool) -> usize {
         if k == 0 {
             break;
         }
+    }
+    if n > 0 && std::env::var_os("PLIRON_WIDE128_STATS").is_some() {
+        let name = func.name.to_string();
+        eprintln!("wide128-stats {name}: rewrites={n}");
     }
     n
 }
@@ -146,6 +174,95 @@ fn halves_consumed(
     ok
 }
 
+/// How many times the high half of `v` would be read if `v` were an
+/// `iconcat`. `ireduce` discards it; `isplit` / `ushr 64` / `ishl 64`
+/// charge the uses of the half they expose; bitwise ops charge the hi
+/// of their result. Anything else is "heavy" (a sentinel).
+fn hi_use_count(func: &Function, uses: &crate::uses::Uses, v: Value, fuel: &mut usize) -> usize {
+    if *fuel == 0 {
+        return 999;
+    }
+    *fuel -= 1;
+    let v = func.dfg.resolve_aliases(v);
+    let mut n = 0usize;
+    for &(_, inst) in uses.sites(v) {
+        if func.layout.inst_block(inst).is_none() {
+            continue;
+        }
+        let op = func.dfg.insts[inst].opcode();
+        match op {
+            Opcode::Ireduce => {}
+            Opcode::Isplit => {
+                let Some(hi) = func.dfg.inst_results(inst).get(1).copied() else {
+                    return 999;
+                };
+                n = n.saturating_add(uses.sites(hi).len());
+            }
+            Opcode::Ushr => {
+                let args = func.dfg.inst_args(inst);
+                let Some(amt) = args.get(1).copied() else { return 999 };
+                let Some(k) = konst(func, amt) else { return 999 };
+                if k & 127 != 64 {
+                    return 999;
+                }
+                let Some(r) = func.dfg.inst_results(inst).first().copied() else {
+                    return 999;
+                };
+                // `ushr 64` of `iconcat a,b` is `iconcat b, 0`; counting
+                // uses of `r` over-counts an `ireduce` of it as a hi use,
+                // which is what we want (one).
+                n = n.saturating_add(uses.sites(r).len());
+            }
+            Opcode::Ishl => {
+                let args = func.dfg.inst_args(inst);
+                let Some(amt) = args.get(1).copied() else { return 999 };
+                let Some(k) = konst(func, amt) else { return 999 };
+                if k & 127 != 64 {
+                    return 999;
+                }
+                // `ishl 64` of `iconcat a,b` is `iconcat 0, a`: the new
+                // hi is the old lo — not a hi use of `v`.
+            }
+            Opcode::Bor | Opcode::Bxor | Opcode::Band => {
+                let Some(r) = func.dfg.inst_results(inst).first().copied() else {
+                    return 999;
+                };
+                n = n.saturating_add(hi_use_count(func, uses, r, fuel));
+            }
+            _ => return 999,
+        }
+    }
+    n
+}
+
+/// foldhash's `lo ^ hi` is one hi use; montgomery's mac step uses the
+/// high half a few times per product and many products — `1` keeps the
+/// fold and rejects the rest.
+const IMUL_HI_USE_MAX: usize = 1;
+
+fn hi_uses_light(func: &Function, uses: &crate::uses::Uses, v: Value) -> bool {
+    let mut fuel = 64usize;
+    hi_use_count(func, uses, v, &mut fuel) <= IMUL_HI_USE_MAX
+}
+
+/// A `uextend.i128` that only feeds a heavy-hi `imul` must stay: rewriting
+/// it to `iconcat x, 0` lets Cranelift's own i128 legalizer emit `umulhi`
+/// even when our imul rewrite refuses (montgomery).
+fn uextend_ok(func: &Function, uses: &crate::uses::Uses, v: Value) -> bool {
+    uses.sites(v).iter().all(|&(_, inst)| {
+        if func.layout.inst_block(inst).is_none() {
+            return true;
+        }
+        if func.dfg.insts[inst].opcode() != Opcode::Imul {
+            return true;
+        }
+        let Some(r) = func.dfg.inst_results(inst).first().copied() else {
+            return false;
+        };
+        hi_uses_light(func, uses, r)
+    })
+}
+
 fn pass(func: &mut Function, mulhi64: bool) -> usize {
     let uses = crate::uses::Uses::new(func);
     let mut seen = vec![0u8; func.dfg.num_values()];
@@ -168,7 +285,8 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
                 InstructionData::Unary { opcode: Opcode::Uextend, arg }
                     if rty == types::I128
                         && pos.func.dfg.value_type(arg) == types::I64
-                        && halves_consumed(pos.func, &uses, res, &mut seen) =>
+                        && halves_consumed(pos.func, &uses, res, &mut seen)
+                        && uextend_ok(pos.func, &uses, res) =>
                 {
                     let z = pos.ins().iconst(types::I64, 0);
                     pos.func.replace(inst).iconcat(arg, z);
@@ -218,7 +336,8 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
                 InstructionData::Binary { opcode: Opcode::Imul, args }
                     if rty == types::I128
                         && mulhi64
-                        && halves_consumed(pos.func, &uses, res, &mut seen) =>
+                        && halves_consumed(pos.func, &uses, res, &mut seen)
+                        && hi_uses_light(pos.func, &uses, res) =>
                 {
                     let (Some((a, ah)), Some((b, bh))) = (cat(pos.func, args[0]), cat(pos.func, args[1])) else {
                         continue;

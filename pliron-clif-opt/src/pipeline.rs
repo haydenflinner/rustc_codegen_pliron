@@ -5098,7 +5098,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         .creates_all(),
         cstep("dse", "dse", Gate::Flag(FlagId::Dse), s_dse).needs(shape::STORE),
         step("i128id", "i128id", Gate::OptIn("PLIRON_I128ID"), s_i128id),
-        step("wide128", "wide128", Gate::OptIn("PLIRON_WIDE128"), s_wide128),
+        step("wide128", "wide128", Gate::Env("PLIRON_WIDE128"), s_wide128),
         Step {
             name: "egraph",
             bisect: Some("egraph"),
@@ -5874,7 +5874,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("vrp2", "vrp", Gate::OptIn("PLIRON_VRP2"), s_vrp2),
         // Again once the late steps made loop-carried shift amounts
         // (foldhash's `sponge_len`) constant.
-        step("wide128b", "wide128", Gate::OptIn("PLIRON_WIDE128"), s_wide128),
+        step("wide128b", "wide128", Gate::Env("PLIRON_WIDE128"), s_wide128),
         Step {
             name: "egraph2",
             bisect: Some("egraph2"),

@@ -109,6 +109,28 @@ fn sponge() {
     assert_eq!(count(&after, Opcode::Isplit), 0, "{after}");
 }
 
+/// montgomery-shaped: `isplit` of the product, then many uses of each
+/// half. The imul must stay wide (`hi_uses_light`).
+#[test]
+fn imul_heavy_isplit_stays() {
+    let src = "function %f(i64, i64) -> i64 {
+    block0(v0: i64, v1: i64):
+        v2 = uextend.i128 v0
+        v3 = uextend.i128 v1
+        v4 = imul v2, v3
+        v5, v6 = isplit v4
+        v7 = iadd v5, v6
+        v8 = iadd v7, v5
+        v9 = iadd v8, v6
+        v10 = iadd v9, v5
+        v11 = iadd v10, v6
+        return v11
+    }";
+    let (after, _) = run(src);
+    assert_eq!(count(&after, Opcode::Umulhi), 0, "{after}");
+    assert_eq!(count(&after, Opcode::Imul), 1, "{after}");
+}
+
 #[test]
 fn unknown_high_half_and_odd_shift_stay() {
     let src = "function %f(i64, i64, i64) -> i64, i64 {

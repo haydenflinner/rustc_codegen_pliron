@@ -1278,9 +1278,14 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    shift, bitwise, `imul`), which keeps foldhash's `lo ^ hi` and the
    sponge and leaves the overflow add whole. With that gate, `parse_block`'s
    allocated code matches the default (5,115 instructions, weighted
-   spills 10,711). Still opt-in until a callgrind remeasure: html-rewriter's
-   -377k should remain, pulldown's +31.9k should be gone. Test
-   `imul_feeding_iadd_stays`.
+   spills 10,711).    **Flipped default-on 2026-11-18** after the use gate plus
+   `PLIRON_WIDE128_FNMAX` (default 512): skip bodies bigger than that
+   (montgomery ~1.7k CLIF insts; two uextend rewrites there cascaded to
+   +2.9% blind-sig). Callgrind non-nop: html −0.043%, blind-sig −0.12%,
+   pulldown/blake3/json/protobuf flat, regex/compression +0.000%. Also
+   `hi_uses_light` / `uextend_ok` so a heavy-hi `imul` is not split even
+   in a small function. `=0` off. Test `imul_feeding_iadd_stays`,
+   `imul_heavy_isplit_stays`.
 
 10. **`strwork` +3..4.5% on wasm, dragon's `format_exact`** (looked at
    2026-11-17, not fixed). `cpuprof.sh`: `format_exact` 47.3% of ours
