@@ -188,31 +188,38 @@ fn build_liveness<F: Function>(func: &F, n: usize) -> Liveness {
         }
     }
 
+    // Backward dataflow, word-wise: out = union of successors' in,
+    // in = use-before-def | (out & !def). Blocks are visited last to first
+    // (most successors are later), so a loop-free region settles in one
+    // sweep; buffers are reused.
     let mut live_in = vec![0u64; nb * w];
     let mut live_out = vec![0u64; nb * w];
+    let mut new_out = vec![0u64; w];
     let mut changed = true;
     while changed {
         changed = false;
-        for b in 0..nb {
-            let block = Block::new(b);
-            let mut new_out = vec![0u64; w];
-            for &succ in func.block_succs(block) {
+        for b in (0..nb).rev() {
+            new_out.iter_mut().for_each(|x| *x = 0);
+            for &succ in func.block_succs(Block::new(b)) {
                 let s = succ.index();
-                bit_or_into(&mut new_out, &live_in[s * w..(s + 1) * w]);
-            }
-            let mut new_in = ue_use[b * w..(b + 1) * w].to_vec();
-            for i in 0..n {
-                if bit_get(&new_out, i) && !bit_get(&defs[b * w..(b + 1) * w], i) {
-                    bit_set(&mut new_in, i);
+                for (o, i) in new_out.iter_mut().zip(&live_in[s * w..(s + 1) * w]) {
+                    *o |= *i;
                 }
             }
-            if new_out.as_slice() != &live_out[b * w..(b + 1) * w]
-                || new_in.as_slice() != &live_in[b * w..(b + 1) * w]
-            {
-                live_out[b * w..(b + 1) * w].copy_from_slice(&new_out);
-                live_in[b * w..(b + 1) * w].copy_from_slice(&new_in);
-                changed = true;
+            let range = b * w..(b + 1) * w;
+            let mut any = false;
+            for (k, idx) in range.clone().enumerate() {
+                let new_in = ue_use[idx] | (new_out[k] & !defs[idx]);
+                if new_in != live_in[idx] {
+                    live_in[idx] = new_in;
+                    any = true;
+                }
+                if new_out[k] != live_out[idx] {
+                    live_out[idx] = new_out[k];
+                    any = true;
+                }
             }
+            changed |= any;
         }
     }
     Liveness { w, live_in, live_out }
@@ -2305,10 +2312,18 @@ fn run_inner<F: Function>(
         validate_ssa(func, &CFGInfo::new(func)?)?;
     }
 
+    #[cfg(feature = "std")]
+    let t0 = std::time::Instant::now();
     let intervals = build_intervals(func, env);
     let nv = func.num_vregs();
+    #[cfg(feature = "std")]
+    let t_iv = t0.elapsed();
     let lv = build_liveness(func, nv);
+    #[cfg(feature = "std")]
+    let t_lv = t0.elapsed();
     let interfere = build_interfere(func, nv, &lv);
+    #[cfg(feature = "std")]
+    let t_if = t0.elapsed();
     // PLIRON: `PLIRON_RA_COLOR_MULTI=0` keeps colouring to single-block
     // vregs (and the linear clobber windows); default is whole-function
     // homes with liveness-exact forbid sets.
@@ -2316,6 +2331,8 @@ fn run_inner<F: Function>(
     // PLIRON: a colouring can leave emit no free temp (`TooManyLiveRegs`)
     // at the busiest instruction. Retry with more registers held back from
     // homes before giving up to the all-spill baseline (which always fits).
+    #[cfg(feature = "std")]
+    let t_fb = t0.elapsed();
     let reserve0 = env_usize("PLIRON_RA_MCTS_RESERVE", 1);
     // Whole-function homes cannot split a live range, which is what ion does
     // when pressure exceeds the registers: spilling a vreg that is used in a
@@ -2338,13 +2355,27 @@ fn run_inner<F: Function>(
             &mut spilled,
         );
         if force_mcts && forbid.is_some() && fallback_at > 0.0 && spilled > fallback_at {
+            #[cfg(feature = "std")]
+            if env_flag("PLIRON_RA_TIME") && t0.elapsed().as_millis() >= 50 {
+                std::eprintln!(
+                    "ra2time: DELEGATED insts={} vregs={} intervals={:?} liveness={:?} interfere={:?} forbid={:?} colour={:?}",
+                    func.num_insts(), nv, t_iv, t_lv - t_iv, t_if - t_lv, t_fb - t_if, t0.elapsed() - t_fb
+                );
+            }
             return Ok(None);
         }
         match emit(func, env, &intervals, &mut a, spillslots, &prefs, &lv, nv) {
             Err(RegAllocError::TooManyLiveRegs) if forbid.is_some() && extra < 6 => continue,
             Err(RegAllocError::TooManyLiveRegs) => {
                 if force_mcts && fallback_at > 0.0 {
-                    return Ok(None);
+                    #[cfg(feature = "std")]
+            if env_flag("PLIRON_RA_TIME") && t0.elapsed().as_millis() >= 50 {
+                std::eprintln!(
+                    "ra2time: DELEGATED insts={} vregs={} intervals={:?} liveness={:?} interfere={:?} forbid={:?} colour={:?}",
+                    func.num_insts(), nv, t_iv, t_lv - t_iv, t_if - t_lv, t_fb - t_if, t0.elapsed() - t_fb
+                );
+            }
+            return Ok(None);
                 }
                 let mut sp = 0.0;
                 let (mut a2, spillslots, prefs) =
@@ -2364,6 +2395,19 @@ fn run_inner<F: Function>(
     }
     let (mut allocs, inst_alloc_offsets, mut edits, edit_vregs, num_slots, scratch_tags) =
         emitted.expect("greedy emit");
+    #[cfg(feature = "std")]
+    if env_flag("PLIRON_RA_TIME") && t0.elapsed().as_millis() >= 50 {
+        std::eprintln!(
+            "ra2time: insts={} vregs={} intervals={:?} liveness={:?} interfere={:?} forbid={:?} colour+emit={:?}",
+            func.num_insts(),
+            nv,
+            t_iv,
+            t_lv - t_iv,
+            t_if - t_lv,
+            t_fb - t_if,
+            t0.elapsed() - t_fb
+        );
+    }
     let num_spillslots = renumber_slots(
         func,
         &intervals,

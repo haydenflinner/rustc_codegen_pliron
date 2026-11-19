@@ -885,6 +885,29 @@ impl Problem {
         c
     }
 
+    /// The cheapest action for `i` (what `actions(..)[0]` is), without
+    /// building the list: ties go to the lower register, a spill only when
+    /// strictly cheaper.
+    fn best(&self, i: usize, assign: &[u8], used: u64) -> (u8, f64) {
+        let mut m = self.legal(i, assign);
+        let mut pick = (SPILL, self.spill_cost[i]);
+        let mut best_reg: Option<(u8, f64)> = None;
+        while m != 0 {
+            let a = m.trailing_zeros() as u8;
+            m &= m - 1;
+            let d = self.delta(i, a, assign, used);
+            if best_reg.is_none_or(|(_, bd)| d < bd) {
+                best_reg = Some((a, d));
+            }
+        }
+        if let Some((a, d)) = best_reg {
+            if d <= pick.1 {
+                pick = (a, d);
+            }
+        }
+        pick
+    }
+
     /// Candidate actions for `i` with their deltas, cheapest first, at most
     /// `top_m` registers plus `SPILL`.
     fn actions(&self, i: usize, assign: &[u8], used: u64, top_m: usize) -> Vec<(u8, f64)> {
@@ -913,12 +936,13 @@ fn apply(a: u8, used: &mut u64) {
 fn cost_rollout(p: &Problem, assign: &mut [u8], used: &mut u64, next: usize, eps: f64, rng: &mut Rng) -> f64 {
     let mut total = 0.0;
     for i in next..p.len() {
-        let acts = p.actions(i, assign, *used, 4);
-        // `acts` is cheapest first; a spill is only taken when it is.
-        let pick = if acts.len() > 1 && rng.f() < eps {
+        // The cheapest action; a spill is only taken when it is. With
+        // probability `eps` one of the three cheapest instead.
+        let pick = if eps > 0.0 && rng.f() < eps {
+            let acts = p.actions(i, assign, *used, 4);
             acts[rng.gen_range(acts.len().min(3))]
         } else {
-            acts[0]
+            p.best(i, assign, *used)
         };
         assign[i] = pick.0;
         apply(pick.0, used);
