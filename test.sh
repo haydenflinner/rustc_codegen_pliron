@@ -954,19 +954,19 @@ t_fragcopyout() {
 }
 
 t_sibcall() {
-  # PLIRON_SIBCALL=1 (opt-in, aarch64): `call; return` becomes `return_call`
+  # PLIRON_SIBCALL (default on, aarch64): `call; return` becomes `return_call`
   # on the platform ABIs and the internal `tail` one when nothing in the
   # caller's frame is visible to the callee. The program hands a slot
   # address to a callee, stores one in memory a callee reads, passes stack
   # arguments, returns through sret, and keeps sixteen values live across a
   # function that tail-calls a leaf (FASTCC must count the leaf's writes).
-  # Output pinned by stock rustc with the step off, on, on with 4 CGUs and
-  # the regalloc2 checker. On aarch64, `walk_even` must branch to
+  # Output pinned by stock rustc with the step off, by default, and on
+  # with 4 CGUs and the regalloc2 checker. On aarch64, `walk_even` must branch to
   # `walk_odd`, and `slot_arg` / `slot_stored` / `stack_args` must still
   # call theirs.
   rustc --edition 2021 -O tests/sibcall/main.rs -o $out/sibcall-stock$exe || return 1
   local v i=0
-  for v in "PLIRON_SIBCALL=0 CGU=1" "PLIRON_SIBCALL=1 CGU=1" "PLIRON_SIBCALL=1 PLIRON_RA_CHECK=1 CGU=4"; do
+  for v in "PLIRON_SIBCALL=0 CGU=1" " CGU=1" "PLIRON_SIBCALL=1 PLIRON_RA_CHECK=1 CGU=4"; do
     i=$((i + 1))
     env ${v% CGU=*} rustc $BE --edition 2021 -O -C codegen-units=${v##*CGU=} tests/sibcall/main.rs -o $out/sibcall$i$exe || return 1
     [[ -n "$exe" ]] && continue

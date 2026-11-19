@@ -2147,16 +2147,15 @@ edge of such a call clobbers what a normal fastcall call does
 (`WINDOWS_CLOBBERS`; `RtlUnwindEx` restores nonvolatiles); it panicked
 before.
 
-## `PLIRON_SIBCALL=1` (opt-in): `return_call` on aarch64's platform ABIs (2026-11-19)
+## `PLIRON_SIBCALL` (default on since 2026-11-19, `=0` off): `return_call` on aarch64's platform ABIs
 
 `src/isa/call_conv.rs` (`supports_tail_calls`, `pliron_sibcall`):
-`SystemV` and `AppleAarch64` accept `return_call` under the knob. Only
+`SystemV` and `AppleAarch64` accept `return_call` unless `PLIRON_SIBCALL=0`. Only
 `pliron-clif-opt`'s `sibcall` step emits one there, and it guarantees
 that neither side has stack arguments or a stack return area, so the
 `tail` convention's incoming-argument bookkeeping is empty (the
 `debug_assert` in `src/machinst/abi.rs` allows exactly that). Nothing else
-reads `supports_tail_calls` but the verifier. Without the knob nothing
-changes.
+reads `supports_tail_calls` but the verifier.
 
 FASTCC with tail calls: `src/isa/aarch64/inst/mod.rs` (`ReturnCallInfo::
 pliron_clobbers`, `pliron_tail_clobbers`), `src/isa/aarch64/lower/isle.rs`

@@ -29,13 +29,20 @@ pub struct PassConfig {
 /// `PLIRON_EDGEDEDUP`, `PLIRON_NARROWEXT`, `PLIRON_EDGEMERGE`,
 /// `PLIRON_EPIMERGE`, `PLIRON_BJALIAS`, `PLIRON_TBNZ_IREDUCE`,
 /// `PLIRON_EDITPAIR`, `PLIRON_MCP`, `PLIRON_MCPBB`, `PLIRON_CCMP` and
-/// `PLIRON_JT_NARROW`, and the vendored waffle `PLIRON_WASM_MAXSSA_CUTALIAS`,
+/// `PLIRON_JT_NARROW`, `PLIRON_SIBCALL`, and the vendored waffle `PLIRON_WASM_MAXSSA_CUTALIAS`,
 /// itself and
 /// defaults them the same way (on unless `=0`; EDGEMERGE/EPIMERGE take
 /// their mode default when unset). Validation: docs/history/2026-10-27-defaults.md,
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-19: `call; return` as `return_call` on aarch64 (step
+    // `sibcall`; the vendored Cranelift reads the same knob, on unless
+    // `=0`). Exact counts: html-rewriter -0.60%, protobuf -0.40%, json
+    // -0.25%, pulldown-cmark -0.20%, regex -0.15%, the rest equal
+    // (`docs/history/2026-11-19-sibcall.md`). Stanza sibcall.
+    // `PLIRON_SIBCALL=0` off.
+    "PLIRON_SIBCALL",
     // 2026-11-17, STK: memcpyopt's "tmp could promote" guard skips temps
     // larger than sroa's MAX_SIZE (512 B), which never promote:
     // driftsort_main's 4 KiB scratch is one slot again (regex-syntax both

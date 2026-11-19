@@ -6020,7 +6020,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("deadslot", "deadslot", Gate::Env("PLIRON_DEADSLOT"), s_deadslot).needs(shape::SLOT),
         // After the last step that reads a call's results or a slot's
         // users: `call; return` becomes `return_call` when nothing in
-        // this frame is visible to the callee. Opt-in: `PLIRON_SIBCALL=1`.
+        // this frame is visible to the callee. Default on: `PLIRON_SIBCALL=0` off.
         step("sibcall", "", Gate::OptIn("PLIRON_SIBCALL"), s_sibcall).needs(shape::CALL),
         step("panicstub", "panicstub", Gate::OptIn("PLIRON_PANICSTUB"), s_panicstub)
             .needs(shape::CALL),

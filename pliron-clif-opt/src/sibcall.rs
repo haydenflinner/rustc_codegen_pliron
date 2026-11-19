@@ -1,4 +1,5 @@
-//! Sibling calls on the platform ABI (opt-in: `PLIRON_SIBCALL=1`, aarch64).
+//! Sibling calls on the platform ABI (aarch64; default on since
+//! 2026-11-19, `PLIRON_SIBCALL=0` off).
 //!
 //! Shape: a call whose results are returned as they are:
 //!
@@ -19,7 +20,7 @@
 //!   `tail` one of the internal functions (which `pliron-clif-lower`
 //!   never tail-called unless the source said `become`), or a platform
 //!   one (the vendored Cranelift allows `return_call` from `SystemV` and
-//!   `AppleAarch64` under `PLIRON_SIBCALL=1`),
+//!   `AppleAarch64` unless `PLIRON_SIBCALL=0`),
 //! * neither signature has a stack argument or a stack return area
 //!   (checked by [`reg_only`], conservatively: there is no frame to
 //!   rewrite and the caller pops nothing),

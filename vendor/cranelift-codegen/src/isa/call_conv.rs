@@ -88,7 +88,7 @@ impl CallConv {
     pub fn supports_tail_calls(&self) -> bool {
         match self {
             CallConv::Tail => true,
-            // PLIRON: sibling calls (`PLIRON_SIBCALL=1`): the platform ABIs
+            // PLIRON: sibling calls (`PLIRON_SIBCALL`, default on): the platform ABIs
             // of aarch64 may `return_call` a callee with no stack
             // arguments from a function with none (`pliron-clif-opt`'s
             // `sibcall` step guarantees both; nothing in the backend
@@ -172,9 +172,9 @@ impl str::FromStr for CallConv {
     }
 }
 
-/// PLIRON: `PLIRON_SIBCALL=1` — platform-ABI functions may `return_call`
-/// (see [`CallConv::supports_tail_calls`]).
+/// PLIRON: `PLIRON_SIBCALL` (default on, `=0` off) — platform-ABI
+/// functions may `return_call` (see [`CallConv::supports_tail_calls`]).
 pub fn pliron_sibcall() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_SIBCALL").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_SIBCALL").as_deref() != Ok("0"))
 }
