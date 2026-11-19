@@ -1740,6 +1740,40 @@ fn emit<F: Function>(
             }
         }
 
+        // A tied use that must survive the instruction is copied before it.
+        // Copy it straight into the def's own register when no other operand
+        // of the instruction holds that register: the def then writes its
+        // home and no move follows (a scratch temp costs a second `mov`).
+        let mut reuse_def_home: Vec<Option<PReg>> = vec![None; ops.len()];
+        for (di, op) in ops.iter().enumerate() {
+            let OperandConstraint::Reuse(ui) = op.constraint() else { continue };
+            if ui >= ops.len()
+                || !reuse_use_live_after[ui]
+                || op.as_fixed_nonallocatable().is_some()
+                || ops[ui].constraint() != OperandConstraint::Reg
+            {
+                continue;
+            }
+            let Some(r) = home_of(assign, op.vreg()).as_reg() else { continue };
+            let clash = ops.iter().enumerate().any(|(oi, o)| {
+                if oi == di || oi == ui {
+                    return false;
+                }
+                if let Some(p) = o.as_fixed_nonallocatable() {
+                    return p == r;
+                }
+                if let OperandConstraint::FixedReg(p) = o.constraint() {
+                    if p == r {
+                        return true;
+                    }
+                }
+                home_of(assign, o.vreg()).as_reg() == Some(r)
+            });
+            if !clash && !is_stack_like(env, Allocation::reg(r)) {
+                reuse_def_home[ui] = Some(r);
+            }
+        }
+
         // FixedRegs first (reserve their pregs), then other uses, then defs.
         let order: Vec<usize> = {
             let mut fixed = Vec::new();
@@ -1912,7 +1946,9 @@ fn emit<F: Function>(
                         home
                     } else {
                         let pref = prefer_of(op.class());
-                        let tmp = if let OperandConstraint::Limit(n) = op.constraint() {
+                        let tmp = if let Some(r) = reuse_def_home[i].filter(|_| force_reuse_temp) {
+                            r
+                        } else if let OperandConstraint::Limit(n) = op.constraint() {
                             regs_for_class(env, op.class())
                                 .into_iter()
                                 .find(|r| {

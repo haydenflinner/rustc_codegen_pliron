@@ -1054,7 +1054,94 @@ pub fn search_problem(p: &Problem, seed: u64, params: &Params) -> (Vec<u8>, f64)
             at = c.parent;
         }
     }
-    best
+    let (mut homes, _) = best;
+    refine(p, &mut homes, 4);
+    let cost = total_cost(p, &homes);
+    (homes, cost)
+}
+
+/// Exact cost of a complete assignment (each affinity pair once).
+pub fn total_cost(p: &Problem, assign: &[u8]) -> f64 {
+    let mut c = 0.0;
+    let mut used = 0u64;
+    for i in 0..p.len() {
+        let a = assign[i];
+        if a == SPILL {
+            c += p.spill_cost[i];
+            continue;
+        }
+        used |= 1u64 << a;
+        for &(q, w) in &p.pins[i] {
+            if q != a {
+                c += w;
+            }
+        }
+        for &(j, w) in &p.aff[i] {
+            if (j as usize) > i && assign[j as usize] != a {
+                c += w;
+            }
+        }
+    }
+    c + p.cs_cost * (used & p.callee_saved).count_ones() as f64
+}
+
+/// Local search over a complete assignment: re-place each node, given
+/// everything else, on the register that costs least (or off the stack if a
+/// legal register is cheaper than its spill). The greedy order chooses a
+/// node's register before its later affinity partners exist, so chains of
+/// tied operands (a vector accumulator) end up in different registers and
+/// pay a copy per link; this pulls them together.
+pub fn refine(p: &Problem, assign: &mut [u8], rounds: usize) {
+    let m = p.len();
+    for _ in 0..rounds {
+        let mut changed = false;
+        let mut used = 0u64;
+        for &a in assign.iter() {
+            if a < SPILL {
+                used |= 1u64 << a;
+            }
+        }
+        for i in 0..m {
+            let cur = assign[i];
+            // Legal registers given every other node's current home.
+            let legal = {
+                let full = if p.n_regs >= 64 { !0u64 } else { (1u64 << p.n_regs) - 1 };
+                let mut mk = full & !p.forbid[i];
+                for &j in &p.adj[i] {
+                    let a = assign[j as usize];
+                    if a < SPILL {
+                        mk &= !(1u64 << a);
+                    }
+                }
+                mk
+            };
+            let mut best_a = cur;
+            let mut best_c = if cur == SPILL { p.spill_cost[i] } else { p.delta(i, cur, assign, used) };
+            let mut m2 = legal;
+            while m2 != 0 {
+                let a = m2.trailing_zeros() as u8;
+                m2 &= m2 - 1;
+                if a == cur {
+                    continue;
+                }
+                let c = p.delta(i, a, assign, used);
+                if c + 1e-9 < best_c {
+                    best_c = c;
+                    best_a = a;
+                }
+            }
+            if best_a != cur {
+                assign[i] = best_a;
+                if best_a < SPILL {
+                    used |= 1u64 << best_a;
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// Total physical-register footprint of an assignment slice (simple measure).
