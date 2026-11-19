@@ -1566,6 +1566,9 @@ pub fn run(
     // `drop_glue<Cow<[u8]>>` 67 against the base 64; LLVM inlines both (a
     // tag test and a call, ~45 of its 225). html-rewriter calls them
     // ~250k times a run (stock: inlined into every caller).
+    // TODO(2026-11-19): at 90 this trades (compression +1.25%, regex
+    // +0.35%) for html-rewriter -0.84%; narrow it until nothing loses and
+    // flip it (docs/PARITY.md codegen queue item 12).
     let glue_t: usize = crate::env_get("PLIRON_INLINE_GLUET")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);

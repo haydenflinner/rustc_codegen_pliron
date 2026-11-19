@@ -1503,6 +1503,18 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    functions). Step time 0.8% of the pipeline on wasm-bench, 0.1% on
    std. Not done: dsa timing (tree broken), native kernels, x64.
 
+12. **TODO: `PLIRON_INLINE_GLUET` without its losses** (opened
+   2026-11-19, `history/2026-11-19-sibcall.md`). The drop-glue
+   threshold floor at 90 is html-rewriter -0.84%, protobuf -0.34%,
+   pulldown-cmark -0.31%, json -0.14%, but compression +1.25% and regex
+   +0.35% (non-`nop` exact counts); at 100 json +1.47% and pulldown
+   +0.52% as well, so it stays opt-in. Find which glue the two losers
+   now inline and why it costs (`bench/heldout/irdiff.py
+   rust-compression --env PLIRON_INLINE_GLUET=90`, then `--fn` on the
+   top movers), then narrow the floor (only glue with one warm call,
+   only callers outside loops, or a cap on the caller's growth) until no
+   program loses, and flip it.
+
 Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
 times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,
 `PLIRON_WASM_BRTAB_SHARE`, `PLIRON_WCOAL_EDGE`,
