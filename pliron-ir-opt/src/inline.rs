@@ -1559,6 +1559,16 @@ pub fn run(
     let droplim: usize = crate::env_get("PLIRON_INLINE_DROPLIM")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // `PLIRON_INLINE_GLUET=<n>` (opt-in): a drop-glue callee's threshold is
+    // at least n, applied after the default-on `DROPLIM` cap (64), which
+    // otherwise takes it back. Glue is priced by its warm ops plus 20 per warm call, so
+    // `drop_glue<RawVec<u8>>` (63 ops, one `__rust_dealloc`) scores 83 and
+    // `drop_glue<Cow<[u8]>>` 67 against the base 64; LLVM inlines both (a
+    // tag test and a call, ~45 of its 225). html-rewriter calls them
+    // ~250k times a run (stock: inlined into every caller).
+    let glue_t: usize = crate::env_get("PLIRON_INLINE_GLUET")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let always_all = crate::pass_enabled("PLIRON_INLINE_ALWAYS");
     // `PLIRON_INLINE_WASM_COLDKEEP=1` (small mode; default off): non-keep
     // callees use `WASM_COLDKEEP_THRESH` as the flat cold cap; keep-list
@@ -2191,6 +2201,10 @@ pub fn run(
                         && is_drop_glue(cs)
                     {
                         t = t.min(droplim);
+                    }
+                    // After the `DROPLIM` cap: a floor under it.
+                    if glue_t > 0 && !f.always_inline && !f.cold && is_drop_glue(cs) {
+                        t = t.max(glue_t);
                     }
                     // `PLIRON_INLINE_LEAN`: a wrapper passes the score.
                     let mut lean_n = usize::MAX;
