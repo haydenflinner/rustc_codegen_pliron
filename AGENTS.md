@@ -987,6 +987,20 @@ time, memory, code size, stack frames) in ~20 min and writes
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in, aarch64 Linux) — platform reg allocatable;
   not default-on yet.
+- `PLIRON_SIBCALL` (default on since 2026-11-19, aarch64; `=0` off;
+  vendored Cranelift reads it too) — step `sibcall`: `v = call f(..);
+  return v` becomes `return_call` when caller and callee share a
+  convention (platform or `tail`), neither has stack arguments or a stack
+  return area, and no slot address can reach the callee (indirect calls
+  on `tail` only). FASTCC adds a known tail callee's set to the caller's.
+  html-rewriter `b <fn>` tails 276 -> 935 (LLVM 845). With
+  `PLIRON_DEADSLOT_WRITEONLY` (default on, `=0` off: deadslot deletes
+  stores into slots nothing reads) exact counts: html-rewriter -0.74%,
+  pulldown-cmark -0.56%, protobuf -0.41%, json -0.25%, regex -0.15%, the
+  rest equal. Stanza `sibcall`; `docs/history/2026-11-19-sibcall.md`.
+- `PLIRON_INLINE_GLUET=<n>` (opt-in) — drop-glue call-site threshold at
+  least n (after the `DROPLIM` cap). At 90: html-rewriter -0.84%,
+  pulldown -0.31%, protobuf -0.34%, but compression +1.25%, regex +0.35%.
 - `PLIRON_X30=1|2` (opt-in, aarch64) — the link register is allocatable.
   `=1` everywhere (a frameless leaf grows a frame record). `=2` only in
   a function that already makes a regular call, or when frame pointers

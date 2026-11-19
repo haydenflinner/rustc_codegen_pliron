@@ -1338,6 +1338,19 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    loop shape: `Iterator::cmp_by` over two `Rev` iterators tests both
    ends every limb (two pointer IVs of equal length), where LLVM keeps
    one index.
+   **Done (default on, 2026-11-19): sibling calls and write-only
+   slots.** html-rewriter's binary had 276 `b <function>` tails against
+   LLVM's 845; lol_html's state transitions (`return Self::state(..)`)
+   each paid a frame, an LR save and a return. Step `sibcall`
+   (`PLIRON_SIBCALL`) turns `call; return` into `return_call` on the
+   platform ABIs when no slot address can reach the callee: 935 tails.
+   `PLIRON_DEADSLOT_WRITEONLY` drops the stores into slots nothing reads
+   (memchr's needle splat in `data_state`). Together, exact counts
+   non-`nop`: html-rewriter -0.74%, pulldown-cmark -0.56%, protobuf
+   -0.41%, json -0.25%, regex -0.15%, the rest equal. A drop-glue
+   threshold floor (`PLIRON_INLINE_GLUET=90`) adds html-rewriter -0.84%
+   but costs compression +1.25%, regex +0.35%: opt-in
+   (`history/2026-11-19-sibcall.md`).
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain
