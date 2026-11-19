@@ -32,7 +32,7 @@ use crate::prove::{
 };
 use crate::{
     ssa::validate_ssa, Allocation, Block, Edit, Function, Inst, MachineEnv, OperandConstraint,
-    OperandKind, Output, PReg, PRegSet, ProgPoint, RegAllocError, RegClass, SpillSlot, VReg,
+    OperandKind, OperandPos, Output, PReg, PRegSet, ProgPoint, RegAllocError, RegClass, SpillSlot, VReg,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -233,6 +233,7 @@ fn build_interfere<F: Function>(func: &F, n: usize, lv: &Liveness) -> Vec<Vec<us
         }
     };
     let mut members: Vec<usize> = Vec::new();
+    let share_off = env_off("PLIRON_RA_SHARE_DEF_USE");
     // Backward walk of every block: a definition interferes with everything
     // live just after it (and with the uses of its own instruction: a use
     // that dies there could share the register, but the emitter does not
@@ -268,12 +269,55 @@ fn build_interfere<F: Function>(func: &F, n: usize, lv: &Liveness) -> Vec<Vec<us
                             edge(d, wi * 64 + bit);
                         }
                     }
-                    for op in func.inst_operands(inst) {
-                        if op.as_fixed_nonallocatable().is_some() || op.kind() != OperandKind::Use {
+                }
+                // A def interferes with the uses of its own instruction,
+                // except that a Late def may share a register with an Early
+                // use that dies here (ion's rule; it is what lets a tied
+                // `Reuse` operand cost no move). A `Reuse` def is written
+                // (copied into) before the instruction reads, so it shares
+                // only with its own source, and a source that some def
+                // reuses is never shared with another def (its register
+                // is that def's).
+                let ops = func.inst_operands(inst);
+                let reuse_src = |j: usize| -> Option<usize> {
+                    ops.get(j).filter(|o| o.as_fixed_nonallocatable().is_none()).map(|o| o.vreg().vreg())
+                };
+                for (di, dop) in ops.iter().enumerate() {
+                    if dop.as_fixed_nonallocatable().is_some() || dop.kind() != OperandKind::Def {
+                        continue;
+                    }
+                    let d = dop.vreg().vreg();
+                    if d >= n {
+                        continue;
+                    }
+                    let tied = match dop.constraint() {
+                        OperandConstraint::Reuse(j) => Some(reuse_src(j)),
+                        _ => None,
+                    };
+                    for uop in ops.iter() {
+                        if uop.as_fixed_nonallocatable().is_some() || uop.kind() != OperandKind::Use {
                             continue;
                         }
-                        let u = op.vreg().vreg();
-                        if u < n {
+                        let u = uop.vreg().vreg();
+                        if u >= n {
+                            continue;
+                        }
+                        let mut share = !share_off
+                            && !bit_get(&live, u)
+                            && dop.pos() == OperandPos::Late
+                            && uop.pos() == OperandPos::Early;
+                        if share {
+                            if let Some(src) = tied {
+                                share = src == Some(u);
+                            } else {
+                                share = !ops.iter().enumerate().any(|(oi, o)| {
+                                    oi != di
+                                        && o.kind() == OperandKind::Def
+                                        && matches!(o.constraint(), OperandConstraint::Reuse(j) if reuse_src(j) == Some(u))
+                                });
+                            }
+                        }
+                        if !share {
                             edge(d, u);
                         }
                     }
@@ -826,6 +870,7 @@ fn color<F: Function>(
     force_mcts: bool,
     allow_color: bool,
     forbid_sets: Option<&[PRegSet]>,
+    reserve: usize,
 ) -> (Vec<Option<Allocation>>, usize, ProofPrefs) {
     let n = intervals
         .iter()
@@ -977,7 +1022,7 @@ fn color<F: Function>(
                     // the busiest instruction: homes never take the last few
                     // registers of the class, or the whole function falls
                     // back to all-spill (`TooManyLiveRegs`).
-                    let reserve = env_usize("PLIRON_RA_MCTS_RESERVE", 1).min(regs.len().saturating_sub(1));
+                    let reserve = reserve.min(regs.len().saturating_sub(1));
                     for f in prob.forbid.iter_mut() {
                         for k in 0..reserve {
                             *f |= 1u64 << (regs.len() - 1 - k);
@@ -1597,8 +1642,11 @@ type EmitOut = (
 
 /// Is `r` already an operand register of this instruction for a vreg other
 /// than `v`?
-fn taken_by_other(taken: &[(PReg, usize)], r: PReg, v: usize) -> bool {
-    taken.iter().any(|&(t, tv)| t == r && tv != v)
+/// A Late def does not count an Early use's register as taken: the use is
+/// read before the def writes (the colouring only lets them share when the
+/// use dies there).
+fn taken_by_other(taken: &[(PReg, usize, bool)], r: PReg, v: usize, late_def: bool) -> bool {
+    taken.iter().any(|&(t, tv, early_use)| t == r && tv != v && !(late_def && early_use))
 }
 
 fn emit<F: Function>(
@@ -1715,7 +1763,7 @@ fn emit<F: Function>(
 
         // Registers the operands of this instruction already hold, with the
         // vreg that holds each (see `taken_by_other`).
-        let mut taken: Vec<(PReg, usize)> = Vec::new();
+        let mut taken: Vec<(PReg, usize, bool)> = Vec::new();
         for &i in &order {
             let op = ops[i];
             if let Some(p) = op.as_fixed_nonallocatable() {
@@ -1803,7 +1851,7 @@ fn emit<F: Function>(
                     // will be read as a use alongside it. Stack/Any on a
                     // free home stays put.
                     if let Some(hr) = home.as_reg() {
-                        if taken_by_other(&taken, hr, op.vreg().vreg()) && op.kind() == OperandKind::Use {
+                        if taken_by_other(&taken, hr, op.vreg().vreg(), false) && op.kind() == OperandKind::Use {
                             let tmp = pick_temp_or_dead_home(
                                 env,
                                 op.class(),
@@ -1845,7 +1893,14 @@ fn emit<F: Function>(
                     // own included (a `mov` for each register-homed operand).
                     let home_blocked = home
                         .as_reg()
-                        .map(|hr| taken_by_other(&taken, hr, op.vreg().vreg()))
+                        .map(|hr| {
+                            taken_by_other(
+                                &taken,
+                                hr,
+                                op.vreg().vreg(),
+                                op.kind() == OperandKind::Def && op.pos() == OperandPos::Late,
+                            )
+                        })
                         .unwrap_or(false);
                     let need_temp = force_reuse_temp
                         || home.is_stack()
@@ -1923,7 +1978,7 @@ fn emit<F: Function>(
             };
             op_alloc[i] = a;
             if let Some(r) = a.as_reg() {
-                taken.push((r, op.vreg().vreg()));
+                taken.push((r, op.vreg().vreg(), op.kind() == OperandKind::Use && op.pos() == OperandPos::Early));
                 if !forbidden.iter().any(|f| *f == r) {
                     forbidden.push(r);
                 }
@@ -2102,10 +2157,34 @@ fn renumber_slots<F: Function>(
             *t = Some(c);
         }
     }
+    // Only slots something touches get frame space: colouring turns most of
+    // the all-spill baseline's slots into registers, and a slot per vreg ever
+    // created made a 2.7 KiB frame for 25 real spills.
+    let mut used = vec![false; n_old];
+    for a in allocs.iter() {
+        if let Some(sl) = a.as_stack() {
+            if let Some(u) = used.get_mut(sl.index()) {
+                *u = true;
+            }
+        }
+    }
+    for (_, e) in edits.iter() {
+        let Edit::Move { from, to } = e;
+        for a in [from, to] {
+            if let Some(sl) = a.as_stack() {
+                if let Some(u) = used.get_mut(sl.index()) {
+                    *u = true;
+                }
+            }
+        }
+    }
     let by_last = func.multi_spillslot_named_by_last_slot();
     let mut map = vec![0usize; n_old];
     let mut cur = 0usize;
     for i in 0..n_old {
+        if !used[i] {
+            continue;
+        }
         let size = func.spillslot_size(tags[i].unwrap_or(RegClass::Int)).max(1);
         let off = cur.div_ceil(size) * size;
         map[i] = if by_last { off + size - 1 } else { off };
@@ -2192,32 +2271,43 @@ fn run_inner<F: Function>(
     // vregs (and the linear clobber windows); default is whole-function
     // homes with liveness-exact forbid sets.
     let forbid = if !env_off("PLIRON_RA_COLOR_MULTI") { build_forbid(func, &lv, nv) } else { None };
-    let (mut assign, spillslots, prefs) =
-        color(func, &intervals, &interfere, env, force_mcts, color_allowed(func), forbid.as_deref());
-    #[cfg(feature = "std")]
-    if std::env::var("PLIRON_RA_GREEDY_DUMP").is_ok() {
-        for (v, a) in assign.iter().enumerate() {
-            if let Some(a) = a {
-                if a.is_stack() {
-                    std::eprintln!("greedy-home-stack v{} {:?}", v, a);
-                }
+    // PLIRON: a colouring can leave emit no free temp (`TooManyLiveRegs`)
+    // at the busiest instruction. Retry with more registers held back from
+    // homes before giving up to the all-spill baseline (which always fits).
+    let reserve0 = env_usize("PLIRON_RA_MCTS_RESERVE", 1);
+    let mut emitted = None;
+    let mut assign = Vec::new();
+    for extra in [0usize, 1, 3, 6] {
+        let (mut a, spillslots, prefs) = color(
+            func,
+            &intervals,
+            &interfere,
+            env,
+            force_mcts,
+            color_allowed(func),
+            forbid.as_deref(),
+            reserve0 + extra,
+        );
+        match emit(func, env, &intervals, &mut a, spillslots, &prefs, &lv, nv) {
+            Err(RegAllocError::TooManyLiveRegs) if forbid.is_some() && extra < 6 => continue,
+            Err(RegAllocError::TooManyLiveRegs) => {
+                let (mut a2, spillslots, prefs) =
+                    color(func, &intervals, &interfere, env, force_mcts, false, None, 0);
+                let r = emit(func, env, &intervals, &mut a2, spillslots, &prefs, &lv, nv)?;
+                assign = a2;
+                emitted = Some(r);
+                break;
+            }
+            r => {
+                let r = r?;
+                assign = a;
+                emitted = Some(r);
+                break;
             }
         }
     }
-    // PLIRON: a colouring (MCTS homes especially) can leave emit no free
-    // temp (`TooManyLiveRegs`); the all-spill baseline always fits, so fall
-    // back to it for this function instead of failing the compile.
     let (mut allocs, inst_alloc_offsets, mut edits, edit_vregs, num_slots, scratch_tags) =
-        match emit(func, env, &intervals, &mut assign, spillslots, &prefs, &lv, nv) {
-            Err(RegAllocError::TooManyLiveRegs) => {
-                assign.clear();
-                let (a2, spillslots, prefs) =
-                    color(func, &intervals, &interfere, env, force_mcts, false, None);
-                assign = a2;
-                emit(func, env, &intervals, &mut assign, spillslots, &prefs, &lv, nv)?
-            }
-            r => r?,
-        };
+        emitted.expect("greedy emit");
     let num_spillslots = renumber_slots(
         func,
         &intervals,
