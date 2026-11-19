@@ -946,9 +946,47 @@ time, memory, code size, stack frames) in ~20 min and writes
   (opt-in) prefers, among equal gains, the register free in more blocks.
   `PLIRON_RA_EXPLAIN` prints `region` lines; `clif-check vcode` honours
   it. Stanzas `regionsplit`, `neonpair` (with `PLIRON_RA_CHECK=1`).
+  `PLIRON_RA2_REGION_CAP` default `2` since 2026-11-18 (was 1):
+  pulldown −64k, blind-sig −40k, html −34k non-nop (copies=2);
+  compression +7k (+0.017%).
 - `PLIRON_X17` (default on since 2026-11-18, aarch64; `=0` off) — x17
   allocatable. Callgrind non-nop: blind-sig −0.16%, pulldown −0.10%,
   protobuf −0.08%, compression +0.004%.
+- `PLIRON_RA2_REMATW` (default `7` since 2026-11-18, `=0` off;
+  docs/regalloc.md) — rematerializable bundles get half spill weight
+  when they have at least `PLIRON_RA2_REMATW_MINUSSES` uses (default 8).
+  Plain `=1` wins pulldown but costs protobuf `merge_loop` +205k;
+  mode 7 keeps pulldown −0.21% non-nop (copies=2) with protobuf
+  +0.017%. Modes 1–6 are A/B knobs (`docs/history/2026-11-18-ra-night.md`).
+  Weight membership is cheap-only by default (`PLIRON_RA2_REMATW_CHEAP`,
+  `=0` off: immediates, not GOT/near loads — LLVM/Go/GCC).
+- `PLIRON_RA2_USESPLIT` (default on since 2026-11-18, `=0` off) — before
+  minimal-bundle fallback, cut at the largest use-free gap in a
+  single-block bundle (`_GAP` default 128; `_MULTIBLOCK=1` lifts the
+  one-block rule). blake3 `compress_in_place` −154k non-nop;
+  `docs/history/2026-11-18-ra-five-start.md`.
+- `PLIRON_RA_ALGO=greedy` (opt-in) — all-spill+edits (checker-clean);
+  `PLIRON_RA_GREEDY_COLOR=1` promotes single-block non-param vregs
+  (branch args OK; linear scan; checker-clean, unmeasured). Default
+  remains ion.
+- `PLIRON_RA_ALGO=mcts` (opt-in; or `PLIRON_RA_MCTS=1` under greedy) —
+  Gumbel-root / PUCT home search minimizing distinct preg count + spill
+  weight (`vendor/regalloc2/src/mcts_ra.rs`); `PLIRON_RA_MCTS_SIMS`
+  (default 256), `PLIRON_RA_MCTS_TOPM` (8), `PLIRON_RA_MCTS_GUMBEL=0`
+  off. `tools/raproof --algo mcts` prints `preg_pressure` as usual.
+  See `docs/history/2026-11-18-ra-mcts.md`. Pomodoro: `harness/ra_pomodoro.py`.
+- `PLIRON_RA_PROOFCOLOR=1` (opt-in, needs COLOR) — apply a checked
+  chromatic colouring on classes ≤ `MAX_EXACT`: rematch homes when
+  footprint > `upper_k`, steer emit temps to those K pregs. Fitness
+  on the fixed 40-seed window 0.20 → 0.30; rafuzz-clean. See
+  `docs/history/2026-11-18-ra-raproof-learn.md`.
+- `tools/raproof` — exact clique / chromatic certificates on fuzz
+  funcs vs ion/greedy/fast preg footprint (`regalloc2::prove`;
+  docs/regalloc.md). Research harness, not in the gate.
+- `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
+  minimal / use_cluster / region / evicts).
+- `PLIRON_X18=1` (opt-in, aarch64 Linux) — platform reg allocatable;
+  not default-on yet.
 - `PLIRON_X30=1|2` (opt-in, aarch64) — the link register is allocatable.
   `=1` everywhere (a frameless leaf grows a frame record). `=2` only in
   a function that already makes a regular call, or when frame pointers
