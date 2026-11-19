@@ -26,6 +26,8 @@ pub fn of_isa(isa: &dyn TargetIsa) -> Target {
     Target {
         arch,
         ptr_bits: u32::from(isa.pointer_bits()),
+        platform_reg_free: arch == Arch::Aarch64
+            && isa.triple().operating_system == target_lexicon::OperatingSystem::Linux,
         ..Target::other64()
     }
 }

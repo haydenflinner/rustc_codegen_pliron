@@ -985,8 +985,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   docs/regalloc.md). Research harness, not in the gate.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
-- `PLIRON_X18=1` (opt-in, aarch64 Linux) — platform reg allocatable;
-  not default-on yet.
+- `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,
+  on aarch64 Linux ELF targets only (`Target::platform_reg_free`; Darwin
+  and Windows reserve it, and before 2026-11-19 the knob took it there
+  too). Not default-on yet. Stanza `x18`.
 - `PLIRON_SIBCALL` (default on since 2026-11-19, aarch64; `=0` off;
   vendored Cranelift reads it too) — step `sibcall`: `v = call f(..);
   return v` becomes `return_call` when caller and callee share a

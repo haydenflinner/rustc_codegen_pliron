@@ -27,6 +27,9 @@ pub(crate) fn of(sess: &Session) -> Target {
             sess.opts.optimize,
             rustc_session::config::OptLevel::Size | rustc_session::config::OptLevel::SizeMin
         ),
+        // x18: Linux ELF only (`rustc_target`'s `os`; Android also
+        // reserves it for the shadow call stack).
+        platform_reg_free: arch == Arch::Aarch64 && sess.target.os == rustc_target::spec::Os::Linux,
         ..base
     };
     // `types::size_align` lays out pointers from a process-wide mirror

@@ -44,6 +44,11 @@ pub struct Target {
     /// `-Copt-level=s|z`: code size comes before speed. With wasm32 it
     /// puts the inliner in its size-first mode (`inline::Mode::of`).
     pub opt_size: bool,
+    /// The platform register (aarch64 `x18`) is an ordinary register:
+    /// Linux ELF (LLVM allocates it there). Darwin and Windows reserve
+    /// it (macOS zeroes it on context switches), so it stays out of
+    /// every count. False on every other architecture.
+    pub platform_reg_free: bool,
 }
 
 impl Target {
@@ -52,6 +57,7 @@ impl Target {
             arch: Arch::Aarch64,
             ptr_bits: 64,
             opt_size: false,
+            platform_reg_free: false,
         }
     }
 
@@ -60,6 +66,7 @@ impl Target {
             arch: Arch::X86_64,
             ptr_bits: 64,
             opt_size: false,
+            platform_reg_free: false,
         }
     }
 
@@ -68,6 +75,7 @@ impl Target {
             arch: Arch::Wasm32,
             ptr_bits: 32,
             opt_size: false,
+            platform_reg_free: false,
         }
     }
 
@@ -77,6 +85,7 @@ impl Target {
             arch: Arch::Other,
             ptr_bits: 64,
             opt_size: false,
+            platform_reg_free: false,
         }
     }
 
@@ -176,12 +185,37 @@ impl Target {
     /// (allocatable, callee-saved) integer registers, for register
     /// pressure estimates (licm's `PLIRON_LICM_INNERPRESS=2`). `None` on
     /// wasm32, which has no register file of ours.
+    ///
+    /// aarch64 base 26 is x0–x15 + x19–x28 (x16 scratch, x18 platform,
+    /// x29 FP, x30 LR, x31 SP), the count with every register knob off;
+    /// [`Target::int_regs_alloc`] adds what the knobs make allocatable.
     pub const fn int_regs(&self) -> Option<(u32, u32)> {
         match self.arch {
             Arch::Aarch64 => Some((26, 10)),
             Arch::X86_64 | Arch::Other => Some((14, 5)),
             Arch::Wasm32 => None,
         }
+    }
+
+    /// Allocatable integer registers under the register knobs the
+    /// vendored aarch64 backend reads: `PLIRON_X17` (default on), `PLIRON_X18`
+    /// (opt-in, and only where [`Target::platform_reg_free`]), `PLIRON_X30`
+    /// (`=1|2`; counted for `=2` too, an upper bound for leaves). Elsewhere
+    /// the same as [`Target::int_regs`].
+    pub fn int_regs_alloc(&self) -> Option<(u32, u32)> {
+        let (mut n, csr) = self.int_regs()?;
+        if self.is_aarch64() {
+            if !crate::env_is("PLIRON_X17", "0") {
+                n += 1;
+            }
+            if self.platform_reg_free && crate::env_is("PLIRON_X18", "1") {
+                n += 1;
+            }
+            if crate::env_is("PLIRON_X30", "1") || crate::env_is("PLIRON_X30", "2") {
+                n += 1;
+            }
+        }
+        Some((n, csr))
     }
 
     /// Same architecture and pointer width: what the lowering checks

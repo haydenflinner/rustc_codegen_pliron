@@ -170,16 +170,14 @@ pub fn set_x18_linux_default(on: bool) {
 }
 
 /// `PLIRON_X18`: platform register. On Linux ELF aarch64 LLVM allocates it;
-/// on macOS/Windows it carries inter-procedural state and must stay
-/// reserved. Opt-in `=1` until held-out A/B is clean (2026-11-18: default
-/// on for Linux caused blake3 stack overflow under callgrind). The
-/// Linux-default bit is recorded for a future flip via
-/// `set_x18_linux_default`.
+/// on macOS/Windows it carries inter-procedural state (macOS zeroes it on
+/// context switches) and must stay reserved, so `=1` takes effect only
+/// when the ISA's triple is Linux (`set_x18_linux_default`, called from
+/// `isa_builder`). Opt-in until the held-out A/B is clean (2026-11-18:
+/// default on for Linux caused a blake3 stack overflow under callgrind).
 pub fn x18_allocatable() -> bool {
-    match std::env::var("PLIRON_X18").as_deref() {
-        Ok("1") => true,
-        _ => false,
-    }
+    X18_LINUX_DEFAULT.load(core::sync::atomic::Ordering::Relaxed)
+        && std::env::var("PLIRON_X18").as_deref() == Ok("1")
 }
 
 /// Get a reference to the second temp register. We need this in some edge cases

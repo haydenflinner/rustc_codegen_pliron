@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std mcrdwrap sretnosync shrinkwrap sibcall regionsplit bigtmp fragcopyout
+#   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 regionsplit bigtmp fragcopyout
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -982,6 +982,23 @@ t_sibcall() {
   done
 }
 
+t_x18() {
+  # PLIRON_X18=1 (opt-in, aarch64): the platform register is allocatable on
+  # Linux ELF only. Until 2026-11-19 the knob also took x18 on Darwin, where
+  # the kernel zeroes it on a context switch. The object for the host
+  # (Darwin) must not name x18 under the knob; a Linux object must.
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-apple-darwin) ;; *) return 0 ;; esac
+  local n t
+  for t in aarch64-apple-darwin aarch64-unknown-linux-musl; do
+    PLIRON_X18=1 rustc $BE --edition 2021 -O --crate-type=lib --emit=obj --target $t tests/x18/press.rs -o $out/x18-$t.o || return 1
+    n=$("$llvmod" -d --no-show-raw-insn $out/x18-$t.o | grep -cE '[ ,[](x18|w18)([ ,]|$)' || true)
+    case $t in
+      *darwin) (( n == 0 )) || { echo "x18: $n uses of x18 on Darwin under PLIRON_X18=1" >&2; return 1; } ;;
+      *) (( n > 0 )) || { echo "x18: no use of x18 on Linux under PLIRON_X18=1 (test lost its pressure)" >&2; return 1; } ;;
+    esac
+  done
+}
+
 t_shrinkwrap() {
   # PLIRON_SHRINKWRAP=1 (opt-in, aarch64): the save block must keep its
   # callee saves through emission (EDGEHOIST retargeted a branch past it,
@@ -1626,6 +1643,7 @@ want bigtmp && t_bigtmp
 want fragcopyout && t_fragcopyout
 want shrinkwrap && t_shrinkwrap
 want sibcall && t_sibcall
+want x18 && t_x18
 want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi

@@ -2166,3 +2166,11 @@ a function whose set was recorded adds that set to the caller's own and
 counts as a returning block; a tail call to an unknown callee still
 records nothing. Callers add `x16`, `x17` and `x30` at every narrowed call
 site, which covers the epilogue's scratch and linker veneers on the `b`.
+
+## `PLIRON_X18=1`: Linux targets only (2026-11-19)
+
+`src/isa/aarch64/inst/regs.rs` (`x18_allocatable`): the knob takes effect
+only when `isa_builder` recorded a Linux triple (`set_x18_linux_default`,
+which nothing read before). It used to make x18 allocatable on Darwin and
+Windows too, where the platform reserves it (macOS zeroes it on context
+switches). Stanza `x18`.

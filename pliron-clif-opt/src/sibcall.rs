@@ -42,7 +42,6 @@
 //! assume the platform's full clobber set across it.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
     ArgumentPurpose, Block, Function, Inst, InstBuilder, InstructionData, Opcode, Signature, Value,
