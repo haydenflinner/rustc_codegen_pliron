@@ -2354,7 +2354,16 @@ pub fn run<F: Function>(
             fastalloc::run(func, env, options.verbose_log, options.validate_ssa)
         }
         Algorithm::Greedy => greedy::run(func, env, options.verbose_log, options.validate_ssa),
-        Algorithm::Mcts => greedy::run_mcts(func, env, options.verbose_log, options.validate_ssa),
+        Algorithm::Mcts => {
+            match greedy::run_mcts(func, env, options.verbose_log, options.validate_ssa)? {
+                Some(out) => Ok(out),
+                None => {
+                    let mut ctx = Ctx::default();
+                    ion::run(func, env, &mut ctx, options.verbose_log, options.validate_ssa)?;
+                    Ok(ctx.output)
+                }
+            }
+        }
     }
 }
 
@@ -2398,7 +2407,10 @@ pub fn run_with_ctx<'a, F: Function>(
             ctx.output = greedy::run(func, env, options.verbose_log, options.validate_ssa)?
         }
         Algorithm::Mcts => {
-            ctx.output = greedy::run_mcts(func, env, options.verbose_log, options.validate_ssa)?
+            match greedy::run_mcts(func, env, options.verbose_log, options.validate_ssa)? {
+                Some(out) => ctx.output = out,
+                None => ion::run(func, env, ctx, options.verbose_log, options.validate_ssa)?,
+            }
         }
     }
     Ok(&ctx.output)

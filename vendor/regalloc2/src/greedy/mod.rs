@@ -53,10 +53,10 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 /// `TooManyLiveRegs` with a trace of the emit site that ran out of temps.
-fn too_many(_line: u32) -> RegAllocError {
+fn too_many(_line: u32, _inst: usize) -> RegAllocError {
     #[cfg(feature = "std")]
     if crate::explain_on() || env_flag("PLIRON_RA_FALLBACK_LOG") {
-        std::eprintln!("ra2x: greedy emit out of temps at greedy/mod.rs:{}", _line);
+        std::eprintln!("ra2x: greedy emit out of temps at greedy/mod.rs:{} inst {}", _line, _inst);
     }
     RegAllocError::TooManyLiveRegs
 }
@@ -871,6 +871,7 @@ fn color<F: Function>(
     allow_color: bool,
     forbid_sets: Option<&[PRegSet]>,
     reserve: usize,
+    spilled_cost: &mut f64,
 ) -> (Vec<Option<Allocation>>, usize, ProofPrefs) {
     let n = intervals
         .iter()
@@ -1067,6 +1068,9 @@ fn color<F: Function>(
                     let mut used = Vec::new();
                     for (i, &v) in eligible.iter().enumerate() {
                         let h = homes[i];
+                        if (h as usize) >= regs.len() {
+                            *spilled_cost += prob.spill_cost[i];
+                        }
                         if (h as usize) < regs.len() {
                             assign[v] = Some(Allocation::reg(regs[h as usize]));
                             if !used.iter().any(|x| *x == regs[h as usize]) {
@@ -1550,7 +1554,7 @@ fn push_move(
     }
     if is_stack_like(env, from) && is_stack_like(env, to) {
         let tmp = pick_temp_or_dead_home(env, class, forbidden, intervals, assign, at, prefer)
-            .ok_or_else(|| too_many(line!()))?;
+            .ok_or_else(|| too_many(line!(), at))?;
         forbidden.push(tmp);
         let t = Allocation::reg(tmp);
         push_edit(edits, edit_vregs, pp, from, t, v);
@@ -1895,7 +1899,7 @@ fn emit<F: Function>(
                                 inst_idx,
                                 prefer_of(op.class()),
                             )
-                            .ok_or_else(|| too_many(line!()))?;
+                            .ok_or_else(|| too_many(line!(), inst_idx))?;
                             forbidden.push(tmp);
                             let t = Allocation::reg(tmp);
                             push_move(
@@ -1967,7 +1971,7 @@ fn emit<F: Function>(
                                     )
                                     .filter(|r| (r.hw_enc() as usize) < n)
                                 })
-                                .ok_or_else(|| too_many(line!()))?
+                                .ok_or_else(|| too_many(line!(), inst_idx))?
                         } else {
                             pick_temp_or_dead_home(
                                 env,
@@ -1978,7 +1982,7 @@ fn emit<F: Function>(
                                 inst_idx,
                                 pref,
                             )
-                            .ok_or_else(|| too_many(line!()))?
+                            .ok_or_else(|| too_many(line!(), inst_idx))?
                         };
                         forbidden.push(tmp);
                         let t = Allocation::reg(tmp);
@@ -2160,7 +2164,7 @@ pub fn run<F: Function>(
     _verbose: bool,
     check_ssa: bool,
 ) -> Result<Output, RegAllocError> {
-    run_inner(func, env, check_ssa, false)
+    run_inner(func, env, check_ssa, false)?.ok_or(RegAllocError::TooManyLiveRegs)
 }
 
 /// PLIRON: greedy hands out one logical slot per spill; a vector value
@@ -2280,12 +2284,14 @@ fn color_allowed<F: Function>(func: &F) -> bool {
 }
 
 /// Like `run`, but forces the MCTS home search (`PLIRON_RA_ALGO=mcts`).
+/// `None`: the whole-function homes would spill too much (see
+/// `PLIRON_RA_MCTS_FALLBACK`); the caller runs ion on this function.
 pub fn run_mcts<F: Function>(
     func: &F,
     env: &MachineEnv,
     _verbose: bool,
     check_ssa: bool,
-) -> Result<Output, RegAllocError> {
+) -> Result<Option<Output>, RegAllocError> {
     run_inner(func, env, check_ssa, true)
 }
 
@@ -2294,7 +2300,7 @@ fn run_inner<F: Function>(
     env: &MachineEnv,
     check_ssa: bool,
     force_mcts: bool,
-) -> Result<Output, RegAllocError> {
+) -> Result<Option<Output>, RegAllocError> {
     if check_ssa {
         validate_ssa(func, &CFGInfo::new(func)?)?;
     }
@@ -2311,9 +2317,15 @@ fn run_inner<F: Function>(
     // at the busiest instruction. Retry with more registers held back from
     // homes before giving up to the all-spill baseline (which always fits).
     let reserve0 = env_usize("PLIRON_RA_MCTS_RESERVE", 1);
+    // Whole-function homes cannot split a live range, which is what ion does
+    // when pressure exceeds the registers: spilling a vreg that is used in a
+    // loop costs a reload per iteration. Past this much weighted spill cost
+    // the function goes back to ion (`run_mcts` returns `None`).
+    let fallback_at = env_usize("PLIRON_RA_MCTS_FALLBACK", 50) as f64;
     let mut emitted = None;
     let mut assign = Vec::new();
     for extra in [0usize, 1, 3, 6] {
+        let mut spilled = 0.0f64;
         let (mut a, spillslots, prefs) = color(
             func,
             &intervals,
@@ -2323,12 +2335,20 @@ fn run_inner<F: Function>(
             color_allowed(func),
             forbid.as_deref(),
             reserve0 + extra,
+            &mut spilled,
         );
+        if force_mcts && forbid.is_some() && fallback_at > 0.0 && spilled > fallback_at {
+            return Ok(None);
+        }
         match emit(func, env, &intervals, &mut a, spillslots, &prefs, &lv, nv) {
             Err(RegAllocError::TooManyLiveRegs) if forbid.is_some() && extra < 6 => continue,
             Err(RegAllocError::TooManyLiveRegs) => {
+                if force_mcts && fallback_at > 0.0 {
+                    return Ok(None);
+                }
+                let mut sp = 0.0;
                 let (mut a2, spillslots, prefs) =
-                    color(func, &intervals, &interfere, env, force_mcts, false, None, 0);
+                    color(func, &intervals, &interfere, env, force_mcts, false, None, 0, &mut sp);
                 let r = emit(func, env, &intervals, &mut a2, spillslots, &prefs, &lv, nv)?;
                 assign = a2;
                 emitted = Some(r);
@@ -2388,5 +2408,5 @@ fn run_inner<F: Function>(
         }
     }
 
-    Ok(output)
+    Ok(Some(output))
 }
