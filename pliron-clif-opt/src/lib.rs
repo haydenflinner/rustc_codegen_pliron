@@ -38,6 +38,7 @@ pub mod stkorder;
 pub mod cmp3;
 pub mod cmpcancel;
 pub mod deadslot;
+pub mod sibcall;
 pub mod cmpmerge;
 pub mod selset;
 pub mod selxor;

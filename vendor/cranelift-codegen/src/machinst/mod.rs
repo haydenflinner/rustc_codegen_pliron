@@ -349,6 +349,13 @@ pub trait MachInst: Clone + Debug {
     /// for tail calls that don't return to the caller.
     fn call_type(&self) -> CallType;
 
+    /// PLIRON: FASTCC — for a tail call, the registers its callee may
+    /// write, when known (see `VCode::pliron_written_regs`). `None`: not
+    /// known, or not a tail call.
+    fn pliron_tail_clobbers(&self) -> Option<regalloc2::PRegSet> {
+        None
+    }
+
     /// PLIRON: the trap code of an unconditional trap (`is_trap`), if the
     /// backend records one. Used to find `TrapCode::NORETURN_CALL` traps
     /// that emission may drop.

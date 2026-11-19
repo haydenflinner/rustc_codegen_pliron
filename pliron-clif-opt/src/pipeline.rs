@@ -3919,6 +3919,19 @@ fn s_retest(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 // Slots whose last reference a late pass removed — see `deadslot`.
+// `call; return` as `return_call` (aarch64 platform ABIs) — see `sibcall`.
+fn s_sibcall(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if !p.target.is_aarch64() {
+        return 0;
+    }
+    let k = crate::sibcall::run(&mut p.clctx.func, p.nocap);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("sibcall");
+    }
+    k
+}
+
 fn s_deadslot(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // `-g -O0`: every variable keeps its own slot for the debugger.
     if p.flags.keep_dbg_slots {
@@ -6005,6 +6018,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // A slot whose last store `dse3` deleted (after `slotmerge`)
         // still has its size, and the function a frame for it.
         step("deadslot", "deadslot", Gate::Env("PLIRON_DEADSLOT"), s_deadslot).needs(shape::SLOT),
+        // After the last step that reads a call's results or a slot's
+        // users: `call; return` becomes `return_call` when nothing in
+        // this frame is visible to the callee. Opt-in: `PLIRON_SIBCALL=1`.
+        step("sibcall", "", Gate::OptIn("PLIRON_SIBCALL"), s_sibcall).needs(shape::CALL),
         step("panicstub", "panicstub", Gate::OptIn("PLIRON_PANICSTUB"), s_panicstub)
             .needs(shape::CALL),
         // A zero counter stepped in lockstep with an index, whose only

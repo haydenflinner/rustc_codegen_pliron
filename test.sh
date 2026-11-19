@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std mcrdwrap sretnosync shrinkwrap regionsplit bigtmp fragcopyout
+#   o0std mcrdwrap sretnosync shrinkwrap sibcall regionsplit bigtmp fragcopyout
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -953,6 +953,35 @@ t_fragcopyout() {
   PLIRON_SROA_FRAGCOPY_OUT=0 rustc $BE --edition 2021 -O tests/fragcopyout/main.rs -o $out/fragcopyout$exe && [[ "$($out/fragcopyout$exe)" == "$want" ]]
 }
 
+t_sibcall() {
+  # PLIRON_SIBCALL=1 (opt-in, aarch64): `call; return` becomes `return_call`
+  # on the platform ABIs and the internal `tail` one when nothing in the
+  # caller's frame is visible to the callee. The program hands a slot
+  # address to a callee, stores one in memory a callee reads, passes stack
+  # arguments, returns through sret, and keeps sixteen values live across a
+  # function that tail-calls a leaf (FASTCC must count the leaf's writes).
+  # Output pinned by stock rustc with the step off, on, on with 4 CGUs and
+  # the regalloc2 checker. On aarch64, `walk_even` must branch to
+  # `walk_odd`, and `slot_arg` / `slot_stored` / `stack_args` must still
+  # call theirs.
+  rustc --edition 2021 -O tests/sibcall/main.rs -o $out/sibcall-stock$exe || return 1
+  local v i=0
+  for v in "PLIRON_SIBCALL=0 CGU=1" "PLIRON_SIBCALL=1 CGU=1" "PLIRON_SIBCALL=1 PLIRON_RA_CHECK=1 CGU=4"; do
+    i=$((i + 1))
+    env ${v% CGU=*} rustc $BE --edition 2021 -O -C codegen-units=${v##*CGU=} tests/sibcall/main.rs -o $out/sibcall$i$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/sibcall-stock$exe) <($out/sibcall$i$exe) || { echo "sibcall: output differs ($v)" >&2; return 1; }
+  done
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
+  local dis f
+  dis=$("$llvmod" -d --no-show-raw-insn $out/sibcall2$exe)
+  body() { awk -v f="$1" '$0 ~ "^[0-9a-f]+ <_*[^ ]*" f ">:$" {p=1; next} /^$/ {p=0} p' <<< "$dis"; }
+  body 9walk_even | grep -qE "\sb\s.*walk_odd>" || { echo "sibcall: walk_even does not branch to walk_odd" >&2; return 1; }
+  for f in "8slot_arg read_ptr" "11slot_stored read_held" "10stack_args 3ten"; do
+    body "${f% *}" | grep -qE "\sbl\s.*${f#* }>" || { echo "sibcall: ${f% *} lost its call to ${f#* }" >&2; return 1; }
+  done
+}
+
 t_shrinkwrap() {
   # PLIRON_SHRINKWRAP=1 (opt-in, aarch64): the save block must keep its
   # callee saves through emission (EDGEHOIST retargeted a branch past it,
@@ -1596,6 +1625,7 @@ want sretnosync && t_sretnosync
 want bigtmp && t_bigtmp
 want fragcopyout && t_fragcopyout
 want shrinkwrap && t_shrinkwrap
+want sibcall && t_sibcall
 want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi

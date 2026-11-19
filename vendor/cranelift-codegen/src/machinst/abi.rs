@@ -2062,9 +2062,12 @@ impl<M: ABIMachineSpec> Callee<M> {
         let word_bits = M::word_bits() as usize;
 
         if is_tail_call {
-            debug_assert_eq!(
-                self.call_conv,
-                isa::CallConv::Tail,
+            // PLIRON: a platform-ABI sibling call (`PLIRON_SIBCALL=1`) has
+            // no stack arguments on either side (`sibcall` step), so the
+            // `tail` convention's incoming-argument bookkeeping is empty.
+            debug_assert!(
+                self.call_conv == isa::CallConv::Tail
+                    || (self.call_conv.supports_tail_calls() && stack_arg_space == 0),
                 "Can only do `return_call`s from within a `tail` calling convention function"
             );
         }

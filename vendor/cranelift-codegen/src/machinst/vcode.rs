@@ -1690,8 +1690,10 @@ impl<I: VCodeInst> VCode<I> {
     /// reduced set. Without this a single bounds-check panic gives a leaf
     /// the whole ABI clobber set.
     ///
-    /// `None` when the function contains a tail call — the tail callee
-    /// runs in this function's place and its writes are not known here.
+    /// `None` when the function contains a tail call whose callee's set is
+    /// not known — the tail callee runs in this function's place; a
+    /// known set (a direct `return_call` to a function compiled earlier)
+    /// is part of this function's own.
     fn pliron_written_regs(&self, regalloc: &regalloc2::Output) -> Option<PRegSet> {
         static NORET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let noret = *NORET.get_or_init(|| std::env::var("PLIRON_FASTCC_NORET").as_deref() != Ok("0"));
@@ -1701,21 +1703,28 @@ impl<I: VCodeInst> VCode<I> {
         let mut returns = vec![!noret; nb];
         let mut insn_block = vec![0u32; self.insts.len()];
         let mut work: Vec<usize> = Vec::new();
+        let mut tail_written = PRegSet::default();
         for b in 0..nb {
             let r = self.block_ranges.get(b);
             for i in r.start..r.end {
                 insn_block[i] = b as u32;
+                // A tail call runs its callee in this function's place: the
+                // callee's writes are this function's, so it counts when
+                // they are known (`pliron_tail_clobbers`) and the block
+                // returns like a `ret` block.
                 if self.insts[i].call_type() == CallType::TailCall {
-                    return None;
+                    match self.insts[i].pliron_tail_clobbers() {
+                        Some(set) => tail_written.union_from(set),
+                        None => return None,
+                    }
                 }
                 match self.insts[i].is_term() {
-                    MachTerminator::Ret => {
+                    MachTerminator::Ret | MachTerminator::RetCall => {
                         if !returns[b] {
                             returns[b] = true;
                         }
                         work.push(b);
                     }
-                    MachTerminator::RetCall => return None,
                     _ => {}
                 }
             }
@@ -1734,7 +1743,7 @@ impl<I: VCodeInst> VCode<I> {
                 }
             }
         }
-        let mut written = PRegSet::default();
+        let mut written = tail_written;
         for (pp, Edit::Move { to, .. }) in &regalloc.edits {
             if let Some(preg) = to.as_reg()
                 && returns[insn_block[pp.inst().index()] as usize]

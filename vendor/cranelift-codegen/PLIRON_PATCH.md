@@ -2146,3 +2146,24 @@ travels through a TLS slot. Without the knob nothing changes.
 edge of such a call clobbers what a normal fastcall call does
 (`WINDOWS_CLOBBERS`; `RtlUnwindEx` restores nonvolatiles); it panicked
 before.
+
+## `PLIRON_SIBCALL=1` (opt-in): `return_call` on aarch64's platform ABIs (2026-11-19)
+
+`src/isa/call_conv.rs` (`supports_tail_calls`, `pliron_sibcall`):
+`SystemV` and `AppleAarch64` accept `return_call` under the knob. Only
+`pliron-clif-opt`'s `sibcall` step emits one there, and it guarantees
+that neither side has stack arguments or a stack return area, so the
+`tail` convention's incoming-argument bookkeeping is empty (the
+`debug_assert` in `src/machinst/abi.rs` allows exactly that). Nothing else
+reads `supports_tail_calls` but the verifier. Without the knob nothing
+changes.
+
+FASTCC with tail calls: `src/isa/aarch64/inst/mod.rs` (`ReturnCallInfo::
+pliron_clobbers`, `pliron_tail_clobbers`), `src/isa/aarch64/lower/isle.rs`
+(`gen_return_call_info` looks up the callee's recorded set),
+`src/machinst/mod.rs` (`MachInst::pliron_tail_clobbers`),
+`src/machinst/vcode.rs` (`pliron_written_regs`): a direct `return_call` to
+a function whose set was recorded adds that set to the caller's own and
+counts as a returning block; a tail call to an unknown callee still
+records nothing. Callers add `x16`, `x17` and `x30` at every narrowed call
+site, which covers the epilogue's scratch and linker veneers on the `b`.

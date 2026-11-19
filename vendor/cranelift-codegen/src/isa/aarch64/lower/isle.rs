@@ -717,12 +717,24 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         let key =
             AArch64MachineDeps::select_api_key(&self.backend.isa_flags, isa::CallConv::Tail, true);
 
+        // PLIRON: FASTCC — the callee's recorded write set, if it is known.
+        let pliron_clobbers = match &dest {
+            ExternalName::User(name_ref) => self
+                .lower_ctx
+                .f
+                .params
+                .user_named_funcs()
+                .get(*name_ref)
+                .and_then(|n| crate::machinst::pliron_fastcc_callee(n.namespace, n.index)),
+            _ => None,
+        };
         Box::new(ReturnCallInfo {
             dest,
             uses,
             key,
             sign_return_address_all: self.backend.isa_flags.sign_return_address_all(),
             new_stack_arg_size,
+            pliron_clobbers,
         })
     }
 
@@ -746,6 +758,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             key,
             sign_return_address_all: self.backend.isa_flags.sign_return_address_all(),
             new_stack_arg_size,
+            pliron_clobbers: None,
         })
     }
 

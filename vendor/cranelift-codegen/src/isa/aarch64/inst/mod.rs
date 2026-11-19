@@ -91,6 +91,12 @@ pub struct ReturnCallInfo<T> {
     pub key: Option<APIKey>,
     /// Whether pointer-auth return addresses are signed even without frame setup.
     pub sign_return_address_all: bool,
+    /// PLIRON: FASTCC (`machinst/abi.rs`) — the registers the callee may
+    /// write before it returns, when it is a direct call to a function
+    /// compiled earlier in this object whose set was recorded; `None`
+    /// otherwise. The callee returns to this function's caller, so its
+    /// writes belong to this function's own set.
+    pub pliron_clobbers: Option<regalloc2::PRegSet>,
 }
 
 fn count_zero_half_words(mut value: u64, num_half_words: u8) -> usize {
@@ -1093,6 +1099,13 @@ impl MachInst for Inst {
                 true
             }
             _ => false,
+        }
+    }
+
+    fn pliron_tail_clobbers(&self) -> Option<regalloc2::PRegSet> {
+        match self {
+            Inst::ReturnCall { info } => info.pliron_clobbers,
+            _ => None,
         }
     }
 
