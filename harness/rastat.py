@@ -456,6 +456,25 @@ def norm(run_irdiff, names):
     return names
 
 
+def canon_fn(n):
+    return re.sub(r"\.llvm\.\d+$|17h[0-9a-f]{16}E$|::h[0-9a-f]{16}$", "", n)
+
+
+def classify_gap(lrows, prows):
+    """Split excess overhead into both-sides vs inline_only (LLVM has ~no body)."""
+    both = inline_only = 0
+    for k in set(lrows) | set(prows):
+        d = overhead(prows[k]) - overhead(lrows[k])
+        if d <= 0:
+            continue
+        lo = overhead(lrows[k])
+        if lo * 20 < overhead(prows[k]) and lo < 1000:
+            inline_only += d
+        else:
+            both += d
+    return both, inline_only
+
+
 def print_prog(prog, sides, top):
     L, P = sides["llvm"]["total"], sides["pliron"]["total"]
     print(f"\n{prog}: insts llvm {L.get('insts', 0)} pliron {P.get('insts', 0)} "
@@ -465,22 +484,26 @@ def print_prog(prog, sides, top):
         print(f"  {c:<8} {l:>12} {p:>12}  x{p / l if l else float('inf'):.2f}  {p - l:+d}")
     lo, po = overhead(L), overhead(P)
     print(f"  {'overhead':<8} {lo:>12} {po:>12}  x{po / lo if lo else float('inf'):.2f}  {po - lo:+d}")
-    lf, pf = collections.Counter(), collections.defaultdict(collections.Counter)
-    canon_name = lambda n: re.sub(r"\.llvm\.\d+$|17h[0-9a-f]{16}E$|::h[0-9a-f]{16}$", "", n)
     lrows = collections.defaultdict(collections.Counter)
     for n, row in sides["llvm"]["functions"].items():
-        lrows[canon_name(n)].update(row)
+        lrows[canon_fn(n)].update(row)
     prows = collections.defaultdict(collections.Counter)
     for n, row in sides["pliron"]["functions"].items():
-        prows[canon_name(n)].update(row)
+        prows[canon_fn(n)].update(row)
+    both, inl = classify_gap(lrows, prows)
+    po_both = max(0, po - inl)
+    print(f"  {'gap':<8} both {both:+d}  inline_only {inl:+d}  "
+          f"both-only overhead x{po_both / lo if lo else float('inf'):.3f}")
     keys = sorted(set(lrows) | set(prows), key=lambda k: overhead(lrows[k]) - overhead(prows[k]))
     print(f"  top {top} functions by excess overhead (pliron - llvm; classes pliron/llvm)")
     for k in keys[:top]:
         d = overhead(prows[k]) - overhead(lrows[k])
         if d <= 0:
             break
+        lo_k = overhead(lrows[k])
+        tag = "inline_only" if lo_k * 20 < overhead(prows[k]) and lo_k < 1000 else "both"
         det = " ".join(f"{c} {prows[k].get(c, 0)}/{lrows[k].get(c, 0)}" for c in CLASSES)
-        print(f"  {d:>+11}  {det}  {k[:100]}")
+        print(f"  {d:>+11}  [{tag}]  {det}  {k[:90]}")
 
 
 def print_summary(res):

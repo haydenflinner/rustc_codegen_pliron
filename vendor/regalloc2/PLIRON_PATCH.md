@@ -586,3 +586,5 @@ heaviest first, as LLVM's greedy allocator orders candidates by copy
 hints. `1`: only for a bundle without a spillset hint; `2`: in place of
 it. Static html corpus, `=2`: loop-weighted moves 716k -> 675k,
 instructions 6.970M -> 6.919M; `=1` almost nothing.
+  2026-11-19: exact interference, reserve-and-retry temps, ion delegation over
+  `PLIRON_RA_MCTS_FALLBACK`, `PLIRON_RA_TIME`: `docs/history/2026-11-19-ra-mcts-whole-function.md`.

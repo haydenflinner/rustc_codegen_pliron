@@ -66,7 +66,22 @@ KNOBS = [
     ("PLIRON_RA2_XBLOCK", "0", ["1"], "ra2", "1"),
     ("PLIRON_RA2_MERGEDEPTH", "0", ["1", "2", "3"], "ra2", "2"),
     # Cranelift (vendor/cranelift-codegen/src/machinst, isa/aarch64).
-    ("PLIRON_RA2_REMATW", "0", ["1"], "clif", "1"),
+    ("PLIRON_RA2_REMATW", "7", ["0", "1", "2", "3", "4", "5", "6"], "clif", "7"),
+    ("PLIRON_RA2_REMATW_MAXUSES", "4", ["2", "8", "16"], "clif", "4"),
+    ("PLIRON_RA2_REMATW_MINUSSES", "8", ["4", "16", "32"], "clif", "8"),
+    ("PLIRON_RA2_REMATW_CHEAP", "1", ["0"], "clif", "1"),
+    ("PLIRON_RA2_USESPLIT", "1", ["0"], "ra2", "1"),
+    ("PLIRON_RA2_USESPLIT_GAP", "128", ["8", "32", "64"], "ra2", "128"),
+    ("PLIRON_RA2_USESPLIT_MULTIBLOCK", "0", ["1"], "ra2", "0"),
+    # greedy default is all-spill; COLOR=1 single-block non-edge (both clean).
+    # PROOFCOLOR=1 needs COLOR; mixes chromatic rematch + temp prefs.
+    # mcts = UCT homes on greedy emit (SIMS/TOPM dials; light-rafuzz clean).
+    ("PLIRON_RA_ALGO", "ion", ["greedy", "mcts"], "ra2", "ion"),
+    ("PLIRON_RA_GREEDY_COLOR", "0", ["1"], "ra2", "0"),
+    ("PLIRON_RA_PROOFCOLOR", "0", ["1"], "ra2", "0"),
+    ("PLIRON_RA_MCTS_SIMS", "256", ["64", "128", "512"], "ra2", "256"),
+    ("PLIRON_RA_MCTS_TOPM", "8", ["4", "16"], "ra2", "8"),
+    ("PLIRON_X18", "0", ["1"], "clif", "0"),
     ("PLIRON_REMAT", "1", ["0"], "clif", "1"),
     ("PLIRON_REMAT_STORE", "1", ["0"], "clif", "1"),
     ("PLIRON_RELOADPRE", "1", ["0"], "clif", "1"),
@@ -81,7 +96,7 @@ KNOBS = [
 # Names the sources read that are reports or debugging aids, not behaviour.
 IGNORED = {"PLIRON_RA2_STATS", "PLIRON_RA2_VERBOSE", "PLIRON_RA2_EDITS", "PLIRON_RA2_ALLOC",
            "PLIRON_RA2_POSTOPT_STATS", "PLIRON_RA_CHECK", "PLIRON_RA_CHECK_LABELS", "PLIRON_RA_EXPLAIN",
-           "PLIRON_RA_ALGO", "PLIRON_RA2_",
+           "PLIRON_RA_STATS", "PLIRON_RA2_",
            # REGION / spill tuners and probes (behaviour only via REGION=1)
            "PLIRON_RA2_COPYHINT", "PLIRON_RA2_MOVESTATS", "PLIRON_RA2_REGION_CAP",
            "PLIRON_RA2_REGION_K", "PLIRON_RA2_REGION_MAX", "PLIRON_RA2_REGION_MAXB",

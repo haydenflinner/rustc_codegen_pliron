@@ -7,6 +7,75 @@ programs, with no other loss. Everyone working on regalloc2 heuristics,
 moves/coalescing/remat or the analyses feeding them records here what a
 knob does and where it stands.
 
+## Five workstreams (2026-11-18)
+
+Knob-tweaking on spill weights is largely exhausted (ratios still
+1.12–1.46). Active tracks — details in
+`docs/history/2026-11-18-ra-five-start.md`:
+
+| # | track | knob / entry | status |
+|---|---|---|---|
+| 1 | Decision stats | `PLIRON_RA_STATS=1`, `ra2stats:` | landed |
+| 2 | RA vs inlining gap | `rastat.py dyn` `both` / `inline_only` | landed |
+| 3 | Register file facts | `PLIRON_X18`, `Target::int_regs_alloc` | landed (Linux default) |
+| 4 | Ion use-cluster split | `PLIRON_RA2_USESPLIT` (GAP=128, single-block) | **on** since 2026-11-18 |
+| 5 | Greedy + SplitKit | `PLIRON_RA_ALGO=greedy` (+ `GREEDY_COLOR=1`) | all-spill clean; COLOR=1 single-block non-param (args OK) clean (10k rafuzz) |
+| 6 | Proof engine | `tools/raproof` + `regalloc2::prove` | MVP + opt-in `PLIRON_RA_PROOFCOLOR=1` (greedy) |
+
+USESPLIT already flipped. Default allocator remains ion until greedy
+wins held-out non-nop callgrind and stays rafuzz/checker clean.
+
+### Proof engine (`tools/raproof`)
+
+Register allocation as an assembly-line certificate: the largest set of
+same-class values live together is a *proof* you need that many homes
+(registers or spill slots); a colouring with K colours is a proof that
+K registers suffice with no spill. `vendor/regalloc2/src/prove.rs`
+builds the interference graph from liveness, finds a max-clique lower
+bound (exact Bron–Kerbosch up to `MAX_EXACT=48` vertices per class,
+greedy beyond), and binary-searches the chromatic number when the class
+is small enough. `tools/raproof` runs that against ion / greedy / fast
+on fuzz seeds and prints a verdict:
+
+```
+cargo run --release -p raproof --manifest-path tools/raproof/Cargo.toml -- --count 50
+cargo run --release --manifest-path tools/raproof/Cargo.toml -- --algo greedy --replay 22
+```
+
+- `heuristic_matches_optimum` — preg footprint equals chromatic number.
+- `heuristic_above_optimum` — footprint > chromatic: a colouring uses
+  fewer registers; the certificate names the clique and the K.
+- `heuristic_spills_under_*` — footprint below the bound because the
+  allocator spilled (expected; clique is simultaneous live values).
+- `gap_above_clique_unresolved` — class too big for exact colouring;
+  only the clique lower bound is known.
+
+Every bound is re-checked (`check_bound`) before it is printed.
+`--prove-fewer` runs `try_fewer`: search for a colouring with K <
+heuristic footprint (budget via `--budget`, default 2e6). A hit prints
+the assignment; `tight=true` means K−1 was also ruled out. That is the
+"prove one fewer is impossible, or hand me the counterexample" loop.
+
+Trade more compute: raise `MAX_EXACT` / `--budget`, feed profile-hot
+functions, or score colourings by spill/move cost. First signal: ion
+leaves register footprint on the table on many small fuzz funcs
+(`docs/history/2026-11-18-ra-raproof.md`).
+
+**Learning loop** (`harness/raproof_learn.py`): rebuilds only
+`tools/raproof`, runs a fixed seed window, appends
+`target/raproof/learn.jsonl` with
+`fitness = match / (match + above_opt + 1)`. Optional `--rafuzz-quick`
+for checker green under the same env.
+
+**`PLIRON_RA_PROOFCOLOR=1`** (opt-in, requires `PLIRON_RA_GREEDY_COLOR=1`):
+when a regclass has ≤ `MAX_EXACT` vertices and a checked chromatic
+colouring exists, greedy rematches single-block non-param homes if
+their footprint exceeds `upper_k`, and emit prefers that colouring's
+K pregs for reload/spill temps. Fixed 40-seed window: COLOR alone
+fitness 0.20 → COLOR+PROOFCOLOR 0.30; rafuzz 2k green. Do not flip
+default — remaining `above_opt` is live-K + temp (proof graph ignores
+edit temps). Log: `docs/history/2026-11-18-ra-raproof-learn.md`.
+
 The allocator is regalloc2 0.15.2, vendored with PLIRON patches
 (`vendor/regalloc2/PLIRON_PATCH.md`), behind Cranelift's machinst glue
 (`vendor/cranelift-codegen/src/machinst`: `compile.rs` runs it,
@@ -171,14 +240,33 @@ before acting on it. `rastat.py dyn` already charged by llvm-objdump's
 function ranges and used `fn=` only for the load offset (now 0 when the
 addresses are the binary's own); its tables stand.
 
-### Dynamic baseline (main at d74c3554 + the harness, 2026-11-17)
+### Dynamic baseline (main after X17 + WIDE128 + REGION, 2026-11-18)
 
 Executed instructions, callgrind, aarch64-unknown-linux-musl, both sides
-built with `PLIRON_RA_CHECK=1 PLIRON_RELOADPRE_CHECK=1` (all eight
-checker-clean). Class cells: ours/LLVM. "Share of gap" is our excess
-overhead as a share of the whole executed-instruction gap.
-`target/rastat/dyn-base.json` in the agent's worktree holds the
-per-function numbers.
+under the default knobs of that night (`PLIRON_X17`, `PLIRON_WIDE128`,
+`PLIRON_RA2_REGION` / `SPILLHOIST`, `XCGU_LEAF`/`LASTCALL`). Class cells:
+ours/LLVM. "Share of gap" is our excess overhead as a share of the whole
+executed-instruction gap. `target/rastat/dyn-night.json` holds the
+per-function numbers. Against the 2026-11-17 baseline below, overhead
+ratios fell on every program (compression 1.999 → 1.459, pulldown 1.434
+→ 1.240, regex 1.265 → 1.118).
+
+| program | insts LLVM | insts ours | overhead LLVM | overhead ours | ours/LLVM | share of gap | st | ld | mov | csr |
+|---|---|---|---|---|---|---|---|---|---|---|
+| blake3-scalar | 46.63M | 49.06M | 3.98M | 5.03M | 1.264 | 43% | 0.59/0.59M | 3.22/1.81M | 0.60/1.11M | 0.62/0.47M |
+| blind-sig | 31.50M | 34.42M | 0.81M | 1.14M | 1.411 | 11% | 0.06/0.04M | 0.21/0.09M | 0.62/0.46M | 0.25/0.22M |
+| pulldown-cmark | 45.33M | 50.77M | 6.84M | 8.48M | 1.240 | 30% | 1.34/0.98M | 1.46/1.64M | 3.31/1.82M | 2.37/2.40M |
+| regex | 45.97M | 49.85M | 3.59M | 4.01M | 1.118 | 11% | 0.87/0.98M | 0.77/0.76M | 1.79/1.27M | 0.58/0.58M |
+| rust-compression | 39.72M | 42.75M | 2.21M | 3.23M | 1.459 | 34% | 0.50/0.15M | 1.15/1.31M | 1.45/0.60M | 0.13/0.15M |
+| rust-html-rewriter | 85.83M | 100.12M | 12.16M | 15.75M | 1.295 | 25% | 2.16/1.47M | 1.46/1.21M | 6.22/4.14M | 5.90/5.34M |
+| rust-json | 45.55M | 50.68M | 3.20M | 3.63M | 1.135 | 8% | 0.23/0.17M | 0.51/0.48M | 1.54/1.04M | 1.36/1.51M |
+| rust-protobuf | 60.76M | 64.76M | 7.28M | 8.61M | 1.182 | 33% | 1.05/0.61M | 0.72/0.40M | 3.51/3.06M | 3.33/3.21M |
+
+### Dynamic baseline (main at d74c3554 + the harness, 2026-11-17)
+
+Pre-REGION / pre-X17 reference. `target/rastat/dyn-base.json` in the
+agent's worktree holds the per-function numbers. Checker-clean with
+`PLIRON_RA_CHECK=1 PLIRON_RELOADPRE_CHECK=1`.
 
 | program | insts LLVM | insts ours | overhead LLVM | overhead ours | ours/LLVM | share of gap | st | ld | mov | csr |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -258,11 +346,14 @@ program) and in regalloc overhead (st+ld+mov+csr), pliron side:
   rust-json +615 (0.001%) is outside the overhead classes (layout). With
   SRCVREG on, block-parameter labels name instruction results, so the
   checker's label check covers them.
-- `REMATW` halves the spill weight of rematerializable bundles: the
-  largest single overhead cut on pulldown (-360k) but protobuf +298k
-  instructions (`mov` +437k: the remat'd values push others into moves).
-  A candidate for a narrower rule (only when the bundle crosses no call,
-  or a smaller weight cut), not as is.
+- `REMATW` halves the spill weight of rematerializable bundles. Plain
+  `=1` cut pulldown overhead hard but cost protobuf `merge_loop` +205k
+  non-nop. Default since 2026-11-18 is mode `7` (only bundles with ≥8
+  uses): pulldown −0.21% non-nop (copies=2), protobuf +0.017%, html
+  +0.006% (`docs/history/2026-11-18-ra-night.md`). The remat set for
+  weights is *cheap* by default (`rematerialize_cheap`: immediates,
+  not GOT/near symbol loads — LLVM/Go/GCC), `PLIRON_RA2_REMATW_CHEAP=0`
+  restores the old set.
 - `XBLOCK` is too small to matter (largest win html -10.7k moves, which
   layout eats) and loses 5k on pulldown.
 - `MERGEDEPTH` breaks pulldown-cmark (+0.63M / +1.19M; `mov` +0.17M /
@@ -350,19 +441,19 @@ source, not `pliron-cfg`'s `DEFAULT_ON`.
 |---|---|---|---|
 | `PLIRON_RA2_FREQ=0..5` | regalloc2 `cfg.rs` | block-frequency spill weights; 3 normalizes by the hottest block | on (3) |
 | `PLIRON_RA2_LOOPSPLIT=<n>` | regalloc2 `process.rs` | split a bundle at the entry/exit of the small loop (<= n insts) around its hottest use | on (16) |
-| `PLIRON_RA2_LOOPDEPTH=1` | regalloc2 `cfg.rs` | only dominance-checked back edges count for loop depth | opt-in |
-| `PLIRON_RA2_FREQSPLIT=1` | regalloc2 `process.rs` | move a split point to the cheapest block boundary | opt-in |
+| `PLIRON_RA2_LOOPDEPTH=1` | regalloc2 `cfg.rs` | only dominance-checked back edges count for loop depth | opt-in (2026-11-18: blind-sig +1.6%; reject) |
+| `PLIRON_RA2_FREQSPLIT=1` | regalloc2 `process.rs` | move a split point to the cheapest block boundary | opt-in (2026-11-18: json +0.07%, protobuf +0.02% non-nop; not for default) |
 | `PLIRON_RA2_COLDSPLIT=1..3` (+`_RATIO`, `_COLDDIV`, `_BIAS`) | regalloc2 | cut cold call blocks out of a hot bundle | opt-in |
 | `PLIRON_RA2_NOPINMERGE` | regalloc2 `merge.rs` | refuse merges that spread a fixed-register pin | on |
 | `PLIRON_RA2_SLOTPAIR` | regalloc2 `spill.rs` | repack spill slots so consecutive spills pair (`stp`/`ldp`) | on |
 | `PLIRON_RA2_POSTOPT=<bits>` | regalloc2 `postopt.rs` | post-allocation cleanup: 1 redundant reloads, 2 reload as copy, 4 redundant spill stores, 8 dead spill stores | on (15) since 2026-11-17 |
-| `PLIRON_RA2_REGION=1\|2` | regalloc2 `regionsplit.rs` | min-cut region splitting (LLVM `tryRegionSplit`) | on (1) since 2026-11-18 |
+| `PLIRON_RA2_REGION=1\|2` | regalloc2 `regionsplit.rs` | min-cut region splitting (LLVM `tryRegionSplit`); `_CAP` default 2 since 2026-11-18 | on (1) since 2026-11-18 |
 | `PLIRON_RA2_SPILLHOIST` | regalloc2 `spillhoist.rs` | one spill store at the definition | on since 2026-11-18 |
 | `PLIRON_RA2_SRCVREG` | regalloc2 `moves.rs` | block-param moves carry the argument's vreg (constant args rematerialize) | on since 2026-11-17 |
 | `PLIRON_RA2_REHOME` | regalloc2 `rehome.rs` | a value's register in a join-only block follows the cheaper side | on (2) |
 | `PLIRON_RA2_XBLOCK=1` | regalloc2 `moves.rs` | redundant-move state survives a single-predecessor fallthrough | opt-in (evaluated: pulldown +5k) |
 | `PLIRON_RA2_MERGEDEPTH=1..3` | regalloc2 `merge.rs` | merge blockparams of the deepest loops first | opt-in (evaluated: pulldown +0.6M..1.2M) |
-| `PLIRON_RA2_REMATW=1` | Cranelift `vcode.rs` | rematerializable bundles get half the spill weight | opt-in (evaluated: protobuf +298k) |
+| `PLIRON_RA2_REMATW=0..7` (+`_MAXUSES`, `_MINUSSES`, `_CHEAP`) | Cranelift `vcode.rs` + regalloc2 `process.rs` | rematerializable spill weight; default `7` (`uses≥MINUSSES`, default 8); `=0` off; `_CHEAP` default on (immediates only for weight set) | on (7) since 2026-11-18 |
 | `PLIRON_REMAT`, `_STORE` | Cranelift `vcode.rs` | reloads of constants/addresses rematerialize; stores only remat reads die | on |
 | `PLIRON_RELOADPRE` (`_ROUNDS`), `PLIRON_RELOADCSE`, `PLIRON_SPILLCSE` | Cranelift `vcode.rs` | reload PRE into predecessors; per-block and cross-block reload CSE | on |
 | `PLIRON_EDITPAIR` | Cranelift `vcode.rs` | fuse adjacent spill/reload edits into pairs | on |
