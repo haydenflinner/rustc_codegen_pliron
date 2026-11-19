@@ -58,6 +58,12 @@ Tried and dropped: letting a plain copy `d = a` share `a`'s register while
 `a` stays live. Sound, but the vendored checker has no `is_move`, so it
 reports the shared register as holding only `d`; not worth patching it.
 
+## Search budget
+
+`PLIRON_RA_MCTS_SIMS` default 256 -> 64. std corpus, user time / weighted
+insts: ion 23.3 s / 6.4831M; sims 1 23.8 s / 6.5198M; 4 23.9 s / 6.4984M;
+16 24.2 s / 6.4966M; 64 25.3 s / 6.4921M; 256 29.3 s / 6.4906M.
+
 ## Verdict
 
 Parity, not a win. Whole-function homes cannot split live ranges, which is

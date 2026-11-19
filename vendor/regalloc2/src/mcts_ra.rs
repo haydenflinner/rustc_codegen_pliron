@@ -21,7 +21,7 @@
 //! - Reward = `−(preg_footprint + SPILL_W · spills)` — the simple, total
 //!   register-count measure. Higher (less negative) is better.
 //!
-//! Compute dial: `PLIRON_RA_MCTS_SIMS` (default 256). Opt-in via
+//! Compute dial: `PLIRON_RA_MCTS_SIMS` (default 64). Opt-in via
 //! `PLIRON_RA_ALGO=mcts` (implies colouring) or `PLIRON_RA_MCTS=1` under
 //! greedy+COLOR. `PLIRON_RA_MCTS_GUMBEL=0` turns off root Gumbel.
 
@@ -56,7 +56,7 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Params {
-            sims: 256,
+            sims: 64,
             top_m: 8,
             gumbel_root: true,
             cpuct: 1.5,
