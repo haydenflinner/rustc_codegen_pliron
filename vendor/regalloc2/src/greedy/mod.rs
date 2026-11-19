@@ -438,29 +438,45 @@ fn build_forbid<F: Function>(func: &F, lv: &Liveness, n: usize) -> Option<Vec<PR
             }
             let any_clob = clob != PRegSet::empty();
             if any_clob || !fixed.is_empty() {
-                // present = live after ∪ the operands' vregs
-                let mut present = live.clone();
-                for op in func.inst_operands(inst) {
-                    if op.as_fixed_nonallocatable().is_none() && op.vreg().vreg() < n {
-                        bit_set(&mut present, op.vreg().vreg());
+                // present = live after ∪ the operands' vregs. A clobber does
+                // not touch a vreg that is only read here (Early uses, dead
+                // after): the instruction reads it before it clobbers, so a
+                // call argument may be homed in the register it is passed in.
+                let mut apply = |v: usize, clobbered: bool, visits: &mut u64| {
+                    *visits += 1;
+                    if clobbered {
+                        forbid[v].union_from(clob);
                     }
-                }
-                for (wi, &word) in present.iter().enumerate() {
+                    for &(p, w) in &fixed {
+                        if w != v {
+                            forbid[v].add(p);
+                        }
+                    }
+                };
+                for (wi, &word) in live.iter().enumerate() {
                     let mut m = word;
                     while m != 0 {
                         let v = wi * 64 + m.trailing_zeros() as usize;
                         m &= m - 1;
-                        visits += 1;
-                        if any_clob {
-                            forbid[v].union_from(clob);
-                        }
-                        for &(p, w) in &fixed {
-                            if w != v {
-                                forbid[v].add(p);
-                            }
-                        }
+                        apply(v, any_clob, &mut visits);
                     }
-                    visits += 1;
+                }
+                let ops = func.inst_operands(inst);
+                for op in ops {
+                    if op.as_fixed_nonallocatable().is_some() || op.vreg().vreg() >= n {
+                        continue;
+                    }
+                    let v = op.vreg().vreg();
+                    if bit_get(&live, v) {
+                        continue;
+                    }
+                    let read_only = !env_off("PLIRON_RA_FORBID_USEONLY")
+                        && ops.iter().all(|o| {
+                            o.as_fixed_nonallocatable().is_some()
+                                || o.vreg().vreg() != v
+                                || (o.kind() == OperandKind::Use && o.pos() == OperandPos::Early)
+                        });
+                    apply(v, any_clob && !read_only, &mut visits);
                 }
                 if visits > FORBID_BUDGET {
                     return None;

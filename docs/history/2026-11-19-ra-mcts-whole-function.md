@@ -44,6 +44,20 @@ Smoke weighted code: instructions 13.99M vs ion 13.97M; raw movs 34.7k vs
 25k, stack ops about equal. `PLIRON_RA_MCTS_SIMS=1` gives nearly the same
 quality as 256: the tree search does not pay, the graph/emit work dominates.
 
+## Follow-up: read-only operands at clobbers
+
+`build_forbid` barred every vreg present at a call from every clobbered
+register, including an argument that is only read there. The call reads it
+before it clobbers, so an argument can be homed in the register it is
+passed in (`PLIRON_RA_FORBID_USEONLY=0` restores the old rule). Smoke movs
+34.6k -> 29.9k, insts 288.2k -> 280.4k; std weighted insts 1.0048x -> 1.0012x
+of ion; checker clean (smoke, std, clcg), rafuzz 3000 seeds. Held-out
+instruction counts do not move (+-0.2%).
+
+Tried and dropped: letting a plain copy `d = a` share `a`'s register while
+`a` stays live. Sound, but the vendored checker has no `is_move`, so it
+reports the shared register as holding only `d`; not worth patching it.
+
 ## Verdict
 
 Parity, not a win. Whole-function homes cannot split live ranges, which is
