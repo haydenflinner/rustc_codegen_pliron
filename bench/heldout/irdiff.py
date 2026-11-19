@@ -107,13 +107,23 @@ def callgrind(prog, exe, tag):
     cmd = ["docker", "run", "--rm",
            "-v", f"{run.src_dir(prog)}:/src:ro", "-v", f"{os.path.dirname(exe)}:/exe:ro", "-v", f"{out_dir}:/out",
            "-w", "/src", IMAGE,
-           "valgrind", "--tool=callgrind", f"--callgrind-out-file=/out/{os.path.basename(out)}",
-           "--dump-instr=yes", "--dump-line=yes", "--compress-strings=no", "--compress-pos=no",
-           f"/exe/{os.path.basename(exe)}"]
+           # Written inside the container and copied out: valgrind could not
+           # open its output file on the bind mount after a long run
+           # (docker desktop, 2026-11-19).
+           "sh", "-c",
+           f"valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out "
+           f"--dump-instr=yes --dump-line=yes --compress-strings=no --compress-pos=no "
+           f"/exe/{os.path.basename(exe)} >/dev/null 2>/tmp/vg.err; rc=$?; "
+           f"cp /tmp/cg.out /out/{os.path.basename(out)} || {{ tail -5 /tmp/vg.err >&2; exit 1; }}; exit $rc"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(out):
         sys.exit(f"irdiff: callgrind run failed for {tag}:\n{r.stderr[-2000:]}")
     return out
+
+
+def short(k, w=int(os.environ.get("IRDIFF_NAMEW", "110"))):
+    """A long generic name keeps its head and its tail (the method)."""
+    return k if len(k) <= w else k[: w // 2 - 1] + "…" + k[-(w // 2) :]
 
 
 def demangle(names):
@@ -223,7 +233,7 @@ def main():
     if a.fn:
         lfn = collections.Counter({k: v for k, v in lfn.items() if a.fn in k})
         pfn = collections.Counter({k: v for k, v in pfn.items() if a.fn in k})
-    table("functions, self", lfn, pfn, lambda k: k[:110])
+    table("functions, self", lfn, pfn, lambda k: short(k))
     if not a.fn:
         ln = collections.Counter({(short_path(f or "?"), n): v for (f, n), v in ll.items()})
         pn = collections.Counter({(short_path(f or "?"), n): v for (f, n), v in pl.items()})
