@@ -43,6 +43,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // (`docs/history/2026-11-19-sibcall.md`). Stanza sibcall.
     // `PLIRON_SIBCALL=0` off.
     "PLIRON_SIBCALL",
+    // 2026-11-19: deadslot deletes the stores into a slot nothing reads
+    // (every address use is a plain notrap store's address), then the
+    // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
+    // rest equal. `PLIRON_DEADSLOT_WRITEONLY=0` off.
+    "PLIRON_DEADSLOT_WRITEONLY",
     // 2026-11-17, STK: memcpyopt's "tmp could promote" guard skips temps
     // larger than sroa's MAX_SIZE (512 B), which never promote:
     // driftsort_main's 4 KiB scratch is one slot again (regex-syntax both

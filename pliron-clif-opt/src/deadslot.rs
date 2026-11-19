@@ -30,14 +30,15 @@
 //! it unreferenced. The shape: memchr's splat of the needle written to a
 //! slot (`stur q16, [sp]`, never read) after `dse3` ran and a later fold
 //! removed the last reader, which cost a frame in `data_state` of every
-//! lol_html tag scanner (opt-in: `PLIRON_DEADSLOT_WRITEONLY=1`).
+//! lol_html tag scanner (default on since 2026-11-19:
+//! `PLIRON_DEADSLOT_WRITEONLY=0` off).
 
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::{Function, Inst, InstructionData, Opcode, StackSlot, Value};
 use rustc_hash::FxHashMap;
 
 /// Returns the number of slots zeroed (plus stores deleted, with the
-/// write-only rule: `PLIRON_DEADSLOT_WRITEONLY=1`).
+/// write-only rule, `PLIRON_DEADSLOT_WRITEONLY`, default on).
 pub fn run(func: &mut Function) -> usize {
     run_with(func, pliron_cfg::env_is("PLIRON_DEADSLOT_WRITEONLY", "1"))
 }
