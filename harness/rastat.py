@@ -4,6 +4,7 @@
   harness/rastat.py dyn [--only a,b] [--env K=V ...] [--tag T] [--skip-build] [--top N] [--save F]
   harness/rastat.py static [--corpus std] [--every N] [--env K=V ...] [--clif-check BIN] [--top N] [--save F]
   harness/rastat.py cmp A.json B.json [--top N]
+  harness/rastat.py selftest          the move-kind classifier on a hand-written function
 
 Classes (one shared classifier, aarch64; docs/regalloc.md "Metric"):
 
@@ -26,6 +27,9 @@ excess overhead (by demangled name; inlining differs, so read it as where, not w
 `static`: the fast loop, no docker. `clif-check codegen --vcode` over a corpus (pipeline +
 Cranelift, the backend's aarch64 flags), the same classes per function, each instruction
 weighted 8^min(loop depth, 3). About a minute for std. `--env K=V` sets knobs for that run.
+
+`dyn` also splits executed `mov`s by kind (`move_kinds`: edge, callarg, callret, ret,
+inblock; docs/regalloc.md "Move kinds") and ends with the excess per kind.
 
 `--save F` writes the numbers as JSON; `cmp` compares two saved runs of the same kind
 (totals, and the functions that moved most).
@@ -195,6 +199,84 @@ def classify_fn(insts, spill_from=None):
         cls.append(c)
         written.update(writes(mn, ops))
     return cls
+
+# ---------------------------------------------------------------- move kinds
+
+MOVE_KINDS = ["edge", "callarg", "callret", "ret", "inblock"]
+ARGREG = {f"x{i}" for i in range(8)} | {f"v{i}" for i in range(8)}
+BRANCH = re.compile(r"^(b|b\..+|cbz|cbnz|tbz|tbnz|br|ret|retaa|retab)$")
+CALL = ("bl", "blr")
+
+
+def move_kinds(fn_start, insts, cls):
+    """Kind of each `mov`-class instruction from its context (docs/regalloc.md
+    "Move kinds"): `callarg` (into an argument register, a call follows within the
+    same straight line), `callret` (out of x0-x7/v0-v7 right after a call), `ret`
+    (into a return register ahead of `ret` or a tail branch), `edge` (a run of moves
+    that ends in a jump or falls into a branch target, or starts at one: where
+    regalloc2 puts block-parameter moves), `inblock` (the rest)."""
+    n = len(insts)
+    targets = set()
+    for addr, mn, ops, tail in insts:
+        if BRANCH.match(mn) and mn not in ("br", "ret", "retaa", "retab") and not tail:
+            m = re.match(r"^(?:0x)?([0-9a-f]+)$", ops[-1].split()[0]) if ops else None
+            if m:
+                targets.add(int(m.group(1), 16))
+    starts = set(targets)
+    for i, (addr, mn, ops, tail) in enumerate(insts[:-1]):
+        if BRANCH.match(mn) or mn in CALL:
+            starts.add(insts[i + 1][0])
+    kinds = [None] * n
+    i = 0
+    while i < n:
+        if cls[i] != "mov":
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and cls[j + 1] == "mov" and insts[j + 1][0] not in starts:
+            j += 1
+        prev = insts[i - 1] if i > 0 else None
+        nxt = insts[j + 1] if j + 1 < n else None
+        run_starts_block = insts[i][0] in starts
+        nxt_starts_block = nxt is not None and nxt[0] in starts
+        for k in range(i, j + 1):
+            _, mn, ops, _ = insts[k]
+            dst, src = canon(ops[0]), canon(ops[1])
+            kind = None
+            if prev is not None and prev[1] in CALL and src in ARGREG:
+                kind = "callret"
+            if kind is None and dst in ARGREG:
+                # a call within the next 8 instructions of the same block
+                for m in range(j + 1, min(n, j + 9)):
+                    a2, m2, o2, t2 = insts[m]
+                    if m2 in CALL:
+                        kind = "callarg"
+                        break
+                    if BRANCH.match(m2) or t2 or a2 in starts:
+                        break
+            if kind is None and dst in ARGREG:
+                # only the epilogue (restores, sp moves) between it and the return
+                for m in range(j + 1, min(n, j + 12)):
+                    m2, o2, t2 = insts[m][1], insts[m][2], insts[m][3]
+                    if m2 in ("ret", "retaa", "retab") or t2:
+                        kind = "ret"
+                        break
+                    mi = mem_info(m2, o2)
+                    epi = (mi and mi[0] and mi[3] and all(r in CSR or r in FRAMEREG for r in mi[2])) \
+                        or (m2 in ("add", "sub") and o2 and canon(o2[0]) == "sp") \
+                        or m2 in ("autiasp", "autibsp", "hint", "nop")
+                    if not epi or insts[m][0] in starts:
+                        break
+            if kind is None:
+                ends_jump = nxt is not None and nxt[1] == "b" and not nxt[3]
+                if ends_jump or nxt_starts_block or run_starts_block:
+                    kind = "edge"
+                else:
+                    kind = "inblock"
+            kinds[k] = kind
+        i = j + 1
+    return kinds
+
 
 # ---------------------------------------------------------------- static
 
@@ -416,7 +498,8 @@ def dyn_side(run, irdiff, prog, exe, tag):
     per = collections.defaultdict(collections.Counter)
     for name, _, insts in fns:
         cls = classify_fn([(mn, ops, t) for _, mn, ops, t in insts])
-        for (addr, *_), c in zip(insts, cls):
+        mk = move_kinds(_, insts, cls)
+        for (addr, *_), c, k in zip(insts, cls, mk):
             n = ir.get(addr + off, 0)
             if not n:
                 continue
@@ -425,6 +508,9 @@ def dyn_side(run, irdiff, prog, exe, tag):
             if c:
                 tot[c] += n
                 per[name][c] += n
+            if k:
+                tot["mov:" + k] += n
+                per[name]["mov:" + k] += n
     covered = tot["insts"]
     return {"total": dict(tot), "functions": {k: dict(v) for k, v in per.items()}, "callgrind_total": sum(ir.values()),
             "covered": covered, "offset": off}
@@ -447,6 +533,7 @@ def cmd_dyn(a):
         print_prog(prog, sides, a.top)
         sys.stdout.flush()
     print_summary(res)
+    print_kind_summary(res)
     if a.save:
         json.dump(res, open(a.save, "w"))
         print(f"saved {a.save}")
@@ -484,6 +571,11 @@ def print_prog(prog, sides, top):
         print(f"  {c:<8} {l:>12} {p:>12}  x{p / l if l else float('inf'):.2f}  {p - l:+d}")
     lo, po = overhead(L), overhead(P)
     print(f"  {'overhead':<8} {lo:>12} {po:>12}  x{po / lo if lo else float('inf'):.2f}  {po - lo:+d}")
+    if any(k.startswith("mov:") for k in P):
+        print("  moves by kind (llvm, pliron, excess)")
+        for k in MOVE_KINDS:
+            l, p = L.get("mov:" + k, 0), P.get("mov:" + k, 0)
+            print(f"    {k:<8} {l:>12} {p:>12}  {p - l:+d}")
     lrows = collections.defaultdict(collections.Counter)
     for n, row in sides["llvm"]["functions"].items():
         lrows[canon_fn(n)].update(row)
@@ -517,6 +609,15 @@ def print_summary(res):
               + f"{po / lo if lo else 0:>14.3f}{P.get('insts', 0) / max(1, L.get('insts', 1)):>12.3f}")
 
 
+def print_kind_summary(res):
+    print("\nsummary: excess register moves by kind (pliron - llvm)")
+    print(f"  {'program':<20}" + "".join(f"{k:>11}" for k in MOVE_KINDS) + f"{'mov total':>11}")
+    for prog, s in res["programs"].items():
+        L, P = s["llvm"]["total"], s["pliron"]["total"]
+        print(f"  {prog:<20}" + "".join(f"{P.get('mov:' + k, 0) - L.get('mov:' + k, 0):>+11d}" for k in MOVE_KINDS)
+              + f"{P.get('mov', 0) - L.get('mov', 0):>+11d}")
+
+
 def cmd_cmp(a):
     A, B = json.load(open(a.a)), json.load(open(a.b))
     if A["kind"] != B["kind"]:
@@ -547,9 +648,33 @@ def cmd_cmp(a):
             print(f"  {prog:<20} overhead {overhead(pb) - overhead(pa):+10d}  insts {pb.get('insts', 0) - pa.get('insts', 0):+10d}  {det}")
 
 
+SELFTEST = [
+    ("stp x29, x30, [sp, #-16]!", None), ("mov x19, x0", "inblock"), ("add x2, x19, #1", None),
+    ("mov x0, x2", "callarg"), ("bl 0x100 <f>", None), ("mov x20, x0", "callret"),
+    ("cbz x20, 0x28 <g+0x28>", None), ("add x3, x20, x19", None), ("mov x4, x3", "edge"),
+    ("b 0x2c <g+0x2c>", None), ("mov x4, x19", "edge"), ("add x5, x4, #2", None), ("mov x0, x5", "ret"),
+    ("ldp x29, x30, [sp], #16", None), ("ret", None), ("mov x1, x2", "ret"), ("mov x0, x3", "ret"),
+    ("b 0x200 <h>", None),
+]
+
+
+def cmd_selftest():
+    insts = []
+    for k, (t, _) in enumerate(SELFTEST):
+        mn, ops = parse(t)
+        insts.append((4 * k, mn, ops, mn == "b" and "+0x" not in t))
+    cls = classify_fn([(mn, ops, t) for _, mn, ops, t in insts])
+    got = move_kinds(0, insts, cls)
+    bad = [(t, w, g) for (t, w), g in zip(SELFTEST, got) if w != g]
+    for t, w, g in bad:
+        print(f"selftest: {t!r}: want {w}, got {g}")
+    print("selftest: ok" if not bad else f"selftest: {len(bad)} wrong")
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser(usage=__doc__)
-    ap.add_argument("cmd", choices=["dyn", "static", "cmp"])
+    ap.add_argument("cmd", choices=["dyn", "static", "cmp", "selftest"])
     ap.add_argument("a", nargs="?")
     ap.add_argument("b", nargs="?")
     ap.add_argument("--only", default="")
@@ -569,6 +694,8 @@ def main():
         return cmd_dyn(a)
     if a.cmd == "static":
         return cmd_static(a)
+    if a.cmd == "selftest":
+        return cmd_selftest()
     return cmd_cmp(a)
 
 

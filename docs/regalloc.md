@@ -203,6 +203,28 @@ One classifier (aarch64) for both compilers and both modes:
 recorded from the held-out build); copy it from another checkout or
 record it with `PLIRON_CORPUS`.
 
+### Move kinds
+
+Register moves are the largest excess class in five of the eight
+programs (baseline below), so `rastat.py dyn` splits every executed
+`mov` by its context in the disassembly (`move_kinds`):
+
+| kind | rule |
+|---|---|
+| `callarg` | into x0-x7/v0-v7, a `bl`/`blr` follows within 8 instructions of the same block |
+| `callret` | out of x0-x7/v0-v7 right after a call |
+| `ret` | into x0-x7/v0-v7 with only the epilogue (restores, sp moves) before `ret` or a tail branch |
+| `edge` | in a run of moves that ends in a `b`, falls into a branch target, or starts at one: regalloc2's block-parameter and edge moves |
+| `inblock` | the rest (fixed-register constraints, splits inside a block) |
+
+Block starts are branch targets and the instructions after branches and
+calls, so a run of moves never crosses one. The rules are heuristics on
+final code: an edge move that regalloc2 put mid-block (a split) reads as
+`inblock`, and LLVM's own copies are classified by the same rules.
+`rastat.py selftest` checks them on a hand-written function. Not yet run
+on the held-out programs (2026-11-19: the machine was busy); the first
+run's per-kind excess table decides where the move work starts.
+
 ### Judging a regalloc change against placement
 
 A regalloc change shifts code, which moves loop heads past 16- and 64-byte
