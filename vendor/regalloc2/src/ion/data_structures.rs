@@ -318,6 +318,9 @@ pub struct SpillSet {
     /// PLIRON (`PLIRON_RA2_REGION`): region splits done on bundles of this
     /// spillset (capped by `PLIRON_RA2_REGION_MAX`).
     pub region_count: u8,
+    /// PLIRON (`PLIRON_RA2_USESPLIT`): a use-cluster gap split already ran
+    /// for this spillset; do not loop when `MAX_SPLITS` is hit again.
+    pub use_cluster_done: bool,
 
     /// The aggregate [`CodeRange`] of all involved [`LiveRange`]s. The effect of this abstraction
     /// is that we attempt to allocate one spill slot for the extent of a bundle. For fragmented
@@ -1058,6 +1061,12 @@ pub struct Stats {
     pub blockparam_outs_count: usize,
     pub halfmoves_count: usize,
     pub edits_count: usize,
+    /// PLIRON: `split_into_minimal_bundles` calls (reload-per-use fallback).
+    pub splits_minimal: usize,
+    /// PLIRON: use-cluster / gap splits (`PLIRON_RA2_USESPLIT`).
+    pub splits_use_cluster: usize,
+    /// PLIRON: region splits that took (`PLIRON_RA2_REGION`).
+    pub splits_region: usize,
 }
 
 // Helper function for generating sorting keys. The order of arguments is from

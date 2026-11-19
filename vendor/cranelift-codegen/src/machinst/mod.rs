@@ -450,6 +450,17 @@ pub trait MachInst: Clone + Debug {
         None
     }
 
+    /// PLIRON: whether a rematerializable def is cheap enough for the
+    /// spill-*weight* discount (`PLIRON_RA2_REMATW` / `is_remat`). LLVM's
+    /// `isTriviallyReMaterializable`, Go's rematerializeable, and GCC
+    /// LRA all restrict this to constants / FP-relative forms — not GOT
+    /// or near symbol loads (those are still rematted on reload via
+    /// `rematerialize`, but must not look "free" to the allocator).
+    /// Default off; backends that rematerialize override.
+    fn rematerialize_cheap(&self) -> bool {
+        false
+    }
+
     /// PLIRON: whether this instruction can run before the callee saves
     /// and frame allocation (shrink-wrapping): it touches no stack slot,
     /// `sp`, `fp` or `lr`, and is not a call. Conservative default.

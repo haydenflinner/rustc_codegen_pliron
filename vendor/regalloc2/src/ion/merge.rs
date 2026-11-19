@@ -397,6 +397,7 @@ impl<'a, F: Function> Env<'a, F> {
                 splits: 0,
                 cold_spill: false,
                 region_count: 0,
+                use_cluster_done: false,
                 range,
             });
             self.bundles[bundle].spillset = ssidx;

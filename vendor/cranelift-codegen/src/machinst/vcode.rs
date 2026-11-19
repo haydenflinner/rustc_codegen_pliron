@@ -1471,17 +1471,31 @@ impl<I: VCodeInst> VCode<I> {
             .with(|c| c.get())
             .and_then(|b| self.block_order.lowered_index_for_block(b));
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_RA2_REMATW").as_deref() == Ok("1"))
+        // Default on as mode 7 (`rematw_mode`); `PLIRON_RA2_REMATW=0` off.
+        if !*ON.get_or_init(|| std::env::var("PLIRON_RA2_REMATW").as_deref() != Ok("0"))
             || std::env::var("PLIRON_REMAT").as_deref() == Ok("0")
         {
             return;
         }
+        // Spill-weight remat: `rematerialize_cheap` by default (LLVM
+        // `isTriviallyReMaterializable`, Go constants-only, GCC LRA no
+        // memory). `PLIRON_RA2_REMATW_CHEAP=0` restores every
+        // `rematerialize` form (incl. LoadExtName*). Symbol loads stay
+        // rematerializable on reload either way via `edit_vregs`.
+        static CHEAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let cheap = *CHEAP.get_or_init(|| {
+            std::env::var("PLIRON_RA2_REMATW_CHEAP").as_deref() != Ok("0")
+        });
         let probe = Writable::from_reg(Reg::from(regalloc2::PReg::new(0, regalloc2::RegClass::Int)));
         let mut defs = vec![0u8; self.vreg_types.len()];
         let mut remat = vec![false; self.vreg_types.len()];
         for (i, inst) in self.insts.iter().enumerate() {
             let ops = &self.operands[self.operand_ranges.get(i)];
-            let r = inst.rematerialize(probe).is_some();
+            let r = if cheap {
+                inst.rematerialize_cheap()
+            } else {
+                inst.rematerialize(probe).is_some()
+            };
             for op in ops {
                 if op.kind() == regalloc2::OperandKind::Def {
                     let v = op.vreg().vreg();

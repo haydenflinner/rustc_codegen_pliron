@@ -160,6 +160,28 @@ pub fn x30_mode() -> u8 {
     })
 }
 
+/// Set by `AArch64Backend` when the triple is `aarch64-*-linux-*`.
+static X18_LINUX_DEFAULT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// PLIRON: record whether this ISA is Linux ELF aarch64 (x18 free).
+pub fn set_x18_linux_default(on: bool) {
+    X18_LINUX_DEFAULT.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `PLIRON_X18`: platform register. On Linux ELF aarch64 LLVM allocates it;
+/// on macOS/Windows it carries inter-procedural state and must stay
+/// reserved. Opt-in `=1` until held-out A/B is clean (2026-11-18: default
+/// on for Linux caused blake3 stack overflow under callgrind). The
+/// Linux-default bit is recorded for a future flip via
+/// `set_x18_linux_default`.
+pub fn x18_allocatable() -> bool {
+    match std::env::var("PLIRON_X18").as_deref() {
+        Ok("1") => true,
+        _ => false,
+    }
+}
+
 /// Get a reference to the second temp register. We need this in some edge cases
 /// where we need both the spilltmp and another temporary.
 ///

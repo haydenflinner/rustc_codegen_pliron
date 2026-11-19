@@ -358,26 +358,67 @@ impl<'a, F: Function> Env<'a, F> {
                 let prio = self.ctx.bundles[bundle].prio;
                 // PLIRON: a rematerializable bundle (every range's vreg is
                 // a constant or address) costs one instruction per reload:
-                // no long-range favor, and half weight (LLVM's
-                // `weightCalcHelper`). Hoisted constants otherwise held
-                // callee-saved registers across regex's whole
+                // no long-range favor, and a reduced weight (LLVM's
+                // `weightCalcHelper` halves). Hoisted constants otherwise
+                // held callee-saved registers across regex's whole
                 // `Utf8Sequences::next` and evicted its real values.
-                let remat = self.ctx.bundles[bundle].ranges.iter().all(|e| {
-                    let v = self.ctx.ranges[e.index].vreg;
-                    v.is_valid() && self.func.is_remat(v.index())
-                });
+                // Modes (`PLIRON_RA2_REMATW`): 1 always /2; 2 /2 only with
+                // no call in the live range; 3 /2 only across a call;
+                // 4 always /4; 5 /2 only when prio > 64; 6 /2 only when
+                // uses <= REMATW_MAXUSES (default 4). Modes 1/3/5 all
+                // left protobuf `merge_loop` at +205k (dense remats);
+                // pulldown `parse_block` wants sparse long-lived ones.
+                let rematw = crate::rematw_mode();
+                let remat = rematw != 0
+                    && self.ctx.bundles[bundle].ranges.iter().all(|e| {
+                        let v = self.ctx.ranges[e.index].vreg;
+                        v.is_valid() && self.func.is_remat(v.index())
+                    });
                 if remat {
-                    let final_weight =
-                        core::cmp::min(BUNDLE_MAX_NORMAL_SPILL_WEIGHT, (total.to_f32() as u32) / prio / 2);
-                    trace!(" -> rematerializable; final weight {}", final_weight);
-                    self.ctx.bundles[bundle].set_cached_spill_weight_and_props(
-                        final_weight,
-                        minimal,
-                        fixed,
-                        fixed_def,
-                        stack,
-                    );
-                    return;
+                    let crosses_call = self.ctx.bundles[bundle].ranges.iter().any(|e| {
+                        let r = &self.ctx.ranges[e.index].range;
+                        let mut i = r.from.inst().index();
+                        let end = r.to.inst().index();
+                        while i < end {
+                            if self.func.inst_clobbers(Inst::new(i)).len() > 0 {
+                                return true;
+                            }
+                            i += 1;
+                        }
+                        false
+                    });
+                    let nuses: usize = self.ctx.bundles[bundle]
+                        .ranges
+                        .iter()
+                        .map(|e| self.ctx.ranges[e.index].uses.len())
+                        .sum();
+                    let apply = match rematw {
+                        1 | 4 => true,
+                        2 => !crosses_call,
+                        3 => crosses_call,
+                        5 => prio > 64,
+                        6 => nuses <= crate::rematw_maxuses(),
+                        7 => nuses >= crate::rematw_minusses(),
+                        _ => false,
+                    };
+                    if apply {
+                        let div = if rematw == 4 { 4 } else { 2 };
+                        let final_weight = core::cmp::min(
+                            BUNDLE_MAX_NORMAL_SPILL_WEIGHT,
+                            (total.to_f32() as u32) / prio / div,
+                        );
+                        trace!(
+                            " -> rematerializable (mode {rematw}, call={crosses_call}); final weight {final_weight}"
+                        );
+                        self.ctx.bundles[bundle].set_cached_spill_weight_and_props(
+                            final_weight,
+                            minimal,
+                            fixed,
+                            fixed_def,
+                            stack,
+                        );
+                        return;
+                    }
                 }
                 let div = if option_env!("RA2_LINEAR").is_some() {
                     prio
@@ -475,7 +516,15 @@ impl<'a, F: Function> Env<'a, F> {
         // to a "minimal bundles and spill bundle" setup for this
         // bundle. See the doc-comment on
         // `split_into_minimal_bundles()` above for more.
+        // PLIRON: try a use-cluster / gap split first (`PLIRON_RA2_USESPLIT`)
+        // so dense use groups stay non-minimal (blake3 message words).
         if self.ctx.spillsets[spillset].splits >= MAX_SPLITS_PER_SPILLSET {
+            if crate::usesplit_on()
+                && !self.ctx.spillsets[spillset].use_cluster_done
+                && self.try_use_cluster_split(bundle, hint)
+            {
+                return;
+            }
             self.split_into_minimal_bundles(bundle, hint);
             return;
         }
@@ -866,6 +915,7 @@ impl<'a, F: Function> Env<'a, F> {
     /// registers just at uses/defs and moves the "spilled" value
     /// into/out of them immediately.
     pub fn split_into_minimal_bundles(&mut self, bundle: LiveBundleIndex, hint: PReg) {
+        self.ctx.output.stats.splits_minimal += 1;
         explain!("  minimal-split {}", self.explain_bundle(bundle));
         assert_eq!(self.ctx.scratch_removed_lrs_vregs.len(), 0);
         self.ctx.scratch_removed_lrs.clear();
@@ -1722,6 +1772,73 @@ impl<'a, F: Function> Env<'a, F> {
     ///   was cold for the original and has been cut out already. It
     ///   does not count against `MAX_SPLITS_PER_SPILLSET`.
     ///
+    /// PLIRON (`PLIRON_RA2_USESPLIT`): instead of minimal bundles, cut at
+    /// the largest gap between uses so each dense use cluster can keep a
+    /// register (LLVM local / use-cluster split). Returns false when the
+    /// gap is below `PLIRON_RA2_USESPLIT_GAP` (default 128) or the split
+    /// point is not interior.
+    ///
+    /// Default also requires the bundle's code range to sit in one block
+    /// (`PLIRON_RA2_USESPLIT_MULTIBLOCK=1` lifts that): multi-block cuts
+    /// cost pulldown `HtmlWriter::run` / `item_to_event` ~+89k while the
+    /// blake3 win is a single 832-inst block.
+    pub(crate) fn try_use_cluster_split(
+        &mut self,
+        bundle: LiveBundleIndex,
+        hint: PReg,
+    ) -> bool {
+        let bundle_start = self.ctx.bundles[bundle].ranges.first().unwrap().range.from;
+        let bundle_end = self.ctx.bundles[bundle].ranges.last().unwrap().range.to;
+        let b0 = self.ctx.cfginfo.insn_block[bundle_start.inst().index()];
+        let b1 = self.ctx.cfginfo.insn_block[bundle_end.prev().inst().index()];
+        if b0 != b1 && !crate::usesplit_multiblock() {
+            return false;
+        }
+        let mut use_insts: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        for entry in &self.ctx.bundles[bundle].ranges {
+            for u in &self.ctx.ranges[entry.index].uses {
+                use_insts.push(u.pos.inst().index());
+            }
+        }
+        if use_insts.len() < 2 {
+            return false;
+        }
+        use_insts.sort_unstable();
+        use_insts.dedup();
+        let min_gap = crate::usesplit_min_gap();
+        let mut best_gap = 0usize;
+        let mut best_after = 0usize;
+        for w in use_insts.windows(2) {
+            let gap = w[1].saturating_sub(w[0]);
+            if gap > best_gap {
+                best_gap = gap;
+                best_after = w[0];
+            }
+        }
+        if best_gap < min_gap {
+            return false;
+        }
+        // Split just after the earlier use of the gap (Before of next inst).
+        let split_inst = best_after + 1;
+        let split_at = ProgPoint::before(Inst::new(split_inst));
+        if split_at <= bundle_start || split_at >= bundle_end {
+            return false;
+        }
+        let spillset = self.ctx.bundles[bundle].spillset;
+        self.ctx.spillsets[spillset].use_cluster_done = true;
+        // One more normal split after the cluster cut.
+        self.ctx.spillsets[spillset].splits = MAX_SPLITS_PER_SPILLSET - 1;
+        self.ctx.output.stats.splits_use_cluster += 1;
+        explain!(
+            "  use-cluster-split {} gap={} after_inst={}",
+            self.explain_bundle(bundle),
+            best_gap,
+            best_after
+        );
+        self.split_and_requeue_bundle(bundle, split_at, hint, /*trim*/ true);
+        true
+    }
+
     /// Only block-boundary points are split at, and the moves between
     /// the pieces come from the normal edge/range move insertion
     /// (`moves.rs`), so the checker's view is that of any other split.

@@ -67,6 +67,66 @@ pub(crate) fn freqsplit_on() -> bool {
     false
 }
 
+/// PLIRON: `PLIRON_RA2_USESPLIT` (default on since 2026-11-18; `=0` off):
+/// before falling back to minimal bundles at `MAX_SPLITS`, cut the
+/// bundle at its largest use-free gap so dense use clusters stay
+/// non-minimal (LLVM local / use-cluster split). Single-block only
+/// unless `USESPLIT_MULTIBLOCK=1`. Gap floor 128. blake3
+/// `compress_in_place` −154k non-nop; blind-sig −41k at GAP=128
+/// (GAP=8 cost blind-sig +47k).
+pub(crate) fn usesplit_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_USESPLIT").as_deref() != Ok("0"))
+    }
+    #[cfg(not(feature = "std"))]
+    true
+}
+
+/// PLIRON: `PLIRON_RA2_USESPLIT_GAP` (default 128): minimum instruction
+/// gap between uses for a use-cluster split.
+pub(crate) fn usesplit_min_gap() -> usize {
+    #[cfg(feature = "std")]
+    {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("PLIRON_RA2_USESPLIT_GAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n >= 2)
+                .unwrap_or(128)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    128
+}
+
+/// PLIRON: `PLIRON_RA2_USESPLIT_MULTIBLOCK=1` — allow use-cluster splits
+/// across block boundaries (default off: single-block bundles only).
+pub(crate) fn usesplit_multiblock() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_USESPLIT_MULTIBLOCK").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON: `PLIRON_RA_STATS=1` — print one `ra2stats:` line per allocated
+/// function (also on when `explain_on`).
+pub fn ra_stats_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA_STATS").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+
 /// PLIRON: `PLIRON_RA2_LOOPSPLIT` (default 16): split a bundle at the
 /// boundaries of the small loop around its hottest use (see
 /// `process_bundle`).
@@ -94,6 +154,69 @@ pub(crate) fn loopsplit_max() -> usize {
     }
     #[cfg(not(feature = "std"))]
     0
+}
+
+/// PLIRON: `PLIRON_RA2_REMATW` mode. Rematerializable bundles take a
+/// reduced spill weight instead of the long-range sqrt favor
+/// (`ion/process.rs`). Default `7` since 2026-11-18 (`=0` off): `/2` only
+/// when the bundle has at least `REMATW_MINUSSES` uses (default 8).
+/// Modes: 1 always `/2`; 2 `/2` no-call; 3 `/2` call-cross; 4 always `/4`;
+/// 5 `/2` if `prio > 64`; 6 `/2` if uses ≤ `REMATW_MAXUSES`; 7 `/2` if
+/// uses ≥ `REMATW_MINUSSES`. Plain `1`/`3`/`5` all left protobuf
+/// `merge_loop` at +205k; `6` lost pulldown's win; `7` keeps pulldown
+/// (−0.21% non-nop, copies=2) with protobuf +0.017%.
+pub(crate) fn rematw_mode() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("PLIRON_RA2_REMATW") {
+            Ok(s) if s == "0" => 0,
+            Ok(s) => s
+                .parse::<u8>()
+                .ok()
+                .filter(|m| (1..=7).contains(m))
+                .unwrap_or(7),
+            Err(_) => 7,
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    7
+}
+
+/// PLIRON: `PLIRON_RA2_REMATW_MAXUSES` (default 4): use-count cap for
+/// rematw mode 6.
+pub(crate) fn rematw_maxuses() -> usize {
+    #[cfg(feature = "std")]
+    {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("PLIRON_RA2_REMATW_MAXUSES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(4)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    4
+}
+
+/// PLIRON: `PLIRON_RA2_REMATW_MINUSSES` (default 8): use-count floor for
+/// rematw mode 7.
+pub(crate) fn rematw_minusses() -> usize {
+    #[cfg(feature = "std")]
+    {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("PLIRON_RA2_REMATW_MINUSSES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(8)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    8
 }
 
 /// PLIRON: `PLIRON_RA2_COLDSPLIT=1` (opt-in): carve the cold blocks whose
@@ -258,16 +381,18 @@ pub(crate) fn region_k() -> usize {
     8
 }
 
-/// PLIRON: `PLIRON_RA2_REGION_CAP` (default 1): uses an S block is
-/// charged for at most (a block-local piece reloads once per stretch).
+/// PLIRON: `PLIRON_RA2_REGION_CAP` (default 2 since 2026-11-18): uses an
+/// S block is charged for at most (a block-local piece reloads once per
+/// stretch). Was 1; 2 wins pulldown/blind-sig/html with compression
+/// +0.017% (`docs/history/2026-11-18-ra-night.md`).
 pub(crate) fn region_use_cap() -> u32 {
     #[cfg(feature = "std")]
     {
         static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        env_f32("PLIRON_RA2_REGION_CAP", &C, 1.0).max(1.0) as u32
+        env_f32("PLIRON_RA2_REGION_CAP", &C, 2.0).max(1.0) as u32
     }
     #[cfg(not(feature = "std"))]
-    1
+    2
 }
 
 /// PLIRON: `PLIRON_RA2_REGION_MAXB` (default 2048): bundles live in more
@@ -537,6 +662,12 @@ type FxHashSet<V> = hashbrown::HashSet<V, BuildHasherDefault<FxHasher>>;
 pub(crate) mod cfg;
 pub(crate) mod domtree;
 pub(crate) mod fastalloc;
+/// PLIRON: greedy + SplitKit-style allocator (`PLIRON_RA_ALGO=greedy`).
+pub(crate) mod greedy;
+/// PLIRON: exact clique / colouring certificates on interference graphs.
+pub mod prove;
+/// PLIRON: Gumbel-root / PUCT home search (`PLIRON_RA_ALGO=mcts`).
+pub mod mcts_ra;
 pub mod indexset;
 pub(crate) mod ion;
 pub(crate) mod moves;
@@ -2222,7 +2353,31 @@ pub fn run<F: Function>(
         Algorithm::Fastalloc => {
             fastalloc::run(func, env, options.verbose_log, options.validate_ssa)
         }
+        Algorithm::Greedy => greedy::run(func, env, options.verbose_log, options.validate_ssa),
+        Algorithm::Mcts => greedy::run_mcts(func, env, options.verbose_log, options.validate_ssa),
     }
+}
+
+/// PLIRON: `PLIRON_RA_ALGO_FNS=lo..hi` (per-mille of the function-content hash,
+/// `color_fn_mille`) keeps `greedy`/`mcts` to the functions in that slice; the
+/// rest go through ion. For bisecting a miscompile by function
+/// (`harness/ra_colorbisect.py`).
+fn algorithm_for<F: Function>(func: &F, algo: Algorithm) -> Algorithm {
+    #[cfg(feature = "std")]
+    if matches!(algo, Algorithm::Greedy | Algorithm::Mcts) {
+        if let Ok(v) = std::env::var("PLIRON_RA_ALGO_FNS") {
+            if let Some((lo, hi)) = v.split_once("..") {
+                if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<u64>(), hi.trim().parse::<u64>()) {
+                    let m = color_fn_mille(func);
+                    if !(lo <= m && m < hi) {
+                        return Algorithm::Ion;
+                    }
+                }
+            }
+        }
+    }
+    let _ = func;
+    algo
 }
 
 /// Run the allocator with reusable context.
@@ -2234,10 +2389,16 @@ pub fn run_with_ctx<'a, F: Function>(
     options: &RegallocOptions,
     ctx: &'a mut Ctx,
 ) -> Result<&'a Output, RegAllocError> {
-    match options.algorithm {
+    match algorithm_for(func, options.algorithm) {
         Algorithm::Ion => ion::run(func, env, ctx, options.verbose_log, options.validate_ssa)?,
         Algorithm::Fastalloc => {
             ctx.output = fastalloc::run(func, env, options.verbose_log, options.validate_ssa)?
+        }
+        Algorithm::Greedy => {
+            ctx.output = greedy::run(func, env, options.verbose_log, options.validate_ssa)?
+        }
+        Algorithm::Mcts => {
+            ctx.output = greedy::run_mcts(func, env, options.verbose_log, options.validate_ssa)?
         }
     }
     Ok(&ctx.output)
@@ -2248,6 +2409,34 @@ pub enum Algorithm {
     #[default]
     Ion,
     Fastalloc,
+    /// PLIRON: greedy + use-cluster / region split (LLVM SplitKit-shaped).
+    Greedy,
+    /// PLIRON: greedy emit + Gumbel/PUCT home search (`mcts_ra`; sims via
+    /// `PLIRON_RA_MCTS_SIMS`, branching via `PLIRON_RA_MCTS_TOPM`).
+    Mcts,
+}
+
+/// PLIRON: the per-mille slot (`0..1000`) of a function's content hash that
+/// `PLIRON_RA_COLOR_FNS=lo..hi` tests (`harness/ra_colorbisect.py`).
+#[cfg(feature = "std")]
+pub fn color_fn_mille<F: Function>(func: &F) -> u64 {
+    greedy::fn_hash(func) % 1000
+}
+
+/// PLIRON: `PLIRON_RA_ALGO=ion|greedy|fast|mcts` — which `Algorithm` Cranelift
+/// selects (default ion).
+pub fn ra_algo_from_env() -> Algorithm {
+    #[cfg(feature = "std")]
+    {
+        match std::env::var("PLIRON_RA_ALGO").as_deref() {
+            Ok("greedy") => Algorithm::Greedy,
+            Ok("fast") | Ok("fastalloc") => Algorithm::Fastalloc,
+            Ok("mcts") => Algorithm::Mcts,
+            _ => Algorithm::Ion,
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    Algorithm::Ion
 }
 
 /// Options for allocation.

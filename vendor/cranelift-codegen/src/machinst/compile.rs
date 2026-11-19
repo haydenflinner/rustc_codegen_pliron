@@ -84,11 +84,34 @@ pub fn compile<B: LowerBackend + TargetIsa>(
             options.validate_ssa = true;
         }
 
-        options.algorithm = match b.flags().regalloc_algorithm() {
-            RegallocAlgorithm::Backtracking => Algorithm::Ion,
-            RegallocAlgorithm::SinglePass => Algorithm::Fastalloc,
+        // PLIRON: `PLIRON_RA_ALGO=ion|greedy|fast|mcts` overrides the settings
+        // flag (default ion / Backtracking).
+        options.algorithm = match regalloc2::ra_algo_from_env() {
+            Algorithm::Greedy => Algorithm::Greedy,
+            Algorithm::Fastalloc => Algorithm::Fastalloc,
+            Algorithm::Mcts => Algorithm::Mcts,
+            Algorithm::Ion => match b.flags().regalloc_algorithm() {
+                RegallocAlgorithm::Backtracking => Algorithm::Ion,
+                RegallocAlgorithm::SinglePass => Algorithm::Fastalloc,
+            },
         };
 
+        // PLIRON: `PLIRON_RA_COLOR_FNS_LOG=1` names each function with its
+        // `PLIRON_RA_COLOR_FNS` slot (`harness/ra_colorbisect.py`).
+        // `PLIRON_RA_DUMP_MILLE=<n>` prints the CLIF and VCode of slot `n`.
+        if let Ok(n) = std::env::var("PLIRON_RA_DUMP_MILLE") {
+            if n.parse::<u64>().ok() == Some(regalloc2::color_fn_mille(&vcode)) {
+                eprintln!("==== ra-dump-mille {n} ====\n{f:?}\n{vcode:?}");
+            }
+        }
+        if std::env::var_os("PLIRON_RA_COLOR_FNS_LOG").is_some() {
+            eprintln!(
+                "ra-color-fn mille={} {} {}",
+                regalloc2::color_fn_mille(&vcode),
+                f.name,
+                crate::PLIRON_FN_NAME.with(|s| s.borrow().clone())
+            );
+        }
         vcode.compute_remat_vregs();
         vcode.compute_block_freq();
         regalloc2::run_with_ctx(&vcode, vcode.abi.machine_env(), &options, regalloc_ctx)
@@ -103,6 +126,23 @@ pub fn compile<B: LowerBackend + TargetIsa>(
                 err
             })
             .expect("register allocation");
+
+        // PLIRON: `PLIRON_RA_STATS=1` or explain — one summary line.
+        if regalloc2::ra_stats_on() || regalloc2::explain_on() {
+            let s = &regalloc_ctx.output.stats;
+            eprintln!(
+                "ra2stats: {} algo={:?} splits={} minimal={} use_cluster={} region={} evict={} spill_bundles={} edits={}",
+                f.name,
+                options.algorithm,
+                s.splits,
+                s.splits_minimal,
+                s.splits_use_cluster,
+                s.splits_region,
+                s.evict_bundle_count,
+                s.spill_bundle_count,
+                s.edits_count,
+            );
+        }
 
         // PLIRON: `PLIRON_RA2_VERBOSE=1` dumps regalloc decision
         // annotations for the same functions as `PLIRON_PREVCODE`.

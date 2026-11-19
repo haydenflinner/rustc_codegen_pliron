@@ -463,6 +463,7 @@ impl<'a, F: Function> Env<'a, F> {
         self.ctx.spillsets[spillset].region_count += 1;
         self.ctx.bundles[bundle].region_blocks = infos.len() as u32;
         self.ctx.output.stats.splits += 1;
+        self.ctx.output.stats.splits_region += 1;
         let label = |b: usize| -> Option<bool> {
             infos
                 .binary_search_by_key(&(b as u32), |i| i.block)

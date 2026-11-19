@@ -269,6 +269,12 @@ pub fn isa_builder(triple: Triple) -> IsaBuilder {
         triple,
         setup: aarch64_settings::builder(),
         constructor: |triple, shared_flags, builder| {
+            // PLIRON: x18 allocatable on Linux ELF (LLVM); reserved elsewhere.
+            let linux = matches!(
+                triple.operating_system,
+                target_lexicon::OperatingSystem::Linux
+            );
+            inst::regs::set_x18_linux_default(linux);
             let isa_flags = aarch64_settings::Flags::new(&shared_flags, builder);
             let backend = AArch64Backend::new_with_flags(triple, shared_flags, isa_flags);
             Ok(backend.wrapped())

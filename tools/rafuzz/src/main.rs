@@ -24,7 +24,7 @@
 
 use arbitrary::Unstructured;
 use regalloc2::fuzzing::func::{self, Func, Options};
-use regalloc2::{checker::Checker, Algorithm, Ctx, Edit, MachineEnv, RegallocOptions};
+use regalloc2::{checker::Checker, Ctx, Edit, MachineEnv, RegClass, RegallocOptions};
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -129,12 +129,66 @@ fn generate(c: &Case) -> Option<Func> {
     })
 }
 
+/// A stack allocation names `spillslot_size(class)` units, aligned to that
+/// size (named by its last unit when the function says so). Every one an
+/// operand or edit uses must fit `num_spillslots`, and slots of different
+/// start must not overlap: a v128 spill beside an 8-byte one once
+/// overwrote it (greedy, `contains_rng`), which the value checker cannot see.
+fn check_slot_extents(f: &Func, out: &regalloc2::Output) -> Result<(), String> {
+    use regalloc2::Function;
+    let mut used: Vec<(usize, usize, RegClass)> = Vec::new();
+    let mut note = |a: regalloc2::Allocation, class: RegClass| {
+        if let Some(sl) = a.as_stack() {
+            let size = f.spillslot_size(class).max(1);
+            let end = sl.index() + 1;
+            let start = if f.multi_spillslot_named_by_last_slot() { end.saturating_sub(size) } else { sl.index() };
+            used.push((start, size, class));
+        }
+    };
+    for i in 0..f.num_insts() {
+        let inst = regalloc2::Inst::new(i);
+        for (op, &a) in f.inst_operands(inst).iter().zip(out.inst_allocs(inst)) {
+            note(a, op.class());
+        }
+    }
+    for (_, Edit::Move { from, to }) in &out.edits {
+        match (from.as_reg(), to.as_reg()) {
+            (Some(r), None) => note(*to, r.class()),
+            (None, Some(r)) => note(*from, r.class()),
+            _ => {}
+        }
+    }
+    used.sort();
+    used.dedup();
+    for w in used.windows(2) {
+        let (s0, z0, c0) = w[0];
+        let (s1, _, c1) = w[1];
+        if s0 + z0 > s1 && (s0 != s1 || c0 != c1) {
+            return Err(format!("slot [{s0}, {}) of {c0:?} overlaps the one at {s1} of {c1:?}", s0 + z0));
+        }
+    }
+    for &(s, z, c) in &used {
+        if s % z != 0 {
+            return Err(format!("{c:?} slot at {s} is not aligned to {z}"));
+        }
+        if s + z > out.num_spillslots {
+            return Err(format!("{c:?} slot [{s}, {}) past num_spillslots {}", s + z, out.num_spillslots));
+        }
+    }
+    Ok(())
+}
+
 fn run_case(c: &Case) -> Outcome {
     let Some(f) = generate(c) else {
         return Outcome::NoFunc;
     };
     let env = env_of(c);
-    let ro = RegallocOptions { verbose_log: c.annotate, validate_ssa: c.validate, algorithm: Algorithm::Ion };
+    // PLIRON: honour `PLIRON_RA_ALGO=greedy|fast|ion` (harness/rafuzz.py).
+    let ro = RegallocOptions {
+        verbose_log: c.annotate,
+        validate_ssa: c.validate,
+        algorithm: regalloc2::ra_algo_from_env(),
+    };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         CTX.with(|ctx| -> Result<(usize, usize), (&'static str, String)> {
             let mut ctx = ctx.borrow_mut();
@@ -146,6 +200,9 @@ fn run_case(c: &Case) -> Outcome {
             ck.prepare(out);
             if let Err(e) = ck.run() {
                 return Err(("checker", format!("{e:?}")));
+            }
+            if let Err(e) = check_slot_extents(&f, out) {
+                return Err(("slots", e));
             }
             if c.fresh {
                 let mut fresh = Ctx::default();

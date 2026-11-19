@@ -970,8 +970,12 @@ fn backend_isa() -> std::sync::Arc<dyn TargetIsa> {
     let triple = std::env::var("CLIF_CHECK_TRIPLE").unwrap_or_else(|_| "aarch64-apple-darwin".into());
     fb.set("tls_model", if triple.contains("apple") { "macho" } else { "elf_gd" }).unwrap();
     // `PLIRON_RA_ALGO=single_pass`: Cranelift's other allocator, to compare.
+    // Only the settings flag's own values go there; `greedy`/`mcts`/`fast` are
+    // regalloc2 algorithms that `machinst/compile.rs` reads from the env itself.
     if let Ok(a) = std::env::var("PLIRON_RA_ALGO") {
-        fb.set("regalloc_algorithm", &a).unwrap();
+        if matches!(a.as_str(), "backtracking" | "single_pass") {
+            fb.set("regalloc_algorithm", &a).unwrap();
+        }
     }
     // `PLIRON_RA_CHECK=1`: regalloc2's symbolic checker on every function,
     // as the backend sets it (`src/lib.rs`).

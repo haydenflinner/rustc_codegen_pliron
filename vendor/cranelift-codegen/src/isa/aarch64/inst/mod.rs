@@ -1308,6 +1308,23 @@ impl MachInst for Inst {
         }
     }
 
+    // Spill-weight remat only (LLVM/Go/GCC): immediates, not symbol loads.
+    // `LoadExtNameNear`/`Got` stay rematerializable on reload.
+    fn rematerialize_cheap(&self) -> bool {
+        match self {
+            Inst::MovWide { .. }
+            | Inst::VecDupImm { .. }
+            | Inst::VecDupFPImm { .. }
+            | Inst::FpuMoveFPImm { .. } => true,
+            Inst::AluRRImmLogic {
+                alu_op: ALUOp::Orr,
+                rn,
+                ..
+            } if *rn == zero_reg() => true,
+            _ => false,
+        }
+    }
+
     fn pliron_frame_free(&self) -> bool {
         let ok = |r: &Reg| *r != stack_reg() && *r != fp_reg() && *r != link_reg();
         let am = |m: &AMode| match m {

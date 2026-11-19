@@ -1338,14 +1338,20 @@ impl ABIMachineSpec for AArch64MachineDeps {
             2 => has_calls || flags.preserve_frame_pointers(),
             _ => false,
         };
-        if x17_allocatable() || lr {
-            static ENVS: [std::sync::OnceLock<MachineEnv>; 4] =
-                [const { std::sync::OnceLock::new() }; 4];
+        let x18 = x18_allocatable();
+        if x17_allocatable() || lr || x18 {
+            // pinned | lr | x18 → 8 slots
+            static ENVS: [std::sync::OnceLock<MachineEnv>; 8] =
+                [const { std::sync::OnceLock::new() }; 8];
             let pinned = flags.enable_pinned_reg();
-            return ENVS[usize::from(pinned) * 2 + usize::from(lr)].get_or_init(|| {
+            let key = usize::from(pinned) * 4 + usize::from(lr) * 2 + usize::from(x18);
+            return ENVS[key].get_or_init(|| {
                 let mut env = create_reg_env(pinned);
                 if x17_allocatable() {
                     env.preferred_regs_by_class[0].add(xreg_preg(17));
+                }
+                if x18 {
+                    env.preferred_regs_by_class[0].add(xreg_preg(18));
                 }
                 if lr {
                     env.preferred_regs_by_class[0].add(xreg_preg(30));

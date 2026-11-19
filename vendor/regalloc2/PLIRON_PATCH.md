@@ -45,13 +45,62 @@ in `Output::edit_vregs` alongside `edits` (empty from the fast
 allocator). Cranelift uses it to rematerialize constant and address
 reloads (cranelift-codegen PLIRON_PATCH 76).
 
-## `Function::is_remat` (opt-in through Cranelift's `PLIRON_RA2_REMATW=1`)
+## Five workstreams (2026-11-18): stats, USESPLIT, greedy
 
-`src/lib.rs` (trait hook, default `false`), `src/ion/process.rs`
+- `Output::stats`: `splits_minimal`, `splits_use_cluster`, `splits_region`
+  (`data_structures.rs`); `PLIRON_RA_STATS=1` / explain prints
+  `ra2stats:` from Cranelift `compile.rs`.
+- `PLIRON_RA2_USESPLIT` (default on since 2026-11-18, `=0` off): before
+  `MAX_SPLITS` → minimal, cut at the largest use-free gap
+  (`try_use_cluster_split` in `process.rs`; `_GAP` default 128;
+  single-block unless `_MULTIBLOCK=1`). Spillset `use_cluster_done`
+  prevents loops. blake3 −154k, blind-sig −41k non-nop.
+- `Algorithm::Greedy` + `PLIRON_RA_ALGO=greedy` (`src/greedy/`): all-spill
+  homes + reload/spill/edge edits (checker-clean, 20k rafuzz seeds).
+  `PLIRON_RA_GREEDY_COLOR=1`: per-block linear scan promoting single-block
+  non-param vregs (branch args OK; params stay spilled; clobber /
+  foreign-FixedReg aware). Checker-clean on 10k rafuzz seeds; unmeasured
+  on held-out. `tools/rafuzz` mixes greedy and `GREEDY_COLOR=1`.
+- `Algorithm::Mcts` + `PLIRON_RA_ALGO=mcts` (`src/mcts_ra.rs`,
+  `greedy::run_mcts`): Gumbel-root / prior-shaped PUCT over homes for
+  single-block non-param vregs. Prior prefers already-used pregs (lower
+  footprint), deprioritizes new pregs and spill; FixedReg pin boost +
+  clobber/foreign-fixed forbid lists from greedy. Branching capped to
+  top-M free pregs + spill (`PLIRON_RA_MCTS_TOPM`, default 8). Reward =
+  `-(preg_count + 8*spills)`. Sims: `PLIRON_RA_MCTS_SIMS` (256);
+  `PLIRON_RA_MCTS_GUMBEL=0` disables root Gumbel. `tools/raproof
+  --algo mcts` reports `preg_pressure`. Default-off. Log:
+  `docs/history/2026-11-18-ra-mcts.md`.
+- `src/prove.rs` + `tools/raproof`: interference-graph certificates —
+  max-clique lower bound and (≤48 verts/class) chromatic upper bound —
+  compared to the heuristic's distinct-preg footprint; `check_bound`
+  re-verifies every cert; `try_fewer` / `--prove-fewer` searches for a
+  colouring with K < heuristic footprint (trade-compute dial:
+  `--budget`). See `docs/regalloc.md` "Proof engine" and
+  `docs/history/2026-11-18-ra-raproof.md`.
+- `PLIRON_RA_PROOFCOLOR=1` (opt-in, needs `GREEDY_COLOR=1`): greedy
+  applies a checked chromatic colouring when the class has ≤
+  `MAX_EXACT` verts — rematches single-block non-param homes if their
+  footprint exceeds `upper_k`, and steers emit temps toward the
+  colouring's K pregs (`greedy/mod.rs` `proof_recolor`). Fitness
+  `match/(match+above_opt+1)` on the fixed 40-seed window: greedy
+  COLOR 0.20 → COLOR+PROOFCOLOR 0.30; rafuzz 2k seeds green. Remaining
+  `above_opt` rows are edit temps that need a preg while all K proof
+  homes are live (abstraction gap). See
+  `docs/history/2026-11-18-ra-raproof-learn.md`.
+
+## `Function::is_remat` (`PLIRON_RA2_REMATW`, default 7 since 2026-11-18)
+
+`src/lib.rs` (trait hook, default `false`; `rematw_mode`), `src/ion/process.rs`
 `recompute_bundle_properties`: a bundle whose every range's vreg is
-rematerializable takes `total / prio / 2` as its spill weight (capped
-like the others) instead of the long-range sqrt normalization, as LLVM
-halves the weight of rematerializable intervals.
+rematerializable takes a reduced spill weight instead of the long-range
+sqrt normalization, as LLVM halves the weight of rematerializable
+intervals. Default mode `7`: `/2` only when the bundle has at least
+`PLIRON_RA2_REMATW_MINUSSES` uses (default 8). `=0` off. Other modes:
+`1` always `/2`; `2` no-call; `3` call-cross; `4` `/4`; `5` `prio>64`;
+`6` `uses≤MAXUSES`. Cranelift fills `remat_vregs` whenever the knob is
+not `0`. Held-out (copies=2): pulldown −0.21%, protobuf +0.017%, html
++0.006%; see `docs/history/2026-11-18-ra-night.md`.
 
 ## `Function::no_param_merge` (Cranelift shrink-wrapping, opt-in)
 
@@ -375,7 +424,8 @@ When a bundle must split, every block it is live in is a node labelled R
 (in one physical register) or S (on the stack). For a candidate register,
 blocks where the register is not free over the bundle's part of the block
 must be S. An S block costs `hot_bonus x min(register uses, CAP)` (CAP =
-`PLIRON_RA2_REGION_CAP`, default 1: a block-local piece reloads once per
+`PLIRON_RA2_REGION_CAP`, default 2 since 2026-11-18 (was 1): a block-local
+piece reloads once per
 stretch); an edge the bundle is live across costs `min(hot(pred),
 hot(succ))` when its ends differ. The cheapest labelling is a minimum s-t
 cut (symmetric pairwise costs: submodular), found by Dinic's max-flow with

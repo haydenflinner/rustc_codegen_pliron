@@ -1108,12 +1108,21 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `ImmLogic` bitmask-immediate oracle is `#[cfg(feature = "arm64")]`
     gated so non-arm64 hosts still compile (it reports false there).
 
-79. Opt-in rematerialization-aware spill weights (`PLIRON_RA2_REMATW=1`;
-    `VCode::compute_remat_vregs`, vendored regalloc2 `Function::is_remat`):
-    a bundle whose vregs are all single-def rematerializable values gets
-    upstream's linear weight, halved (LLVM `weightCalcHelper`), instead
-    of pliron's long-range sqrt favor. Held-out A/B: 1.271 vs 1.264
-    without (and 1.283 combined with 78 and `PLIRON_CSTDEDUP=0`); stays off.
+79. Rematerialization-aware spill weights (`PLIRON_RA2_REMATW`, default
+    `7` since 2026-11-18, `=0` off; `VCode::compute_remat_vregs`, vendored
+    regalloc2 `Function::is_remat` / `rematw_mode`): a bundle whose vregs
+    are all single-def rematerializable values gets a reduced weight
+    instead of pliron's long-range sqrt favor. Mode `7`: `/2` only when
+    uses ≥ `PLIRON_RA2_REMATW_MINUSSES` (default 8). Plain `/2` (`=1`)
+    cost protobuf `merge_loop` +205k; the use floor keeps pulldown's
+    `parse_block` win (−0.21% non-nop, copies=2) with protobuf +0.017%.
+    Spill-weight membership uses `MachInst::rematerialize_cheap` by
+    default (aarch64: `MovWide` / ImmLogic `orr xzr` / VecDup* /
+    `FpuMoveFPImm` — not `LoadExtNameNear`/`Got`), matching LLVM's
+    `isTriviallyReMaterializable`, Go's constants-only remat, and GCC
+    LRA's no-memory remat candidates. `PLIRON_RA2_REMATW_CHEAP=0`
+    restores every `rematerialize` form for the weight set; reload
+    remat via `edit_vregs` still remats symbol loads either way.
 
 80. 64-bit integer vector shifts on aarch64 (`src/isa/aarch64/lower.isle`):
     upstream's `ishl`/`ushr`/`sshr` vector rules match only 128-bit types,
