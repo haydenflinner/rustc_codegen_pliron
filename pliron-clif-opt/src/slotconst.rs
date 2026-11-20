@@ -27,7 +27,9 @@
 //! word: brotli's `nodes[pos].u = Union1::shortcut(x)` stored the payload
 //! and the tag `2` to the stack and reloaded both as an `i64` on every
 //! position (240k stores and 120k loads in compression); the stores then die
-//! in `dse` and the slot in `deadslot`.
+//! in `dse` and the slot in `deadslot`. Only for a slot read by that one
+//! load and whose address escapes nowhere (`single_read_slots`): otherwise
+//! the stores stay and the combination is not worth its shifts.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
@@ -128,10 +130,69 @@ fn materialize(pos: &mut FuncCursor, inst: cranelift_codegen::ir::Inst, ty: Type
     false
 }
 
+/// `PLIRON_SLOTCOMB`: the slots read by exactly one load whose address
+/// reaches nothing but load and store addresses (through constant adds).
+/// Combining that load lets `dse` drop the stores and `deadslot` the slot;
+/// where the slot is read again, or escapes, the stores stay and the
+/// combination only trades one load for shifts and ORs and a longer-lived
+/// value (blake3's `compress_chunks_parallel`: +3k loads).
+fn single_read_slots(func: &Function) -> rustc_hash::FxHashSet<StackSlot> {
+    let mut addr: FxHashMap<Value, StackSlot> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            match func.dfg.insts[i] {
+                InstructionData::StackAddr { opcode: Opcode::StackAddr, stack_slot, .. } => {
+                    addr.insert(func.dfg.first_result(i), stack_slot);
+                }
+                InstructionData::Binary { opcode: Opcode::Iadd, args } => {
+                    let (a, c) = (func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1]));
+                    let base = if iconst(func, c).is_some() { a } else if iconst(func, a).is_some() { c } else { continue };
+                    if let Some(&ss) = addr.get(&base) {
+                        addr.insert(func.dfg.first_result(i), ss);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut loads: FxHashMap<StackSlot, u32> = FxHashMap::default();
+    let mut escaped: rustc_hash::FxHashSet<StackSlot> = Default::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let data = func.dfg.insts[i];
+            let slot_of = |v: Value| addr.get(&func.dfg.resolve_aliases(v)).copied();
+            match data {
+                InstructionData::Load { arg, .. } => {
+                    if let Some(ss) = slot_of(arg) {
+                        *loads.entry(ss).or_default() += 1;
+                    }
+                }
+                InstructionData::Store { args, .. } => {
+                    if let Some(ss) = slot_of(args[0]) {
+                        escaped.insert(ss);
+                    }
+                }
+                InstructionData::StackAddr { .. } => {}
+                InstructionData::Binary { opcode: Opcode::Iadd, args }
+                    if addr.contains_key(&func.dfg.first_result(i))
+                        && (iconst(func, args[0]).is_some() || iconst(func, args[1]).is_some()) => {}
+                _ => {
+                    for v in func.dfg.inst_values(i) {
+                        if let Some(ss) = slot_of(v) {
+                            escaped.insert(ss);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    loads.into_iter().filter(|&(ss, n)| n == 1 && !escaped.contains(&ss)).map(|(ss, _)| ss).collect()
+}
+
 /// `PLIRON_SLOTCOMB`: replace the integer load `inst` of `ty` from slot `ss`
 /// at `off` by the combination of the whole pieces and constant bytes that
 /// cover it, when they do exactly (every piece wholly inside the load) and
-/// there are at least two terms. `false`, with nothing changed, otherwise.
+/// there are exactly two terms. `false`, with nothing changed, otherwise.
 fn combine(
     pos: &mut FuncCursor,
     inst: cranelift_codegen::ir::Inst,
@@ -161,7 +222,12 @@ fn combine(
         terms.push((v, w, start - off));
         k += i64::from(w);
     }
-    if terms.is_empty() || terms.len() + usize::from(nconst > 0) < 2 {
+    // Two terms at most (one piece and the constant bytes, or two pieces):
+    // a third and later piece costs a shift and an OR each against one
+    // store, and regex's byte-assembled words lost (+0.06%) when they were
+    // combined.
+    let nterms = terms.len() + usize::from(nconst > 0 && cbits != 0);
+    if terms.is_empty() || terms.len() + usize::from(nconst > 0) < 2 || nterms > 2 {
         return false;
     }
     let mut acc: Option<Value> = (nconst > 0 && cbits != 0).then(|| pos.ins().iconst(ty, cbits as i64));
@@ -209,6 +275,7 @@ pub fn run(func: &mut Function) -> usize {
 
 /// [`run`] with `PLIRON_SLOTCOMB` chosen by the caller.
 pub fn run_with(func: &mut Function, comb: bool) -> usize {
+    let single = if comb { single_read_slots(func) } else { Default::default() };
     let mut n = 0;
     let mut known: FxHashMap<(StackSlot, i64), u8> = FxHashMap::default();
     // Byte -> (stored value, its width in bytes, the slot offset it starts at).
@@ -284,7 +351,11 @@ pub fn run_with(func: &mut Function, comb: bool) -> usize {
                             if materialize(&mut pos, inst, ty, &bs) {
                                 n += 1;
                             }
-                        } else if comb && ty.is_int() && ty.bytes() <= 8 && combine(&mut pos, inst, ty, ss, off, &known, &pieces)
+                        } else if comb
+                            && ty.is_int()
+                            && ty.bytes() <= 8
+                            && single.contains(&ss)
+                            && combine(&mut pos, inst, ty, ss, off, &known, &pieces)
                         {
                             n += 1;
                         }

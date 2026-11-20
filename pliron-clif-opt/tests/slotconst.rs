@@ -159,9 +159,10 @@ fn comb_enum_word() {
 }
 
 /// Mixed widths: an `i8` constant, an `i16` value and an `istore8` of an
-/// `i32` (its low byte) make one `i32`.
+/// `i32` would make one `i32` from three terms: over the two-term cap
+/// (each further piece costs a shift and an OR), so the load stays.
 #[test]
-fn comb_mixed_widths() {
+fn comb_three_terms_stay() {
     let (after, n) = run_comb("function %f(i16, i32) -> i32 {
         ss0 = explicit_slot 4, align = 4
     block0(v0: i16, v1: i32):
@@ -171,6 +172,23 @@ fn comb_mixed_widths() {
         store notrap v0, v2+1
         istore8 notrap v1, v2+3
         v4 = load.i32 notrap v2
+        return v4
+    }");
+    assert_eq!(n, 0, "{after}");
+    assert_eq!(loads(&after), 1, "{after}");
+}
+
+/// Two pieces of different widths: an `istore8` of an `i32` (its low byte)
+/// and an `i8` value at offset 1, read as one `i16`.
+#[test]
+fn comb_two_pieces() {
+    let (after, n) = run_comb("function %f(i32, i8) -> i16 {
+        ss0 = explicit_slot 2, align = 2
+    block0(v0: i32, v1: i8):
+        v2 = stack_addr.i64 ss0
+        istore8 notrap v0, v2
+        store notrap v1, v2+1
+        v4 = load.i16 notrap v2
         return v4
     }");
     assert_eq!(n, 1, "{after}");
