@@ -57,6 +57,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // Exact counts: compression -0.56%, no program worse
     // (`docs/history/2026-11-20-ivsr.md`). `PLIRON_SLOTCOMB=0` off.
     "PLIRON_SLOTCOMB",
+    // 2026-11-20: brthread retargets edges into a bare `brif c` that the
+    // edge decides (lol_html's `tag_is_one_of!` variant re-tests). Exact
+    // counts: html -0.32%, protobuf -0.13%, json -0.06%, pulldown -0.03%,
+    // none worse (`docs/history/2026-11-20-ivsr.md`). `PLIRON_BRTHREAD=0`.
+    "PLIRON_BRTHREAD",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the

@@ -1076,7 +1076,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   -1.5k, none worse; `REM` + `MASKSHL` compression -0.025%, html +0.063%
   (lol_html lowercases names under 8 bytes: the extra dispatch costs
   about 7 instructions a call). Tests `tests/loopvec_rem.rs`.
-- `PLIRON_BRTHREAD=1` (opt-in, 2026-11-20) — step `brthread` before
+- `PLIRON_BRTHREAD` (default on since 2026-11-20, `=0` off) — step `brthread` before
   `bittab2`: an edge into a block that is only `brif c` goes straight to
   the successor `c` selects when the edge decides `c` (its own `brif`
   side, or a fact inherited down the dominator tree from a single-edge
