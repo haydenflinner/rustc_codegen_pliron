@@ -1024,10 +1024,22 @@ time, memory, code size, stack frames) in ~20 min and writes
   plain call across which no value wider than 64 bits is live no longer
   clobbers aarch64's `v8`-`v15` for regalloc (the ABI keeps their low 64
   bits; regalloc2 has no partial registers, so every `f32`/`f64` across a
-  call was spilled). Liveness of wide vregs per call; the FASTCC summary
-  keeps reporting the registers. compression -0.12% (brotli's literal
-  cost: 56k stores and 56k loads become moves), the rest within noise.
-  Stanza `halfclob`.
+  call was spilled). Liveness of wide vregs per call, plain calls and
+  invokes (the unwinder restores `d8`-`d15` from CFI like `x19`-`x28`); the
+  FASTCC summary keeps reporting the registers. compression -0.12%
+  (brotli's literal cost: 56k stores and 56k loads become moves), the rest
+  within noise; std: 904 needless `d8`-`d15` prologue saves/restores gone
+  (a call to a function of another convention folded the old all-vector
+  clobber set into the caller's). What stays spilled across a call: values
+  wider than 64 bits (LLVM spills them too). Stanza `halfclob` (doubles
+  across libm calls and across invokes read by an unwinding destructor; a
+  vector across a local call).
+- `PLIRON_SLOTCOMB=1` (opt-in, 2026-11-20) — `slotconst` also forwards an
+  integer load wholly covered by narrower non-constant stores (and
+  constants) in the same block: `const | uextend(p) << 8k | ...`. brotli's
+  `nodes[pos].u = Union1::shortcut(x)` built the enum in a stack temp and
+  reloaded it as one word (240k stores, 120k loads in compression). Tests
+  `tests/slotconst.rs` (`comb_*`).
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

@@ -2193,7 +2193,9 @@ across a call was spilled (LLVM keeps them in `d8`-`d15`). For each plain
 call (not a terminator, `CallType::Regular`) across which no vreg wider
 than 64 bits in the float class is live (liveness of the wide vregs only,
 bitsets, round and count budgets), the half-clobbered registers leave the
-call's clobber set before allocation. regalloc2, its checker and the
+call's clobber set before allocation; `try_call`s included (on the unwind
+edge the unwinder restores `d8`-`d15` from CFI, which records their saves
+as DWARF registers 72-79). regalloc2, its checker and the
 emission-time liveness read the stripped sets; the prologue saves what the
 allocation used (as `d` registers). The FASTCC summary adds the registers
 back so a caller holding a 128-bit value never believes such a function

@@ -1477,8 +1477,8 @@ impl<I: VCodeInst> VCode<I> {
     /// upper half: take `v8`-`v15` out of the plain calls' clobber sets
     /// before allocation. regalloc2, its checker and the emission-time
     /// liveness read these sets; the prologue saves the registers the
-    /// allocation used (as `d` registers). `try_call`s (terminators) keep
-    /// their full sets. The interprocedural summary (`pliron_written_regs`)
+    /// allocation used (as `d` registers). `try_call`s count as calls: the
+    /// unwinder restores `d8`-`d15` from CFI. The interprocedural summary (`pliron_written_regs`)
     /// adds the registers back, so a caller holding a 128-bit value never
     /// believes this function preserves all of them.
     pub fn pliron_strip_half_clobbers(&mut self) {
@@ -1507,8 +1507,9 @@ impl<I: VCodeInst> VCode<I> {
         self.pliron_half_stripped = any;
     }
 
-    /// PLIRON (`PLIRON_A64_HALFCLOB`): the plain calls (not terminators)
-    /// across which no vreg wider than 64 bits in the float class is live.
+    /// PLIRON (`PLIRON_A64_HALFCLOB`): the calls (`CallType::Regular`, plain
+    /// or `try_call`) across which no vreg wider than 64 bits in the float
+    /// class is live.
     /// Liveness of the wide vregs only (bitsets; usually a handful), by
     /// backward dataflow over the blocks; `None` past the budgets (then
     /// nothing is stripped).
@@ -1525,10 +1526,13 @@ impl<I: VCodeInst> VCode<I> {
                 nw += 1;
             }
         }
+        // Plain calls and `try_call`s (terminators): on the unwind edge the
+        // unwinder restores `d8`-`d15` from each frame's CFI (Cranelift
+        // describes their saves as DWARF registers 72-79), exactly as it
+        // restores `x19`-`x28`, which the exceptional clobber sets already
+        // leave out.
         let calls = |i: InsnIndex| {
-            self.insts[i.index()].is_term() == MachTerminator::None
-                && self.insts[i.index()].call_type() == CallType::Regular
-                && self.clobbers.contains_key(&i)
+            self.insts[i.index()].call_type() == CallType::Regular && self.clobbers.contains_key(&i)
         };
         let nb = self.num_blocks();
         if nw == 0 {

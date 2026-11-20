@@ -17,6 +17,17 @@
 //! from a slot whose every byte is known becomes the constant: `iconst`
 //! for integers up to 64 bits, `f32const`/`f64const`, `vconst` for 64-
 //! and 128-bit vectors. Linear in the block.
+//!
+//! `PLIRON_SLOTCOMB=1` (opt-in): the scan also remembers, per byte, which
+//! non-constant integer store wrote it (plain `store` of an integer of at
+//! most 8 bytes, or `istore8/16/32`), and an integer load whose bytes are
+//! exactly covered by whole such pieces and known constants becomes their
+//! combination, `const | uextend(p1) << 8*k1 | ...` (little-endian, as the
+//! constant path). An enum assembled in a temporary and copied out as one
+//! word: brotli's `nodes[pos].u = Union1::shortcut(x)` stored the payload
+//! and the tag `2` to the stack and reloaded both as an `i64` on every
+//! position (240k stores and 120k loads in compression); the stores then die
+//! in `dse` and the slot in `deadslot`.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
@@ -117,13 +128,95 @@ fn materialize(pos: &mut FuncCursor, inst: cranelift_codegen::ir::Inst, ty: Type
     false
 }
 
+/// `PLIRON_SLOTCOMB`: replace the integer load `inst` of `ty` from slot `ss`
+/// at `off` by the combination of the whole pieces and constant bytes that
+/// cover it, when they do exactly (every piece wholly inside the load) and
+/// there are at least two terms. `false`, with nothing changed, otherwise.
+fn combine(
+    pos: &mut FuncCursor,
+    inst: cranelift_codegen::ir::Inst,
+    ty: Type,
+    ss: StackSlot,
+    off: i64,
+    known: &FxHashMap<(StackSlot, i64), u8>,
+    pieces: &FxHashMap<(StackSlot, i64), (Value, u8, i64)>,
+) -> bool {
+    let len = ty.bytes() as i64;
+    let mut cbits: u64 = 0;
+    let mut nconst = 0;
+    let mut terms: Vec<(Value, u8, i64)> = Vec::new();
+    let mut k = 0;
+    while k < len {
+        if let Some(&b) = known.get(&(ss, off + k)) {
+            cbits |= u64::from(b) << (8 * k);
+            nconst += 1;
+            k += 1;
+            continue;
+        }
+        let Some(&(v, w, start)) = pieces.get(&(ss, off + k)) else { return false };
+        // The piece must start here and lie wholly inside the load.
+        if start != off + k || start + i64::from(w) > off + len {
+            return false;
+        }
+        terms.push((v, w, start - off));
+        k += i64::from(w);
+    }
+    if terms.is_empty() || terms.len() + usize::from(nconst > 0) < 2 {
+        return false;
+    }
+    let mut acc: Option<Value> = (nconst > 0 && cbits != 0).then(|| pos.ins().iconst(ty, cbits as i64));
+    let last = terms.len() - 1;
+    for (j, &(v, w, sh)) in terms.iter().enumerate() {
+        let vty = pos.func.dfg.value_type(v);
+        let wty = Type::int(u16::from(w) * 8).expect("piece width");
+        let mut t = v;
+        if vty.bytes() > u32::from(w) {
+            t = pos.ins().ireduce(wty, t);
+        }
+        if wty != ty {
+            t = pos.ins().uextend(ty, t);
+        }
+        if sh > 0 {
+            t = pos.ins().ishl_imm(t, 8 * sh);
+        }
+        if j == last {
+            match acc {
+                Some(a) => {
+                    pos.func.replace(inst).bor(a, t);
+                }
+                None => {
+                    // A single piece shifted, no constant: `t` is the value.
+                    let r = pos.func.dfg.first_result(inst);
+                    pos.func.dfg.clear_results(inst);
+                    pos.func.dfg.change_to_alias(r, t);
+                    pos.remove_inst_and_step_back();
+                }
+            }
+        } else {
+            acc = Some(match acc {
+                Some(a) => pos.ins().bor(a, t),
+                None => t,
+            });
+        }
+    }
+    true
+}
+
 /// Returns the number of loads replaced.
 pub fn run(func: &mut Function) -> usize {
+    run_with(func, pliron_cfg::env_is("PLIRON_SLOTCOMB", "1"))
+}
+
+/// [`run`] with `PLIRON_SLOTCOMB` chosen by the caller.
+pub fn run_with(func: &mut Function, comb: bool) -> usize {
     let mut n = 0;
     let mut known: FxHashMap<(StackSlot, i64), u8> = FxHashMap::default();
+    // Byte -> (stored value, its width in bytes, the slot offset it starts at).
+    let mut pieces: FxHashMap<(StackSlot, i64), (Value, u8, i64)> = FxHashMap::default();
     let mut pos = FuncCursor::new(func);
     while let Some(_b) = pos.next_block() {
         known.clear();
+        pieces.clear();
         while let Some(inst) = pos.next_inst() {
             let data = pos.func.dfg.insts[inst];
             match data {
@@ -131,19 +224,55 @@ pub fn run(func: &mut Function) -> usize {
                     let val = args[0];
                     let size = pos.func.dfg.value_type(val).bytes() as i64;
                     match slot_addr(pos.func, args[1], i64::from(i32::from(offset))) {
-                        Some((ss, off)) => match const_bytes(pos.func, val) {
-                            Some(bs) => {
-                                for (k, &x) in bs.iter().enumerate() {
-                                    known.insert((ss, off + k as i64), x);
+                        Some((ss, off)) => {
+                            for k in 0..size {
+                                pieces.remove(&(ss, off + k));
+                            }
+                            match const_bytes(pos.func, val) {
+                                Some(bs) => {
+                                    for (k, &x) in bs.iter().enumerate() {
+                                        known.insert((ss, off + k as i64), x);
+                                    }
+                                }
+                                None => {
+                                    for k in 0..size {
+                                        known.remove(&(ss, off + k));
+                                    }
+                                    let ty = pos.func.dfg.value_type(val);
+                                    if comb && ty.is_int() && size <= 8 {
+                                        for k in 0..size {
+                                            pieces.insert((ss, off + k), (val, size as u8, off));
+                                        }
+                                    }
                                 }
                             }
-                            None => {
-                                for k in 0..size {
-                                    known.remove(&(ss, off + k));
-                                }
+                        }
+                        None => {
+                            known.clear();
+                            pieces.clear();
+                        }
+                    }
+                }
+                InstructionData::Store { opcode: op @ (Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32), args, offset, .. }
+                    if comb =>
+                {
+                    let val = args[0];
+                    let size: i64 = match op {
+                        Opcode::Istore8 => 1,
+                        Opcode::Istore16 => 2,
+                        _ => 4,
+                    };
+                    match slot_addr(pos.func, args[1], i64::from(i32::from(offset))) {
+                        Some((ss, off)) => {
+                            for k in 0..size {
+                                known.remove(&(ss, off + k));
+                                pieces.insert((ss, off + k), (val, size as u8, off));
                             }
-                        },
-                        None => known.clear(),
+                        }
+                        None => {
+                            known.clear();
+                            pieces.clear();
+                        }
                     }
                 }
                 InstructionData::Load { opcode: Opcode::Load, arg, offset, .. } => {
@@ -155,6 +284,9 @@ pub fn run(func: &mut Function) -> usize {
                             if materialize(&mut pos, inst, ty, &bs) {
                                 n += 1;
                             }
+                        } else if comb && ty.is_int() && ty.bytes() <= 8 && combine(&mut pos, inst, ty, ss, off, &known, &pieces)
+                        {
+                            n += 1;
                         }
                     }
                 }
@@ -162,6 +294,7 @@ pub fn run(func: &mut Function) -> usize {
                     let op = data.opcode();
                     if op.can_store() || op.is_call() || op.other_side_effects() {
                         known.clear();
+                        pieces.clear();
                     }
                 }
             }

@@ -6,7 +6,10 @@
 //    keeps a double across a libm call (its FASTCC summary must still say
 //    it clobbers v8-v15 above 64 bits, or the caller's vector loses its
 //    upper half);
-//  - a loop with several floats live across calls.
+//  - a loop with several floats live across calls;
+//  - doubles live across invokes (`try_call`) and read by a destructor on
+//    the unwind path, caught by `catch_unwind`: the unwinder must hand the
+//    landing pad d8-d15 as they were at the call.
 // Output pinned against stock rustc by test.sh.
 use std::hint::black_box;
 
@@ -63,6 +66,32 @@ fn looped(n: usize) -> (f64, f32) {
     (s + t, u)
 }
 
+static SEEN: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+
+struct Guard(f64, f64);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        SEEN.lock().unwrap().push(self.0 * 3.0 + self.1);
+    }
+}
+
+#[inline(never)]
+fn may_panic(x: f64) -> f64 {
+    if black_box(x) > 5.0 {
+        panic!("x = {x}");
+    }
+    x.sin()
+}
+
+#[inline(never)]
+fn across_invokes(x: f64) -> f64 {
+    let g = Guard(black_box(x * 2.0).cos(), black_box(x + 0.25).sqrt());
+    let a = may_panic(x);
+    let b = may_panic(x - 1.0);
+    let c = may_panic(x + 0.5);
+    g.0 + g.1 * (a + b + c)
+}
+
 fn main() {
     let mut acc = 0.0f64;
     for i in 0..200 {
@@ -79,4 +108,14 @@ fn main() {
     }
     let (l, m) = looped(black_box(5000));
     println!("{:.9e} {:.6e} {:.6e} {:.9e} {:.6e}", acc, fa, w, l, m);
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut ok = 0.0;
+    for i in 0..12 {
+        match std::panic::catch_unwind(|| across_invokes(i as f64 * 0.5)) {
+            Ok(v) => ok += v,
+            Err(_) => ok -= 1.0,
+        }
+    }
+    let seen: f64 = SEEN.lock().unwrap().iter().sum();
+    println!("invokes {:.9e} drops {:.9e} n {}", ok, seen, SEEN.lock().unwrap().len());
 }

@@ -127,3 +127,86 @@ fn unwritten_byte_stays() {
     let (_, n) = run(src);
     assert_eq!(n, 0);
 }
+
+fn run_comb(src: &str) -> (Function, usize) {
+    let before = parse(src);
+    let mut after = before.clone();
+    let n = slotconst::run_with(&mut after, true);
+    cranelift_codegen::verify_function(&after, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
+        .unwrap_or_else(|e| panic!("invalid after slotcomb: {e}\n{after}"));
+    check(&before, &after, &Facts::default(), &Config { trials: 64, ..Config::default() })
+        .unwrap_or_else(|m| panic!("slotcomb changed behaviour: {m:?}\n{after}"));
+    (after, n)
+}
+
+/// `PLIRON_SLOTCOMB`: brotli's `Union1::shortcut(x)`: a payload and the tag
+/// `2` stored as two words, reloaded as one `i64`.
+#[test]
+fn comb_enum_word() {
+    let (after, n) = run_comb("function %f(i32, i64) {
+        ss0 = explicit_slot 8, align = 8
+    block0(v0: i32, v1: i64):
+        v2 = stack_addr.i64 ss0
+        store notrap v0, v2+4
+        v3 = iconst.i32 2
+        store notrap v3, v2
+        v4 = load.i64 notrap v2
+        store notrap v4, v1
+        return
+    }");
+    assert_eq!(n, 1, "{after}");
+    assert_eq!(loads(&after), 0, "{after}");
+}
+
+/// Mixed widths: an `i8` constant, an `i16` value and an `istore8` of an
+/// `i32` (its low byte) make one `i32`.
+#[test]
+fn comb_mixed_widths() {
+    let (after, n) = run_comb("function %f(i16, i32) -> i32 {
+        ss0 = explicit_slot 4, align = 4
+    block0(v0: i16, v1: i32):
+        v2 = stack_addr.i64 ss0
+        v3 = iconst.i8 7
+        store notrap v3, v2
+        store notrap v0, v2+1
+        istore8 notrap v1, v2+3
+        v4 = load.i32 notrap v2
+        return v4
+    }");
+    assert_eq!(n, 1, "{after}");
+    assert_eq!(loads(&after), 0, "{after}");
+}
+
+/// A byte no store covered: the load stays.
+#[test]
+fn comb_uncovered_byte_stays() {
+    let (after, n) = run_comb("function %f(i16) -> i32 {
+        ss0 = explicit_slot 4, align = 4
+    block0(v0: i16):
+        v2 = stack_addr.i64 ss0
+        store notrap v0, v2
+        v3 = iconst.i8 1
+        store notrap v3, v2+2
+        v4 = load.i32 notrap v2
+        return v4
+    }");
+    assert_eq!(n, 0, "{after}");
+    assert_eq!(loads(&after), 1, "{after}");
+}
+
+/// A piece that reaches past the load (its upper half is read, the rest is
+/// not): not combined (a single-store forward is `loadfwd`'s job).
+#[test]
+fn comb_piece_past_the_load_stays() {
+    let (after, n) = run_comb("function %f(i32, i16) -> i32 {
+        ss0 = explicit_slot 8, align = 8
+    block0(v0: i32, v1: i16):
+        v2 = stack_addr.i64 ss0
+        store notrap v1, v2
+        store notrap v0, v2+2
+        v4 = load.i32 notrap v2
+        return v4
+    }");
+    assert_eq!(n, 0, "{after}");
+    assert_eq!(loads(&after), 1, "{after}");
+}
