@@ -30,6 +30,7 @@ pub mod nnret;
 pub mod nocapture;
 pub mod nounwind;
 pub mod nowrite;
+pub mod partinline;
 pub mod pgo;
 pub mod phisimp;
 pub mod retarg;

@@ -130,6 +130,11 @@ pub fn wasm_cold_keep(sym: &str) -> bool {
 
 /// rustc's drop paths (`drop_in_place<T>` monomorphizations lower to the
 /// `4core3ptr9drop_glue` v0 fragment; same test as `memcpyopt`'s).
+/// `is_drop_glue` for other passes' diagnostics.
+pub fn is_drop_glue_sym(sym: &str) -> bool {
+    is_drop_glue(sym)
+}
+
 fn is_drop_glue(sym: &str) -> bool {
     sym.contains("4core3ptr9drop_glue") || sym.contains("13drop_in_place")
 }

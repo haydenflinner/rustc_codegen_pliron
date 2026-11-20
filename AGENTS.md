@@ -1104,6 +1104,20 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_RA2_MAXSPLITS=<n>` (vendored regalloc2, default 4 since
   2026-11-20; upstream 2) — splits per value before the minimal-bundle fallback (a reload at
   every use). See `LOOPROT_MULTI` and `docs/history/2026-11-20-ivsr.md`.
+- `PLIRON_PARTINLINE=1` (opt-in, 2026-11-20; IR pass after the inliner,
+  before `xcgu-home`) — partial inlining of a callee's entry guard (LLVM's
+  `PartialInlining`): when a callee's entry block is only `gep`/`load`/
+  `zext`/`trunc`/`icmp` ending in a `cond_br` whose one side is a bare
+  `return` (enum drop glue: return unless the variant owns something),
+  each direct void call the inliner kept becomes `if guard { call }`, the
+  side where the callee returns expected (`PLIRON_PARTINLINE_EXPECT=0`
+  drops the expectation). lol_html's `finish_tag_name` called
+  `drop_glue::<TreeBuilderFeedback>` 21k times for a variant owning
+  nothing. Exact counts: regex -0.10%, html -0.045%, blind-sig -0.03%,
+  none worse. The copied guard is not yet folded where the caller knows
+  the variant only through a join (html: 3 instructions per call left).
+  `PLIRON_TRACE=pliron::partinline` names guards and sites. Stanza
+  `partinline` (fails with the guard inverted).
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

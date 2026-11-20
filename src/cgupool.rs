@@ -1194,6 +1194,15 @@ pub(crate) fn iropt_head(
     );
     pliron_ir_opt::irstat::report(ctx, st, "post-inline");
     dumpfn(ctx, st, "inline");
+    // `PLIRON_PARTINLINE=1` (opt-in): the entry guard of a callee the
+    // inliner kept (enum drop glue: return unless the variant owns
+    // something) is copied in front of each call, so the passes below fold
+    // it where the caller knows the variant. Before `xcgu-home`: the
+    // callee is often a cross-CGU copy, an import again after it.
+    if env_is("PLIRON_PARTINLINE", "1") {
+        pt!(prof, cgu, "partinline", pliron_ir_opt::partinline::run(ctx, st));
+        pt!(prof, cgu, "domcheck:partinline", domcheck::run(ctx, st, "partinline"));
+    }
     pt!(prof, cgu, "xcgu-home", inline::home_copies(ctx, st));
     // Inlining kills most copy callsites — mark the dead ones now so
     // spec/sroa/constload/devirt never walk their emit-only bodies.
