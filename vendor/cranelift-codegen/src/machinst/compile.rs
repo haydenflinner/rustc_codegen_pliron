@@ -114,6 +114,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         }
         vcode.compute_remat_vregs();
         vcode.compute_block_freq();
+        vcode.pliron_strip_half_clobbers();
         regalloc2::run_with_ctx(&vcode, vcode.abi.machine_env(), &options, regalloc_ctx)
             .map_err(|err| {
                 log::error!(

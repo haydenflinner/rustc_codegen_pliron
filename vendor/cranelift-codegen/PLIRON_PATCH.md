@@ -2179,3 +2179,22 @@ switches). Stanza `x18`.
 
 `src/machinst/vcode.rs` (`RegallocFunction for VCode`): `pliron_move`
 reports `MachInst::is_move` copies as `(source, destination)` vregs.
+
+## `PLIRON_A64_HALFCLOB=1` (opt-in, 2026-11-20): v8-v15 survive calls for values of at most 64 bits
+
+`src/machinst/vcode.rs` (`pliron_strip_half_clobbers`,
+`pliron_calls_without_wide_live`, `pliron_written_regs`),
+`src/machinst/compile.rs` (called before regalloc),
+`src/machinst/mod.rs` / `src/isa/aarch64/inst/mod.rs`
+(`MachInst::pliron_call_half_clobbered`: aarch64 `v8`-`v15`).
+`default_aapcs_clobbers` marks every vector register clobbered by a call
+because regalloc2 has no partial registers, so every `f32`/`f64` live
+across a call was spilled (LLVM keeps them in `d8`-`d15`). For each plain
+call (not a terminator, `CallType::Regular`) across which no vreg wider
+than 64 bits in the float class is live (liveness of the wide vregs only,
+bitsets, round and count budgets), the half-clobbered registers leave the
+call's clobber set before allocation. regalloc2, its checker and the
+emission-time liveness read the stripped sets; the prologue saves what the
+allocation used (as `d` registers). The FASTCC summary adds the registers
+back so a caller holding a 128-bit value never believes such a function
+preserves them whole. Stanza `halfclob`.

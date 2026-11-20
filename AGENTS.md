@@ -1020,6 +1020,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   `is_mostly_utf8`: `add; add; cbnz` then `mov; mov; b` -> `cbnz` then
   `add; add; b`). Exact counts: compression -0.56%, pulldown -0.36%,
   blind-sig -0.07%, nothing worse. Tests `tests/latchspec.rs`.
+- `PLIRON_A64_HALFCLOB=1` (opt-in, 2026-11-20; vendored Cranelift) — a
+  plain call across which no value wider than 64 bits is live no longer
+  clobbers aarch64's `v8`-`v15` for regalloc (the ABI keeps their low 64
+  bits; regalloc2 has no partial registers, so every `f32`/`f64` across a
+  call was spilled). Liveness of wide vregs per call; the FASTCC summary
+  keeps reporting the registers. compression -0.12% (brotli's literal
+  cost: 56k stores and 56k loads become moves), the rest within noise.
+  Stanza `halfclob`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

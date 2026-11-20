@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 regionsplit bigtmp fragcopyout
+#   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 halfclob regionsplit bigtmp fragcopyout
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -999,6 +999,26 @@ t_x18() {
   done
 }
 
+t_halfclob() {
+  # PLIRON_A64_HALFCLOB=1 (opt-in, aarch64): v8-v15 keep their low 64 bits
+  # across calls, so a call across which no value wider than 64 bits is
+  # live clobbers them for nothing. Doubles and floats across libm calls,
+  # a 128-bit vector across a local call whose callee keeps a double in
+  # v8-v15 (FASTCC must still report those as clobbered above 64 bits),
+  # and a loop. Output against stock with the knob off and on (regalloc2
+  # checker on); with it on, `narrow` keeps a value in d8-d15.
+  rustc --edition 2021 -O tests/halfclob/main.rs -o $out/halfclob-stock$exe || return 1
+  local k
+  for k in 0 1; do
+    PLIRON_A64_HALFCLOB=$k PLIRON_RA_CHECK=1 rustc $BE --edition 2021 -O tests/halfclob/main.rs -o $out/halfclob$k$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/halfclob-stock$exe) <($out/halfclob$k$exe) || { echo "halfclob: output differs (PLIRON_A64_HALFCLOB=$k)" >&2; return 1; }
+  done
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
+  "$llvmod" -d --no-show-raw-insn $out/halfclob1$exe | awk '/<_*[^ ]*6narrow>:$/ {p=1; next} /^$/ {p=0} p' \
+    | grep -qE '(stp|str|stur)[[:space:]]+d(8|9|1[0-5])' || { echo "halfclob: narrow saves no d8-d15 with the knob on" >&2; return 1; }
+}
+
 t_shrinkwrap() {
   # PLIRON_SHRINKWRAP=1 (opt-in, aarch64): the save block must keep its
   # callee saves through emission (EDGEHOIST retargeted a branch past it,
@@ -1644,6 +1664,7 @@ want fragcopyout && t_fragcopyout
 want shrinkwrap && t_shrinkwrap
 want sibcall && t_sibcall
 want x18 && t_x18
+want halfclob && t_halfclob
 want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi

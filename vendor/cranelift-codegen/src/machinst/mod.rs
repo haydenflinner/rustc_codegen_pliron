@@ -356,6 +356,13 @@ pub trait MachInst: Clone + Debug {
         None
     }
 
+    /// PLIRON (`PLIRON_A64_HALFCLOB`): registers a call clobbers only above
+    /// their low 64 bits under the platform ABI (aarch64: `v8`-`v15`), so a
+    /// value of at most 64 bits survives a call in them. Empty: none.
+    fn pliron_call_half_clobbered() -> regalloc2::PRegSet {
+        regalloc2::PRegSet::empty()
+    }
+
     /// PLIRON: the trap code of an unconditional trap (`is_trap`), if the
     /// backend records one. Used to find `TrapCode::NORETURN_CALL` traps
     /// that emission may drop.

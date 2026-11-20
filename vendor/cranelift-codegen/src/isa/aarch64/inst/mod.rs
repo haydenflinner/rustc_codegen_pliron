@@ -1102,6 +1102,14 @@ impl MachInst for Inst {
         }
     }
 
+    fn pliron_call_half_clobbered() -> regalloc2::PRegSet {
+        let mut s = regalloc2::PRegSet::empty();
+        for r in 8..=15u8 {
+            s.add(crate::isa::aarch64::inst::regs::vreg_preg(r));
+        }
+        s
+    }
+
     fn pliron_tail_clobbers(&self) -> Option<regalloc2::PRegSet> {
         match self {
             Inst::ReturnCall { info } => info.pliron_clobbers,

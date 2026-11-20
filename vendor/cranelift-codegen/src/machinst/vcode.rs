@@ -165,6 +165,10 @@ pub struct VCode<I: VCodeInst> {
     /// Clobbers: a sparse map from instruction indices to clobber masks.
     clobbers: FxHashMap<InsnIndex, PRegSet>,
 
+    /// PLIRON (`PLIRON_A64_HALFCLOB`): the half-clobbered registers were
+    /// taken out of the plain calls' clobber sets (`pliron_strip_half_clobbers`).
+    pliron_half_stripped: bool,
+
     /// Source locations for each instruction. (`SourceLoc` is a `u32`, so it is
     /// reasonable to keep one of these per instruction.)
     srclocs: Vec<RelSourceLoc>,
@@ -1464,6 +1468,157 @@ impl<I: VCodeInst> VCode<I> {
         }
     }
 
+    /// PLIRON (`PLIRON_A64_HALFCLOB=1`, opt-in): the platform ABI preserves
+    /// the low 64 bits of aarch64's `v8`-`v15` across a call, but regalloc2
+    /// has no partial registers, so every call clobbers all vector
+    /// registers and every `f32`/`f64` live across a call is spilled (LLVM
+    /// keeps them in `d8`-`d15`). When the function has no vreg wider than
+    /// 64 bits in the float class, nothing it could keep there loses an
+    /// upper half: take `v8`-`v15` out of the plain calls' clobber sets
+    /// before allocation. regalloc2, its checker and the emission-time
+    /// liveness read these sets; the prologue saves the registers the
+    /// allocation used (as `d` registers). `try_call`s (terminators) keep
+    /// their full sets. The interprocedural summary (`pliron_written_regs`)
+    /// adds the registers back, so a caller holding a 128-bit value never
+    /// believes this function preserves all of them.
+    pub fn pliron_strip_half_clobbers(&mut self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_A64_HALFCLOB").as_deref() == Ok("1")) {
+            return;
+        }
+        let half = I::pliron_call_half_clobbered();
+        if half == PRegSet::default() || self.clobbers.is_empty() {
+            return;
+        }
+        let Some(strip) = self.pliron_calls_without_wide_live() else { return };
+        let mut any = false;
+        for iix in strip {
+            if let Some(set) = self.clobbers.get_mut(&iix) {
+                let mut s = *set;
+                for r in half {
+                    s.remove(r);
+                }
+                if s != *set {
+                    *set = s;
+                    any = true;
+                }
+            }
+        }
+        self.pliron_half_stripped = any;
+    }
+
+    /// PLIRON (`PLIRON_A64_HALFCLOB`): the plain calls (not terminators)
+    /// across which no vreg wider than 64 bits in the float class is live.
+    /// Liveness of the wide vregs only (bitsets; usually a handful), by
+    /// backward dataflow over the blocks; `None` past the budgets (then
+    /// nothing is stripped).
+    fn pliron_calls_without_wide_live(&self) -> Option<Vec<InsnIndex>> {
+        use regalloc2::Function as _;
+        const MAX_WIDE: usize = 256;
+        const MAX_ROUNDS: usize = 64;
+        let n = self.vreg_types.len();
+        let mut bit = vec![u32::MAX; n];
+        let mut nw = 0usize;
+        for (v, t) in self.vreg_types.iter().enumerate() {
+            if (t.is_vector() || t.is_float()) && t.bits() > 64 {
+                bit[v] = nw as u32;
+                nw += 1;
+            }
+        }
+        let calls = |i: InsnIndex| {
+            self.insts[i.index()].is_term() == MachTerminator::None
+                && self.insts[i.index()].call_type() == CallType::Regular
+                && self.clobbers.contains_key(&i)
+        };
+        let nb = self.num_blocks();
+        if nw == 0 {
+            return Some((0..self.insts.len()).map(InsnIndex::new).filter(|&i| calls(i)).collect());
+        }
+        if nw > MAX_WIDE {
+            return None;
+        }
+        let words = (nw + 63) / 64;
+        let wbit = |v: usize| if v < n && bit[v] != u32::MAX { Some(bit[v] as usize) } else { None };
+        // Backward transfer of one block from `live` (its live-out) to its
+        // live-in; with `on_call`, report each plain call's live-after set.
+        let transfer = |b: usize, live: &mut Vec<u64>, on_call: &mut dyn FnMut(InsnIndex, &[u64])| {
+            let block = BlockIndex::new(b);
+            let insns: Vec<InsnIndex> = self.block_insns(block).iter().collect();
+            for &i in insns.iter().rev() {
+                if calls(i) {
+                    on_call(i, live);
+                }
+                let ops = self.inst_operands(i);
+                for op in ops {
+                    if op.kind() == regalloc2::OperandKind::Def {
+                        if let Some(k) = wbit(op.vreg().vreg()) {
+                            live[k / 64] &= !(1u64 << (k % 64));
+                        }
+                    }
+                }
+                for op in ops {
+                    if op.kind() == regalloc2::OperandKind::Use {
+                        if let Some(k) = wbit(op.vreg().vreg()) {
+                            live[k / 64] |= 1u64 << (k % 64);
+                        }
+                    }
+                }
+                if self.is_branch(i) {
+                    for s in 0..self.block_succs(block).len() {
+                        for a in self.branch_blockparams(block, i, s) {
+                            if let Some(k) = wbit(a.vreg()) {
+                                live[k / 64] |= 1u64 << (k % 64);
+                            }
+                        }
+                    }
+                }
+            }
+            for p in self.block_params(block) {
+                if let Some(k) = wbit(p.vreg()) {
+                    live[k / 64] &= !(1u64 << (k % 64));
+                }
+            }
+        };
+        let mut live_in = vec![vec![0u64; words]; nb];
+        let mut changed = true;
+        let mut rounds = 0;
+        while changed {
+            changed = false;
+            rounds += 1;
+            if rounds > MAX_ROUNDS {
+                return None;
+            }
+            for b in (0..nb).rev() {
+                let mut live = vec![0u64; words];
+                for &s in self.block_succs(BlockIndex::new(b)) {
+                    for w in 0..words {
+                        live[w] |= live_in[s.index()][w];
+                    }
+                }
+                transfer(b, &mut live, &mut |_, _| {});
+                if live != live_in[b] {
+                    live_in[b] = live;
+                    changed = true;
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for b in 0..nb {
+            let mut live = vec![0u64; words];
+            for &s in self.block_succs(BlockIndex::new(b)) {
+                for w in 0..words {
+                    live[w] |= live_in[s.index()][w];
+                }
+            }
+            transfer(b, &mut live, &mut |i, l| {
+                if l.iter().all(|&w| w == 0) {
+                    out.push(i);
+                }
+            });
+        }
+        Some(out)
+    }
+
     /// PLIRON: fill `remat_vregs` (see the field) before regalloc, and
     /// pick up shrink-wrapping's split block.
     pub fn compute_remat_vregs(&mut self) {
@@ -1535,6 +1690,7 @@ impl<I: VCodeInst> VCode<I> {
             operands: Vec::with_capacity(30 * n_blocks),
             operand_ranges: Ranges::with_capacity(10 * n_blocks),
             clobbers: FxHashMap::default(),
+            pliron_half_stripped: false,
             srclocs: Vec::with_capacity(10 * n_blocks),
             entry: BlockIndex::new(0),
             block_ranges: Ranges::with_capacity(n_blocks),
@@ -1771,6 +1927,12 @@ impl<I: VCodeInst> VCode<I> {
             }
             if let Some(&inst_clobbered) = self.clobbers.get(&InsnIndex::new(i)) {
                 written.union_from(inst_clobbered);
+                // `PLIRON_A64_HALFCLOB` took these out for this function's
+                // own allocation; its callees still clobber their upper
+                // halves, which a caller with a wide value must assume.
+                if self.pliron_half_stripped {
+                    written.union_from(I::pliron_call_half_clobbered());
+                }
             }
         }
         Some(written)
