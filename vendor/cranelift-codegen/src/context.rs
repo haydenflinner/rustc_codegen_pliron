@@ -589,18 +589,20 @@ impl Context {
         if membase.is_empty() {
             return;
         }
-        // PLIRON: `PLIRON_BUMPHOIST_INLOOP=1` (opt-in): a base the loop it
-        // heads reads again in a block other than the header that every
-        // trip runs (not as another constant bump) is left alone by both
-        // phases. Such a use
-        // runs on every trip, so phase 2's remat `sub` costs what the fused
-        // writeback saves, and a bump hoisted without the fusion keeps the
-        // pre- and post-bump values live through the whole body (brotli's
-        // `nodes[i + 1]` pointer IV, read in the arms of the per-position
-        // loop: `ldr [x4], #20` then `sub x0, x4, #20` in two arms; hoisted
-        // alone, the bump spilled). One pass over the function.
+        // PLIRON: `PLIRON_BUMPHOIST_INLOOP=1` (opt-in): weigh the fusion
+        // against the base's other reads in blocks every trip of the loop it
+        // heads runs (they dominate each latch; not other constant bumps).
+        // Fused, each such block pays phase 2's remat `sub`; unfused, the
+        // bump stays in its latch, which costs a jump when the bump was all
+        // that block held. A base with more such blocks than that is left
+        // alone by both phases: brotli's `nodes[i + 1]` pointer IV is read
+        // in two (`ldr [x4], #20`, then `sub x0, x4, #20` in each; hoisted
+        // without the fusion the bump spilled), pulldown-cmark's byte cursor
+        // in one, its end test, with a latch of `add; b` (+109k jumps when
+        // it was left alone). One pass over the function.
         static INLOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mut inloop_keep: FxHashSet<Value> = FxHashSet::default();
+        let mut useblk: FxHashMap<Value, Vec<Block>> = FxHashMap::default();
         if *INLOOP.get_or_init(|| {
             std::env::var_os("PLIRON_BUMPHOIST_INLOOP").is_some_and(|v| v == "1")
         }) {
@@ -628,7 +630,7 @@ impl Context {
                     for v in self.func.dfg.inst_values(i) {
                         let v = self.func.dfg.resolve_aliases(v);
                         let Some(&h) = membase.get(&v) else { continue };
-                        if h == bb || inloop_keep.contains(&v) {
+                        if h == bb || useblk.get(&v).is_some_and(|u| u.last() == Some(&bb)) {
                             continue;
                         }
                         if let Some(lp) = la.innermost_loop(h)
@@ -650,7 +652,7 @@ impl Context {
                             if !latches.is_empty()
                                 && latches.iter().all(|&l| self.domtree.block_dominates(bb, l))
                             {
-                                inloop_keep.insert(v);
+                                useblk.entry(v).or_default().push(bb);
                             }
                         }
                     }
@@ -675,9 +677,6 @@ impl Context {
                     }
                     let x = self.func.dfg.resolve_aliases(args[side]);
                     let Some(&h) = membase.get(&x) else { continue };
-                    if inloop_keep.contains(&x) {
-                        continue;
-                    }
                     let okc = self
                         .func
                         .dfg
@@ -694,6 +693,19 @@ impl Context {
                         });
                     if h == b || !okc {
                         continue;
+                    }
+                    if let Some(u) = useblk.get(&x) {
+                        // The latch empties when the bump moves out: only
+                        // constants and a jump stay.
+                        let empties = self.func.layout.block_insts(b).all(|j| {
+                            j == i
+                                || matches!(self.func.dfg.insts[j], InstructionData::UnaryImm { opcode: Opcode::Iconst, .. })
+                                || self.func.dfg.insts[j].opcode() == Opcode::Jump
+                        });
+                        if u.len() > 1 + usize::from(empties) {
+                            inloop_keep.insert(x);
+                            continue;
+                        }
                     }
                     cand.push((i, h));
                     break;

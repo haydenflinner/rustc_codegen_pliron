@@ -1042,21 +1042,26 @@ time, memory, code size, stack frames) in ~20 min and writes
   reloaded it as one word (240k stores, 120k loads in compression).
   Exact counts: compression -0.56%, no program worse. Tests
   `tests/slotconst.rs` (`comb_*`).
-- `PLIRON_IVSR=1`, `PLIRON_BUMPHOIST_INLOOP=1` (opt-in, 2026-11-20) —
-  step `ivsr` after `lsr`: in-loop `base + (i + k) * S` (`S` not a power
-  of two, `base` invariant, `i` a header parameter stepped by a constant)
-  becomes a pointer header parameter stepped by `S` on the back edge
-  (brotli's 20-byte `nodes[i + 1]`: `madd` plus a spilled base reloaded
-  per trip become `ldr w0, [x21]`). Skipped: an address passed back to the
-  header (the loop carries it already), a loop with a parameter already
-  stepping by `S*c`, a group with no address on every trip;
-  `PLIRON_IVSR_MIN=<insts>` skips smaller loops (default 0).
+- `PLIRON_IVSR=2`, `PLIRON_BUMPHOIST_INLOOP=1` (opt-in, 2026-11-20) —
+  `ivsr` (`pliron-clif-opt/src/ivsr.rs`): in-loop `base + (i + k) * S`
+  (`S` not a power of two, `base` invariant, `i` a header parameter
+  stepped by a constant) becomes a pointer header parameter stepped by `S`
+  on the back edge (brotli's 20-byte `nodes[i + 1]`: `madd` plus a spilled
+  base reloaded per trip become `ldr w0, [x21]`). Skipped: an address
+  passed back to the header, a loop with a parameter already stepping by
+  `S*c`, a group with no address on every trip. `=2` (aarch64): the
+  backend applies it to a copy after the pipeline, compiles both and keeps
+  the copy when its frequency-weighted code (vendored
+  `pliron_cost_take`) is smaller and the part that runs once per call is
+  not larger (`ivsr::pick`; `PLIRON_IVSR_MARGIN=<pct>`); `=1` always
+  rewrites, as a pipeline step after `lsr` (html-rewriter +0.10%: short
+  loops where aarch64's `madd` already did the work).
   `BUMPHOIST_INLOOP` keeps vendored Cranelift's `bump_hoist` off a base
-  read again every trip (it fused `ldr [x], #20` and put `sub x, #20`
-  in the arms). Exact counts, `ivsr` alone: compression -0.55%, pulldown
-  -0.04%, html-rewriter +0.10%, protobuf +0.06%; with `INLOOP`:
-  compression -1.27%, pulldown +0.18%
-  (`docs/history/2026-11-20-ivsr.md`). `PLIRON_TRACE=pliron::ivsr`.
+  read again in more every-trip blocks than an emptied latch saves.
+  Exact counts with both: compression -1.17%, blind-sig -0.10%, pulldown
+  -0.04%, none worse; `INLOOP` alone compression -0.03%, none worse
+  (`docs/history/2026-11-20-ivsr.md`). `PLIRON_TRACE=pliron::ivsr`
+  (`pick` lines); `clif-check vcode` replays `=2` (`ivsr-pick:` line).
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

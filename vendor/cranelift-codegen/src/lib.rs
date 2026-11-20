@@ -51,6 +51,7 @@ mod machinst;
 // PLIRON: frame breakdown of the last compiled function (debug aid).
 pub use crate::machinst::pliron_last_frame;
 pub use crate::machinst::pliron_last_layout;
+pub use crate::machinst::{pliron_cost_begin, pliron_cost_end, pliron_cost_take};
 // PLIRON: placement phase knob (`PLIRON_PLACE_PHASE`, measurement aid).
 pub use crate::machinst::pliron_place_phase;
 // PLIRON: FASTCC per-callee clobber sets (`machinst/abi.rs`).

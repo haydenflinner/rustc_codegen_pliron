@@ -249,6 +249,34 @@ pub struct VCode<I: VCodeInst> {
     log2_min_function_alignment: u8,
 }
 
+std::thread_local! {
+    static PLIRON_COST_WANT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static PLIRON_LAST_COST: core::cell::Cell<Option<[f64; 2]>> = const { core::cell::Cell::new(None) };
+}
+
+/// PLIRON: the next functions compiled on this thread record their
+/// frequency-weighted code size: every emitted block's bytes / 4 times its
+/// static frequency (placement's `block_freq`, entry = 1), regalloc's moves,
+/// spills and reloads included. Read it with [`pliron_cost_take`]; turn
+/// recording off with `pliron_cost_end`. Used to pick between two CLIF
+/// versions of a function (`PLIRON_IVSR=2`).
+pub fn pliron_cost_begin() {
+    PLIRON_COST_WANT.with(|c| c.set(true));
+    PLIRON_LAST_COST.with(|c| c.set(None));
+}
+
+/// PLIRON: stop recording (see [`pliron_cost_begin`]).
+pub fn pliron_cost_end() {
+    PLIRON_COST_WANT.with(|c| c.set(false));
+}
+
+/// PLIRON: the cost of the function compiled last since
+/// [`pliron_cost_begin`], if any: `[total, part in blocks that run at most
+/// once per call]` (static frequency at most the entry's).
+pub fn pliron_cost_take() -> Option<[f64; 2]> {
+    PLIRON_LAST_COST.with(|c| c.take())
+}
+
 /// The result of `VCode::emit`. Contains all information computed
 /// during emission: actual machine code, optionally a disassembly,
 /// and optionally metadata about the code layout.
@@ -1974,6 +2002,10 @@ impl<I: VCodeInst> VCode<I> {
         buffer.set_pliron_phase(phase);
         buffer.set_log2_min_function_alignment(self.log2_min_function_alignment);
         let mut bb_starts: Vec<Option<CodeOffset>> = vec![];
+        // PLIRON: `pliron_cost_begin` — (block start, static frequency) of
+        // every emitted block, for a frequency-weighted size of the code.
+        let want_cost = PLIRON_COST_WANT.with(|c| c.get());
+        let mut cost_starts: Vec<(CodeOffset, f64)> = vec![];
 
         // The first M MachLabels are reserved for block indices.
         buffer.reserve_labels_for_blocks(self.num_blocks());
@@ -3009,6 +3041,17 @@ impl<I: VCodeInst> VCode<I> {
                     }
                     None => writeln!(&mut disasm, "block{}:", block.index()).unwrap(),
                 }
+            }
+
+            if want_cost {
+                // A branch the buffer deleted moves the offset back: the
+                // blocks starting at or after it emitted nothing (left).
+                let cur = buffer.cur_offset();
+                while cost_starts.last().is_some_and(|&(o, _)| o >= cur) {
+                    cost_starts.pop();
+                }
+                let f = self.block_freq.get(block.index()).copied().unwrap_or(1.0) as f64;
+                cost_starts.push((cur, f));
             }
 
             if flags.machine_code_cfg_info() {
@@ -4479,6 +4522,19 @@ impl<I: VCodeInst> VCode<I> {
         *ctrl_plane = state.take_ctrl_plane();
 
         let func_body_len = buffer.cur_offset();
+        if want_cost {
+            let (mut cost, mut once) = (0.0, 0.0);
+            for (k, &(o, f)) in cost_starts.iter().enumerate() {
+                let end = cost_starts.get(k + 1).map_or(func_body_len, |x| x.0);
+                let c = f * f64::from(end.saturating_sub(o)) / 4.0;
+                cost += c;
+                // Blocks that run at most once per call (outside loops).
+                if f <= 1.0 + 1e-6 {
+                    once += c;
+                }
+            }
+            PLIRON_LAST_COST.with(|c| c.set(Some([cost, once])));
+        }
 
         // Create `bb_edges` and final (filtered) `bb_starts`.
         let mut bb_edges = vec![];

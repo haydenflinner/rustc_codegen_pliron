@@ -201,10 +201,17 @@ fn main() -> ExitCode {
             if std::env::var_os("PLIRON_RA_EXPLAIN").is_some() {
                 cranelift_codegen::ra_set_explain(true);
             }
-            let after = with_pipe(&*isa, f, &facts, |p| {
+            let mut after = with_pipe(&*isa, f, &facts, |p| {
                 pipeline::run_pipeline(p);
                 p.clctx.func.clone()
             });
+            // `PLIRON_IVSR=2`: the backend's compile-both choice.
+            if pliron_cfg::env_is("PLIRON_IVSR", "2") {
+                let margin = pliron_cfg::env_get("PLIRON_IVSR_MARGIN").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                if let Some((k, a, b, take)) = pliron_clif_opt::ivsr::pick(&mut after, &*isa, margin) {
+                    eprintln!("ivsr-pick: rewrites {k} cost {a:?} -> {b:?} take {take}");
+                }
+            }
             if opts.print {
                 println!("{}", after.display());
             }

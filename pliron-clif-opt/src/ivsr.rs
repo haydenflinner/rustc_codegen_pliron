@@ -315,3 +315,39 @@ fn rewrite(func: &mut Function, g: &Group) {
         }
     }
 }
+
+/// `PLIRON_IVSR=2`: apply the rewrite to a copy of `func`, compile both
+/// versions for `isa`, and keep the copy when its frequency-weighted code
+/// (`cranelift_codegen::pliron_cost_take`) is smaller by more than
+/// `margin_pct` percent and the part that runs once per call is no larger.
+/// Static frequencies do not know trip counts: lol_html's attribute
+/// map-fold (one to three trips) looked 2.7% cheaper with the rewrite and
+/// paid a callee save and the entry multiply per call (+0.008% executed);
+/// brotli's per-position loop looked 0.5% cheaper and won 1.2%, its setup
+/// in a preheader inside outer loops. Returns `(rewrites, cost before,
+/// cost after, taken)` (`[total, once]` each), or `None` when the rewrite
+/// changes nothing. The scratch compiles publish no FASTCC set (they run
+/// outside `pliron_fastcc_begin`).
+pub fn pick(func: &mut Function, isa: &dyn cranelift_codegen::isa::TargetIsa, margin_pct: f64) -> Option<(usize, Option<[f64; 2]>, Option<[f64; 2]>, bool)> {
+    let mut alt = func.clone();
+    let k = run(&mut alt, &mut Analysis::default());
+    if k == 0 {
+        return None;
+    }
+    let cost = |f: &Function| -> Option<[f64; 2]> {
+        let mut c = cranelift_codegen::Context::for_function(f.clone());
+        cranelift_codegen::pliron_cost_begin();
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.compile(isa, &mut cranelift_codegen::control::ControlPlane::default()).is_ok()
+        }));
+        cranelift_codegen::pliron_cost_end();
+        let v = cranelift_codegen::pliron_cost_take();
+        if matches!(ok, Ok(true)) { v } else { None }
+    };
+    let (a, b) = (cost(func), cost(&alt));
+    let take = matches!((a, b), (Some(a), Some(b)) if b[0] < a[0] * (1.0 - margin_pct / 100.0) && b[1] <= a[1]);
+    if take {
+        *func = alt;
+    }
+    Some((k, a, b, take))
+}

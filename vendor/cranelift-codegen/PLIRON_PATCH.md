@@ -1614,16 +1614,16 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     successor its own copy; a loop exit that reads `q` after
     `edgesink::exit_sink`) aliases to the kept result instead of being
     rematerialized as `(q - k) + k`. `PLIRON_BUMPHOIST_INLOOP=1`
-    (opt-in, 2026-11-20): a base that the loop it heads reads again in a
-    non-header block every trip runs (it dominates each latch; not as
-    another constant bump) is skipped by both phases. That use runs on every trip, so the remat `sub` costs
-    what the writeback saves, and a bump hoisted without the fusion keeps
-    `p` and `q` both live through the body. Found on `ivsr`'s pointer IV
-    in brotli's shortest-path loop: `ldr w0, [x4], #20` and then
-    `sub x0, x4, #20` in two arms; hoisted alone, `q` spilled. Alone it
-    loses (pulldown-cmark +0.22%: the bump kept in the latch keeps that
-    block's jump, +109k executed jumps; compression +0.13%); with
-    `PLIRON_IVSR` it doubles that pass's compression win.
+    (opt-in, 2026-11-20) weighs the fusion against the base's other reads
+    in blocks every trip of the loop runs (they dominate each latch; other
+    constant bumps do not count): fused, each such block pays a remat
+    `sub`; unfused, the bump stays in its latch, which costs a jump when
+    the bump was all that block held. A base with more such blocks than
+    that is skipped by both phases. brotli's `ivsr` pointer IV is read in
+    two (`ldr w0, [x4], #20` and then `sub x0, x4, #20` in each; hoisted
+    without the fusion `q` spilled); pulldown-cmark's byte cursor in one,
+    its end test, with an `add; b` latch (a plain "skip if read every
+    trip" rule kept that latch: +109k executed jumps).
 
 117. aarch64 `x + (a cc b ? 1 : 0)` to `csinc` (`PLIRON_CINC`, opt-in,
     `=1` on; `isa/aarch64/lower.isle` `iadd_cinc_{r,l}` +
@@ -2210,3 +2210,16 @@ emission-time liveness read the stripped sets; the prologue saves what the
 allocation used (as `d` registers). The FASTCC summary adds the registers
 back so a caller holding a 128-bit value never believes such a function
 preserves them whole. Stanza `halfclob`.
+
+## Frequency-weighted code cost for a compile-both choice (2026-11-20)
+
+`src/machinst/vcode.rs` (`pliron_cost_begin`, `pliron_cost_end`,
+`pliron_cost_take`; re-exported from `lib.rs`). Between begin and end,
+`VCode::emit` records each emitted block's start offset and its placement
+frequency (`block_freq`, entry = 1); after emission it stores
+`[total, once]`: frequency times bytes / 4 summed over all blocks, and over
+the blocks whose frequency is at most the entry's. Regalloc's moves, spills
+and reloads count because they are emitted; a branch the buffer deletes
+moves the next start back, and the emptied blocks drop out. Used by
+`pliron_clif_opt::ivsr::pick` (`PLIRON_IVSR=2`) to choose between two CLIF
+versions of a function.

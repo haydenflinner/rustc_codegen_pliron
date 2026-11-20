@@ -1201,6 +1201,17 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
             }
         }
     }
+    // `PLIRON_IVSR=2` (opt-in): apply `ivsr` to a copy of the optimized
+    // function and keep the copy when it compiles to less frequency-weighted
+    // code without more code that runs once per call (`ivsr::pick`). `ivsr` pays where register pressure spilled the base or the
+    // stride (brotli's per-position loop) and costs a register elsewhere
+    // (short loops, where aarch64's `madd` already did the work); only the
+    // allocation tells which. The two scratch compiles happen only where
+    // `ivsr` changes something; they publish no FASTCC set.
+    // Measured on aarch64 only, where the cost (bytes / 4) is exact.
+    if sh.target.is_aarch64() && pliron_cfg::env_is("PLIRON_IVSR", "2") {
+        ivsr_pick(&mut clctx.func, sh, n);
+    }
     if sh.wasm {
         j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
         clctx.clear();
@@ -1221,6 +1232,18 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         return;
     }
     compile_job(j, clctx, sh);
+}
+
+/// `PLIRON_IVSR=2`: replace `func` by its `ivsr` rewrite when that compiles
+/// to less frequency-weighted code (see the call site).
+fn ivsr_pick(func: &mut ir::Function, sh: &JobShared, n: &str) {
+    // `PLIRON_IVSR_MARGIN=<percent>`: the rewrite must win by that much.
+    let margin = pliron_cfg::env_get("PLIRON_IVSR_MARGIN").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    if let Some((k, a, b, take)) = pliron_clif_opt::ivsr::pick(func, &*sh.isa, margin)
+        && pliron_cfg::tracing_on()
+    {
+        tracing::debug!(target: "pliron::ivsr", "pick {n}: rewrites {k} cost {a:?} -> {b:?} take {take}");
+    }
 }
 
 /// The Cranelift half of [`run_job`]: compile `clctx.func` (the job's
