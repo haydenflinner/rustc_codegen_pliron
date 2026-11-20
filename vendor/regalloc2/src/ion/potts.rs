@@ -62,6 +62,17 @@ struct Pair {
     to: Block,
 }
 
+/// A place of the value that may change register: its piece of one block
+/// (the whole block, or with `PLIRON_RA2_POTTS_PIECES` the part from the
+/// block's entry to its death, or from its definition to the block's end
+/// or its death) and the live range holding it.
+#[derive(Clone, Copy)]
+struct Node {
+    blk: Block,
+    range: CodeRange,
+    lr: super::LiveRangeIndex,
+}
+
 #[derive(Clone, Copy)]
 enum Side {
     Node(u32),
@@ -160,7 +171,8 @@ impl<'a, F: Function> Env<'a, F> {
         // Scratch, reused across values.
         let mut stamp = vec![u32::MAX; nb];
         let mut node_of = vec![0u32; nb];
-        let mut nodes: Vec<Block> = Vec::new();
+        let mut nodes: Vec<Node> = Vec::new();
+        let pieces = crate::potts_pieces_on();
         let mut cur: Vec<Allocation> = Vec::new();
         let mut pairs: Vec<Pair> = Vec::new();
 
@@ -170,12 +182,12 @@ impl<'a, F: Function> Env<'a, F> {
             if mode == 0 {
                 break;
             }
-            if overlap[v] || start[v] == start[v + 1] {
+            if overlap[v] || (start[v] == start[v + 1] && !pieces) {
                 continue;
             }
             let vi = VRegIndex::new(v);
             if !self.potts_build(vi, &sites[start[v] as usize..start[v + 1] as usize], &args,
-                                 v as u32, &mut stamp, &mut node_of, &mut nodes, &mut cur, &mut pairs) {
+                                 v as u32, pieces, &mut stamp, &mut node_of, &mut nodes, &mut cur, &mut pairs) {
                 continue;
             }
             let c = energy(&pairs, &cur);
@@ -194,7 +206,7 @@ impl<'a, F: Function> Env<'a, F> {
             let vi = VRegIndex::new(v as usize);
             // Labels may have moved since the first pass (a partner changed).
             let vs = &sites[start[v as usize] as usize..start[v as usize + 1] as usize];
-            if !self.potts_build(vi, vs, &args, v | (1 << 30), &mut stamp, &mut node_of, &mut nodes,
+            if !self.potts_build(vi, vs, &args, v | (1 << 30), pieces, &mut stamp, &mut node_of, &mut nodes,
                                  &mut cur, &mut pairs) {
                 continue;
             }
@@ -233,14 +245,11 @@ impl<'a, F: Function> Env<'a, F> {
                 let mut improved = false;
                 for k in 0..cands.len() {
                     let alpha = Allocation::reg(cands[k].0);
-                    // Which nodes may take alpha: free over the whole block.
+                    // Which nodes may take alpha: free over the node's piece.
                     free.clear();
-                    for (i, &blk) in nodes.iter().enumerate() {
+                    for (i, nd) in nodes.iter().enumerate() {
                         let ok = cur[i] == alpha || {
-                            let key = LiveRangeKey::from_range(&CodeRange {
-                                from: self.ctx.cfginfo.block_entry[blk.index()],
-                                to: self.ctx.cfginfo.block_exit[blk.index()].next(),
-                            });
+                            let key = LiveRangeKey::from_range(&nd.range);
                             !self.ctx.pregs[cands[k].0.index()].allocations.btree.contains_key(&key)
                         };
                         free.push(ok);
@@ -285,7 +294,7 @@ impl<'a, F: Function> Env<'a, F> {
                     continue;
                 }
                 let preg = cur[i].as_reg().expect("potts labels are registers");
-                self.potts_assign(vi, nodes[i], preg);
+                self.potts_assign(vi, nodes[i].range, preg);
                 moved_blocks += 1;
             }
         }
@@ -428,9 +437,10 @@ impl<'a, F: Function> Env<'a, F> {
         vsites: &[u32],
         args: &FxHashMap<(u32, u32), VRegIndex>,
         gen: u32,
+        pieces: bool,
         stamp: &mut [u32],
         node_of: &mut [u32],
-        nodes: &mut Vec<Block>,
+        nodes: &mut Vec<Node>,
         cur: &mut Vec<Allocation>,
         pairs: &mut Vec<Pair>,
     ) -> bool {
@@ -445,14 +455,17 @@ impl<'a, F: Function> Env<'a, F> {
             let entry = self.ctx.cfginfo.block_entry[blk.index()];
             let end = self.ctx.cfginfo.block_exit[blk.index()].next();
             let Some(e) = self.rehome_lr_at(v, entry) else { return false };
-            if e.range.to < end {
+            // Through the block, or (with pieces) a head piece: live in,
+            // dies inside.
+            if e.range.to < end && !pieces {
                 continue;
             }
+            let to = if e.range.to < end { e.range.to } else { end };
             let lr = &self.ctx.ranges[e.index];
             if self.ctx.bundles[lr.bundle].limit.is_some() {
                 continue;
             }
-            let plain = lr.uses.iter().filter(|u| u.pos >= entry && u.pos < end).all(|u| {
+            let plain = lr.uses.iter().filter(|u| u.pos >= entry && u.pos < to).all(|u| {
                 u.operand.kind() == OperandKind::Use
                     && matches!(u.operand.constraint(), OperandConstraint::Any | OperandConstraint::Reg)
             });
@@ -465,8 +478,59 @@ impl<'a, F: Function> Env<'a, F> {
             }
             stamp[blk.index()] = gen;
             node_of[blk.index()] = nodes.len() as u32;
-            nodes.push(blk);
+            nodes.push(Node { blk, range: CodeRange { from: entry, to }, lr: e.index });
             cur.push(a);
+        }
+        // With pieces: the piece from the value's definition to the end of
+        // its block (tail) or to its death there (local).
+        if pieces {
+            if let Some(&first) = self.ctx.vregs[v].ranges.first() {
+                let from = first.range.from;
+                let blk = self.ctx.cfginfo.insn_block[from.inst().index()];
+                let entry = self.ctx.cfginfo.block_entry[blk.index()];
+                let end = self.ctx.cfginfo.block_exit[blk.index()].next();
+                let lr = &self.ctx.ranges[first.index];
+                if from > entry && stamp[blk.index()] != gen && self.ctx.bundles[lr.bundle].limit.is_none() {
+                    let to = if first.range.to < end { first.range.to } else { end };
+                    let mut has_def = false;
+                    let plain = lr.uses.iter().filter(|u| u.pos >= from && u.pos < to).all(|u| {
+                        has_def |= u.operand.kind() == OperandKind::Def;
+                        matches!(u.operand.constraint(), OperandConstraint::Any | OperandConstraint::Reg)
+                    });
+                    let a = self.get_alloc_for_range(first.index);
+                    if plain && has_def && a.as_reg().is_some() {
+                        stamp[blk.index()] = gen;
+                        node_of[blk.index()] = nodes.len() as u32;
+                        nodes.push(Node { blk, range: CodeRange { from, to }, lr: first.index });
+                        cur.push(a);
+                    }
+                }
+            }
+            // Copies inside a piece where the value dies (source) or is born
+            // (destination): the other side is fixed.
+            for i in 0..nodes.len() {
+                let nd = nodes[i];
+                for u in self.ctx.ranges[nd.lr].uses.iter() {
+                    if u.pos < nd.range.from || u.pos >= nd.range.to {
+                        continue;
+                    }
+                    let inst = u.pos.inst();
+                    let Some((src, dst)) = self.func.pliron_move(inst) else { continue };
+                    let (other, at) = if VRegIndex::new(src.vreg()) == v
+                        && u.operand.kind() == OperandKind::Use
+                        && nd.range.to <= ProgPoint::after(inst)
+                    {
+                        (VRegIndex::new(dst.vreg()), ProgPoint::after(inst))
+                    } else if VRegIndex::new(dst.vreg()) == v && u.operand.kind() == OperandKind::Def {
+                        (VRegIndex::new(src.vreg()), ProgPoint::before(inst))
+                    } else {
+                        continue;
+                    };
+                    let Some(oe) = self.rehome_lr_at(other, at) else { continue };
+                    let b = Side::Fixed(self.get_alloc_for_range(oe.index));
+                    pairs.push(Pair { a: Side::Node(i as u32), b, w: hot[nd.blk.index()], from: nd.blk, to: nd.blk });
+                }
+            }
         }
         let side = |blk: Block, at: ProgPoint, of: VRegIndex| -> Option<Side> {
             if of == v && stamp[blk.index()] == gen {
@@ -519,9 +583,8 @@ impl<'a, F: Function> Env<'a, F> {
     /// Give `v`'s piece in `blk` (which it lives through in one range) the
     /// register `preg`: cut the range at the block's boundaries and move
     /// the middle piece to a bundle of its own.
-    fn potts_assign(&mut self, v: VRegIndex, blk: Block, preg: PReg) {
-        let from = self.ctx.cfginfo.block_entry[blk.index()];
-        let to = self.ctx.cfginfo.block_exit[blk.index()].next();
+    fn potts_assign(&mut self, v: VRegIndex, piece: CodeRange, preg: PReg) {
+        let (from, to) = (piece.from, piece.to);
         let Some(e) = self.rehome_lr_at(v, from) else { return };
         let mut mid = e.index;
         if self.ctx.ranges[mid].range.from < from {

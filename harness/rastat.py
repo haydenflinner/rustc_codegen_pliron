@@ -208,7 +208,7 @@ BRANCH = re.compile(r"^(b|b\..+|cbz|cbnz|tbz|tbnz|br|ret|retaa|retab)$")
 CALL = ("bl", "blr")
 
 
-def move_kinds(fn_start, insts, cls):
+def move_kinds(fn_start, insts, cls, starts=None):
     """Kind of each `mov`-class instruction from its context (docs/regalloc.md
     "Move kinds"): `callarg` (into an argument register, a call follows within the
     same straight line), `callret` (out of x0-x7/v0-v7 right after a call), `ret`
@@ -216,6 +216,8 @@ def move_kinds(fn_start, insts, cls):
     that ends in a jump or falls into a branch target, or starts at one: where
     regalloc2 puts block-parameter moves), `inblock` (the rest)."""
     n = len(insts)
+    if starts is not None:
+        return _move_kinds(insts, cls, set(starts))
     targets = set()
     for addr, mn, ops, tail in insts:
         if BRANCH.match(mn) and mn not in ("br", "ret", "retaa", "retab") and not tail:
@@ -226,6 +228,11 @@ def move_kinds(fn_start, insts, cls):
     for i, (addr, mn, ops, tail) in enumerate(insts[:-1]):
         if BRANCH.match(mn) or mn in CALL:
             starts.add(insts[i + 1][0])
+    return _move_kinds(insts, cls, starts)
+
+
+def _move_kinds(insts, cls, starts):
+    n = len(insts)
     kinds = [None] * n
     i = 0
     while i < n:
@@ -309,7 +316,7 @@ def score_vcode_file(path):
         if cur is None:
             return
         spill_from = None
-        depth, insts, weights = 0, [], []
+        depth, insts, weights, starts = 0, [], [], []
         for l in lines:
             t = l.strip()
             if t.startswith("; frame"):
@@ -321,6 +328,7 @@ def score_vcode_file(path):
             if re.match(r"^block\d+:", t):
                 m = re.search(r"depth=(\d+)", t)
                 depth = int(m.group(1)) if m else 0
+                starts.append(len(insts))
                 continue
             mn, ops = parse(t)
             if not mn:
@@ -328,13 +336,17 @@ def score_vcode_file(path):
             insts.append((mn, ops, mn.startswith("return_call")))
             weights.append(8 ** min(depth, 3))
         cls = classify_fn(insts, spill_from)
+        # Block starts are the vcode's block lines; addresses are indices.
+        mk = _move_kinds([(k, mn, ops, t) for k, (mn, ops, t) in enumerate(insts)], cls, set(starts))
         row = collections.Counter()
-        for c, w in zip(cls, weights):
+        for c, w, k in zip(cls, weights, mk):
             row["insts"] += 1
             row["winsts"] += w
             if c:
                 row[c] += w
                 row["n_" + c] += 1
+            if k:
+                row["mov:" + k] += w
         fns[cur] = dict(row)
 
     for l in open(path, errors="replace"):
@@ -386,6 +398,7 @@ def print_static(res, top):
     for c in CLASSES + ["slot", "frame"]:
         print(f"  {c:<8}{t.get('n_' + c, 0):>10}{t.get(c, 0):>14}")
     print(f"  {'overhead':<8}{overhead(t, False):>10}{overhead(t):>14}   (st+ld+mov+csr; weighted 8^depth)")
+    print("  weighted moves by kind: " + "  ".join(f"{k} {t.get('mov:' + k, 0)}" for k in MOVE_KINDS))
     print(f"\n  top {top} functions by weighted overhead")
     for f, row in sorted(res["functions"].items(), key=lambda kv: -overhead(kv[1]))[:top]:
         print(f"  {overhead(row):>10}  " + " ".join(f"{c} {row.get(c, 0)}" for c in CLASSES) + f"  {f[:90]}")
@@ -625,7 +638,7 @@ def cmd_cmp(a):
     if A["kind"] == "static":
         ta, tb = A["total"], B["total"]
         print(f"A: {' '.join(A['env']) or '(defaults)'}   B: {' '.join(B['env']) or '(defaults)'}  ({A['corpus']})")
-        for c in CLASSES + ["slot", "frame", "insts", "winsts"]:
+        for c in CLASSES + ["slot", "frame", "insts", "winsts"] + ["mov:" + k for k in MOVE_KINDS]:
             x, y = ta.get(c, 0), tb.get(c, 0)
             print(f"  {c:<8} {x:>14} {y:>14}  {100 * (y - x) / x if x else 0:+7.2f}%")
         x, y = overhead(ta), overhead(tb)

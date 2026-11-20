@@ -645,6 +645,20 @@ pub(crate) fn potts_copy_on() -> bool {
     false
 }
 
+/// PLIRON (`PLIRON_RA2_POTTS_PIECES=1`, opt-in): `PLIRON_RA2_POTTS` also
+/// relabels a value's partial block pieces (live in and dying, or defined
+/// and leaving or dying) and counts the register copies inside them as
+/// pairs of its energy. See `ion/potts.rs`.
+pub(crate) fn potts_pieces_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_POTTS_PIECES").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
 /// PLIRON (`PLIRON_RA2_POTTS_MAXLIVE`, default 2,000,000): functions with
 /// more live-in entries than this skip the relabelling (compile time).
 pub(crate) fn potts_max_liveins() -> usize {
