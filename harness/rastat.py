@@ -433,10 +433,16 @@ def callgrind_instr(run, irdiff, prog, exe, tag):
     cmd = ["docker", "run", "--rm",
            "-v", f"{run.src_dir(prog)}:/src:ro", "-v", f"{os.path.dirname(exe)}:/exe:ro", "-v", f"{out_dir}:/out",
            "-w", "/src", irdiff.IMAGE,
-           "valgrind", "--tool=callgrind", f"--callgrind-out-file=/out/{os.path.basename(out)}",
-           "--dump-instr=yes", "--dump-line=no", "--compress-strings=no", "--compress-pos=no",
-           f"/exe/{os.path.basename(exe)}"]
+           # Written inside the container and copied out (valgrind sometimes
+           # cannot open its output on the bind mount; irdiff.py, placement.py).
+           "sh", "-c",
+           f"valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out "
+           f"--dump-instr=yes --dump-line=no --compress-strings=no --compress-pos=no "
+           f"/exe/{os.path.basename(exe)} >/dev/null 2>/tmp/vg.err; rc=$?; "
+           f"cp /tmp/cg.out /out/{os.path.basename(out)} || {{ tail -20 /tmp/vg.err >&2; exit 1; }}; exit $rc"]
     r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(out):
+        r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(out):
         sys.exit(f"rastat: callgrind failed for {prog} {tag}:\n{r.stderr[-2000:]}")
     return out
