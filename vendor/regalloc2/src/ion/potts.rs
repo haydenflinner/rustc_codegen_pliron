@@ -202,6 +202,7 @@ impl<'a, F: Function> Env<'a, F> {
         let mut saved = 0.0f32;
         let mut cands: SmallVec<[(PReg, f32); 16]> = SmallVec::new();
         let mut free: Vec<bool> = Vec::new();
+        let csr_blocks = if order.is_empty() { Vec::new() } else { self.potts_csr_blocks() };
         for &(_, v) in &order {
             let vi = VRegIndex::new(v as usize);
             // Labels may have moved since the first pass (a partner changed).
@@ -247,10 +248,12 @@ impl<'a, F: Function> Env<'a, F> {
                     let alpha = Allocation::reg(cands[k].0);
                     // Which nodes may take alpha: free over the node's piece.
                     free.clear();
+                    let alpha_csr = self.potts_is_csr(cands[k].0);
                     for (i, nd) in nodes.iter().enumerate() {
                         let ok = cur[i] == alpha || {
                             let key = LiveRangeKey::from_range(&nd.range);
-                            !self.ctx.pregs[cands[k].0.index()].allocations.btree.contains_key(&key)
+                            (!alpha_csr || csr_blocks[nd.blk.index()])
+                                && !self.ctx.pregs[cands[k].0.index()].allocations.btree.contains_key(&key)
                         };
                         free.push(ok);
                     }
@@ -307,6 +310,40 @@ impl<'a, F: Function> Env<'a, F> {
         }
     }
 
+    /// Per block: does any callee-saved register (the environment's
+    /// non-preferred set, as Cranelift builds it) already hold a value in
+    /// it? A relabelling never brings one into a block that has none: the
+    /// energy does not price callee-save placement, and shrink-wrapping
+    /// (`PLIRON_SHRINKWRAP`) keeps the blocks ahead of its save point free
+    /// of them.
+    fn potts_csr_blocks(&self) -> Vec<bool> {
+        let nb = self.func.num_blocks();
+        let mut out = vec![false; nb];
+        for class in 0..3 {
+            for preg in self.env.non_preferred_regs_by_class[class] {
+                for key in self.ctx.pregs[preg.index()].allocations.btree.keys() {
+                    if key.to <= key.from {
+                        continue;
+                    }
+                    let a = ProgPoint::from_index(key.from).inst().index();
+                    let b = ProgPoint::from_index(key.to - 1).inst().index();
+                    if a >= self.ctx.cfginfo.insn_block.len() || b >= self.ctx.cfginfo.insn_block.len() {
+                        continue;
+                    }
+                    let (ba, bb) = (self.ctx.cfginfo.insn_block[a].index(), self.ctx.cfginfo.insn_block[b].index());
+                    for blk in ba..=bb.min(nb - 1) {
+                        out[blk] = true;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn potts_is_csr(&self, preg: PReg) -> bool {
+        self.env.non_preferred_regs_by_class[preg.class() as u8 as usize].contains(preg)
+    }
+
     /// `PLIRON_RA2_POTTS_COPY`: make register copies identities. For a copy
     /// `d = s` whose two sides hold different registers, give one side the
     /// other's register when that side is a single live range defined by
@@ -318,6 +355,7 @@ impl<'a, F: Function> Env<'a, F> {
     fn potts_copies(&mut self, overlap: &[bool]) {
         let n = self.func.num_insts();
         let mut done = 0usize;
+        let csr_blocks = self.potts_csr_blocks();
         for i in 0..n {
             let inst = crate::Inst::new(i);
             let Some((src, dst)) = self.func.pliron_move(inst) else { continue };
@@ -334,7 +372,7 @@ impl<'a, F: Function> Env<'a, F> {
             // Try the source taking the destination's register, then the
             // destination taking the source's.
             for (v, lr, to) in [(vs, rs, ad), (vd, rd, as_)] {
-                if self.potts_copy_try(v, lr, to) {
+                if self.potts_copy_try(v, lr, to, &csr_blocks) {
                     done += 1;
                     break;
                 }
@@ -347,8 +385,16 @@ impl<'a, F: Function> Env<'a, F> {
 
     /// One side of `potts_copies`: may value `v`'s only live range `lr` take
     /// `to`? Applies it when so.
-    fn potts_copy_try(&mut self, v: VRegIndex, lr: LiveRangeListEntry, to: Allocation) -> bool {
+    fn potts_copy_try(&mut self, v: VRegIndex, lr: LiveRangeListEntry, to: Allocation, csr_blocks: &[bool]) -> bool {
         let Some(preg) = to.as_reg() else { return false };
+        if self.potts_is_csr(preg) {
+            let ib = &self.ctx.cfginfo.insn_block;
+            let a = ib[lr.range.from.inst().index()].index();
+            let b = ib[ProgPoint::from_index(lr.range.to.to_index() - 1).inst().index()].index();
+            if (a..=b).any(|blk| !csr_blocks[blk]) {
+                return false;
+            }
+        }
         if self.ctx.pregs[preg.index()].is_stack || self.ctx.vregs[v].ranges.len() != 1 {
             return false;
         }
