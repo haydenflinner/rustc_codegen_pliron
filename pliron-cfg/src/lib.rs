@@ -62,6 +62,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // counts: html -0.32%, protobuf -0.13%, json -0.06%, pulldown -0.03%,
     // none worse (`docs/history/2026-11-20-ivsr.md`). `PLIRON_BRTHREAD=0`.
     "PLIRON_BRTHREAD",
+    // 2026-11-20: partial inlining of a kept callee's entry guard (enum drop
+    // glue). Exact counts: regex -0.10%, html -0.045%, blind-sig -0.03%,
+    // none worse (`docs/history/2026-11-20-ivsr.md`). `PLIRON_PARTINLINE=0`.
+    "PLIRON_PARTINLINE",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the

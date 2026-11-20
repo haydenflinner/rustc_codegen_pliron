@@ -1104,7 +1104,7 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_RA2_MAXSPLITS=<n>` (vendored regalloc2, default 4 since
   2026-11-20; upstream 2) — splits per value before the minimal-bundle fallback (a reload at
   every use). See `LOOPROT_MULTI` and `docs/history/2026-11-20-ivsr.md`.
-- `PLIRON_PARTINLINE=1` (opt-in, 2026-11-20; IR pass after the inliner,
+- `PLIRON_PARTINLINE` (default on since 2026-11-20, `=0` off; IR pass after the inliner,
   before `xcgu-home`) — partial inlining of a callee's entry guard (LLVM's
   `PartialInlining`): when a callee's entry block is only `gep`/`load`/
   `zext`/`trunc`/`icmp` ending in a `cond_br` whose one side is a bare

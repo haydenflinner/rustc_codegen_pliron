@@ -1396,6 +1396,9 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    split a value twice more before reloading it at every use. Together:
    html -0.62%, compression -0.39%, json -0.11%, blake3 -0.11%, protobuf
    -0.06%, pulldown -0.05%, regex -0.003%.
+   **Done (default on, 2026-11-20): `PLIRON_PARTINLINE`** copies a kept
+   callee's entry guard (enum drop glue) to its call sites: regex -0.10%,
+   html -0.045%, blind-sig -0.03%, none worse.
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain

@@ -984,7 +984,7 @@ t_sibcall() {
 }
 
 t_partinline() {
-  # PLIRON_PARTINLINE: the entry guard of drop glue the inliner kept is
+  # PLIRON_PARTINLINE (default on): the entry guard of drop glue the inliner kept is
   # copied in front of each call. Output (with a drop count) pinned by stock
   # rustc, the pass off, on, and on with 4 CGUs (the drop glue is then a
   # cross-CGU copy until `xcgu-home`).
