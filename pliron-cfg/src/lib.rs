@@ -29,7 +29,8 @@ pub struct PassConfig {
 /// `PLIRON_EDGEDEDUP`, `PLIRON_NARROWEXT`, `PLIRON_EDGEMERGE`,
 /// `PLIRON_EPIMERGE`, `PLIRON_BJALIAS`, `PLIRON_TBNZ_IREDUCE`,
 /// `PLIRON_EDITPAIR`, `PLIRON_MCP`, `PLIRON_MCPBB`, `PLIRON_CCMP` and
-/// `PLIRON_JT_NARROW`, `PLIRON_SIBCALL`, and the vendored waffle `PLIRON_WASM_MAXSSA_CUTALIAS`,
+/// `PLIRON_JT_NARROW`, `PLIRON_SIBCALL`, `PLIRON_A64_HALFCLOB`,
+/// `PLIRON_BUMPHOIST_INLOOP`, and the vendored waffle `PLIRON_WASM_MAXSSA_CUTALIAS`,
 /// itself and
 /// defaults them the same way (on unless `=0`; EDGEMERGE/EPIMERGE take
 /// their mode default when unset). Validation: docs/history/2026-10-27-defaults.md,
@@ -479,6 +480,14 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // 2026-11-20: `ivsr` decided per function after allocation (aarch64):
+    // the backend compiles the function with and without the pointer IV
+    // and keeps the rewrite when its frequency-weighted code is smaller and
+    // the once-per-call part is not larger. With `PLIRON_BUMPHOIST_INLOOP`
+    // (vendored, default on): compression -1.165%, blind-sig -0.102%,
+    // pulldown -0.043%, none worse (`docs/history/2026-11-20-ivsr.md`).
+    // `=1` the plain pipeline step, `=0` off.
+    ("PLIRON_IVSR", "2"),
     // 2026-11-17, STK: sroa's FRAGCOPY rule does not keep whole an
     // aggregate of at least 64 bytes that direct stores build (all but
     // less than a word of padding) and one copy moves out: the copy

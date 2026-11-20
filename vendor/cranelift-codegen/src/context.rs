@@ -589,7 +589,8 @@ impl Context {
         if membase.is_empty() {
             return;
         }
-        // PLIRON: `PLIRON_BUMPHOIST_INLOOP=1` (opt-in): weigh the fusion
+        // PLIRON: `PLIRON_BUMPHOIST_INLOOP` (default on since 2026-11-20,
+        // `=0` off): weigh the fusion
         // against the base's other reads in blocks every trip of the loop it
         // heads runs (they dominate each latch; not other constant bumps).
         // Fused, each such block pays phase 2's remat `sub`; unfused, the
@@ -604,7 +605,7 @@ impl Context {
         let mut inloop_keep: FxHashSet<Value> = FxHashSet::default();
         let mut useblk: FxHashMap<Value, Vec<Block>> = FxHashMap::default();
         if *INLOOP.get_or_init(|| {
-            std::env::var_os("PLIRON_BUMPHOIST_INLOOP").is_some_and(|v| v == "1")
+            std::env::var_os("PLIRON_BUMPHOIST_INLOOP").is_none_or(|v| v != "0")
         }) {
             self.compute_loop_analysis();
             let la = &self.loop_analysis;

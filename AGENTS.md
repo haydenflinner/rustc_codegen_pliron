@@ -1042,7 +1042,8 @@ time, memory, code size, stack frames) in ~20 min and writes
   reloaded it as one word (240k stores, 120k loads in compression).
   Exact counts: compression -0.56%, no program worse. Tests
   `tests/slotconst.rs` (`comb_*`).
-- `PLIRON_IVSR=2`, `PLIRON_BUMPHOIST_INLOOP=1` (opt-in, 2026-11-20) —
+- `PLIRON_IVSR` (default `2` since 2026-11-20, aarch64; `=0` off) and
+  `PLIRON_BUMPHOIST_INLOOP` (vendored, default on, `=0` off) —
   `ivsr` (`pliron-clif-opt/src/ivsr.rs`): in-loop `base + (i + k) * S`
   (`S` not a power of two, `base` invariant, `i` a header parameter
   stepped by a constant) becomes a pointer header parameter stepped by `S`
@@ -1059,7 +1060,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   `BUMPHOIST_INLOOP` keeps vendored Cranelift's `bump_hoist` off a base
   read again in more every-trip blocks than an emptied latch saves.
   Exact counts with both: compression -1.17%, blind-sig -0.10%, pulldown
-  -0.04%, none worse; `INLOOP` alone compression -0.03%, none worse
+  -0.04%, none worse; `INLOOP` alone compression -0.03%, none worse.
+  Compile time: two scratch compiles per function the rewrite changes
+  (about 0.5% of functions)
   (`docs/history/2026-11-20-ivsr.md`). `PLIRON_TRACE=pliron::ivsr`
   (`pick` lines); `clif-check vcode` replays `=2` (`ivsr-pick:` line).
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /

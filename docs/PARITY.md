@@ -1378,11 +1378,12 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `PLIRON_A64_HALFCLOB` keeps `f32`/`f64` in `d8`-`d15` across calls
    (compression -0.12%); `PLIRON_SLOTCOMB` forwards a load of a stack
    temp built by at most two narrower stores (brotli's
-   `Union1::shortcut`: compression -0.56%, nothing worse). **Open, opt-in:
-   `PLIRON_IVSR`** carries brotli's `nodes[i + 1]` address as a pointer IV
-   (compression -0.55%, -1.27% with `PLIRON_BUMPHOIST_INLOOP`) but costs
-   html-rewriter +0.10% on short `Vec<Attribute>` loops, where aarch64's
-   `madd` already did the work: it needs a register-pressure signal
+   `Union1::shortcut`: compression -0.56%, nothing worse). **Done (default on, 2026-11-20): `PLIRON_IVSR=2`**
+   carries brotli's `nodes[i + 1]` address as a pointer IV where register
+   allocation says it pays: the backend compiles the function with and
+   without it and keeps the cheaper (frequency-weighted, once-per-call part
+   not larger). With `PLIRON_BUMPHOIST_INLOOP`: compression -1.17%,
+   blind-sig -0.10%, pulldown -0.04%, none worse
    (`history/2026-11-20-ivsr.md`).
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +

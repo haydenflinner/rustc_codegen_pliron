@@ -198,3 +198,22 @@ block2(v21: i32):
 }");
     assert_eq!(k, 0, "{}", after.display());
 }
+
+/// `PLIRON_IVSR=2`'s choice: both versions compile, both costs are read, and
+/// the function is replaced only when the copy is cheaper.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn pick_compiles_both() {
+    use cranelift_codegen::settings::{self, Configurable};
+    let mut b = settings::builder();
+    b.set("opt_level", "speed").unwrap();
+    let isa = cranelift_codegen::isa::lookup_by_name("aarch64-apple-darwin").unwrap().finish(settings::Flags::new(b)).unwrap();
+    let mut f = cranelift_reader::parse_functions(&NODES.replace("function %f(i64, i64, i64) -> i32 {", "function %f(i64, i64, i64) -> i32 apple_aarch64 {")).unwrap().remove(0);
+    let before = f.clone();
+    let (k, a, b, take) = pliron_clif_opt::ivsr::pick(&mut f, &*isa, 0.0).expect("ivsr fires");
+    assert_eq!(k, 2);
+    let (a, b) = (a.expect("cost before"), b.expect("cost after"));
+    assert!(a[0] > 0.0 && b[0] > 0.0 && a[1] <= a[0] && b[1] <= b[0], "{a:?} {b:?}");
+    assert_eq!(take, b[0] < a[0] && b[1] <= a[1]);
+    assert_eq!(take, f.display().to_string() != before.display().to_string());
+}
