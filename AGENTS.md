@@ -1086,6 +1086,18 @@ time, memory, code size, stack frames) in ~20 min and writes
   per `is_void_element` call): microbench 308.9M -> 207.2M instructions
   (LLVM 214.7M). Exact counts: html -0.32%, protobuf -0.13%, json
   -0.06%, pulldown -0.03%, none worse. Tests `tests/brthread.rs`.
+- `PLIRON_LOOPROT_MULTI=<k>` (opt-in, 2026-11-20) — `looprot` rotates a
+  loop with up to `k` latches: each latch takes its own copy of the
+  header's exit test, so every arm ends in one conditional branch back
+  (lol_html's `LocalNameHash::update`, one latch per `match` arm: 164.8M
+  -> 146.1M instructions, LLVM 147.0M). Only headers whose computed values
+  stay inside them (brotli's `is_mostly_utf8` keeps an accumulator there:
+  compression +0.49% before the rule) and call-free latch-reaching bodies.
+  Exact counts at `k=4`: html -0.43%, compression -0.40%, json -0.06%,
+  protobuf -0.02%, but regex +0.09% (aho-corasick's DFA loop: the copied
+  test's end bound, also a call argument elsewhere, loses its register and
+  is reloaded in the hot latch) and pulldown +0.05%: a trade, so opt-in.
+  Test `tests/looprot_multi.rs`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

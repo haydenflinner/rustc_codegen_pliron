@@ -15,6 +15,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INSTS: usize = 8;
 const MAX_ROTATIONS: usize = 256;
+/// Loop blocks walked to find calls before a multi-latch rotation.
+const MAX_BODY_WALK: usize = 256;
 
 pub fn run(
     func: &mut Function,
@@ -77,11 +79,11 @@ pub fn run_with(
                     // `PLIRON_REDUCIBLE`: the latch takes a copy of `h`'s
                     // `brif`; refuse when one of its edges would be a loop
                     // side entrance (see `jumpthread::side_enters`).
-                    let l = cfg
+                    let ls: Vec<Block> = cfg
                         .pred_iter(h)
-                        .find(|p| domtree.block_dominates(h, p.block))
-                        .unwrap()
-                        .block;
+                        .filter(|p| domtree.block_dominates(h, p.block))
+                        .map(|p| p.block)
+                        .collect();
                     let mut la = LoopAnalysis::new();
                     la.compute(func, cfg, domtree);
                     // Both arms inside the loop (the header is a dispatch,
@@ -92,7 +94,7 @@ pub fn run_with(
                     let both_in = la.is_loop_header(h).is_some_and(|lh| {
                         la.is_in_loop(s1, lh) && la.is_in_loop(s2, lh)
                     });
-                    !both_in && !crate::jumpthread::side_enters(func, &la, l, h)
+                    !both_in && !ls.iter().any(|&l| crate::jumpthread::side_enters(func, &la, l, h))
                 })
         };
         if ok {
@@ -343,38 +345,80 @@ fn rotatable(
         .pred_iter(h)
         .filter(|p| domtree.block_dominates(h, p.block))
         .collect();
-    let [ref l] = latches[..] else {
+    // `PLIRON_LOOPROT_MULTI=<k>` (opt-in): up to `k` latches, each taking
+    // its own copy of the test (see `rotate`).
+    if latches.is_empty() || latches.len() > multi_max().max(1) {
         bail!("latches {:?}", latches);
-    };
-    if func.layout.last_inst(l.block) != Some(l.inst) {
-        bail!("latch not last inst");
     }
-    // The back-edge is either `jump h(args)` or one arm of a `brif`; the brif
-    // form appears in `while`-style loops where the body ends in a conditional
-    // continue (e.g. hash-table probing's `while mask != 0`).
-    match &func.dfg.insts[l.inst] {
-        InstructionData::Jump { destination, .. } => {
-            if destination
-                .args(pool)
-                .any(|a| !matches!(a, BlockArg::Value(_)))
-            {
-                return false;
+    // Several latches: call-free loops only. A call pins values in
+    // callee-saved registers, and a test copied into every latch keeps its
+    // operands live across it: aho-corasick's DFA loop (`leftmost_find_at`,
+    // a prefilter call inside) lost its end bound's register (+49k
+    // executed, regex +0.09%). The body: blocks reaching a latch without
+    // passing `h`, at most `MAX_BODY_WALK`.
+    if latches.len() > 1 {
+        let mut stack: Vec<Block> = latches.iter().map(|l| l.block).collect();
+        let mut body: FxHashSet<Block> = stack.iter().copied().collect();
+        while let Some(b) = stack.pop() {
+            if b == h {
+                continue;
+            }
+            if body.len() > MAX_BODY_WALK {
+                bail!("multi-latch body over {MAX_BODY_WALK} blocks");
+            }
+            if func.layout.block_insts(b).any(|i| func.dfg.insts[i].opcode().is_call()) {
+                bail!("multi-latch loop with a call in {b}");
+            }
+            for p in cfg.pred_iter(b) {
+                if p.block != h && domtree.block_dominates(h, p.block) && body.insert(p.block) {
+                    stack.push(p.block);
+                }
             }
         }
-        InstructionData::Brif { blocks, .. } => {
-            let arms: Vec<_> = blocks.iter().filter(|b| b.block(pool) == h).collect();
-            if arms.len() != 1 || arms[0].args(pool).any(|a| !matches!(a, BlockArg::Value(_))) {
-                bail!("brif latch arms");
-            }
+    }
+    // A block with two edges back to `h` (both `brif` arms) would need two
+    // copies in one block.
+    let mut seen = FxHashSet::default();
+    for l in &latches {
+        if !seen.insert(l.block) {
+            bail!("latch {} twice", l.block);
         }
-        _ => bail!("latch terminator"),
+        if func.layout.last_inst(l.block) != Some(l.inst) {
+            bail!("latch not last inst");
+        }
+        // The back-edge is either `jump h(args)` or one arm of a `brif`; the
+        // brif form appears in `while`-style loops where the body ends in a
+        // conditional continue (e.g. hash-table probing's `while mask != 0`).
+        match &func.dfg.insts[l.inst] {
+            InstructionData::Jump { destination, .. } => {
+                if destination
+                    .args(pool)
+                    .any(|a| !matches!(a, BlockArg::Value(_)))
+                {
+                    return false;
+                }
+            }
+            InstructionData::Brif { blocks, .. } => {
+                let arms: Vec<_> = blocks.iter().filter(|b| b.block(pool) == h).collect();
+                if arms.len() != 1 || arms[0].args(pool).any(|a| !matches!(a, BlockArg::Value(_))) {
+                    bail!("brif latch arms");
+                }
+            }
+            _ => bail!("latch terminator"),
+        }
     }
     if dbg {
         if pliron_cfg::tracing_on() {
-            tracing::debug!(target: "pliron::looprot", "looprot {h}: rotatable s1={s1} s2={s2} latch={}", l.block)
+            tracing::debug!(target: "pliron::looprot", "looprot {h}: rotatable s1={s1} s2={s2} latches={}", latches.len())
         };
     }
     true
+}
+
+/// `PLIRON_LOOPROT_MULTI`: the most latches a rotated loop may have (each
+/// gets a copy of the header's test). Unset or `0`: one.
+fn multi_max() -> usize {
+    pliron_cfg::env_get("PLIRON_LOOPROT_MULTI").and_then(|v| v.parse().ok()).unwrap_or(1)
 }
 
 fn resolved_args(func: &Function, i: Inst) -> Vec<Value> {
@@ -400,10 +444,10 @@ fn rotate(
         blocks[0].block(&func.dfg.value_lists),
         blocks[1].block(&func.dfg.value_lists),
     ];
-    let l = cfg
+    let ls: Vec<_> = cfg
         .pred_iter(h)
-        .find(|p| domtree.block_dominates(h, p.block))
-        .unwrap();
+        .filter(|p| domtree.block_dominates(h, p.block))
+        .collect();
 
     // Values defined in `h`, and which successor region uses each one outside `h`.
     let mut defs: Vec<Value> = func.dfg.block_params(h).to_vec();
@@ -437,6 +481,21 @@ fn rotate(
             if seen_user.insert(i) {
                 users.push((i, side));
             }
+        }
+    }
+
+    // Several latches (`PLIRON_LOOPROT_MULTI`): only a header that is the
+    // exit test. A value it computes and the loop reads past it (brotli's
+    // `is_mostly_utf8` keeps its accumulator `size_utf8 += n` there) would
+    // be recomputed in every latch and carried into the successors as a
+    // block parameter from each copy: compression +0.49%.
+    if ls.len() > 1 {
+        let params: FxHashSet<Value> = func.dfg.block_params(h).iter().map(|&v| func.dfg.resolve_aliases(v)).collect();
+        if need.iter().flatten().any(|v| !params.contains(v)) {
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::looprot", tracing::Level::DEBUG) {
+                tracing::debug!(target: "pliron::looprot", "looprot {h}: bail multi-latch header value live out");
+            }
+            return false;
         }
     }
 
@@ -491,122 +550,128 @@ fn rotate(
         }
     }
 
-    // Copy the header into the latch, in place of its back-edge to `h`.
-    let args: Vec<BlockArg> = match &func.dfg.insts[l.inst] {
-        InstructionData::Jump { destination, .. } => {
-            destination.args(&func.dfg.value_lists).collect()
-        }
-        InstructionData::Brif { blocks, .. } => blocks
-            .iter()
-            .find(|b| b.block(&func.dfg.value_lists) == h)
-            .unwrap()
-            .args(&func.dfg.value_lists)
-            .collect(),
-        _ => unreachable!(),
-    };
-    let mut map: FxHashMap<Value, Value> = FxHashMap::default();
-    for (&prm, a) in func.dfg.block_params(h).to_vec().iter().zip(args) {
-        let BlockArg::Value(a) = a else {
-            unreachable!()
+    // Each latch takes its own copy of the header, in place of its back
+    // edge (`PLIRON_LOOPROT_MULTI`: several latches). The successors' new
+    // params are fed by the header and by every copy (the copies clone the
+    // header's `brif` with the arguments appended above).
+    for l in ls {
+        // Copy the header into the latch, in place of its back-edge to `h`.
+        let args: Vec<BlockArg> = match &func.dfg.insts[l.inst] {
+            InstructionData::Jump { destination, .. } => {
+                destination.args(&func.dfg.value_lists).collect()
+            }
+            InstructionData::Brif { blocks, .. } => blocks
+                .iter()
+                .find(|b| b.block(&func.dfg.value_lists) == h)
+                .unwrap()
+                .args(&func.dfg.value_lists)
+                .collect(),
+            _ => unreachable!(),
         };
-        map.insert(prm, a);
-    }
-    // For a `brif` latch the cloned test needs its own block (`l` already ends
-    // in the conditional); place it right after `l` so the loop arm falls
-    // through. For a `jump` latch the clone replaces the terminator in place.
-    let brif_latch = matches!(func.dfg.insts[l.inst], InstructionData::Brif { .. });
-    let mut h2 = None;
-    if brif_latch {
-        let b = func.dfg.make_block();
-        func.layout.insert_block_after(b, l.block);
-        h2 = Some(b);
-    }
-    let body: Vec<Inst> = func.layout.block_insts(h).collect();
-    let mut lt = None;
-    for i in body {
-        let ni = func.dfg.clone_inst(i);
-        // `-g`: the copy is the same source operation.
-        func.set_srcloc(ni, func.srcloc(i));
-        let dfg = &mut func.dfg;
-        let mut data = dfg.insts[ni];
-        for d in data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
-            *d = d.deep_clone(&mut dfg.value_lists);
+        let mut map: FxHashMap<Value, Value> = FxHashMap::default();
+        for (&prm, a) in func.dfg.block_params(h).to_vec().iter().zip(args) {
+            let BlockArg::Value(a) = a else {
+                unreachable!()
+            };
+            map.insert(prm, a);
         }
-        dfg.insts[ni] = data;
-        let vals: Vec<Value> = resolved_args(func, ni)
-            .into_iter()
-            .map(|v| *map.get(&v).unwrap_or(&v))
-            .collect();
-        func.dfg.overwrite_inst_values(ni, vals.into_iter());
-        let res: Vec<(Value, Value)> = func
-            .dfg
-            .inst_results(i)
-            .iter()
-            .copied()
-            .zip(func.dfg.inst_results(ni).iter().copied())
-            .collect();
-        for &(o, nr) in &res {
-            crate::jumpthread::prop_derived(&func.dfg, derived, o, nr, &map);
+        // For a `brif` latch the cloned test needs its own block (`l` already ends
+        // in the conditional); place it right after `l` so the loop arm falls
+        // through. For a `jump` latch the clone replaces the terminator in place.
+        let brif_latch = matches!(func.dfg.insts[l.inst], InstructionData::Brif { .. });
+        let mut h2 = None;
+        if brif_latch {
+            let b = func.dfg.make_block();
+            func.layout.insert_block_after(b, l.block);
+            h2 = Some(b);
         }
-        map.extend(res);
-        match h2 {
-            Some(h2) => func.layout.append_inst(ni, h2),
-            None => func.layout.insert_inst(ni, l.inst),
+        let body: Vec<Inst> = func.layout.block_insts(h).collect();
+        let mut lt = None;
+        for i in body {
+            let ni = func.dfg.clone_inst(i);
+            // `-g`: the copy is the same source operation.
+            func.set_srcloc(ni, func.srcloc(i));
+            let dfg = &mut func.dfg;
+            let mut data = dfg.insts[ni];
+            for d in data.branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
+                *d = d.deep_clone(&mut dfg.value_lists);
+            }
+            dfg.insts[ni] = data;
+            let vals: Vec<Value> = resolved_args(func, ni)
+                .into_iter()
+                .map(|v| *map.get(&v).unwrap_or(&v))
+                .collect();
+            func.dfg.overwrite_inst_values(ni, vals.into_iter());
+            let res: Vec<(Value, Value)> = func
+                .dfg
+                .inst_results(i)
+                .iter()
+                .copied()
+                .zip(func.dfg.inst_results(ni).iter().copied())
+                .collect();
+            for &(o, nr) in &res {
+                crate::jumpthread::prop_derived(&func.dfg, derived, o, nr, &map);
+            }
+            map.extend(res);
+            match h2 {
+                Some(h2) => func.layout.append_inst(ni, h2),
+                None => func.layout.insert_inst(ni, l.inst),
+            }
+            if i == t {
+                lt = Some(ni);
+            }
         }
-        if i == t {
-            lt = Some(ni);
-        }
-    }
-    if let Some(h2) = h2 {
-        // Keep the loop arm on the fall-through (else) slot: `brif c, exit,
-        // h2` emits `jcc exit` + fall-through into the cloned test.
-        if let InstructionData::Brif { blocks, .. } = &func.dfg.insts[l.inst]
-            && blocks[0].block(&func.dfg.value_lists) == h
-        {
-            if let InstructionData::Brif { arg, .. } = func.dfg.insts[l.inst]
-                && uses(func, arg) == 1
-                && let Some(ci) = func.dfg.resolved_value_def(arg).inst()
-                && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
+        if let Some(h2) = h2 {
+            // Keep the loop arm on the fall-through (else) slot: `brif c, exit,
+            // h2` emits `jcc exit` + fall-through into the cloned test.
+            if let InstructionData::Brif { blocks, .. } = &func.dfg.insts[l.inst]
+                && blocks[0].block(&func.dfg.value_lists) == h
             {
-                *cond = cond.complement();
-                let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[l.inst] else {
-                    unreachable!()
-                };
-                blocks.swap(0, 1);
+                if let InstructionData::Brif { arg, .. } = func.dfg.insts[l.inst]
+                    && uses(func, arg) == 1
+                    && let Some(ci) = func.dfg.resolved_value_def(arg).inst()
+                    && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
+                {
+                    *cond = cond.complement();
+                    let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[l.inst] else {
+                        unreachable!()
+                    };
+                    blocks.swap(0, 1);
+                }
             }
-        }
-        let mut data = func.dfg.insts[l.inst];
-        let InstructionData::Brif { blocks, .. } = &mut data else {
-            unreachable!()
-        };
-        for b in blocks.iter_mut() {
-            if b.block(&func.dfg.value_lists) == h {
-                *b = BlockCall::new(h2, std::iter::empty(), &mut func.dfg.value_lists);
+            let mut data = func.dfg.insts[l.inst];
+            let InstructionData::Brif { blocks, .. } = &mut data else {
+                unreachable!()
+            };
+            for b in blocks.iter_mut() {
+                if b.block(&func.dfg.value_lists) == h {
+                    *b = BlockCall::new(h2, std::iter::empty(), &mut func.dfg.value_lists);
+                }
             }
+            func.dfg.insts[l.inst] = data;
+        } else {
+            func.layout.remove_inst(l.inst);
         }
-        func.dfg.insts[l.inst] = data;
-    } else {
-        func.layout.remove_inst(l.inst);
-    }
-    // The cloned test ends each iteration; keep the loop-directed edge on
-    // the taken arm so the exit can fall through — `brif c, exit, loop`
-    // emits `jcc tramp; jmp tramp` where `brif !c, loop, exit` is a single
-    // `jcc` back when the exit lands next in layout.
-    let Some(lt) = lt else { return true };
-    if succ
-        .iter()
-        .position(|s| domtree.block_dominates(*s, l.block))
-        == Some(1)
-        && let InstructionData::Brif { arg, .. } = func.dfg.insts[lt]
-        && uses(func, arg) == 1
-        && let Some(ci) = func.dfg.resolved_value_def(arg).inst()
-        && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
-    {
-        *cond = cond.complement();
-        let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[lt] else {
-            unreachable!()
-        };
-        blocks.swap(0, 1);
+        // The cloned test ends each iteration; keep the loop-directed edge on
+        // the taken arm so the exit can fall through — `brif c, exit, loop`
+        // emits `jcc tramp; jmp tramp` where `brif !c, loop, exit` is a single
+        // `jcc` back when the exit lands next in layout.
+        let Some(lt) = lt else { continue };
+        if succ
+            .iter()
+            .position(|s| domtree.block_dominates(*s, l.block))
+            == Some(1)
+            && let InstructionData::Brif { arg, .. } = func.dfg.insts[lt]
+            && uses(func, arg) == 1
+            && let Some(ci) = func.dfg.resolved_value_def(arg).inst()
+            && let InstructionData::IntCompare { cond, .. } = &mut func.dfg.insts[ci]
+        {
+            *cond = cond.complement();
+            let InstructionData::Brif { blocks, .. } = &mut func.dfg.insts[lt] else {
+                unreachable!()
+            };
+            blocks.swap(0, 1);
+        }
     }
     true
 }
