@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     ion::data_structures::{
-        CodeRange, Use, BUNDLE_MAX_NORMAL_SPILL_WEIGHT, MAX_SPLITS_PER_SPILLSET,
+        CodeRange, Use, BUNDLE_MAX_NORMAL_SPILL_WEIGHT,
         MINIMAL_BUNDLE_SPILL_WEIGHT, MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT,
         MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT,
     },
@@ -518,7 +518,7 @@ impl<'a, F: Function> Env<'a, F> {
         // `split_into_minimal_bundles()` above for more.
         // PLIRON: try a use-cluster / gap split first (`PLIRON_RA2_USESPLIT`)
         // so dense use groups stay non-minimal (blake3 message words).
-        if self.ctx.spillsets[spillset].splits >= MAX_SPLITS_PER_SPILLSET {
+        if self.ctx.spillsets[spillset].splits >= crate::max_splits() {
             if crate::usesplit_on()
                 && !self.ctx.spillsets[spillset].use_cluster_done
                 && self.try_use_cluster_split(bundle, hint)
@@ -1827,7 +1827,7 @@ impl<'a, F: Function> Env<'a, F> {
         let spillset = self.ctx.bundles[bundle].spillset;
         self.ctx.spillsets[spillset].use_cluster_done = true;
         // One more normal split after the cluster cut.
-        self.ctx.spillsets[spillset].splits = MAX_SPLITS_PER_SPILLSET - 1;
+        self.ctx.spillsets[spillset].splits = crate::max_splits().saturating_sub(1);
         self.ctx.output.stats.splits_use_cluster += 1;
         explain!(
             "  use-cluster-split {} gap={} after_inst={}",

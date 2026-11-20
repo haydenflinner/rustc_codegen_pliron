@@ -74,6 +74,21 @@ pub(crate) fn freqsplit_on() -> bool {
 /// unless `USESPLIT_MULTIBLOCK=1`. Gap floor 128. blake3
 /// `compress_in_place` −154k non-nop; blind-sig −41k at GAP=128
 /// (GAP=8 cost blind-sig +47k).
+/// PLIRON: `PLIRON_RA2_MAXSPLITS=<n>` (default 2, upstream's
+/// `MAX_SPLITS_PER_SPILLSET`): how many times one value's bundles split
+/// before the minimal-bundle fallback (a reload at every use).
+pub(crate) fn max_splits() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static N: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("PLIRON_RA2_MAXSPLITS").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    2
+}
+
 pub(crate) fn usesplit_on() -> bool {
     #[cfg(feature = "std")]
     {

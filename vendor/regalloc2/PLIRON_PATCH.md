@@ -611,3 +611,15 @@ range defined by an instruction (no block parameter, no branch argument)
 takes the other side's register when free over the range; kept only when
 no copy of that range stops being an identity. `pliron_potts_counts()`
 reports how many values / copy ranges were relabelled (rafuzz prints it).
+
+## `PLIRON_RA2_MAXSPLITS=<n>` (2026-11-20)
+
+`src/lib.rs` (`max_splits`), `src/ion/process.rs`: upstream's
+`MAX_SPLITS_PER_SPILLSET` (2) as a knob. Past it, a bundle that still
+conflicts goes to minimal bundles (a reload at every use). aho-corasick's
+`leftmost_find_at_no_state` takes its end bound in `x3`; two loop splits
+used the budget, the third (a call at the entry clobbers `x3`) fell back to
+minimal bundles, and whether the hot latch reloaded the bound depended on
+which register a temporary took. At 4 the loop keeps the bound and the
+automaton pointer in registers (loop-weighted stack accesses 181 -> 133).
+rafuzz: 400k seeds at 4 and 8, no failure.

@@ -21,6 +21,7 @@ Knob-tweaking on spill weights is largely exhausted (ratios still
 | 4 | Ion use-cluster split | `PLIRON_RA2_USESPLIT` (GAP=128, single-block) | **on** since 2026-11-18 |
 | 5 | Greedy + SplitKit | `PLIRON_RA_ALGO=greedy` (+ `GREEDY_COLOR=1`) | all-spill clean; COLOR=1 single-block non-param (args OK) clean (10k rafuzz) |
 | 6 | Proof engine | `tools/raproof` + `regalloc2::prove` | MVP + opt-in `PLIRON_RA_PROOFCOLOR=1` (greedy) |
+| 7 | Split budget | `PLIRON_RA2_MAXSPLITS` (upstream 2) | measured at 3, 4: see `history/2026-11-20-ivsr.md` |
 
 USESPLIT already flipped. Default allocator remains ion until greedy
 wins held-out non-nop callgrind and stays rafuzz/checker clean.

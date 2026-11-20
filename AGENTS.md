@@ -1098,6 +1098,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   test's end bound, also a call argument elsewhere, loses its register and
   is reloaded in the hot latch) and pulldown +0.05%: a trade, so opt-in.
   Test `tests/looprot_multi.rs`.
+- `PLIRON_RA2_MAXSPLITS=<n>` (vendored regalloc2, 2026-11-20; upstream
+  2) — splits per value before the minimal-bundle fallback (a reload at
+  every use). See `LOOPROT_MULTI` and `docs/history/2026-11-20-ivsr.md`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,
