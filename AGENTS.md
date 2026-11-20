@@ -1076,6 +1076,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   -1.5k, none worse; `REM` + `MASKSHL` compression -0.025%, html +0.063%
   (lol_html lowercases names under 8 bytes: the extra dispatch costs
   about 7 instructions a call). Tests `tests/loopvec_rem.rs`.
+- `PLIRON_BRTHREAD=1` (opt-in, 2026-11-20) — step `brthread` before
+  `bittab2`: an edge into a block that is only `brif c` goes straight to
+  the successor `c` selects when the edge decides `c` (its own `brif`
+  side, or a fact inherited down the dominator tree from a single-edge
+  `brif`), following chains of such blocks. lol_html's
+  `tag_is_one_of!(name, [..])` over `LocalName::Hash(u64) | Bytes`
+  re-tested the variant and reloaded the payload per constant (21 `cbz`
+  per `is_void_element` call): microbench 308.9M -> 207.2M instructions
+  (LLVM 214.7M). Exact counts: html -0.32%, protobuf -0.13%, json
+  -0.06%, pulldown -0.03%, none worse. Tests `tests/brthread.rs`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

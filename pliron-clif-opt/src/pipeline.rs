@@ -3518,6 +3518,20 @@ fn s_rebase(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// Edges into a block that only re-tests a condition the edge decides —
+// see `brthread`.
+fn s_brthread(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (cfg, dt) = an.cfg_dt(&p.clctx.func);
+    let k = crate::brthread::run(&mut p.clctx.func, cfg, dt);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("brthread");
+        }
+    }
+    k
+}
+
 // `base + i * stride` onto a pointer IV — see `ivsr`.
 fn s_ivsr(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::ivsr::run(&mut p.clctx.func, an);
@@ -5503,6 +5517,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_jtround,
         )
         .needs(shape::CONDBR),
+        // Variant re-tests in `a == X || a == Y` chains over an enum (bare
+        // `brif v` blocks appear from `bcheck` on). Before bittab2, which
+        // may then see one membership chain. Opt-in.
+        step("brthread", "", Gate::OptIn("PLIRON_BRTHREAD"), s_brthread).needs(shape::CONDBR),
         // Membership trees the late threading assembled (serde_json's
         // whitespace skip `x - 9 in {0, 1, 4, 23}` only becomes one chain
         // after brchain/mergechain/jtround).

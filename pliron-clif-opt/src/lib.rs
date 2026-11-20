@@ -40,6 +40,7 @@ pub mod cmpcancel;
 pub mod deadslot;
 pub mod sibcall;
 pub mod ivsr;
+pub mod brthread;
 pub mod cmpmerge;
 pub mod selset;
 pub mod selxor;
