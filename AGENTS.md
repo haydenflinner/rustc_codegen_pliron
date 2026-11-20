@@ -1118,6 +1118,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   the variant only through a join (html: 3 instructions per call left).
   `PLIRON_TRACE=pliron::partinline` names guards and sites. Stanza
   `partinline` (fails with the guard inverted).
+- `PLIRON_RANGEFOLD_TREE=1` (opt-in, 2026-11-20) — `rangefold` takes hit
+  edges whose arguments are pure trees of up to three levels (lol_html's
+  `b'a'..=b'z' | b'A'..=b'Z' => (c & 31) + 5`, a copy per arm), so both
+  range pairs fold and merge into one case-folded test `(c | 32) - 97 u<
+  26`; a tree of more than one inst is re-emitted in a landing block on the
+  hit edge. Exact counts: html +0.052% (`tag_name_state` -12k, but
+  `tag_open_state` +63k: the slice's pointer and length are copied to other
+  registers on every call, and a later pass hoists the landing block's hash
+  step back in front of the test), json +0.001%, the rest flat. Filetest
+  `rangefold_tree_arms`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

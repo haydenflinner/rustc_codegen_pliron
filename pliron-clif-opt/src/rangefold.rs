@@ -195,90 +195,193 @@ fn args_avail(func: &Function, dom: &DominatorTree, bc: BlockCall, inst: Inst) -
 enum Mat {
     /// Keep the edge arg verbatim (pseudo-args or dominating values).
     Arg(BlockArg),
-    /// Pure inst the fold bypasses: re-emit it with dominating
-    /// operands (`iadd count,1` produced per-arm by paramsink).
-    Clone(Inst),
+    /// A small tree of pure insts the fold bypasses: re-emit it at the
+    /// merge point, reusing operands that dominate it (`iadd count,1`
+    /// produced per-arm by paramsink; lol_html's per-arm hash step
+    /// `(c & 31) + 5`, two levels).
+    Tree(Value),
     /// Literal — re-emit an iconst.
     K(u64, cranelift_codegen::ir::Type),
 }
 
+/// Depth of a pure tree `Mat::Tree` re-emits and `tree_eq` compares:
+/// `PLIRON_RANGEFOLD_TREE=1` (opt-in) allows this many levels, else one
+/// (the old rule: a single pure inst over dominating operands).
+const TREE_DEPTH: u32 = 3;
+
+fn dominates_at(func: &Function, dom: &DominatorTree, v: Value, at: Inst) -> bool {
+    let pp = match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => ProgramPoint::Inst(i),
+        ValueDef::Param(b, _) => ProgramPoint::Block(b),
+        _ => return false,
+    };
+    dom.try_dominates(pp, at, &func.layout)
+}
+
+/// The single-result pure inst of a plain operand format defining `v`.
+fn tree_inst(func: &Function, v: Value) -> Option<Inst> {
+    let ValueDef::Result(di, 0) = func.dfg.value_def(v) else {
+        return None;
+    };
+    let plain = matches!(
+        func.dfg.insts[di],
+        InstructionData::Binary { .. } | InstructionData::Unary { .. } | InstructionData::IntCompare { .. }
+    );
+    (plain && func.dfg.inst_results(di).len() == 1 && crate::jumpthread::pure_op(func, di)).then_some(di)
+}
+
+/// `v` can be produced at `at`: it dominates `at`, is a literal, or is a
+/// pure tree of at most `depth` levels over such values.
+fn clonable(func: &Function, dom: &DominatorTree, v: Value, at: Inst, depth: u32) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    if dominates_at(func, dom, v, at) || iconst(func, v).is_some() {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let Some(di) = tree_inst(func, v) else { return false };
+    func.dfg.inst_args(di).to_vec().iter().all(|&o| clonable(func, dom, o, at, depth - 1))
+}
+
 /// Can this edge arg be materialized at `at`? Dominating defs reuse;
-/// a pure inst may be re-emitted when every operand dominates `at` or
-/// is itself an iconst (depth-1 — enough for `count+1` arms).
-fn mat_of(func: &Function, dom: &DominatorTree, a: BlockArg, at: Inst) -> Option<Mat> {
+/// literals and small pure trees are re-emitted (`clonable`).
+fn mat_of(func: &Function, dom: &DominatorTree, a: BlockArg, at: Inst, depth: u32) -> Option<Mat> {
     // Pseudo-args (try_call ret/exn) are bound to their own terminator
     // — they can't ride the merged edge.
     let v = a.as_value()?;
     let v = func.dfg.resolve_aliases(v);
-    let pp = match func.dfg.value_def(v) {
-        ValueDef::Result(i, _) => ProgramPoint::Inst(i),
-        ValueDef::Param(b, _) => ProgramPoint::Block(b),
-        _ => return None,
-    };
-    if dom.try_dominates(pp, at, &func.layout) {
+    if dominates_at(func, dom, v, at) {
         return Some(Mat::Arg(a));
     }
     if let Some(k) = iconst(func, v) {
         return Some(Mat::K(k, func.dfg.value_type(v)));
     }
-    let ValueDef::Result(di, 0) = func.dfg.value_def(v) else {
-        return None;
-    };
-    if !crate::jumpthread::pure_op(func, di) {
-        return None;
-    }
-    let ok = func.dfg.inst_args(di).to_vec().iter().all(|&o| {
-        let o = func.dfg.resolve_aliases(o);
-        if iconst(func, o).is_some() {
-            return true;
-        }
-        let pp = match func.dfg.value_def(o) {
-            ValueDef::Result(i, _) => ProgramPoint::Inst(i),
-            ValueDef::Param(b, _) => ProgramPoint::Block(b),
-            _ => return false,
-        };
-        dom.try_dominates(pp, at, &func.layout)
-    });
-    ok.then_some(Mat::Clone(di))
+    clonable(func, dom, v, at, depth).then_some(Mat::Tree(v))
 }
 
-fn emit_mat(func: &mut Function, at: Inst, m: &Mat) -> BlockArg {
+/// Re-emit `v` before `at` (see `clonable`).
+fn emit_tree(func: &mut Function, dom: &DominatorTree, at: Inst, v: Value) -> Value {
+    let v = func.dfg.resolve_aliases(v);
+    if dominates_at(func, dom, v, at) {
+        return v;
+    }
+    if let Some(k) = iconst(func, v) {
+        let ty = func.dfg.value_type(v);
+        let mut pos = FuncCursor::new(func).at_inst(at);
+        return pos.ins().iconst(ty, k as i64);
+    }
+    let di = tree_inst(func, v).expect("clonable checked the tree");
+    let data = func.dfg.insts[di];
+    let ty = func.dfg.value_type(v);
+    let args: Vec<Value> = func.dfg.inst_args(di).to_vec();
+    let vs: Vec<Value> = args.iter().map(|&o| emit_tree(func, dom, at, o)).collect();
+    let nd = crate::paramsink::rebuild(&data, &vs);
+    let ni = func.dfg.make_inst(nd);
+    func.dfg.make_inst_results(ni, ty);
+    func.layout.insert_inst(ni, at);
+    func.dfg.first_result(ni)
+}
+
+/// Insts `emit_tree` would add for `v` at `at`.
+fn tree_size(func: &Function, dom: &DominatorTree, v: Value, at: Inst) -> usize {
+    let v = func.dfg.resolve_aliases(v);
+    if dominates_at(func, dom, v, at) {
+        return 0;
+    }
+    if iconst(func, v).is_some() {
+        return 1;
+    }
+    match tree_inst(func, v) {
+        Some(di) => 1 + func.dfg.inst_args(di).iter().map(|&o| tree_size(func, dom, o, at)).sum::<usize>(),
+        None => 0,
+    }
+}
+
+/// `bc` itself, or for an argument-free edge into a landing block (one
+/// predecessor, pure insts, a `jump`), that block's jump.
+fn landed(func: &Function, cfg: &ControlFlowGraph, bc: BlockCall) -> BlockCall {
+    let l = dest_block(func, bc);
+    if bc.args(&func.dfg.value_lists).next().is_some() || cfg.pred_iter(l).count() != 1 || !bypassable(func, l) {
+        return bc;
+    }
+    match func.layout.last_inst(l).map(|t| func.dfg.insts[t]) {
+        Some(InstructionData::Jump { destination, .. }) => destination,
+        _ => bc,
+    }
+}
+
+/// The merged hit edge. Arguments that cost at most one new inst are
+/// computed in front of `term`, as before trees; a larger tree goes in a
+/// landing block on the hit edge, so it runs on hits only: computed in
+/// front of the branch, html's tag-name hash step `(c & 31) + 5` ran on
+/// every byte (+86k executed instructions).
+fn hit_call(func: &mut Function, dom: &DominatorTree, term: Inst, hdest: Block, mats: &[Mat]) -> BlockCall {
+    let big = mats.iter().any(|m| match m {
+        Mat::Tree(v) => tree_size(func, dom, *v, term) > 1,
+        _ => false,
+    });
+    if !big {
+        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, dom, term, m)).collect();
+        return BlockCall::new(hdest, hargs, &mut func.dfg.value_lists);
+    }
+    let tb = func.layout.inst_block(term).unwrap();
+    let land = func.dfg.make_block();
+    func.layout.insert_block_after(land, tb);
+    let mut pos = FuncCursor::new(func).at_bottom(land);
+    let j = pos.ins().jump(hdest, &[]);
+    // `term` dominates `land`, so whatever dominates `term` is available
+    // at `j` too: emit there.
+    let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat_at(func, dom, term, j, m)).collect();
+    let jbc = BlockCall::new(hdest, hargs, &mut func.dfg.value_lists);
+    let InstructionData::Jump { destination, .. } = &mut func.dfg.insts[j] else { unreachable!() };
+    *destination = jbc;
+    BlockCall::new(land, [], &mut func.dfg.value_lists)
+}
+
+/// `emit_mat` with availability judged at `term` and new insts placed in
+/// front of `at` (a landing block `term` dominates).
+fn emit_mat_at(func: &mut Function, dom: &DominatorTree, term: Inst, at: Inst, m: &Mat) -> BlockArg {
     match m {
         Mat::Arg(a) => *a,
         Mat::K(k, ty) => {
             let mut pos = FuncCursor::new(func).at_inst(at);
             BlockArg::Value(pos.ins().iconst(*ty, *k as i64))
         }
-        Mat::Clone(di) => {
-            let data = func.dfg.insts[*di];
-            let ty = func.dfg.value_type(func.dfg.first_result(*di));
-            let ops: Vec<Result<Value, (u64, cranelift_codegen::ir::Type)>> = func
-                .dfg
-                .inst_args(*di)
-                .to_vec()
-                .iter()
-                .map(|&o| {
-                    let o = func.dfg.resolve_aliases(o);
-                    match iconst(func, o) {
-                        Some(k) => Err((k, func.dfg.value_type(o))),
-                        None => Ok(o),
-                    }
-                })
-                .collect();
+        Mat::Tree(v) => BlockArg::Value(emit_tree_at(func, dom, term, at, *v)),
+    }
+}
+
+fn emit_tree_at(func: &mut Function, dom: &DominatorTree, term: Inst, at: Inst, v: Value) -> Value {
+    let v = func.dfg.resolve_aliases(v);
+    if dominates_at(func, dom, v, term) {
+        return v;
+    }
+    if let Some(k) = iconst(func, v) {
+        let ty = func.dfg.value_type(v);
+        let mut pos = FuncCursor::new(func).at_inst(at);
+        return pos.ins().iconst(ty, k as i64);
+    }
+    let di = tree_inst(func, v).expect("clonable checked the tree");
+    let data = func.dfg.insts[di];
+    let ty = func.dfg.value_type(v);
+    let args: Vec<Value> = func.dfg.inst_args(di).to_vec();
+    let vs: Vec<Value> = args.iter().map(|&o| emit_tree_at(func, dom, term, at, o)).collect();
+    let nd = crate::paramsink::rebuild(&data, &vs);
+    let ni = func.dfg.make_inst(nd);
+    func.dfg.make_inst_results(ni, ty);
+    func.layout.insert_inst(ni, at);
+    func.dfg.first_result(ni)
+}
+
+fn emit_mat(func: &mut Function, dom: &DominatorTree, at: Inst, m: &Mat) -> BlockArg {
+    match m {
+        Mat::Arg(a) => *a,
+        Mat::K(k, ty) => {
             let mut pos = FuncCursor::new(func).at_inst(at);
-            let vs: Vec<Value> = ops
-                .iter()
-                .map(|o| match o {
-                    Ok(v) => *v,
-                    Err((k, ty)) => pos.ins().iconst(*ty, *k as i64),
-                })
-                .collect();
-            let nd = crate::paramsink::rebuild(&data, &vs);
-            let ni = pos.func.dfg.make_inst(nd);
-            pos.func.dfg.make_inst_results(ni, ty);
-            pos.func.layout.insert_inst(ni, at);
-            BlockArg::Value(pos.func.dfg.first_result(ni))
+            BlockArg::Value(pos.ins().iconst(*ty, *k as i64))
         }
+        Mat::Tree(v) => BlockArg::Value(emit_tree(func, dom, at, *v)),
     }
 }
 
@@ -324,7 +427,7 @@ fn bypassable(func: &Function, b: Block) -> bool {
 
 /// Rule 1: `brif (x >= lo) → [brif (x < hi) → HIT else MISS] else MISS`
 /// becomes `brif (x-lo u< hi-lo) → HIT else MISS`.
-fn bound_pairs(func: &mut Function) -> usize {
+fn bound_pairs(func: &mut Function, depth: u32) -> usize {
     let dbg = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::rangefold", tracing::Level::DEBUG);
     let uses = use_blocks(func);
@@ -394,7 +497,7 @@ fn bound_pairs(func: &mut Function) -> usize {
             // hoist unconditionally: the `mov;stur` flag regression shape.
             let Some(hit_mats) = hbc
                 .args(&func.dfg.value_lists)
-                .map(|a| mat_of(func, &dom, a, term))
+                .map(|a| mat_of(func, &dom, a, term, depth))
                 .collect::<Option<Vec<_>>>()
             else {
                 continue;
@@ -438,8 +541,7 @@ fn bound_pairs(func: &mut Function) -> usize {
         let Some((term, x, lo, w, hdest, fbc, mats)) = found else {
             return n;
         };
-        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, term, m)).collect();
-        let hbc = BlockCall::new(hdest, hargs, &mut func.dfg.value_lists);
+        let hbc = hit_call(func, &dom, term, hdest, &mats);
         let ty = func.dfg.value_type(x);
         let mut pos = FuncCursor::new(func).at_inst(term);
         let k = pos.ins().iconst(ty, lo as i64);
@@ -466,17 +568,27 @@ fn op_eq(func: &Function, x: Value, y: Value) -> bool {
         }
 }
 
-/// Same pure op on equal operands — edge args paramsink produced read
-/// as different insts (`iadd count,1` cloned per classification arm).
-fn shape_eq(func: &Function, di: Inst, dj: Inst) -> bool {
-    if func.dfg.insts[di].opcode() != func.dfg.insts[dj].opcode() {
+/// Same pure tree on equal leaves — edge args paramsink produced read as
+/// different insts (`iadd count,1` cloned per classification arm), or a
+/// match arm's own copy of a shared expression (`(c & 31) + 5`).
+fn tree_eq(func: &Function, x: Value, y: Value, depth: u32) -> bool {
+    if op_eq(func, x, y) {
+        return true;
+    }
+    if depth == 0 {
         return false;
     }
-    let (aa, bb) = (
-        func.dfg.inst_args(di).to_vec(),
-        func.dfg.inst_args(dj).to_vec(),
-    );
-    aa.len() == bb.len() && aa.iter().zip(&bb).all(|(&x, &y)| op_eq(func, x, y))
+    let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+    let (Some(di), Some(dj)) = (tree_inst(func, x), tree_inst(func, y)) else { return false };
+    let same_op = match (func.dfg.insts[di], func.dfg.insts[dj]) {
+        (InstructionData::IntCompare { cond: a, .. }, InstructionData::IntCompare { cond: b, .. }) => a == b,
+        _ => func.dfg.insts[di].opcode() == func.dfg.insts[dj].opcode(),
+    };
+    let (aa, bb) = (func.dfg.inst_args(di).to_vec(), func.dfg.inst_args(dj).to_vec());
+    same_op
+        && func.dfg.value_type(x) == func.dfg.value_type(y)
+        && aa.len() == bb.len()
+        && aa.iter().zip(&bb).all(|(&p, &q)| tree_eq(func, p, q, depth - 1))
 }
 
 /// Hit-edge args for a union merge: same dest, and per-slot either the
@@ -488,6 +600,7 @@ fn shared_args(
     a: BlockCall,
     b: BlockCall,
     at: Inst,
+    depth: u32,
 ) -> Option<Vec<Mat>> {
     let av: Vec<BlockArg> = a.args(&func.dfg.value_lists).collect();
     let bv: Vec<BlockArg> = b.args(&func.dfg.value_lists).collect();
@@ -498,19 +611,15 @@ fn shared_args(
         .zip(&bv)
         .map(|(&x, &y)| {
             if x == y {
-                return mat_of(func, dom, x, at);
+                return mat_of(func, dom, x, at, depth);
             }
             let (Some(xv), Some(yv)) = (x.as_value(), y.as_value()) else {
                 return None;
             };
-            let (xi, yi) = (
-                func.dfg.resolved_value_def(xv).inst()?,
-                func.dfg.resolved_value_def(yv).inst()?,
-            );
-            if !shape_eq(func, xi, yi) {
+            if !tree_eq(func, xv, yv, depth) {
                 return None;
             }
-            mat_of(func, dom, x, at)
+            mat_of(func, dom, x, at, depth)
         })
         .collect()
 }
@@ -518,7 +627,7 @@ fn shared_args(
 /// Rule 2: `brif (x-k1 u<w) → HIT else [brif (x-k2 u<w) → HIT else MISS]`
 /// becomes `brif ((x|d)-k_hi u<w) → HIT else MISS` when the bit-d
 /// partition is exact.
-fn range_unions(func: &mut Function) -> usize {
+fn range_unions(func: &mut Function, depth: u32) -> usize {
     let uses = use_blocks(func);
     let mut n = 0;
     // Same one-fold-per-dominator-rebuild discipline as bound_pairs:
@@ -560,13 +669,16 @@ fn range_unions(func: &mut Function) -> usize {
             let Some((x2, k2, w2)) = offset_test(func, c2) else {
                 continue;
             };
+            // Hit edges through `hit_call`'s landing blocks count as edges to
+            // where those blocks jump, with the jumps' arguments.
+            let (tbc, tbc2) = (landed(func, &cfg, tbc), landed(func, &cfg, tbc2));
             if x1 != x2 || w1 != w2 || k1 == k2 || dest_block(func, tbc) != dest_block(func, tbc2) {
                 continue;
             }
             // The hit edges must agree on args: identical values, or the
             // same sunk computation on each arm (`iadd count,1`), which
             // re-emits once at the merged edge.
-            let Some(hit_mats) = shared_args(func, &dom, tbc, tbc2, term) else {
+            let Some(hit_mats) = shared_args(func, &dom, tbc, tbc2, term, depth) else {
                 continue;
             };
             let (k_lo, k_hi) = (k1.min(k2), k1.max(k2));
@@ -600,8 +712,7 @@ fn range_unions(func: &mut Function) -> usize {
         let Some((term, x, k_hi, d, w, hdest, fbc, mats)) = found else {
             return n;
         };
-        let hargs: Vec<BlockArg> = mats.iter().map(|m| emit_mat(func, term, m)).collect();
-        let hbc = BlockCall::new(hdest, hargs, &mut func.dfg.value_lists);
+        let hbc = hit_call(func, &dom, term, hdest, &mats);
         let ty = func.dfg.value_type(x);
         let mut pos = FuncCursor::new(func).at_inst(term);
         let dv = pos.ins().iconst(ty, d as i64);
@@ -620,6 +731,12 @@ fn range_unions(func: &mut Function) -> usize {
 }
 
 pub fn run(func: &mut Function) -> usize {
+    let depth = if pliron_cfg::env_is("PLIRON_RANGEFOLD_TREE", "1") { TREE_DEPTH } else { 1 };
+    run_with(func, depth)
+}
+
+/// [`run`] with the hit-arg tree depth chosen by the caller (filetests).
+pub fn run_with(func: &mut Function, depth: u32) -> usize {
     let mut n = 0;
     // bound_pairs creates the `isub`+`icmp ult` shape range_unions
     // consumes; iterate so a union exposing the next pair gets folded.
@@ -631,7 +748,7 @@ pub fn run(func: &mut Function) -> usize {
     let r2 = crate::config::config().enabled("PLIRON_RF2");
     for _ in 0..4 {
         let k =
-            (if r1 { bound_pairs(func) } else { 0 }) + (if r2 { range_unions(func) } else { 0 });
+            (if r1 { bound_pairs(func, depth) } else { 0 }) + (if r2 { range_unions(func, depth) } else { 0 });
         n += k;
         if k == 0 {
             break;

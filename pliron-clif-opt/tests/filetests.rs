@@ -149,6 +149,7 @@ fn pass(name: &str) -> Pass {
             pliron_clif_opt::punroll::run(f, &mut an, "filetest", &prof, false)
         },
         "rangefold" => rangefold::run,
+        "rangefold_tree" => |f| rangefold::run_with(f, 3),
         "rebase" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::rebase::run(f, &mut an)

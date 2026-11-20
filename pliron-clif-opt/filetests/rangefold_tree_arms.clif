@@ -1,0 +1,48 @@
+; test rangefold_tree
+; lol_html's `LocalNameHash::update`: `b'a'..=b'z' | b'A'..=b'Z' => (c & 31) + 5`
+; lowers to two bound pairs whose hit edges each pass their own copy of the
+; two-level expression `(c & 31) + 5`. With trees of three levels the pairs
+; become offset tests, and the two tests one case-folded test
+; `(c | 32) - 97 u< 26`. The hit edge goes through a landing block that
+; computes the hash step, so it runs on letters only (computed in front of
+; the branch it ran on every byte). The bypassed blocks stay until
+; unreachable-code removal.
+; check: bor v0
+; check: , block4
+; check: band.i64 v0
+; check: jump block5(
+; diffcheck
+function %hash(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v10 = iconst.i64 97
+    v11 = icmp uge v0, v10
+    brif v11, block1, block2
+block1:
+    v12 = iconst.i64 122
+    v13 = icmp ule v0, v12
+    v14 = iconst.i64 31
+    v15 = band v0, v14
+    v16 = iconst.i64 5
+    v17 = iadd v15, v16
+    brif v13, block5(v17), block2
+block2:
+    v21 = iconst.i64 65
+    v22 = icmp uge v0, v21
+    brif v22, block3, block4
+block3:
+    v23 = iconst.i64 90
+    v24 = icmp ule v0, v23
+    v25 = iconst.i64 31
+    v26 = band v0, v25
+    v27 = iconst.i64 5
+    v28 = iadd v26, v27
+    brif v24, block5(v28), block4
+block4:
+    v30 = iconst.i64 -1
+    jump block5(v30)
+block5(v40: i64):
+    v41 = iconst.i64 5
+    v42 = ishl v1, v41
+    v43 = bor v42, v40
+    return v43
+}
