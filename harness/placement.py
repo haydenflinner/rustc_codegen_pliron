@@ -96,10 +96,20 @@ def callgrind_summary(prog, exe, out_json):
     cmd = ["docker", "run", "--rm",
            "-v", f"{run.src_dir(prog)}:/src:ro", "-v", f"{os.path.dirname(exe)}:/exe:ro", "-v", f"{tmpd}:/out",
            "-w", "/src", irdiff.IMAGE,
-           "valgrind", "--tool=callgrind", f"--callgrind-out-file=/out/{name}",
-           "--dump-instr=yes", "--dump-line=no", "--compress-strings=no", "--compress-pos=no",
-           f"/exe/{os.path.basename(exe)}"]
+           # Written inside the container and copied out: valgrind sometimes
+           # cannot open its output file on the bind mount (docker desktop /
+           # OrbStack; irdiff.py does the same).
+           "sh", "-c",
+           f"valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out "
+           f"--dump-instr=yes --dump-line=no --compress-strings=no --compress-pos=no "
+           f"/exe/{os.path.basename(exe)} >/dev/null 2>/tmp/vg.err; rc=$?; "
+           f"cp /tmp/cg.out /out/{name} || {{ tail -20 /tmp/vg.err >&2; exit 1; }}; "
+           f"[ $rc = 0 ] || tail -20 /tmp/vg.err >&2; exit $rc"]
+    # One retry: a callgrind run killed from outside (memory pressure on a
+    # busy machine) is not a result.
     r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(raw):
+        r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(raw):
         sys.exit(f"placement: callgrind failed for {exe}:\n{r.stderr[-2000:]}")
     text = Text(exe)

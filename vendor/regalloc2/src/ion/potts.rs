@@ -510,6 +510,18 @@ impl<'a, F: Function> Env<'a, F> {
             // (destination): the other side is fixed.
             for i in 0..nodes.len() {
                 let nd = nodes[i];
+                // A piece that ends inside its block where ion split the
+                // value: the next range of the value starts there, and the
+                // move between the two is an edge of the energy too.
+                let bend = self.ctx.cfginfo.block_exit[nd.blk.index()].next();
+                if nd.range.to < bend {
+                    if let Some(e2) = self.rehome_lr_at(v, nd.range.to) {
+                        if e2.index != nd.lr {
+                            let b = Side::Fixed(self.get_alloc_for_range(e2.index));
+                            pairs.push(Pair { a: Side::Node(i as u32), b, w: hot[nd.blk.index()], from: nd.blk, to: nd.blk });
+                        }
+                    }
+                }
                 for u in self.ctx.ranges[nd.lr].uses.iter() {
                     if u.pos < nd.range.from || u.pos >= nd.range.to {
                         continue;
