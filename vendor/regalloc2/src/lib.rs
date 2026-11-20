@@ -604,7 +604,7 @@ pub(crate) fn rehome_mode() -> u8 {
     2
 }
 
-/// PLIRON (`PLIRON_RA2_POTTS`, default `0`): after allocation, each
+/// PLIRON (`PLIRON_RA2_POTTS`, default `1` since 2026-11-20, `0` off): after allocation, each
 /// value's register is relabelled block by block by α-expansion (minimum
 /// cuts) to remove edge moves. `1`: Pareto steps only (no edge gains a
 /// move, safe under any profile); `2`: trust the block frequencies. See
@@ -614,11 +614,11 @@ pub(crate) fn potts_mode() -> u8 {
     {
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         *MODE.get_or_init(|| {
-            std::env::var("PLIRON_RA2_POTTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("PLIRON_RA2_POTTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
         })
     }
     #[cfg(not(feature = "std"))]
-    0
+    1
 }
 
 /// PLIRON (`PLIRON_RA2_POTTS_MAXLIVE`, default 2,000,000): functions with

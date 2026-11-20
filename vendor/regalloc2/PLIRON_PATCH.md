@@ -589,7 +589,7 @@ instructions 6.970M -> 6.919M; `=1` almost nothing.
   2026-11-19: exact interference, reserve-and-retry temps, ion delegation over
   `PLIRON_RA_MCTS_FALLBACK`, `PLIRON_RA_TIME`: `docs/history/2026-11-19-ra-mcts-whole-function.md`.
 
-## `PLIRON_RA2_POTTS` (2026-11-19): relabel registers block by block to remove edge moves
+## `PLIRON_RA2_POTTS` (2026-11-19; default `1` since 2026-11-20, `0` off): relabel registers block by block to remove edge moves
 
 `src/ion/potts.rs`, called from `Env::run` after `rehome_joins`. Per value,
 an α-expansion over the blocks it lives through (Potts energy: edge

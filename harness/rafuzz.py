@@ -63,7 +63,7 @@ KNOBS = [
     ("PLIRON_RA2_REGION_TIE", "0", ["1"], "ra2", "1"),
     ("PLIRON_RA2_SRCVREG", "1", ["0"], "ra2", "1"),
     ("PLIRON_RA2_REHOME", "2", ["0", "1"], "ra2", "2"),
-    ("PLIRON_RA2_POTTS", "0", ["1"], "ra2,clif", "1"),
+    ("PLIRON_RA2_POTTS", "1", ["0", "2"], "ra2,clif", "1"),
     ("PLIRON_RA2_XBLOCK", "0", ["1"], "ra2", "1"),
     ("PLIRON_RA2_MERGEDEPTH", "0", ["1", "2", "3"], "ra2", "2"),
     # Cranelift (vendor/cranelift-codegen/src/machinst, isa/aarch64).

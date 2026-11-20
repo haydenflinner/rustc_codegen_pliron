@@ -983,7 +983,7 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `tools/raproof` — exact clique / chromatic certificates on fuzz
   funcs vs ion/greedy/fast preg footprint (`regalloc2::prove`;
   docs/regalloc.md). Research harness, not in the gate.
-- `PLIRON_RA2_POTTS=1|2` (opt-in, vendored regalloc2, 2026-11-19) —
+- `PLIRON_RA2_POTTS=1|2` (default `1` since 2026-11-20, `=0` off; vendored regalloc2) —
   after allocation, each value's register is relabelled block by block
   to remove edge moves: a Potts energy (edge frequency where the ends
   disagree) minimized by α-expansion, each step a min-cut

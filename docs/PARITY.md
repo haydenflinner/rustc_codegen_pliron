@@ -1351,6 +1351,14 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    threshold floor (`PLIRON_INLINE_GLUET=90`) adds html-rewriter -0.84%
    but costs compression +1.25%, regex +0.35%: opt-in
    (`history/2026-11-19-sibcall.md`).
+   **Done (default on, 2026-11-20): edge moves by min-cut relabelling.**
+   Edge moves are the largest excess over LLVM on six programs
+   (`regalloc.md` "Move kinds"). `PLIRON_RA2_POTTS=1` relabels each
+   value's register block by block after allocation (α-expansion,
+   Pareto steps only): blind-sig -0.18%, html-rewriter -0.10%, protobuf
+   -0.08%, regex -0.02%, nothing worse. Compression's edge moves are a
+   placement problem (loop increments computed before a conditional
+   back edge), next (`history/2026-11-19-ra-flow.md`).
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain
