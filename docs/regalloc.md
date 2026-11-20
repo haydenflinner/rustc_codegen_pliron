@@ -221,9 +221,34 @@ Block starts are branch targets and the instructions after branches and
 calls, so a run of moves never crosses one. The rules are heuristics on
 final code: an edge move that regalloc2 put mid-block (a split) reads as
 `inblock`, and LLVM's own copies are classified by the same rules.
-`rastat.py selftest` checks them on a hand-written function. Not yet run
-on the held-out programs (2026-11-19: the machine was busy); the first
-run's per-kind excess table decides where the move work starts.
+`rastat.py selftest` checks them on a hand-written function.
+
+First table (2026-11-19, from the 2026-11-18 night builds and callgrind
+outputs already on disk: `ir-llvm` against `ir-pliron-night`, coverage
+1.000 on both sides; before `PLIRON_SIBCALL`; per-function numbers in
+`target/rastat/dyn-night-kinds.json`). Executed moves, LLVM / ours,
+millions, and our excess edge moves as a share of the program's whole
+instruction gap:
+
+| program | gap | edge | callarg | callret | ret | inblock | edge excess / gap |
+|---|---|---|---|---|---|---|---|
+| rust-compression | 3.03M | 0.04 / 1.11 | 0.04 / 0.06 | 0.06 / 0.01 | 0.03 / 0.00 | 0.43 / 0.28 | 35% |
+| regex | 3.88M | 0.36 / 1.07 | 0.09 / 0.15 | 0.01 / 0.01 | 0.01 / 0.01 | 0.81 / 0.55 | 18% |
+| pulldown-cmark | 5.45M | 0.39 / 1.01 | 0.54 / 0.90 | 0.10 / 0.13 | 0.13 / 0.06 | 0.67 / 1.21 | 11% |
+| rust-protobuf | 3.99M | 0.21 / 0.65 | 1.70 / 1.69 | 0.09 / 0.06 | 0.18 / 0.08 | 0.88 / 1.02 | 11% |
+| rust-html-rewriter | 14.29M | 0.38 / 1.62 | 1.31 / 2.04 | 0.31 / 0.31 | 0.29 / 0.17 | 1.85 / 2.08 | 9% |
+| blind-sig | 2.92M | 0.16 / 0.40 | 0.05 / 0.10 | 0.01 / 0.01 | 0.00 / 0.00 | 0.23 / 0.11 | 8% |
+| rust-json | 5.13M | 0.33 / 0.42 | 0.28 / 0.53 | 0.01 / 0.01 | 0.03 / 0.02 | 0.39 / 0.55 | 2% |
+| blake3-scalar | 2.42M | 0.00 / 0.02 | 0.12 / 0.16 | 0.00 / 0.00 | 0.01 / 0.00 | 0.99 / 0.41 | 1% |
+
+Edge moves are the largest excess kind on six programs (compression
+runs 27x LLVM's), `callarg` second (html-rewriter +0.73M, pulldown
++0.36M, json +0.25M). Bringing edge moves to LLVM's count alone would
+remove 2.5% of compression's executed instructions, 1.4% of regex's,
+1.2% of html-rewriter's and pulldown-cmark's. Where they come from:
+a value held in different registers on the two sides of an edge, which
+ion's bundle merging leaves when it splits a range (the Potts / flow
+framing in `history/2026-11-19-ra-flow.md`).
 
 ### Judging a regalloc change against placement
 
