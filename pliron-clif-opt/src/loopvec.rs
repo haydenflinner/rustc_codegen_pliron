@@ -225,6 +225,9 @@ struct IvAff {
 }
 
 struct Plan {
+    /// Vector groups per iteration: `UNROLL`, or 1 for the remainder loop
+    /// `PLIRON_VEC_REM` builds in front of a converted loop's scalar tail.
+    unroll: usize,
     entry: Edge,
     h: Block,
     body: FxHashSet<Block>,
@@ -1204,6 +1207,7 @@ fn plan(
     cmp64: bool,
     x64: bool,
     wc: WideCaps,
+    unroll: usize,
 ) -> Option<Plan> {
     let Some(info) = gather(func, cfg, dt, la, lp) else {
         why!(fname; "gather loop {:?}", lp);
@@ -2321,6 +2325,27 @@ fn plan(
             vb = 128;
         }
     }
+    // `PLIRON_VEC_REM`'s remainder loop: plain map/store loops only (a
+    // search loop's short trips paid the extra dispatch: lol_html's
+    // `data_state` +182k), and on aarch64 at half width, so 8..15-byte
+    // trips reach vector code too and at most `vf/2 - 1` iterations stay
+    // scalar (LLVM's epilogue loop runs on `d` registers).
+    if unroll == 1 {
+        if !early.is_empty() || !reducs.is_empty() {
+            why!(fname; "rem: early exit or reduction");
+        }
+        // Half width only for plain contiguous ascending streams: lane
+        // reversal shuffles through a fixed `i8x16` (descending streams in
+        // the sorts), gathers and extending accesses were never built for
+        // 64-bit vectors.
+        if !x64
+            && elem.bits() <= 32
+            && streams.iter().all(|s| !s.neg && s.stride == 1)
+            && mems.iter().all(|&i| matches!(func.dfg.insts[i].opcode(), Opcode::Load | Opcode::Store))
+        {
+            vb = 64;
+        }
+    }
     let vf = vb / elem.bits();
     let Some(vt) = elem.by(vf) else {
         why!(fname; "vec ty");
@@ -2334,7 +2359,7 @@ fn plan(
     if streams.iter().any(|s| s.stride > 1)
         && let Some(t) = ins_eval(func, &iters)
         && t >= 0
-        && t < i64::from(vf) * UNROLL as i64
+        && t < i64::from(vf) * unroll as i64
     {
         why!(fname; "gather trip {t} below one vector group");
     }
@@ -2342,7 +2367,7 @@ fn plan(
     // (`len <u 9` before an inline-array slice loop) never reaches the
     // vector body: skip the clone, its dispatch and the remainder loop.
     if let Some(m) = crate::loopidiom::count_trip_max(func, cfg, dt, info.h, &cnt)
-        && m < u64::from(vf) * UNROLL as u64
+        && m < u64::from(vf) * unroll as u64
     {
         why!(fname; "trip <= {m} below one vector group");
     }
@@ -2537,6 +2562,7 @@ fn plan(
         }
     }
     Some(Plan {
+        unroll,
         entry: info.entry,
         h: info.h,
         body: info.body.iter().copied().collect(),
@@ -4399,6 +4425,7 @@ fn pos_block(func: &mut Function, after: Block) -> Block {
 }
 
 fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
+    let unroll = p.unroll;
     let pb = func.layout.inst_block(p.entry.inst).unwrap();
     let (cb, vh, vb, ve) = (
         func.dfg.make_block(),
@@ -4458,7 +4485,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         let iters = emit(&mut pos, iv_ty, &p.iters);
         // One group, plus the iteration a body-first epilogue keeps.
         let full_floor = !p.post_tested || p.exit_bare.is_some();
-        let need = p.vf * UNROLL as i64 + i64::from(!full_floor);
+        let need = p.vf * unroll as i64 + i64::from(!full_floor);
         let k = pos.ins().iconst(iv_ty, need);
         let c = pos.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, iters, k);
         pos.ins().brif(c, cb, &[], p.h, &h_args);
@@ -4467,7 +4494,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         None
     };
     let mut pos = FuncCursor::new(func).at_bottom(cb);
-    // nm = iters & -(VF*UNROLL) ; end_v = iv0 + nm*step. A post-tested
+    // nm = iters & -(VF*unroll) ; end_v = iv0 + nm*step. A post-tested
     // epilogue can't run 0 iters (the body precedes its test), so round
     // `iters-1` down instead and leave ≥1 scalar iteration (preds give
     // `iters ≥ 1` on this path).
@@ -4478,7 +4505,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // `base - (base & (K-1))` == `base & -K`, but unlike `band x, iconst`
     // the result isn't in the egraph's remat set, so the trip bound stays
     // hoisted instead of being re-executed on every vector-loop backedge.
-    let mk = pos.ins().iconst(iv_ty, p.vf * UNROLL as i64 - 1);
+    let mk = pos.ins().iconst(iv_ty, p.vf * unroll as i64 - 1);
     // A post-tested epilogue can be skipped entirely when the vector count
     // consumes all `iters` and the exit takes no args, so only then is it
     // safe to cover the final group (`iters & -K`); otherwise drop the
@@ -4594,7 +4621,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // (end - iv0 = nm*step -> 0) for the countdown latch.
     let mut v_arg_vals = vec![if countdown { off } else { p.iv0 }, end, nmv];
     for (r, &sp) in p.reducs.iter().zip(&splits) {
-        let n = if r.ordered { 1 } else { UNROLL * sp };
+        let n = if r.ordered { 1 } else { unroll * sp };
         for _ in 0..n {
             if r.ordered {
                 // The scalar acc enters the vector loop directly — lanes
@@ -4610,8 +4637,8 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // Strength-reduced stream bases: a `base + iv*rate` address would
     // otherwise recompute a scaled-index `mul`/`iadd` tree every
     // iteration; carry the per-iteration base as a vector-loop
-    // parameter stepped ±vf*UNROLL elements per backedge instead.
-    // Descending streams anchor at the UNROLL block's lowest byte so
+    // parameter stepped ±vf*unroll elements per backedge instead.
+    // Descending streams anchor at the unroll block's lowest byte so
     // every group's load/store offset is a non-negative displacement —
     // the unsigned amode form the emit-time ldp/stp fusion requires.
     let mut sr_steps: Vec<i64> = Vec::new();
@@ -4632,18 +4659,18 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         };
         let mut base = emit(&mut pos, pty, &subst(&s.base, p.iv, w0));
         if s.neg {
-            let c = pos.ins().iconst(pty, -(UNROLL as i64 - 1) * p.vf * e);
+            let c = pos.ins().iconst(pty, -(unroll as i64 - 1) * p.vf * e);
             base = pos.ins().iadd(base, c);
         }
         v_arg_vals.push(base);
         // A lane-gather stream steps `stride` elements per iteration —
         // its carried base advances `stride`× the unit-stream rate.
-        sr_steps.push(if s.neg { -e } else { e * s.stride } * p.vf * UNROLL as i64);
+        sr_steps.push(if s.neg { -e } else { e * s.stride } * p.vf * unroll as i64);
     }
     // Carried iv-affine vectors (`iv_affines`): lane value at outer
     // iteration t, group g is `coeff*(iv_t + g*vf*step + k*step) + off` —
     // the param holds group 0's vector `splat(coeff*iv_t + off) ± iota`
-    // and steps `coeff*UNROLL*vf*step` per backedge. Init and the
+    // and steps `coeff*unroll*vf*step` per backedge. Init and the
     // per-group/backedge step constants emit once here in `cb` (they
     // dominate the whole vector loop).
     let mut aff_gstep: Vec<Vec<Value>> = Vec::new();
@@ -4664,7 +4691,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         };
         v_arg_vals.push(w0);
         let mut gs = Vec::new();
-        for g in 1..UNROLL {
+        for g in 1..unroll {
             let k = pos
                 .ins()
                 .iconst(iv_ty, a.coeff * g as i64 * p.vf * p.step);
@@ -4673,7 +4700,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         aff_gstep.push(gs);
         let bk = pos
             .ins()
-            .iconst(iv_ty, a.coeff * UNROLL as i64 * p.vf * p.step);
+            .iconst(iv_ty, a.coeff * unroll as i64 * p.vf * p.step);
         aff_bstep.push(pos.ins().splat(p.vt, bk));
     }
     let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
@@ -4686,7 +4713,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         .iter()
         .zip(&splits)
         .map(|(r, &sp)| {
-            let n = if r.ordered { 1 } else { UNROLL * sp };
+            let n = if r.ordered { 1 } else { unroll * sp };
             (0..n)
                 .map(|_| {
                     pos.func
@@ -4922,10 +4949,10 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     if !jumped {
         pos.ins().jump(p.h, &eargs);
     }
-    // vb: UNROLL groups of the body. Group g's streams are offset g*VF
+    // vb: unroll groups of the body. Group g's streams are offset g*VF
     // elements ahead; same-stream program order is preserved within each
     // group, and groups advance together (a cross-group read-back hazard
-    // would need a store->load distance < VF*UNROLL, which can't exist:
+    // would need a store->load distance < VF*unroll, which can't exist:
     // same-stream addresses differ by whole iterations).
     //
     // Early-exit loops put each group in its own block (the fused lane
@@ -4935,7 +4962,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     let mut vbs = vec![vb];
     let mut resume = None;
     if !p.early.is_empty() {
-        for _ in 0..UNROLL {
+        for _ in 0..unroll {
             let b = pos.func.dfg.make_block();
             pos.func.layout.insert_block_after(b, *vbs.last().unwrap());
             vbs.push(b);
@@ -4968,7 +4995,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         .unwrap_or(p.mems.len());
     let hoist = p.early.is_empty();
     let mut groups: Vec<(Vec<(Value, i64)>, FxHashMap<Value, Value>)> = Vec::new();
-    for g in 0..UNROLL {
+    for g in 0..unroll {
         let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
         // Per-stream (base, byte-offset): the base is emitted once per
         // iteration (sharing `iv*rate` across groups), the group shift
@@ -4988,12 +5015,12 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             } else {
                 // Strength-reduced carried base: the group shift rides
                 // the load/store's immediate operand. Descending bases
-                // are anchored at the UNROLL block's lowest byte, so
+                // are anchored at the unroll block's lowest byte, so
                 // group offsets count up from there. A lane-gather stream
                 // shifts `stride` elements per iteration.
                 let a = sr_ptrs[j].unwrap();
                 let off = if s.neg {
-                    (UNROLL as i64 - 1 - g as i64) * p.vf * e
+                    (unroll as i64 - 1 - g as i64) * p.vf * e
                 } else {
                     (g as i64) * p.vf * e * s.stride
                 };
@@ -5020,8 +5047,8 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                 if !p.can_vec.contains(&r) {
                     continue;
                 }
-                let mut raws: Vec<(usize, Value)> = Vec::with_capacity(UNROLL);
-                for g in 0..UNROLL {
+                let mut raws: Vec<(usize, Value)> = Vec::with_capacity(unroll);
+                for g in 0..unroll {
                     let (addrs, vmap) = &mut groups[g];
                     if vmap.contains_key(&r) {
                         continue;
@@ -5068,7 +5095,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // resume lane.
     let mut group_oks: Vec<Value> = Vec::new();
     let mut exact = !p.early.is_empty() && crate::env_is("PLIRON_VEC_EXACT", "1");
-    for g in 0..UNROLL {
+    for g in 0..unroll {
         let (addrs, mut vmap) = core::mem::take(&mut groups[g]);
         let mut pos = FuncCursor::new(pos.func).at_bottom(vbs[g.min(vbs.len() - 1)]);
         // iv-stream lanes: the group's first scalar iv is `ivv +
@@ -5184,13 +5211,13 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             _ => exact = false,
         }
         if !p.early.is_empty() {
-            if g + 1 == UNROLL {
+            if g + 1 == unroll {
                 let mut ok = pos.ins().vall_true(exit_accs[0]);
                 for &a in &exit_accs[1..] {
                     let t = pos.ins().vall_true(a);
                     ok = pos.ins().band(ok, t);
                 }
-                pos.ins().brif(ok, vbs[UNROLL], &[], resume.unwrap(), &[]);
+                pos.ins().brif(ok, vbs[unroll], &[], resume.unwrap(), &[]);
             } else {
                 pos.ins().jump(vbs[g + 1], &[]);
             }
@@ -5351,7 +5378,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         pos.ins()
             .store(MemFlagsData::new().with_notrap(), vv, a, off as i32);
     }
-    let k = pos.ins().iconst(iv_ty, p.step * p.vf * UNROLL as i64);
+    let k = pos.ins().iconst(iv_ty, p.step * p.vf * unroll as i64);
     let iv2 = if countdown {
         pos.ins().isub(ivv, k)
     } else {
@@ -5366,7 +5393,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     for accs in &back_accs {
         back.extend(accs);
     }
-    // Step the strength-reduced stream bases: ±vf*UNROLL elements per
+    // Step the strength-reduced stream bases: ±vf*unroll elements per
     // vector iteration.
     for (j, s) in p.streams.iter().enumerate() {
         if s.direct {
@@ -5375,7 +5402,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         let c = pos.ins().iconst(pty, sr_steps[j]);
         back.push(pos.ins().iadd(sr_ptrs[j].unwrap(), c));
     }
-    // Step the carried iv-affine vectors: coeff*UNROLL*vf*step per
+    // Step the carried iv-affine vectors: coeff*unroll*vf*step per
     // outer iteration.
     for (ai, _) in p.iv_affines.iter().enumerate() {
         back.push(pos.ins().iadd(wparams[ai], aff_bstep[ai]));
@@ -5391,7 +5418,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // not walked again lane by lane.
     if let Some(r) = resume {
         let mut pos = FuncCursor::new(pos.func).at_bottom(r);
-        let lane = (exact && group_oks.len() == UNROLL)
+        let lane = (exact && group_oks.len() == unroll)
             .then(|| exact_lane(&mut pos, r, &group_oks, p.vf, iv_ty));
         let ivr = match lane {
             Some(l) => {
@@ -5490,6 +5517,7 @@ pub fn run(
         && tracing::enabled!(target: "pliron::loopvec", tracing::Level::DEBUG);
     let pty = tcfg.pointer_type();
     let mut n = 0;
+    let mut done: Vec<Block> = Vec::new();
     let max_loops = crate::env_get("PLIRON_LOOPVEC_LOOPS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(MAX_LOOPS);
@@ -5501,7 +5529,7 @@ pub fn run(
         let facts = proots::facts_cfg(func, &cfg);
         let ps = proots::alias_of(&facts);
         let Some(p) = plan(
-            func, &ps, &facts, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64, wc,
+            func, &ps, &facts, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64, wc, UNROLL,
         ) else {
             continue;
         };
@@ -5511,12 +5539,142 @@ pub fn run(
             };
         }
         apply(func, &p, pty, x64);
+        done.push(p.h);
         n += 1;
         if n >= MAX_CONV {
             break;
         }
     }
+    // `PLIRON_VEC_REM=1` (opt-in): the scalar loop a conversion keeps runs
+    // up to `vf * UNROLL - 1` iterations (63 bytes for `u8`), and every
+    // shorter trip count never reaches the vector body at all. Convert that
+    // loop once more with one vector per iteration, as LLVM's epilogue
+    // vectorization does: `make_ascii_lowercase` on 16..63 bytes was 3.9x to
+    // 5.7x LLVM's instructions. One CFG rebuild for all of them.
+    if !done.is_empty() && pliron_cfg::env_is("PLIRON_VEC_REM", "1") {
+        // The kept loop is entered from the short-trip bypass, the vector
+        // loop's resume and its exit-skip: merge them in a preheader so
+        // `gather` sees one entry edge. One analysis rebuild per converted
+        // loop (at most `MAX_CONV`): a conversion leaves them stale.
+        for &h in &done {
+            let cfg = ControlFlowGraph::with_function(func);
+            let dt = DominatorTree::with_function(func, &cfg);
+            let mut la = LoopAnalysis::new();
+            la.compute(func, &cfg, &dt);
+            let Some(lp) = la.loops().find(|&l| la.loop_header(l) == h) else { continue };
+            let entries: Vec<Inst> =
+                cfg.pred_iter(h).filter(|pr| !la.is_in_loop(pr.block, lp)).map(|pr| pr.inst).collect();
+            let (cfg, dt, la, lp) = if entries.len() > 1 {
+                make_preheader(func, h, &entries);
+                let cfg = ControlFlowGraph::with_function(func);
+                let dt = DominatorTree::with_function(func, &cfg);
+                let mut la = LoopAnalysis::new();
+                la.compute(func, &cfg, &dt);
+                let Some(lp) = la.loops().find(|&l| la.loop_header(l) == h) else { continue };
+                (cfg, dt, la, lp)
+            } else {
+                (cfg, dt, la, lp)
+            };
+            let facts = proots::facts_cfg(func, &cfg);
+            let ps = proots::alias_of(&facts);
+            let Some(p) = plan(func, &ps, &facts, &cfg, &dt, &la, lp, noalias, fname, cmp64, x64, wc, 1) else {
+                continue;
+            };
+            if debug {
+                tracing::debug!(target: "pliron::loopvec", "vec rem {:?}: {}x{}", p.h, p.vf, p.elem);
+            }
+            apply(func, &p, pty, x64);
+            n += 1;
+        }
+    }
+    // `PLIRON_VEC_MASKSHL=1` (opt-in).
+    if n > 0 && pliron_cfg::env_is("PLIRON_VEC_MASKSHL", "1") {
+        fold_mask_shifts(func);
+    }
     n
+}
+
+/// The splat value of a `vconst` whose lanes are all equal, or `None`.
+fn vconst_splat(func: &Function, v: Value) -> Option<u64> {
+    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let InstructionData::UnaryConst { opcode: Opcode::Vconst, constant_handle, .. } = func.dfg.insts[i] else {
+        return None;
+    };
+    let lb = func.dfg.value_type(v).lane_type().bytes() as usize;
+    let bytes = func.dfg.constants.get(constant_handle).as_slice();
+    let lane = |k: usize| bytes[k * lb..(k + 1) * lb].iter().rev().fold(0u64, |a, &b| (a << 8) | u64::from(b));
+    let first = lane(0);
+    (1..bytes.len() / lb).all(|k| lane(k) == first).then_some(first)
+}
+
+/// `ishl(band(m, splat 1), k)` with `m` a vector compare (lanes all ones or
+/// zero) is `band(m, splat(1 << k))`: one op instead of two per vector.
+/// `u8::to_ascii_lowercase`'s `is_ascii_uppercase() as u8 * 32` lowered as
+/// `cmhi; and #1; shl #5`, LLVM's as `cmhi; and #0x20`. One scan of the
+/// function after `loopvec` converted something.
+fn fold_mask_shifts(func: &mut Function) {
+    let mut todo: Vec<(Inst, Value, i64)> = Vec::new();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary { opcode: Opcode::Ishl, args } = func.dfg.insts[i] else { continue };
+            let vt = func.dfg.value_type(func.dfg.first_result(i));
+            if !vt.is_vector() || !vt.lane_type().is_int() {
+                continue;
+            }
+            let Some(k) = iconst(func, args[1]) else { continue };
+            if !(0..i64::from(vt.lane_bits())).contains(&k) {
+                continue;
+            }
+            let Some(bi) = func.dfg.value_def(func.dfg.resolve_aliases(args[0])).inst() else { continue };
+            let InstructionData::Binary { opcode: Opcode::Band, args: ba } = func.dfg.insts[bi] else { continue };
+            let is_cmp = |v: Value| {
+                func.dfg.value_def(func.dfg.resolve_aliases(v)).inst().is_some_and(|ci| {
+                    matches!(func.dfg.insts[ci].opcode(), Opcode::Icmp | Opcode::Fcmp)
+                })
+            };
+            let m = if is_cmp(ba[0]) && vconst_splat(func, ba[1]) == Some(1) {
+                ba[0]
+            } else if is_cmp(ba[1]) && vconst_splat(func, ba[0]) == Some(1) {
+                ba[1]
+            } else {
+                continue;
+            };
+            todo.push((i, m, k));
+        }
+    }
+    for (i, m, k) in todo {
+        let vt = func.dfg.value_type(func.dfg.first_result(i));
+        let lb = vt.lane_type().bytes() as usize;
+        let c = 1u64 << k;
+        let mut bytes = Vec::with_capacity(vt.bytes() as usize);
+        while bytes.len() < vt.bytes() as usize {
+            bytes.extend_from_slice(&c.to_le_bytes()[..lb]);
+        }
+        let h = func.dfg.constants.insert(bytes.into());
+        let mut pos = FuncCursor::new(func).at_inst(i);
+        let cv = pos.ins().vconst(vt, h);
+        pos.func.replace(i).band(m, cv);
+    }
+}
+
+/// A new block in front of `h` that takes every edge `entries` sends to `h`
+/// (with their arguments as its parameters) and jumps to `h`.
+fn make_preheader(func: &mut Function, h: Block, entries: &[Inst]) -> Block {
+    let ph = func.dfg.make_block();
+    let tys: Vec<Type> = func.dfg.block_params(h).iter().map(|&v| func.dfg.value_type(v)).collect();
+    let args: Vec<BlockArg> = tys.iter().map(|&t| BlockArg::Value(func.dfg.append_block_param(ph, t))).collect();
+    func.layout.insert_block(ph, h);
+    for &t in entries {
+        let dfg = &mut func.dfg;
+        for bc in dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
+            if bc.block(&dfg.value_lists) == h {
+                bc.set_block(ph, &mut dfg.value_lists);
+            }
+        }
+    }
+    let mut pos = FuncCursor::new(func).at_bottom(ph);
+    pos.ins().jump(h, &args);
+    ph
 }
 
 #[cfg(test)]
