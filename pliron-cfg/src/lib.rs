@@ -43,6 +43,13 @@ pub const DEFAULT_ON: &[&str] = &[
     // (`docs/history/2026-11-19-sibcall.md`). Stanza sibcall.
     // `PLIRON_SIBCALL=0` off.
     "PLIRON_SIBCALL",
+    // 2026-11-20: latchspec keeps a latch whose header parameter is still
+    // live into the folded branch's other successor (the fold would cost
+    // moves plus the split edge's jump on the back edge). Exact counts
+    // with PLIRON_RA2_POTTS_COPY: pulldown -0.78%, compression -0.57%,
+    // protobuf -0.22%, html -0.13%, none worse
+    // (`docs/history/2026-11-19-ra-flow.md`). `=0` off.
+    "PLIRON_LATCHSPEC_LIVE",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the

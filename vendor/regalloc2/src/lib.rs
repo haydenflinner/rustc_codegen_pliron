@@ -630,7 +630,7 @@ pub fn pliron_potts_counts() -> [usize; 2] {
 pub(crate) static POTTS_VALUES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 pub(crate) static POTTS_COPIES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// PLIRON (`PLIRON_RA2_POTTS_COPY=1`, opt-in): after allocation, a copy
+/// PLIRON (`PLIRON_RA2_POTTS_COPY`, default on since 2026-11-20, `=0` off): after allocation, a copy
 /// whose source dies at it (or whose destination starts there) and whose
 /// other side has one plain live range takes the other side's register
 /// when it is free, so the copy becomes an identity and is dropped at
@@ -639,10 +639,10 @@ pub(crate) fn potts_copy_on() -> bool {
     #[cfg(feature = "std")]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_RA2_POTTS_COPY").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_POTTS_COPY").as_deref() != Ok("0"))
     }
     #[cfg(not(feature = "std"))]
-    false
+    true
 }
 
 /// PLIRON (`PLIRON_RA2_POTTS_PIECES=1`, opt-in): `PLIRON_RA2_POTTS` also

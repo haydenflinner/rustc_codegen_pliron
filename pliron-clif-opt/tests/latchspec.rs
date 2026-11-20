@@ -123,7 +123,10 @@ block5(v17: i64):
 fn live_rule_keeps_a_latch_whose_old_values_live_on() {
     let (_, after, k) = run_live(UTF8);
     assert_eq!(k, 0, "{}", after.display());
-    let (before, after, k) = run(UTF8);
+    // The rule off (it is on by default since 2026-11-20).
+    let before = cranelift_reader::parse_functions(UTF8).unwrap().remove(0);
+    let mut after = before.clone();
+    let k = pliron_clif_opt::latchspec::run_with(&mut after, &mut Analysis::default(), false);
     assert_eq!(k, 2, "{}", after.display());
     let mut cfg = Config::default();
     cfg.trials = 64;

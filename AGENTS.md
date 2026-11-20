@@ -994,7 +994,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   program worse. `PLIRON_RA2_POTTS_LIMIT=N` bisects;
   `PLIRON_RA_EXPLAIN` prints `potts` lines with every changed edge.
   `docs/history/2026-11-19-ra-flow.md`.
-- `PLIRON_RA2_POTTS_COPY=1` (opt-in, 2026-11-20) — after allocation a
+- `PLIRON_RA2_POTTS_COPY` (default on since 2026-11-20, `=0` off) — after allocation a
   register copy whose two sides differ becomes an identity when one side
   is a single plain live range (no block parameter or branch argument)
   and the other side's register is free over it (call arguments
@@ -1009,7 +1009,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   phase's preference inside the same α-expansion. rafuzz: 79k relabelled
   values in 20k seeds, checker-clean. `rastat.py static` now splits
   weighted moves by kind (`mov:edge`, `mov:callarg`, ...).
-- `PLIRON_LATCHSPEC_LIVE=1` (opt-in, 2026-11-20) — `latchspec` does not
+- `PLIRON_LATCHSPEC_LIVE` (default on since 2026-11-20, `=0` off) — `latchspec` does not
   fold a latch whose header parameter is still live into the other
   successor of the folded branch (reachability from that successor, not
   passing the header): the old and new value would both be live and the

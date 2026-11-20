@@ -1359,6 +1359,13 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    -0.08%, regex -0.02%, nothing worse. Compression's edge moves are a
    placement problem (loop increments computed before a conditional
    back edge), next (`history/2026-11-19-ra-flow.md`).
+   **Done (default on, 2026-11-20): copies and the latch fold.**
+   `PLIRON_RA2_POTTS_COPY` turns register copies into identities after
+   allocation (call arguments whose detach copy lost its reason), and
+   `PLIRON_LATCHSPEC_LIVE` stops `latchspec` folding a latch whose old
+   values stay live on the other path (compression's placement case).
+   Together: pulldown-cmark -0.78%, compression -0.57%, protobuf -0.22%,
+   html-rewriter -0.13%, regex -0.09%, nothing worse.
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain
