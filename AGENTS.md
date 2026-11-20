@@ -1086,7 +1086,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   per `is_void_element` call): microbench 308.9M -> 207.2M instructions
   (LLVM 214.7M). Exact counts: html -0.32%, protobuf -0.13%, json
   -0.06%, pulldown -0.03%, none worse. Tests `tests/brthread.rs`.
-- `PLIRON_LOOPROT_MULTI=<k>` (opt-in, 2026-11-20) — `looprot` rotates a
+- `PLIRON_LOOPROT_MULTI=<k>` (default 4 since 2026-11-20, `=1` off) — `looprot` rotates a
   loop with up to `k` latches: each latch takes its own copy of the
   header's exit test, so every arm ends in one conditional branch back
   (lol_html's `LocalNameHash::update`, one latch per `match` arm: 164.8M
@@ -1096,10 +1096,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   Exact counts at `k=4`: html -0.43%, compression -0.40%, json -0.06%,
   protobuf -0.02%, but regex +0.09% (aho-corasick's DFA loop: the copied
   test's end bound, also a call argument elsewhere, loses its register and
-  is reloaded in the hot latch) and pulldown +0.05%: a trade, so opt-in.
+  is reloaded in the hot latch) and pulldown +0.05%; with
+  `PLIRON_RA2_MAXSPLITS=4` (that bound's split budget) every program
+  gains: html -0.62%, compression -0.39%, json -0.11%, blake3 -0.11%,
+  protobuf -0.06%, pulldown -0.05%, regex -0.003%.
   Test `tests/looprot_multi.rs`.
-- `PLIRON_RA2_MAXSPLITS=<n>` (vendored regalloc2, 2026-11-20; upstream
-  2) — splits per value before the minimal-bundle fallback (a reload at
+- `PLIRON_RA2_MAXSPLITS=<n>` (vendored regalloc2, default 4 since
+  2026-11-20; upstream 2) — splits per value before the minimal-bundle fallback (a reload at
   every use). See `LOOPROT_MULTI` and `docs/history/2026-11-20-ivsr.md`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).

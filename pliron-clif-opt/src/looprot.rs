@@ -416,7 +416,8 @@ fn rotatable(
 }
 
 /// `PLIRON_LOOPROT_MULTI`: the most latches a rotated loop may have (each
-/// gets a copy of the header's test). Unset or `0`: one.
+/// gets a copy of the header's test). Default 4 (`DEFAULT_VALUES`); `1`:
+/// one.
 fn multi_max() -> usize {
     pliron_cfg::env_get("PLIRON_LOOPROT_MULTI").and_then(|v| v.parse().ok()).unwrap_or(1)
 }

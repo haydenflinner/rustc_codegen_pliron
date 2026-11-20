@@ -612,7 +612,7 @@ takes the other side's register when free over the range; kept only when
 no copy of that range stops being an identity. `pliron_potts_counts()`
 reports how many values / copy ranges were relabelled (rafuzz prints it).
 
-## `PLIRON_RA2_MAXSPLITS=<n>` (2026-11-20)
+## `PLIRON_RA2_MAXSPLITS=<n>` (default 4 since 2026-11-20, upstream 2)
 
 `src/lib.rs` (`max_splits`), `src/ion/process.rs`: upstream's
 `MAX_SPLITS_PER_SPILLSET` (2) as a knob. Past it, a bundle that still

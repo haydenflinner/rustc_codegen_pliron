@@ -48,7 +48,7 @@ RAFUZZ = os.path.join(RAFUZZ_DIR, "target", "release", "rafuzz")
 # Cranelift (the CLIF leg only).
 KNOBS = [
     ("PLIRON_RA2_FREQ", "3", ["0", "1", "2", "4", "5"], "ra2", "3"),
-    ("PLIRON_RA2_MAXSPLITS", "2", ["3", "4", "8"], "ra2", "4"),
+    ("PLIRON_RA2_MAXSPLITS", "4", ["2", "3", "8"], "ra2", "4"),
     ("PLIRON_RA2_LOOPSPLIT", "16", ["0", "1", "40"], "ra2", "16"),
     ("PLIRON_RA2_LOOPDEPTH", "0", ["1"], "ra2", "1"),
     ("PLIRON_RA2_FREQSPLIT", "0", ["1"], "ra2", "1"),

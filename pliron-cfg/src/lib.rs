@@ -493,6 +493,13 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // pulldown -0.043%, none worse (`docs/history/2026-11-20-ivsr.md`).
     // `=1` the plain pipeline step, `=0` off.
     ("PLIRON_IVSR", "2"),
+    // 2026-11-20: `looprot` rotates loops with up to 4 latches (a copy of
+    // the exit test in each; lol_html's `LocalNameHash::update`). With
+    // regalloc2's `PLIRON_RA2_MAXSPLITS=4` (vendored default): html
+    // -0.62%, compression -0.39%, json -0.11%, blake3 -0.11%, protobuf
+    // -0.06%, pulldown -0.05%, regex -0.003%, blind-sig noise
+    // (`docs/history/2026-11-20-ivsr.md`). `=1` one latch only.
+    ("PLIRON_LOOPROT_MULTI", "4"),
     // 2026-11-17, STK: sroa's FRAGCOPY rule does not keep whole an
     // aggregate of at least 64 bytes that direct stores build (all but
     // less than a word of padding) and one copy moves out: the copy

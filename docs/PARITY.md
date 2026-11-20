@@ -1389,6 +1389,13 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    into a bare `brif` the edge decides: lol_html's `tag_is_one_of!` over
    an enum re-tested the variant per constant. html-rewriter -0.32%,
    protobuf -0.13%, json -0.06%, pulldown -0.03%, none worse.
+   **Done (default on, 2026-11-20): multi-latch rotation and the split
+   budget.** `PLIRON_LOOPROT_MULTI=4` copies a loop's exit test into each
+   of its latches (lol_html's tag-name hash: 164.8M -> 146.1M on a
+   microbench, LLVM 147.0M); `PLIRON_RA2_MAXSPLITS=4` lets regalloc2
+   split a value twice more before reloading it at every use. Together:
+   html -0.62%, compression -0.39%, json -0.11%, blake3 -0.11%, protobuf
+   -0.06%, pulldown -0.05%, regex -0.003%.
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain
