@@ -589,6 +589,74 @@ impl Context {
         if membase.is_empty() {
             return;
         }
+        // PLIRON: `PLIRON_BUMPHOIST_INLOOP=1` (opt-in): a base the loop it
+        // heads reads again in a block other than the header that every
+        // trip runs (not as another constant bump) is left alone by both
+        // phases. Such a use
+        // runs on every trip, so phase 2's remat `sub` costs what the fused
+        // writeback saves, and a bump hoisted without the fusion keeps the
+        // pre- and post-bump values live through the whole body (brotli's
+        // `nodes[i + 1]` pointer IV, read in the arms of the per-position
+        // loop: `ldr [x4], #20` then `sub x0, x4, #20` in two arms; hoisted
+        // alone, the bump spilled). One pass over the function.
+        static INLOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut inloop_keep: FxHashSet<Value> = FxHashSet::default();
+        if *INLOOP.get_or_init(|| {
+            std::env::var_os("PLIRON_BUMPHOIST_INLOOP").is_some_and(|v| v == "1")
+        }) {
+            self.compute_loop_analysis();
+            let la = &self.loop_analysis;
+            let mut latches_of: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
+            for bb in self.func.layout.blocks() {
+                if self.func.layout.is_cold(bb) {
+                    continue;
+                }
+                for i in self.func.layout.block_insts(bb) {
+                    let const_bump = match self.func.dfg.insts[i] {
+                        InstructionData::Binary { opcode: Opcode::Iadd | Opcode::Isub, args } => {
+                            args.iter().any(|&a| {
+                                self.func.dfg.value_def(self.func.dfg.resolve_aliases(a)).inst().is_some_and(
+                                    |ci| matches!(self.func.dfg.insts[ci], InstructionData::UnaryImm { opcode: Opcode::Iconst, .. }),
+                                )
+                            })
+                        }
+                        _ => false,
+                    };
+                    if const_bump {
+                        continue;
+                    }
+                    for v in self.func.dfg.inst_values(i) {
+                        let v = self.func.dfg.resolve_aliases(v);
+                        let Some(&h) = membase.get(&v) else { continue };
+                        if h == bb || inloop_keep.contains(&v) {
+                            continue;
+                        }
+                        if let Some(lp) = la.innermost_loop(h)
+                            && la.loop_header(lp) == h
+                            && la.is_in_loop(bb, lp)
+                        {
+                            // Only a block every trip runs (it dominates
+                            // each latch): a use in a conditional arm is
+                            // paid on that arm's trips only, and keeping
+                            // the bump in the latch costs that block's
+                            // jump on every trip (pulldown-cmark +0.2%).
+                            let latches = latches_of.entry(h).or_insert_with(|| {
+                                self.cfg
+                                    .pred_iter(h)
+                                    .map(|pr| pr.block)
+                                    .filter(|&pb| la.is_in_loop(pb, lp))
+                                    .collect::<Vec<Block>>()
+                            });
+                            if !latches.is_empty()
+                                && latches.iter().all(|&l| self.domtree.block_dominates(bb, l))
+                            {
+                                inloop_keep.insert(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Bump candidates: `iadd p,k`/`isub p,k` outside `p`'s block,
         // `k` a small constant that fits the post-index immediate.
         let mut cand: Vec<(crate::ir::Inst, crate::ir::Block)> = Vec::new();
@@ -607,6 +675,9 @@ impl Context {
                     }
                     let x = self.func.dfg.resolve_aliases(args[side]);
                     let Some(&h) = membase.get(&x) else { continue };
+                    if inloop_keep.contains(&x) {
+                        continue;
+                    }
                     let okc = self
                         .func
                         .dfg
@@ -741,6 +812,9 @@ impl Context {
         let mut remats = 0;
         let mut aliased = false;
         for (&p, &h) in membase.iter() {
+            if inloop_keep.contains(&p) {
+                continue;
+            }
             let mut kept: Option<(Inst, Value, i64, bool)> = None;
             let mut dups: Vec<Inst> = Vec::new();
             for i in self.func.layout.block_insts(h) {

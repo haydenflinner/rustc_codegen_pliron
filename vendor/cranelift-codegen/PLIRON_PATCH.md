@@ -1613,7 +1613,17 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     own constant in a dominated block (the elaborator gives every using
     successor its own copy; a loop exit that reads `q` after
     `edgesink::exit_sink`) aliases to the kept result instead of being
-    rematerialized as `(q - k) + k`.
+    rematerialized as `(q - k) + k`. `PLIRON_BUMPHOIST_INLOOP=1`
+    (opt-in, 2026-11-20): a base that the loop it heads reads again in a
+    non-header block every trip runs (it dominates each latch; not as
+    another constant bump) is skipped by both phases. That use runs on every trip, so the remat `sub` costs
+    what the writeback saves, and a bump hoisted without the fusion keeps
+    `p` and `q` both live through the body. Found on `ivsr`'s pointer IV
+    in brotli's shortest-path loop: `ldr w0, [x4], #20` and then
+    `sub x0, x4, #20` in two arms; hoisted alone, `q` spilled. Alone it
+    loses (pulldown-cmark +0.22%: the bump kept in the latch keeps that
+    block's jump, +109k executed jumps; compression +0.13%); with
+    `PLIRON_IVSR` it doubles that pass's compression win.
 
 117. aarch64 `x + (a cc b ? 1 : 0)` to `csinc` (`PLIRON_CINC`, opt-in,
     `=1` on; `isa/aarch64/lower.isle` `iadd_cinc_{r,l}` +

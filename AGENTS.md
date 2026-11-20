@@ -1040,6 +1040,21 @@ time, memory, code size, stack frames) in ~20 min and writes
   `nodes[pos].u = Union1::shortcut(x)` built the enum in a stack temp and
   reloaded it as one word (240k stores, 120k loads in compression). Tests
   `tests/slotconst.rs` (`comb_*`).
+- `PLIRON_IVSR=1`, `PLIRON_BUMPHOIST_INLOOP=1` (opt-in, 2026-11-20) —
+  step `ivsr` after `lsr`: in-loop `base + (i + k) * S` (`S` not a power
+  of two, `base` invariant, `i` a header parameter stepped by a constant)
+  becomes a pointer header parameter stepped by `S` on the back edge
+  (brotli's 20-byte `nodes[i + 1]`: `madd` plus a spilled base reloaded
+  per trip become `ldr w0, [x21]`). Skipped: an address passed back to the
+  header (the loop carries it already), a loop with a parameter already
+  stepping by `S*c`, a group with no address on every trip;
+  `PLIRON_IVSR_MIN=<insts>` skips smaller loops (default 0).
+  `BUMPHOIST_INLOOP` keeps vendored Cranelift's `bump_hoist` off a base
+  read again every trip (it fused `ldr [x], #20` and put `sub x, #20`
+  in the arms). Exact counts, `ivsr` alone: compression -0.55%, pulldown
+  -0.04%, html-rewriter +0.10%, protobuf +0.06%; with `INLOOP`:
+  compression -1.27%, pulldown +0.18%
+  (`docs/history/2026-11-20-ivsr.md`). `PLIRON_TRACE=pliron::ivsr`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

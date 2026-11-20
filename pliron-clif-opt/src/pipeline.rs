@@ -3518,6 +3518,15 @@ fn s_rebase(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// `base + i * stride` onto a pointer IV — see `ivsr`.
+fn s_ivsr(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::ivsr::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("ivsr");
+    }
+    k
+}
+
 fn s_lsr(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = lsr::run(&mut p.clctx.func, an);
     if k > 0 && p.dump {
@@ -5958,6 +5967,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `[p, #K]` (UTF-8 scan's index-param pairs). After iconst128:
         // `post_sweep` would re-funnel `iadd (iadd root, b), K`.
         step("lsr", "lsr", Gate::OptIn("PLIRON_LSR"), s_lsr).needs(shape::LOOPS),
+        // `base + i * S` (S not a power of two) carried as a pointer IV:
+        // brotli's 20-byte `nodes[i + 1]` per position. Opt-in.
+        step("ivsr", "", Gate::OptIn("PLIRON_IVSR"), s_ivsr).needs(shape::LOOPS),
         // Late trees: egraph2/rebase/lsr re-associate bor chains and
         // normalize loads after the first ldmerge (Min4's stack-copy
         // compare loop is built there).
