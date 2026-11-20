@@ -1468,7 +1468,7 @@ impl<I: VCodeInst> VCode<I> {
         }
     }
 
-    /// PLIRON (`PLIRON_A64_HALFCLOB=1`, opt-in): the platform ABI preserves
+    /// PLIRON (`PLIRON_A64_HALFCLOB`, default on since 2026-11-20, `=0` off): the platform ABI preserves
     /// the low 64 bits of aarch64's `v8`-`v15` across a call, but regalloc2
     /// has no partial registers, so every call clobbers all vector
     /// registers and every `f32`/`f64` live across a call is spilled (LLVM
@@ -1483,7 +1483,7 @@ impl<I: VCodeInst> VCode<I> {
     /// believes this function preserves all of them.
     pub fn pliron_strip_half_clobbers(&mut self) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_A64_HALFCLOB").as_deref() == Ok("1")) {
+        if !*ON.get_or_init(|| std::env::var("PLIRON_A64_HALFCLOB").as_deref() != Ok("0")) {
             return;
         }
         let half = I::pliron_call_half_clobbered();

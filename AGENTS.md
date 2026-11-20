@@ -1020,7 +1020,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   `is_mostly_utf8`: `add; add; cbnz` then `mov; mov; b` -> `cbnz` then
   `add; add; b`). Exact counts: compression -0.56%, pulldown -0.36%,
   blind-sig -0.07%, nothing worse. Tests `tests/latchspec.rs`.
-- `PLIRON_A64_HALFCLOB=1` (opt-in, 2026-11-20; vendored Cranelift) — a
+- `PLIRON_A64_HALFCLOB` (default on since 2026-11-20, `=0` off; vendored Cranelift) — a
   plain call across which no value wider than 64 bits is live no longer
   clobbers aarch64's `v8`-`v15` for regalloc (the ABI keeps their low 64
   bits; regalloc2 has no partial registers, so every `f32`/`f64` across a

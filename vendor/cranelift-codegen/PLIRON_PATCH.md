@@ -2180,7 +2180,7 @@ switches). Stanza `x18`.
 `src/machinst/vcode.rs` (`RegallocFunction for VCode`): `pliron_move`
 reports `MachInst::is_move` copies as `(source, destination)` vregs.
 
-## `PLIRON_A64_HALFCLOB=1` (opt-in, 2026-11-20): v8-v15 survive calls for values of at most 64 bits
+## `PLIRON_A64_HALFCLOB` (default on since 2026-11-20, `=0` off): v8-v15 survive calls for values of at most 64 bits
 
 `src/machinst/vcode.rs` (`pliron_strip_half_clobbers`,
 `pliron_calls_without_wide_live`, `pliron_written_regs`),
