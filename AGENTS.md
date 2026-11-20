@@ -1034,11 +1034,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   wider than 64 bits (LLVM spills them too). Stanza `halfclob` (doubles
   across libm calls and across invokes read by an unwinding destructor; a
   vector across a local call).
-- `PLIRON_SLOTCOMB=1` (opt-in, 2026-11-20) — `slotconst` also forwards an
-  integer load wholly covered by narrower non-constant stores (and
-  constants) in the same block: `const | uextend(p) << 8k | ...`. brotli's
+- `PLIRON_SLOTCOMB` (default on since 2026-11-20, `=0` off) — `slotconst`
+  also forwards an integer load of a single-read slot wholly covered by
+  at most two narrower non-constant stores (and constants) in the same
+  block: `const | uextend(p) << 8k`. brotli's
   `nodes[pos].u = Union1::shortcut(x)` built the enum in a stack temp and
-  reloaded it as one word (240k stores, 120k loads in compression). Tests
+  reloaded it as one word (240k stores, 120k loads in compression).
+  Exact counts: compression -0.56%, no program worse. Tests
   `tests/slotconst.rs` (`comb_*`).
 - `PLIRON_IVSR=1`, `PLIRON_BUMPHOIST_INLOOP=1` (opt-in, 2026-11-20) —
   step `ivsr` after `lsr`: in-loop `base + (i + k) * S` (`S` not a power

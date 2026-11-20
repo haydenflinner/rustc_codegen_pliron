@@ -18,7 +18,7 @@
 //! for integers up to 64 bits, `f32const`/`f64const`, `vconst` for 64-
 //! and 128-bit vectors. Linear in the block.
 //!
-//! `PLIRON_SLOTCOMB=1` (opt-in): the scan also remembers, per byte, which
+//! `PLIRON_SLOTCOMB` (default on since 2026-11-20, `=0` off): the scan also remembers, per byte, which
 //! non-constant integer store wrote it (plain `store` of an integer of at
 //! most 8 bytes, or `istore8/16/32`), and an integer load whose bytes are
 //! exactly covered by whole such pieces and known constants becomes their

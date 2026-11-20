@@ -50,6 +50,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // protobuf -0.22%, html -0.13%, none worse
     // (`docs/history/2026-11-19-ra-flow.md`). `=0` off.
     "PLIRON_LATCHSPEC_LIVE",
+    // 2026-11-20: slotconst forwards an integer load of a single-read slot
+    // wholly covered by at most two narrower stores (brotli's
+    // `Union1::shortcut` built in a stack temp and reloaded as one word).
+    // Exact counts: compression -0.56%, no program worse
+    // (`docs/history/2026-11-20-ivsr.md`). `PLIRON_SLOTCOMB=0` off.
+    "PLIRON_SLOTCOMB",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the

@@ -26,7 +26,8 @@ fn loads(f: &Function) -> usize {
 fn run(src: &str) -> (Function, usize) {
     let before = parse(src);
     let mut after = before.clone();
-    let n = slotconst::run(&mut after);
+    // The plain rule: SLOTCOMB has its own tests (`run_comb`).
+    let n = slotconst::run_with(&mut after, false);
     cranelift_codegen::verify_function(&after, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
         .unwrap_or_else(|e| panic!("invalid after slotconst: {e}\n{after}"));
     check(&before, &after, &Facts::default(), &Config { trials: 64, ..Config::default() })
