@@ -306,9 +306,10 @@ fn main() {
     }
     let dt = t0.elapsed().as_secs_f64();
     println!(
-        "rafuzz: seeds {start}..{seed} ({n} in {dt:.1}s, {:.0}/s): checked {:?}, no-func {nofunc}, unallocatable {unalloc}, edits {edits} (stack {stack}), failures {fails}",
+        "rafuzz: seeds {start}..{seed} ({n} in {dt:.1}s, {:.0}/s): checked {:?}, no-func {nofunc}, unallocatable {unalloc}, edits {edits} (stack {stack}), potts {:?}, failures {fails}",
         n as f64 / dt.max(1e-9),
-        modes
+        modes,
+        regalloc2::pliron_potts_counts()
     );
     std::process::exit(if fails > 0 { 1 } else { 0 });
 }

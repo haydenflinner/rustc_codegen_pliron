@@ -5061,6 +5061,12 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
         self.block_freq.get(block.index()).copied()
     }
 
+    // PLIRON: register copies, for regalloc2's `PLIRON_RA2_POTTS_COPY`.
+    fn pliron_move(&self, insn: InsnIndex) -> Option<(regalloc2::VReg, regalloc2::VReg)> {
+        let (d, s) = self.insts[insn.index()].is_move()?;
+        Some((s.to_virtual_reg()?.into(), d.to_reg().to_virtual_reg()?.into()))
+    }
+
     // PLIRON: the frontend's cold marks, for `PLIRON_RA2_COLDSPLIT`.
     fn block_is_cold(&self, block: BlockIndex) -> bool {
         self.block_order.is_cold(block)

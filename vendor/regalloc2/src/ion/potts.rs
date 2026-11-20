@@ -82,7 +82,8 @@ const PARETO_W: f32 = 1024.0;
 impl<'a, F: Function> Env<'a, F> {
     pub(crate) fn potts_relabel(&mut self) {
         let mode = crate::potts_mode();
-        if mode == 0 {
+        let copies = crate::potts_copy_on();
+        if mode == 0 && !copies {
             return;
         }
         // Mode 1: only Pareto steps (no edge of the value gains a move), so
@@ -166,6 +167,9 @@ impl<'a, F: Function> Env<'a, F> {
         // First pass: each value's current edge cost, to order the work.
         let mut order: Vec<(f32, u32)> = Vec::new();
         for v in 0..nv {
+            if mode == 0 {
+                break;
+            }
             if overlap[v] || start[v] == start[v + 1] {
                 continue;
             }
@@ -274,6 +278,7 @@ impl<'a, F: Function> Env<'a, F> {
                 }
             }
             changed += 1;
+            crate::POTTS_VALUES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             saved += e0 - e;
             for i in 0..nodes.len() {
                 if cur[i] == orig[i] {
@@ -288,6 +293,129 @@ impl<'a, F: Function> Env<'a, F> {
             explain!("potts: {} value(s) relabelled, {} block piece(s), weighted edge cost -{}",
                      changed, moved_blocks, saved);
         }
+        if copies {
+            self.potts_copies(&overlap);
+        }
+    }
+
+    /// `PLIRON_RA2_POTTS_COPY`: make register copies identities. For a copy
+    /// `d = s` whose two sides hold different registers, give one side the
+    /// other's register when that side is a single live range defined by
+    /// an instruction, is neither a block parameter nor a branch argument
+    /// (so no CFG edge's move changes), has only plain operands, and the
+    /// register is free over the whole range. Kept only as a Pareto step
+    /// over every copy the range takes part in: none that is an identity
+    /// now stops being one, and at least one becomes one.
+    fn potts_copies(&mut self, overlap: &[bool]) {
+        let n = self.func.num_insts();
+        let mut done = 0usize;
+        for i in 0..n {
+            let inst = crate::Inst::new(i);
+            let Some((src, dst)) = self.func.pliron_move(inst) else { continue };
+            let (vs, vd) = (VRegIndex::new(src.vreg()), VRegIndex::new(dst.vreg()));
+            if vs == vd || overlap[vs.index()] || overlap[vd.index()] {
+                continue;
+            }
+            let (ps, pd) = (ProgPoint::before(inst), ProgPoint::after(inst));
+            let (Some(rs), Some(rd)) = (self.rehome_lr_at(vs, ps), self.rehome_lr_at(vd, pd)) else { continue };
+            let (as_, ad) = (self.get_alloc_for_range(rs.index), self.get_alloc_for_range(rd.index));
+            if as_ == ad {
+                continue;
+            }
+            // Try the source taking the destination's register, then the
+            // destination taking the source's.
+            for (v, lr, to) in [(vs, rs, ad), (vd, rd, as_)] {
+                if self.potts_copy_try(v, lr, to) {
+                    done += 1;
+                    break;
+                }
+            }
+        }
+        if done > 0 {
+            explain!("potts: {} copy range(s) relabelled", done);
+        }
+    }
+
+    /// One side of `potts_copies`: may value `v`'s only live range `lr` take
+    /// `to`? Applies it when so.
+    fn potts_copy_try(&mut self, v: VRegIndex, lr: LiveRangeListEntry, to: Allocation) -> bool {
+        let Some(preg) = to.as_reg() else { return false };
+        if self.ctx.pregs[preg.index()].is_stack || self.ctx.vregs[v].ranges.len() != 1 {
+            return false;
+        }
+        let r = &self.ctx.ranges[lr.index];
+        if self.ctx.bundles[r.bundle].limit.is_some() {
+            return false;
+        }
+        let from = self.get_alloc_for_range(lr.index);
+        if from.as_reg().is_none() {
+            return false;
+        }
+        // Defined by an instruction inside the range (not a block parameter),
+        // every operand plain.
+        let mut has_def = false;
+        for u in r.uses.iter() {
+            match u.operand.constraint() {
+                OperandConstraint::Any | OperandConstraint::Reg => {}
+                _ => return false,
+            }
+            if u.operand.kind() == OperandKind::Def {
+                has_def = true;
+            }
+        }
+        if !has_def {
+            return false;
+        }
+        // Not a branch argument.
+        let outs = &self.ctx.blockparam_outs;
+        let lo = outs.partition_point(|o| o.from_vreg < v);
+        if outs.get(lo).is_some_and(|o| o.from_vreg == v) {
+            return false;
+        }
+        // Pareto over the range's copies.
+        let mut gain = 0i32;
+        for u in r.uses.iter() {
+            let inst = u.pos.inst();
+            let Some((src, dst)) = self.func.pliron_move(inst) else { continue };
+            let (other, at) = if VRegIndex::new(src.vreg()) == v {
+                (VRegIndex::new(dst.vreg()), ProgPoint::after(inst))
+            } else if VRegIndex::new(dst.vreg()) == v {
+                (VRegIndex::new(src.vreg()), ProgPoint::before(inst))
+            } else {
+                continue;
+            };
+            let Some(oe) = self.rehome_lr_at(other, at) else { return false };
+            let oa = self.get_alloc_for_range(oe.index);
+            if oa == from {
+                return false;
+            }
+            if oa == to {
+                gain += 1;
+            }
+        }
+        if gain <= 0 {
+            return false;
+        }
+        let key = LiveRangeKey::from_range(&lr.range);
+        if self.ctx.pregs[preg.index()].allocations.btree.contains_key(&key) {
+            return false;
+        }
+        if !crate::potts_take() {
+            return false;
+        }
+        explain!("potts copy v{}: {} -> {} ({} copy(s))", v.index(), from, to, gain);
+        crate::POTTS_COPIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let old_bundle = self.ctx.ranges[lr.index].bundle;
+        let range = self.ctx.ranges[lr.index].range;
+        let piece = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
+        self.ctx.bundles[piece].spillset = self.ctx.bundles[old_bundle].spillset;
+        self.ctx.bundles[piece].allocation = to;
+        self.ctx.bundles[old_bundle].ranges.retain(|x| x.index != lr.index);
+        self.ctx.bundles[piece].ranges.push(LiveRangeListEntry { range, index: lr.index });
+        self.ctx.ranges[lr.index].bundle = piece;
+        let res = self.ctx.pregs[preg.index()].allocations.btree.insert(key, lr.index);
+        debug_assert!(res.is_none());
+        true
     }
 
     /// The energy of value `v`: its nodes (blocks it lives through in one

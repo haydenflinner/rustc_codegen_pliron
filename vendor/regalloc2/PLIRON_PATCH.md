@@ -601,3 +601,13 @@ Pareto steps (no edge of the value gains a move); `=2` trusts the block
 frequencies. `PLIRON_RA2_POTTS_MAXLIVE` (live-in budget per function),
 `PLIRON_RA2_POTTS_LIMIT=N` (first N relabelled values, for bisecting).
 Unit test `expansion_matches_brute_force`.
+
+`PLIRON_RA2_POTTS_COPY=1` (2026-11-20): `potts_copies` makes register
+copies identities. New `Function::pliron_move(inst) -> Option<(src, dst)>`
+(default `None`; Cranelift answers it from `MachInst::is_move`, the fuzz
+`Func` for every one-use one-def plain instruction under `Hints::copies`).
+For a copy whose two sides differ, one side that is a single plain live
+range defined by an instruction (no block parameter, no branch argument)
+takes the other side's register when free over the range; kept only when
+no copy of that range stops being an identity. `pliron_potts_counts()`
+reports how many values / copy ranges were relabelled (rafuzz prints it).

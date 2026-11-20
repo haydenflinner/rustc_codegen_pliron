@@ -2174,3 +2174,8 @@ only when `isa_builder` recorded a Linux triple (`set_x18_linux_default`,
 which nothing read before). It used to make x18 allocatable on Darwin and
 Windows too, where the platform reserves it (macOS zeroes it on context
 switches). Stanza `x18`.
+
+## `pliron_move` for regalloc2's `PLIRON_RA2_POTTS_COPY` (2026-11-20)
+
+`src/machinst/vcode.rs` (`RegallocFunction for VCode`): `pliron_move`
+reports `MachInst::is_move` copies as `(source, destination)` vregs.

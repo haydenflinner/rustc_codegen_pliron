@@ -72,6 +72,11 @@ pub struct Hints {
     pub remat: Vec<bool>,
     pub no_merge: Vec<bool>,
     pub last_slot: bool,
+    /// PLIRON: answer `pliron_move` for every one-use one-def plain
+    /// instruction (the checker validates the allocation, not what the
+    /// instruction computes, so any such instruction may stand for a copy):
+    /// exercises `PLIRON_RA2_POTTS_COPY`.
+    pub copies: bool,
 }
 
 impl Function for Func {
@@ -93,6 +98,24 @@ impl Function for Func {
 
     fn multi_spillslot_named_by_last_slot(&self) -> bool {
         self.hints.last_slot
+    }
+
+    fn pliron_move(&self, insn: Inst) -> Option<(VReg, VReg)> {
+        if !self.hints.copies {
+            return None;
+        }
+        let d = &self.insts[insn.index()];
+        if d.op != InstOpcode::Op || d.operands.len() != 2 || !d.clobbers.is_empty() {
+            return None;
+        }
+        let plain = |o: &Operand| matches!(o.constraint(), OperandConstraint::Any | OperandConstraint::Reg);
+        let (a, b) = (&d.operands[0], &d.operands[1]);
+        let (u, df) = match (a.kind(), b.kind()) {
+            (OperandKind::Use, OperandKind::Def) => (a, b),
+            (OperandKind::Def, OperandKind::Use) => (b, a),
+            _ => return None,
+        };
+        (plain(u) && plain(df) && u.vreg().class() == df.vreg().class()).then(|| (u.vreg(), df.vreg()))
     }
 
     fn num_insts(&self) -> usize {
@@ -715,6 +738,7 @@ impl Func {
                 h.remat.push(u.ratio(1, 4)?);
             }
             h.last_slot = bool::arbitrary(u)?;
+            h.copies = u.ratio(3, 4)?;
             builder.f.hints = h;
         }
 

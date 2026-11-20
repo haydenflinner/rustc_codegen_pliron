@@ -994,6 +994,22 @@ time, memory, code size, stack frames) in ~20 min and writes
   program worse. `PLIRON_RA2_POTTS_LIMIT=N` bisects;
   `PLIRON_RA_EXPLAIN` prints `potts` lines with every changed edge.
   `docs/history/2026-11-19-ra-flow.md`.
+- `PLIRON_RA2_POTTS_COPY=1` (opt-in, 2026-11-20) — after allocation a
+  register copy whose two sides differ becomes an identity when one side
+  is a single plain live range (no block parameter or branch argument)
+  and the other side's register is free over it (call arguments
+  `arg_detach` copied whose other uses lowering folded away: pulldown's
+  `Parser::next` computed `sp` into `x4` and moved it to `x0`). Pareto
+  over every copy of that range. Exact counts: pulldown -0.41%, protobuf
+  -0.20%, html -0.12%, regex -0.07%, nothing worse.
+- `PLIRON_LATCHSPEC_LIVE=1` (opt-in, 2026-11-20) — `latchspec` does not
+  fold a latch whose header parameter is still live into the other
+  successor of the folded branch (reachability from that successor, not
+  passing the header): the old and new value would both be live and the
+  back edge would need moves plus the split edge's jump (brotli's
+  `is_mostly_utf8`: `add; add; cbnz` then `mov; mov; b` -> `cbnz` then
+  `add; add; b`). Exact counts: compression -0.56%, pulldown -0.36%,
+  blind-sig -0.07%, nothing worse. Tests `tests/latchspec.rs`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

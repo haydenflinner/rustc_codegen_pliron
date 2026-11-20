@@ -621,6 +621,30 @@ pub(crate) fn potts_mode() -> u8 {
     1
 }
 
+/// PLIRON: how many values `PLIRON_RA2_POTTS` relabelled and how many copy
+/// ranges `PLIRON_RA2_POTTS_COPY` relabelled in this process (fuzz coverage).
+pub fn pliron_potts_counts() -> [usize; 2] {
+    use core::sync::atomic::Ordering;
+    [POTTS_VALUES.load(Ordering::Relaxed), POTTS_COPIES.load(Ordering::Relaxed)]
+}
+pub(crate) static POTTS_VALUES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub(crate) static POTTS_COPIES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// PLIRON (`PLIRON_RA2_POTTS_COPY=1`, opt-in): after allocation, a copy
+/// whose source dies at it (or whose destination starts there) and whose
+/// other side has one plain live range takes the other side's register
+/// when it is free, so the copy becomes an identity and is dropped at
+/// emission. See `ion/potts.rs`.
+pub(crate) fn potts_copy_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_POTTS_COPY").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
 /// PLIRON (`PLIRON_RA2_POTTS_MAXLIVE`, default 2,000,000): functions with
 /// more live-in entries than this skip the relabelling (compile time).
 pub(crate) fn potts_max_liveins() -> usize {
@@ -2005,6 +2029,13 @@ pub trait Function {
     /// weights under `PLIRON_RA2_FREQ`; `None` keeps the loop-depth
     /// estimate for the block.
     fn block_hotness(&self, _block: Block) -> Option<f32> {
+        None
+    }
+
+    /// PLIRON: `insn` is a register-to-register copy `(source, destination)`
+    /// (`MachInst::is_move` in Cranelift), for `PLIRON_RA2_POTTS_COPY`
+    /// (`ion/potts.rs`). `None` when unknown or not a copy.
+    fn pliron_move(&self, _insn: Inst) -> Option<(VReg, VReg)> {
         None
     }
 
