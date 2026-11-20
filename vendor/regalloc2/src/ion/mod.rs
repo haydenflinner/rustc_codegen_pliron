@@ -36,6 +36,7 @@ pub(crate) mod moves;
 pub(crate) mod spill;
 pub(crate) mod postopt;
 pub(crate) mod rehome;
+pub(crate) mod potts;
 pub(crate) mod regionsplit;
 pub(crate) mod spillhoist;
 pub(crate) mod hints;
@@ -110,6 +111,9 @@ impl<'a, F: Function> Env<'a, F> {
         // PLIRON (`PLIRON_RA2_REHOME`): a value's place in a join-only
         // block follows the cheaper side of its edges (`ion/rehome.rs`).
         self.rehome_joins();
+        // PLIRON (`PLIRON_RA2_POTTS`): relabel each value's register block
+        // by block to remove edge moves (`ion/potts.rs`).
+        self.potts_relabel();
         if trace_enabled!() {
             self.dump_state();
         }

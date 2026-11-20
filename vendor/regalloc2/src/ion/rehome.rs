@@ -89,7 +89,7 @@ impl<'a, F: Function> Env<'a, F> {
 
     /// The live range of `vreg` that contains `p` (range lists sorted and
     /// free of overlaps).
-    fn rehome_lr_at(&self, vreg: VRegIndex, p: ProgPoint) -> Option<LiveRangeListEntry> {
+    pub(super) fn rehome_lr_at(&self, vreg: VRegIndex, p: ProgPoint) -> Option<LiveRangeListEntry> {
         let rs = &self.ctx.vregs[vreg].ranges;
         let i = rs.partition_point(|e| e.range.from <= p);
         if i == 0 {
@@ -103,7 +103,7 @@ impl<'a, F: Function> Env<'a, F> {
     /// `orig` keeps `[from, at)`; the new range gets `[at, to)`, the uses
     /// from `at` on, the same bundle, and its place in the vreg's and the
     /// bundle's sorted range lists.
-    fn rehome_split(
+    pub(super) fn rehome_split(
         &mut self,
         vreg: VRegIndex,
         orig: LiveRangeIndex,

@@ -498,6 +498,7 @@ source, not `pliron-cfg`'s `DEFAULT_ON`.
 | `PLIRON_RA2_SPILLHOIST` | regalloc2 `spillhoist.rs` | one spill store at the definition | on since 2026-11-18 |
 | `PLIRON_RA2_SRCVREG` | regalloc2 `moves.rs` | block-param moves carry the argument's vreg (constant args rematerialize) | on since 2026-11-17 |
 | `PLIRON_RA2_REHOME` | regalloc2 `rehome.rs` | a value's register in a join-only block follows the cheaper side | on (2) |
+| `PLIRON_RA2_POTTS=1\|2` | regalloc2 `potts.rs` | per value, α-expansion by min-cut over its blocks to remove edge moves; `1` Pareto steps only, `2` trusts frequencies | opt-in (2026-11-19: `=1` no program worse, html -0.10%, blind-sig -0.18%; `=2` regex +0.41%) |
 | `PLIRON_RA2_XBLOCK=1` | regalloc2 `moves.rs` | redundant-move state survives a single-predecessor fallthrough | opt-in (evaluated: pulldown +5k) |
 | `PLIRON_RA2_MERGEDEPTH=1..3` | regalloc2 `merge.rs` | merge blockparams of the deepest loops first | opt-in (evaluated: pulldown +0.6M..1.2M) |
 | `PLIRON_RA2_REMATW=0..7` (+`_MAXUSES`, `_MINUSSES`, `_CHEAP`) | Cranelift `vcode.rs` + regalloc2 `process.rs` | rematerializable spill weight; default `7` (`uses≥MINUSSES`, default 8); `=0` off; `_CHEAP` default on (immediates only for weight set) | on (7) since 2026-11-18 |

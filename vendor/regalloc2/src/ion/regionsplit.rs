@@ -68,7 +68,7 @@ struct BlockInfo {
 }
 
 /// Dinic max-flow on a small graph with an operation budget.
-struct Flow {
+pub(crate) struct Flow {
     head: Vec<u32>,
     next: Vec<u32>,
     to: Vec<u32>,
@@ -80,7 +80,7 @@ struct Flow {
 const NONE: u32 = u32::MAX;
 
 impl Flow {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Flow {
             head: vec![NONE; n],
             next: Vec::new(),
@@ -91,7 +91,7 @@ impl Flow {
         }
     }
 
-    fn add(&mut self, u: usize, v: usize, c_uv: i64, c_vu: i64) {
+    pub(crate) fn add(&mut self, u: usize, v: usize, c_uv: i64, c_vu: i64) {
         let a = self.to.len() as u32;
         self.to.push(v as u32);
         self.cap.push(c_uv);
@@ -128,7 +128,7 @@ impl Flow {
     }
 
     /// Max flow, or `None` when the budget runs out.
-    fn max_flow(&mut self, s: usize, t: usize, budget: usize) -> Option<i64> {
+    pub(crate) fn max_flow(&mut self, s: usize, t: usize, budget: usize) -> Option<i64> {
         let mut flow = 0i64;
         let mut ops = 0usize;
         let mut path: Vec<u32> = Vec::new();
@@ -190,14 +190,14 @@ impl Flow {
 
     /// Nodes reachable from `s` in the residual graph (the source side
     /// of a minimum cut).
-    fn source_side(&mut self, s: usize) -> Vec<bool> {
+    pub(crate) fn source_side(&mut self, s: usize) -> Vec<bool> {
         let mut ops = 0;
         self.bfs(s, &mut ops);
         self.level.iter().map(|&l| l >= 0).collect()
     }
 }
 
-fn to_cap(x: f32) -> i64 {
+pub(crate) fn to_cap(x: f32) -> i64 {
     (x * 4.0).round().max(0.0) as i64
 }
 

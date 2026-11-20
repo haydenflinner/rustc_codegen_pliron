@@ -983,6 +983,17 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `tools/raproof` — exact clique / chromatic certificates on fuzz
   funcs vs ion/greedy/fast preg footprint (`regalloc2::prove`;
   docs/regalloc.md). Research harness, not in the gate.
+- `PLIRON_RA2_POTTS=1|2` (opt-in, vendored regalloc2, 2026-11-19) —
+  after allocation, each value's register is relabelled block by block
+  to remove edge moves: a Potts energy (edge frequency where the ends
+  disagree) minimized by α-expansion, each step a min-cut
+  (`ion/potts.rs`). `=1` takes only Pareto steps (no edge gains a move:
+  safe under any profile); `=2` trusts the static frequencies, which an
+  eight-way `match` in regex's `follow_epsilons` fooled (+0.41%). Exact
+  counts `=1`: blind-sig -0.18%, html -0.10%, protobuf -0.08%, no
+  program worse. `PLIRON_RA2_POTTS_LIMIT=N` bisects;
+  `PLIRON_RA_EXPLAIN` prints `potts` lines with every changed edge.
+  `docs/history/2026-11-19-ra-flow.md`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

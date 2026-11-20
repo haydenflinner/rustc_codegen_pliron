@@ -588,3 +588,16 @@ it. Static html corpus, `=2`: loop-weighted moves 716k -> 675k,
 instructions 6.970M -> 6.919M; `=1` almost nothing.
   2026-11-19: exact interference, reserve-and-retry temps, ion delegation over
   `PLIRON_RA_MCTS_FALLBACK`, `PLIRON_RA_TIME`: `docs/history/2026-11-19-ra-mcts-whole-function.md`.
+
+## `PLIRON_RA2_POTTS` (2026-11-19): relabel registers block by block to remove edge moves
+
+`src/ion/potts.rs`, called from `Env::run` after `rehome_joins`. Per value,
+an α-expansion over the blocks it lives through (Potts energy: edge
+frequency where the two ends of an edge disagree), each step a minimum
+cut (`regionsplit::Flow`, now `pub(crate)` with `to_cap`); a relabelled
+block's piece gets its own bundle, as in `rehome.rs` (whose
+`rehome_lr_at` / `rehome_split` are now `pub(super)`). `=1` takes only
+Pareto steps (no edge of the value gains a move); `=2` trusts the block
+frequencies. `PLIRON_RA2_POTTS_MAXLIVE` (live-in budget per function),
+`PLIRON_RA2_POTTS_LIMIT=N` (first N relabelled values, for bisecting).
+Unit test `expansion_matches_brute_force`.
