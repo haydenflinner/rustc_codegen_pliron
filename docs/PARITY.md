@@ -1366,6 +1366,14 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    values stay live on the other path (compression's placement case).
    Together: pulldown-cmark -0.78%, compression -0.57%, protobuf -0.22%,
    html-rewriter -0.13%, regex -0.09%, nothing worse.
+   **Done (default on, 2026-11-20): pieces and copy pairs in one energy.**
+   `PLIRON_RA2_POTTS_PIECES` lets the relabelling move a value's partial
+   block pieces and prices register copies inside them: protobuf -0.45%,
+   html-rewriter -0.43%, regex -0.23%, json -0.22%, pulldown -0.19%,
+   blind-sig -0.09%, compression -0.08%, nothing worse. What is left of
+   the move excess is mostly not an allocation choice (call arguments
+   kept across calls, loop-invariant header parameters;
+   `history/2026-11-19-ra-flow.md`).
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain

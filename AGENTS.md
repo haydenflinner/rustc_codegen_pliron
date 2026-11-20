@@ -1002,13 +1002,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   `Parser::next` computed `sp` into `x4` and moved it to `x0`). Pareto
   over every copy of that range. Exact counts: pulldown -0.41%, protobuf
   -0.20%, html -0.12%, regex -0.07%, nothing worse.
-- `PLIRON_RA2_POTTS_PIECES=1` (opt-in, 2026-11-20) — `POTTS` nodes also
+- `PLIRON_RA2_POTTS_PIECES` (default on since 2026-11-20, `=0` off) — `POTTS` nodes also
   include a value's partial block pieces (live in and dying there, or
   defined there and leaving or dying), and register copies inside a
   piece are pairs of the energy (the copy's other side fixed): the copy
-  phase's preference inside the same α-expansion. rafuzz: 79k relabelled
-  values in 20k seeds, checker-clean. `rastat.py static` now splits
-  weighted moves by kind (`mov:edge`, `mov:callarg`, ...).
+  phase's preference inside the same α-expansion; a piece ending at an
+  in-block split pairs with the value's next range, and no relabel brings
+  a callee-saved register into a block that has none (shrink-wrapping).
+  Exact counts: protobuf -0.45%, html -0.43%, regex -0.23%, json -0.22%,
+  pulldown -0.19%, blind-sig -0.09%, compression -0.08%, none worse.
+  `rastat.py static` splits weighted moves by kind (`mov:edge`, ...).
 - `PLIRON_LATCHSPEC_LIVE` (default on since 2026-11-20, `=0` off) — `latchspec` does not
   fold a latch whose header parameter is still live into the other
   successor of the folded branch (reachability from that successor, not
