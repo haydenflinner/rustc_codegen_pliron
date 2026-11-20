@@ -287,6 +287,31 @@ before acting on it. `rastat.py dyn` already charged by llvm-objdump's
 function ranges and used `fn=` only for the load offset (now 0 when the
 addresses are the binary's own); its tables stand.
 
+### Dynamic baseline (main after POTTS / COPY / PIECES / LATCHSPEC_LIVE / SIBCALL, 2026-11-20)
+
+`rastat.py dyn --tag now` at `deeb0f89` (per-function numbers in
+`target/rastat/dyn-now.json`). Ours / LLVM, executed; against the
+2026-11-18 table below every program's overhead ratio fell (compression
+1.459 -> 1.339, pulldown 1.240 -> 1.158, blind-sig 1.411 -> 1.345) and so
+did every total (html 1.166 -> 1.150, pulldown 1.120 -> 1.105).
+
+| program | st | ld | mov | csr | overhead | all insts |
+|---|---|---|---|---|---|---|
+| blake3-scalar | 1.00 | 1.75 | 0.44 | 1.33 | 1.222 | 1.048 |
+| blind-sig | 1.76 | 2.24 | 1.25 | 1.11 | 1.345 | 1.090 |
+| pulldown-cmark | 1.27 | 0.82 | 1.62 | 0.99 | 1.158 | 1.105 |
+| regex | 0.88 | 1.02 | 1.31 | 1.01 | 1.084 | 1.078 |
+| rust-compression | 3.17 | 0.88 | 2.00 | 0.84 | 1.339 | 1.069 |
+| rust-html-rewriter | 1.45 | 1.20 | 1.48 | 1.11 | 1.284 | 1.150 |
+| rust-json | 1.29 | 1.06 | 1.41 | 0.90 | 1.110 | 1.108 |
+| rust-protobuf | 1.73 | 1.81 | 1.07 | 1.02 | 1.144 | 1.055 |
+
+Excess moves by kind (ours - LLVM, executed): edge moves still lead
+(html +1.22M, compression +0.84M, regex +0.67M, pulldown +0.52M,
+protobuf +0.49M); `callarg` fell most (html +0.73M -> +0.47M, pulldown
++0.36M -> +0.25M, protobuf now -0.29M). Compression's stores are 3.2x
+LLVM's, the largest single class ratio left.
+
 ### Dynamic baseline (main after X17 + WIDE128 + REGION, 2026-11-18)
 
 Executed instructions, callgrind, aarch64-unknown-linux-musl, both sides
