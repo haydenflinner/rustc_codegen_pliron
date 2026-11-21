@@ -1320,6 +1320,13 @@ pub(crate) fn iropt_head(
         pt!(prof, cgu, "byvalhome", memcpyopt::run_byval(ctx, st));
         pt!(prof, cgu, "domcheck:bv", domcheck::run(ctx, st, "byvalhome"));
     }
+    // `PLIRON_MEMCPYOPT_SRCFWD=1`: temps that only copy an unaliased
+    // param read the param (memcpyopt::run_srcfwd). After phisimp (an
+    // inlined callee's params no longer go through block args) and nocap
+    // (the param's call operands must be non-captured).
+    if pass_enabled("PLIRON_MEMCPYOPT") {
+        pt!(prof, cgu, "srcfwd", memcpyopt::run_srcfwd(ctx, st));
+    }
     if pass_enabled("PLIRON_SROA") {
         pt!(prof, cgu, "sroa", sroa::run(ctx, st));
         pt!(prof, cgu, "domcheck:sroa", domcheck::run(ctx, st, "sroa"));
@@ -1488,6 +1495,11 @@ pub(crate) fn iropt_tail(
         })
     {
         pt!(prof, cgu, "nocap3", nocapture::run(ctx, st));
+    }
+    // `PLIRON_MEMCPYOPT_SRCFWD=1` again: adopt + nocap3 may have shown a
+    // param's cross-CGU callees keep nothing.
+    if adopt_ord.is_some() && pass_enabled("PLIRON_MEMCPYOPT") {
+        pt!(prof, cgu, "srcfwd2", memcpyopt::run_srcfwd(ctx, st));
     }
     // `PLIRON_SROA_TAILSPLIT=1`: re-split allocas that deferred on a
     // bodiless-callee pin — adopt + nocap3 may have proven the pin

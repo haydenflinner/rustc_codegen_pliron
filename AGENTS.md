@@ -1147,6 +1147,22 @@ time, memory, code size, stack frames) in ~20 min and writes
   (`parse_block`: the changed frame moves which values spill; requiring
   writers in the copy's block or disjoint writers kept that loss and lost
   html's win). Stanza `solecopy`.
+- `PLIRON_MEMCPYOPT_SRCFWD=1` (opt-in, 2026-11-21) — a stack temporary
+  that only a copy of an entry param's bytes writes (rustc `noalias`: a
+  by-value aggregate passed by pointer, a `&mut`, a frozen `&T`) reads the
+  param instead, and the copy and the temporary go
+  (`memcpyopt::run_srcfwd`, after phisimp and again after the xfacts
+  adopt). Refused when an op that may write the param lies on a path from
+  a copy to a read; if a call may keep the param's address, every op that
+  may write memory other than an alloca or a fresh allocation counts. Drop
+  glue on the temporary is rebased too and counts as a write. Exact
+  counts: html -0.354% (`LimitedVec::push`'s by-value item: -134k in push,
+  -134k in `memcpy`), compression -0.174% (`Vec::extend_with`), the rest
+  within noise. lol_html's `exec_without_attrs` keeps its 144-byte copy:
+  `add_execution_branch(&mut ctx)` reaches cross-CGU `RawVec::grow_one` and
+  hashbrown's `reserve_rehash`, so `ctx` may be captured.
+  `PLIRON_TRACE=pliron::memcpyopt=debug` prints `srcfwd:` lines. Stanza
+  `srcfwd`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

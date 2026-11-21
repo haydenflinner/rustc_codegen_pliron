@@ -11,7 +11,7 @@
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 halfclob regionsplit bigtmp fragcopyout
-#   partinline solecopy
+#   partinline solecopy srcfwd
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -998,6 +998,22 @@ t_partinline() {
   done
 }
 
+t_srcfwd() {
+  # PLIRON_MEMCPYOPT_SRCFWD: a temporary that only a copy of an unaliased
+  # by-value parameter writes reads the parameter. The parameter written
+  # between the copy and the reads, directly or through a pointer a call
+  # kept, must keep the copy. Output pinned by stock rustc, the knob off,
+  # on, and on with 4 CGUs.
+  rustc --edition 2021 -O tests/srcfwd/main.rs -o $out/srcfwd-stock$exe || return 1
+  local v i=0
+  for v in "PLIRON_MEMCPYOPT_SRCFWD=0 CGU=1" "PLIRON_MEMCPYOPT_SRCFWD=1 CGU=1" "PLIRON_MEMCPYOPT_SRCFWD=1 CGU=4"; do
+    i=$((i + 1))
+    env ${v% CGU=*} rustc $BE --edition 2021 -O -C codegen-units=${v##*CGU=} tests/srcfwd/main.rs -o $out/srcfwd$i$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/srcfwd-stock$exe) <($out/srcfwd$i$exe) || { echo "srcfwd: output differs ($v)" >&2; return 1; }
+  done
+}
+
 t_solecopy() {
   # PLIRON_MEMCPYOPT_SOLECOPY: memcpyopt's "tmp could promote" guard does not
   # protect a temporary whose only reader is the copy into its destination
@@ -1698,6 +1714,7 @@ want x18 && t_x18
 want halfclob && t_halfclob
 want partinline && t_partinline
 want solecopy && t_solecopy
+want srcfwd && t_srcfwd
 want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi

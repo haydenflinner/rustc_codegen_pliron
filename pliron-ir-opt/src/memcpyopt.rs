@@ -1876,6 +1876,7 @@ fn home_users(
     st: &State,
     a: Value,
     size: u64,
+    drop_writes: bool,
 ) -> Option<FxHashMap<Ptr<Operation>, Vec<Touch>>> {
     let mut out: FxHashMap<Ptr<Operation>, Vec<Touch>> = FxHashMap::default();
     let mut work = vec![(a, 0u64)];
@@ -1969,11 +1970,14 @@ fn home_users(
                         .and_then(|id| st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref())))
                         .and_then(|sym| st.nocapture.get(sym))
                         .is_some_and(|s| s.contains(&(ai as u32)));
-                let (n, _) = info.arg_extent.as_ref().and_then(|e| e.get(ai)).copied()?;
+                let Some((n, _)) = info.arg_extent.as_ref().and_then(|e| e.get(ai)).copied() else {
+                    nope!("home: call operand has no extent ({:?} #{ai})", info.callee);
+                };
                 if !nocap || n == 0 {
-                    nope!("home: call operand may retain or has no extent ({:?} #{ai})", info.callee);
+                    nope!("home: call operand may retain (nocap {nocap}) or has no extent ({n}) ({:?} #{ai})", info.callee);
                 }
-                out.entry(op).or_default().push(touch(!drop, !drop, base, n));
+                let rw = !drop || drop_writes;
+                out.entry(op).or_default().push(touch(rw, rw, base, n));
             } else {
                 nope!("home: address escapes into {}", Operation::get_opid(op, ctx));
             }
@@ -2155,7 +2159,7 @@ fn try_byval(ctx: &mut Context, st: &mut State, m: Ptr<Operation>) -> bool {
     {
         bail!("home range/alignment/promotion");
     }
-    let Some(users) = home_users(ctx, st, a, asize) else {
+    let Some(users) = home_users(ctx, st, a, asize, false) else {
         bail!("home escapes");
     };
     // Another operand of the same call reaching into `%a`: the callee
@@ -2996,4 +3000,470 @@ mod tests {
         );
         assert!(!sib_forward(&body, true));
     }
+}
+
+/// `PLIRON_MEMCPYOPT_SRCFWD=1`: a temporary that only a copy of an
+/// unaliased parameter's bytes writes reads the parameter instead.
+///
+/// ```text
+/// t = alloca n;  memcpy(t, s + off, n);  ... load (t + k) ...
+/// ```
+///
+/// becomes `load (s + off + k)` and the copy and `t` go. `s` is an entry
+/// param rustc marks `noalias` (a by-value aggregate passed by pointer, a
+/// `&mut`, a frozen `&T`) with at least `off + n` dereferenceable bytes,
+/// whose address never leaves the function's view ([`home_users`], drop
+/// glue counted as a write): only the function's own ops can change its
+/// bytes. `t` is an alloca of exactly `n` bytes whose every use, through
+/// GEPs, is a load, the source of a `memcpy`/`memmove`, a lifetime marker,
+/// or the destination of such a copy from the same `(s, off)`. Sound when
+/// no op that may write `s`'s `[off, off + n)` lies on a path from a copy
+/// to a read of `t` (one forward walk from the copies, one from the writes
+/// they reach); a read no copy reaches read uninitialized bytes, and the
+/// parameter's are a refinement of them.
+///
+/// lol_html's `SelectorMatchingVm::exec_without_attrs(ctx)` moved its
+/// 152-byte `ExecutionCtx` into a local on every path and the 144-byte
+/// `stack_item` out of that local again (`into_owned`): two `memcpy` calls
+/// per element, plus one in each bailout path.
+pub fn run_srcfwd(ctx: &mut Context, st: &mut State) {
+    if !pliron_cfg::env_is("PLIRON_MEMCPYOPT_SRCFWD", "1") {
+        return;
+    }
+    let mut n = 0;
+    let trace = pliron_cfg::tracing_on();
+    let funcs: Vec<_> = st.funcs.iter().map(|(name, f)| (f.op, trace.then(|| name.clone()))).collect();
+    for (f, name) in funcs {
+        if !opt_body(ctx, st, f) {
+            continue;
+        }
+        let Some(entry) = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head() else {
+            continue;
+        };
+        let bname = crate::bisect_name(st, f);
+        // Rounds: a temp copied from a rewritten temp is a candidate next.
+        for _ in 0..4 {
+            let mut cands: Vec<Value> = Vec::new();
+            let mut seen: FxHashSet<Value> = FxHashSet::default();
+            for b in crate::inline::blocks(ctx, f) {
+                for op in crate::inline::ops(ctx, b) {
+                    if !matches!(st.intrinsics.get(op).map(|s| s.as_str()), Some("llvm.memcpy" | "llvm.memmove")) {
+                        continue;
+                    }
+                    let t = op.deref(ctx).get_operand(ctx, 0);
+                    if t.defining_op().is_some_and(|a| Operation::is_op::<AllocaOp>(a, ctx))
+                        && param_base(ctx, st, entry, op.deref(ctx).get_operand(ctx, 1)).is_some()
+                        && seen.insert(t)
+                    {
+                        cands.push(t);
+                    }
+                }
+            }
+            let mut did = 0;
+            for t in cands {
+                if srcfwd_one(ctx, st, entry, t, name.as_deref(), &bname) {
+                    did += 1;
+                }
+            }
+            n += did;
+            if did == 0 {
+                break;
+            }
+        }
+    }
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO) {
+        tracing::info!(target: "pliron::stats", "srcfwd {}: {n} temporaries read from their source", st.cgu)
+    }
+}
+
+/// `v` as `(param, offset)`: constant GEPs down to an entry param of
+/// `entry` that rustc marks `noalias`.
+fn param_base(ctx: &Context, st: &State, entry: Ptr<BasicBlock>, v: Value) -> Option<(Value, u64)> {
+    let mut v = v;
+    let mut off = 0u64;
+    for _ in 0..16 {
+        match v.defining_op() {
+            Some(g) if Operation::is_op::<GetElementPtrOp>(g, ctx) => {
+                let o = gep_offset(ctx, st, g)?;
+                off = u64::try_from(off as i64 + o).ok()?;
+                v = g.deref(ctx).get_operand(ctx, 0);
+            }
+            Some(_) => return None,
+            None => {
+                if v.defining_block() != Some(entry) {
+                    return None;
+                }
+                st.noalias.get(v)?;
+                return Some((v, off));
+            }
+        }
+    }
+    None
+}
+
+macro_rules! sfno {
+    ($name:expr, $($t:tt)*) => {{
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::memcpyopt", "srcfwd: {} ({})", format!($($t)*), $name.unwrap_or(""));
+        }
+        return false;
+    }};
+}
+
+/// Ops of `targets` that run after one of `starts` on some path (invoke
+/// unwind edges included); `None` when the walk runs out of budget.
+fn reached_after(
+    ctx: &Context,
+    st: &State,
+    starts: &[Ptr<Operation>],
+    targets: &FxHashSet<Ptr<Operation>>,
+) -> Option<FxHashSet<Ptr<Operation>>> {
+    const MAX_OPS: usize = 1 << 16;
+    let mut out = FxHashSet::default();
+    let mut seen = 0usize;
+    let mut visited: FxHashSet<Ptr<BasicBlock>> = FxHashSet::default();
+    let mut work: Vec<(Ptr<BasicBlock>, Option<Ptr<Operation>>)> = Vec::new();
+    for &s in starts {
+        let b = s.deref(ctx).get_parent_block()?;
+        work.push((b, s.get_next(ctx)));
+        if let Some(&(pad, _)) = st.invokes.get(s) {
+            work.push((pad, None));
+        }
+    }
+    while let Some((b, from)) = work.pop() {
+        if from.is_none() && !visited.insert(b) {
+            continue;
+        }
+        let mut cur = match from {
+            Some(op) => Some(op),
+            None => b.deref(ctx).get_head(),
+        };
+        let mut last = None;
+        while let Some(op) = cur {
+            seen += 1;
+            if seen > MAX_OPS {
+                return None;
+            }
+            last = Some(op);
+            if targets.contains(&op) {
+                out.insert(op);
+            }
+            if let Some(&(pad, _)) = st.invokes.get(op) {
+                work.push((pad, None));
+            }
+            cur = op.get_next(ctx);
+        }
+        if let Some(t) = last {
+            for s in t.deref(ctx).successors(ctx) {
+                work.push((s, None));
+            }
+        }
+    }
+    Some(out)
+}
+
+fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Value, name: Option<&str>, bname: &str) -> bool {
+    let Some(t_op) = t.defining_op() else { return false };
+    let Some(&(n, _)) = st.allocas.get(t) else { return false };
+    if n == 0 {
+        return false;
+    }
+    // `t`'s cone: copies into it, reads of it, markers.
+    let mut copies: Vec<Ptr<Operation>> = Vec::new();
+    let mut readers: Vec<Ptr<Operation>> = Vec::new();
+    let mut markers: Vec<Ptr<Operation>> = Vec::new();
+    let mut drops: Vec<Ptr<Operation>> = Vec::new();
+    let mut src: Option<(Value, u64)> = None;
+    let mut work = vec![t];
+    let mut budget = 4096usize;
+    while let Some(p) = work.pop() {
+        for u in p.uses_iter(ctx) {
+            budget = budget.saturating_sub(1);
+            if budget == 0 {
+                sfno!(name, "budget");
+            }
+            let op = u.user_op();
+            let i = u.find_index(ctx);
+            if Operation::is_op::<GetElementPtrOp>(op, ctx) {
+                if i != 0 {
+                    sfno!(name, "temp as a gep index");
+                }
+                work.push(op.deref(ctx).get_result(ctx, 0));
+            } else if Operation::is_op::<LoadOp>(op, ctx) {
+                if st.volatile.contains(op) {
+                    sfno!(name, "volatile read");
+                }
+                readers.push(op);
+            } else if let Some(nm) = st.intrinsics.get(op).map(|s| s.as_str()) {
+                match nm {
+                    "llvm.lifetime.start" | "llvm.lifetime.end" => markers.push(op),
+                    "llvm.memcpy" | "llvm.memmove" if i == 1 && !st.volatile.contains(op) => readers.push(op),
+                    "llvm.memcpy" | "llvm.memmove" if i == 0 && p == t && !st.volatile.contains(op) && !st.invokes.contains(op) => {
+                        let len = const_int(ctx, st, op.deref(ctx).get_operand(ctx, 2)).and_then(|x| u64::try_from(x).ok());
+                        if len != Some(n) {
+                            sfno!(name, "partial copy into the temp");
+                        }
+                        let Some(b) = param_base(ctx, st, entry, op.deref(ctx).get_operand(ctx, 1)) else {
+                            sfno!(name, "copy from something else");
+                        };
+                        if src.is_some_and(|s| s != b) {
+                            sfno!(name, "copies from two sources");
+                        }
+                        src = Some(b);
+                        copies.push(op);
+                    }
+                    _ => sfno!(name, "temp in {nm}"),
+                }
+            } else if Operation::get_op::<CallOp>(op, ctx).is_some_and(|c| c.get_attr_llvm_call_callee(ctx).is_some())
+                && st
+                    .calls
+                    .get(op)
+                    .and_then(|c| c.callee.as_deref())
+                    .is_some_and(|c| c.contains("4core3ptr9drop_glue") || c.contains("13drop_in_place"))
+            {
+                // Drop glue on the temp or a field of it (an unwind path
+                // dropping a value moved into it): it reads the bytes and,
+                // rebased, may write the param's.
+                drops.push(op);
+            } else {
+                sfno!(name, "temp in {} {:?}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()));
+            }
+        }
+    }
+    let Some((s, off)) = src else { return false };
+    readers.extend_from_slice(&drops);
+    let Some(&(deref, writable)) = st.noalias.get(s) else { return false };
+    if !drops.is_empty() && !writable {
+        sfno!(name, "drop of a temp copied from read-only memory");
+    }
+    if off.checked_add(n).is_none_or(|e| e > deref) {
+        sfno!(name, "source range past dereferenceable {deref}");
+    }
+    let frozen = drops.is_empty() && st.frozen.get(s).is_some_and(|&d| d >= off + n);
+    if !frozen {
+        let (lo, hi) = (off, off + n);
+        let Some((users, captured)) = src_touches(ctx, st, s, deref) else {
+            sfno!(name, "source walk budget");
+        };
+        if readers.iter().any(|r| users.contains_key(r)) {
+            sfno!(name, "a read of the temp also touches the source");
+        }
+        let mut writes: FxHashSet<Ptr<Operation>> = users
+            .iter()
+            .filter(|(_, ts)| ts.iter().any(|x| x.write && x.lo < hi && lo < x.hi))
+            .map(|(&op, _)| op)
+            .chain(drops.iter().copied())
+            .collect();
+        // A call may have kept the param's address: from then on any op
+        // that may write memory other than an alloca's may write it.
+        if captured {
+            // A copy out of the temp into memory the param may share
+            // would become an overlapping copy.
+            if readers.iter().any(|&r| !drops.contains(&r) && may_write_nonlocal(ctx, st, r)) {
+                sfno!(name, "a read of the temp copies into memory the source may share");
+            }
+            let f = entry.deref(ctx).get_parent_region().unwrap().deref(ctx).get_parent_op();
+            for b in crate::inline::blocks(ctx, f) {
+                for op in crate::inline::ops(ctx, b) {
+                    if may_write_nonlocal(ctx, st, op) {
+                        writes.insert(op);
+                    }
+                }
+            }
+        }
+        if !writes.is_empty() {
+            let Some(hit) = reached_after(ctx, st, &copies, &writes) else {
+                sfno!(name, "walk budget");
+            };
+            if !hit.is_empty() {
+                let hit: Vec<_> = hit.into_iter().collect();
+                let rs: FxHashSet<Ptr<Operation>> = readers.iter().copied().collect();
+                let Some(late) = reached_after(ctx, st, &hit, &rs) else {
+                    sfno!(name, "walk budget");
+                };
+                if !late.is_empty() {
+                    let what: Vec<String> = hit
+                        .iter()
+                        .take(4)
+                        .map(|&w| format!("{} {:?}", Operation::get_opid(w, ctx), st.calls.get(w).and_then(|c| c.callee.as_deref()).map(|c| &c[..c.len().min(90)])))
+                        .collect();
+                    sfno!(name, "source may be written between a copy and a read (captured {captured}; {} writes: {what:?})", hit.len());
+                }
+            }
+        }
+    }
+    if !crate::bisect_in("memcpyopt-srcfwd", bname) {
+        return false;
+    }
+    if pliron_cfg::tracing_on() {
+        tracing::debug!(target: "pliron::memcpyopt", "srcfwd: {n}-byte temp reads param at +{off}: {} copies, {} reads ({})",
+            copies.len(), readers.len(), name.unwrap_or(""));
+    }
+    for op in copies.into_iter().chain(markers) {
+        st.intrinsics.remove(op);
+        Operation::erase(op, ctx);
+    }
+    let base = crate::sroa::ptr_plus(ctx, st, s, off, t_op);
+    t.replace_all_uses_with(ctx, &base);
+    st.allocas.remove(t);
+    st.promoted.remove(t);
+    Operation::erase(t_op, ctx);
+    true
+}
+
+/// Every op that touches param `s` (`size` dereferenceable bytes) through
+/// GEPs, with the byte ranges it may read or write, and whether its
+/// address may outlive an op (a call that may keep it, a store of it as a
+/// value, a block argument, an integer). Drop glue reads and writes.
+/// `None` when the walk runs out of budget.
+fn src_touches(
+    ctx: &Context,
+    st: &State,
+    s: Value,
+    size: u64,
+) -> Option<(FxHashMap<Ptr<Operation>, Vec<Touch>>, bool)> {
+    let mut out: FxHashMap<Ptr<Operation>, Vec<Touch>> = FxHashMap::default();
+    let mut captured = false;
+    // (pointer, its offset when constant)
+    let mut work: Vec<(Value, Option<u64>)> = vec![(s, Some(0))];
+    let mut seen = 0usize;
+    let touch = |read, write, lo: Option<u64>, n: Option<u64>| match (lo, n) {
+        (Some(lo), Some(n)) => Touch { read, write, lo, hi: lo.saturating_add(n), kill: false },
+        _ => Touch { read, write, lo: 0, hi: size.max(1), kill: false },
+    };
+    while let Some((p, base)) = work.pop() {
+        for u in p.uses_iter(ctx) {
+            seen += 1;
+            if seen > 4096 {
+                return None;
+            }
+            let op = u.user_op();
+            let i = u.find_index(ctx);
+            if Operation::is_op::<GetElementPtrOp>(op, ctx) {
+                if i != 0 {
+                    captured = true;
+                    continue;
+                }
+                let nb = match (base, gep_offset(ctx, st, op)) {
+                    (Some(b), Some(o)) => u64::try_from(b as i64 + o).ok().filter(|&x| x <= size),
+                    _ => None,
+                };
+                work.push((op.deref(ctx).get_result(ctx, 0), nb));
+            } else if Operation::is_op::<LoadOp>(op, ctx) {
+                let w = size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0;
+                out.entry(op).or_default().push(touch(true, false, base, Some(w)));
+            } else if Operation::is_op::<StoreOp>(op, ctx) {
+                if i != 1 {
+                    captured = true;
+                    continue;
+                }
+                let w = size_align(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx)).0;
+                out.entry(op).or_default().push(touch(false, true, base, Some(w)));
+            } else if Operation::is_op::<ICmpOp>(op, ctx) {
+                // Comparing an address neither reads nor keeps it.
+            } else if let Some(name) = st.intrinsics.get(op).map(|s| s.as_str()) {
+                let opnds: Vec<Value> = op.deref(ctx).operands(ctx).collect();
+                match name {
+                    "llvm.lifetime.start" | "llvm.lifetime.end" => {}
+                    "llvm.memcpy" | "llvm.memmove" | "llvm.memset" if i == 0 || (i == 1 && name != "llvm.memset") => {
+                        let n = const_int(ctx, st, opnds[2]).and_then(|n| u64::try_from(n).ok());
+                        out.entry(op).or_default().push(touch(i == 1, i == 0, base, n));
+                    }
+                    _ => {
+                        captured = true;
+                        out.entry(op).or_default().push(touch(true, true, None, None));
+                    }
+                }
+            } else if let Some(c) = Operation::get_op::<CallOp>(op, ctx) {
+                let direct = c.get_attr_llvm_call_callee(ctx).is_some();
+                let ai = i.wrapping_sub(usize::from(!direct));
+                let info = st.calls.get(op);
+                let drop = info
+                    .and_then(|i| i.callee.as_deref())
+                    .is_some_and(|s| s.contains("4core3ptr9drop_glue") || s.contains("13drop_in_place"));
+                let nocap = (direct || i != 0)
+                    && (drop
+                        || info.and_then(|i| i.nocap.as_ref()).is_some_and(|n| n.get(ai) == Some(&true))
+                        || c
+                            .get_attr_llvm_call_callee(ctx)
+                            .and_then(|id| st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref())))
+                            .and_then(|sym| st.nocapture.get(sym))
+                            .is_some_and(|s| s.contains(&(ai as u32))));
+                let ext = info.and_then(|i| i.arg_extent.as_ref()).and_then(|e| e.get(ai)).map(|e| e.0).filter(|&n| n > 0);
+                if !nocap {
+                    captured = true;
+                }
+                out.entry(op).or_default().push(touch(true, true, base, ext));
+            } else {
+                // A block argument, a select, an integer: the address goes
+                // where this walk does not follow.
+                captured = true;
+                out.entry(op).or_default().push(touch(true, true, None, None));
+            }
+        }
+    }
+    Some((out, captured))
+}
+
+/// `op` may write memory that is not a local alloca's (conservative:
+/// unknown ops may).
+fn may_write_nonlocal(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
+    if Operation::is_op::<LoadOp>(op, ctx)
+        || Operation::is_op::<GetElementPtrOp>(op, ctx)
+        || Operation::is_op::<AllocaOp>(op, ctx)
+        || Operation::is_op::<ICmpOp>(op, ctx)
+    {
+        return false;
+    }
+    // An alloca, or a fresh allocation made in this function: neither
+    // can share the param's bytes.
+    let local = |v: Value| alloca_base(ctx, st, None, v).is_some() || fresh_alloc(ctx, st, v);
+    if Operation::is_op::<StoreOp>(op, ctx) {
+        return !local(op.deref(ctx).get_operand(ctx, 1));
+    }
+    if let Some(name) = st.intrinsics.get(op).map(|s| s.as_str()) {
+        return match name {
+            "llvm.lifetime.start" | "llvm.lifetime.end" | "llvm.assume" | "llvm.expect" | "pliron.eh.exn" => false,
+            "llvm.memcpy" | "llvm.memmove" | "llvm.memset" => !local(op.deref(ctx).get_operand(ctx, 0)),
+            _ => true,
+        };
+    }
+    if Operation::is_op::<CallOp>(op, ctx) {
+        let callee = st.calls.get(op).and_then(|i| i.callee.as_deref());
+        return !callee.is_some_and(|c| st.nowrite.get(c) == Some(&true) || alloc_shim(c));
+    }
+    if op.deref(ctx).num_regions() == 0 && op.deref(ctx).get_num_results() > 0 {
+        let id = Operation::get_opid(op, ctx).to_string();
+        if crate::irstat::is_pure(&id)
+            || matches!(id.as_str(), "llvm.gep" | "llvm.extract_value" | "llvm.insert_value" | "llvm.undef" | "llvm.constant" | "llvm.zero")
+        {
+            return false;
+        }
+    }
+    let id = Operation::get_opid(op, ctx).to_string();
+    !matches!(id.as_str(), "llvm.br" | "llvm.cond_br" | "llvm.switch" | "llvm.return" | "llvm.unreachable")
+}
+
+/// The allocator entry points that hand out fresh memory and write none
+/// the program can see (`__rust_alloc`, `__rust_alloc_zeroed`, the shim
+/// marker); not `realloc`/`dealloc`.
+fn alloc_shim(sym: &str) -> bool {
+    sym.ends_with("___rust_alloc")
+        || sym.ends_with("___rust_alloc_zeroed")
+        || sym.contains("___rust_no_alloc_shim_is_unstable")
+}
+
+/// `v` is, through GEPs, the result of an [`alloc_shim`] call.
+fn fresh_alloc(ctx: &Context, st: &State, v: Value) -> bool {
+    let mut v = v;
+    for _ in 0..16 {
+        let Some(d) = v.defining_op() else { return false };
+        if Operation::is_op::<GetElementPtrOp>(d, ctx) {
+            v = d.deref(ctx).get_operand(ctx, 0);
+            continue;
+        }
+        return Operation::is_op::<CallOp>(d, ctx)
+            && st.calls.get(d).and_then(|i| i.callee.as_deref()).is_some_and(|c| c.ends_with("___rust_alloc") || c.ends_with("___rust_alloc_zeroed"));
+    }
+    false
 }
