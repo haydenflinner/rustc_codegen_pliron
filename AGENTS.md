@@ -1118,7 +1118,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   the variant only through a join (html: 3 instructions per call left).
   `PLIRON_TRACE=pliron::partinline` names guards and sites. Stanza
   `partinline` (fails with the guard inverted).
-- `PLIRON_PARTINLINE_WIDE=1` (opt-in, 2026-11-21) — `partinline` also
+- `PLIRON_PARTINLINE_WIDE` (default on since 2026-11-21, `=0` off) — `partinline` also
   takes drop glue guards that decode a niche (`select`, `sext`, integer
   add/sub/and/or/xor before the compare: `Cow`'s drop glue) and guards
   reached through jumps (block arguments followed), allocas and lifetime

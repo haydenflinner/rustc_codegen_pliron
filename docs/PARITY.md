@@ -1409,6 +1409,9 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    compression -0.174%, the rest within noise. Open: lol_html's
    `exec_without_attrs` keeps its 144-byte copy because `ctx` reaches
    cross-CGU `RawVec::grow_one` (not known nocapture).
+   **Done (default on, 2026-11-21): `PLIRON_PARTINLINE_WIDE`**: drop glue
+   guards that decode a niche or sit behind the jumps inlining leaves
+   (`Cow` drops): pulldown -0.089%, html -0.079%, protobuf -0.032%.
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain

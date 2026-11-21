@@ -76,6 +76,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // compression -0.174%, the rest within noise
     // (`docs/history/2026-11-20-ivsr.md`). `PLIRON_MEMCPYOPT_SRCFWD=0` off.
     "PLIRON_MEMCPYOPT_SRCFWD",
+    // 2026-11-21: partinline takes niche-decoding and jump-chained drop
+    // glue guards. Exact counts: pulldown -0.089%, html -0.079%, protobuf
+    // -0.032%, the rest within noise (`docs/history/2026-11-20-ivsr.md`).
+    // `PLIRON_PARTINLINE_WIDE=0` off.
+    "PLIRON_PARTINLINE_WIDE",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
