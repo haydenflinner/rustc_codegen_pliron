@@ -1,0 +1,40 @@
+; test mergethread
+; lol_html's `consume_ch`: `Option<u8>` from `input.get(pos)`, the position
+; bumped and stored in the merge on both paths, then a match on the byte.
+; Both edges into the merge pass a constant flag: each gets a copy of the
+; bump and the store and jumps straight to its arm; the flag disappears and
+; the arm reads the copy's byte and position.
+; check-not: brif v34
+; check: store
+; check: store
+; diffcheck
+function %tag_open(i64, i64, i64) -> i64 {
+block0(v0: i64, v2: i64, v3: i64):
+    v13 = load.i64 notrap v0+40
+    v14 = icmp ult v13, v3
+    v425 = iconst.i8 0
+    brif v14, block28, block29(v425, v425)
+block28:
+    v24 = iadd.i64 v2, v13
+    v25 = load.i8 notrap v24
+    v16 = iconst.i8 1
+    jump block29(v16, v25)
+block29(v34: i8, v37: i8):
+    v22 = iconst.i64 1
+    v33 = iadd.i64 v13, v22
+    store notrap v33, v0+40
+    brif v34, block2, block8
+block8:
+    v50 = iconst.i64 7
+    return v50
+block2:
+    v61 = iconst.i8 33
+    v62 = icmp eq v37, v61
+    brif v62, block3, block4
+block3:
+    return v33
+block4:
+    v63 = uextend.i64 v37
+    v64 = iadd v63, v33
+    return v64
+}

@@ -1128,6 +1128,18 @@ time, memory, code size, stack frames) in ~20 min and writes
   registers on every call, and a later pass hoists the landing block's hash
   step back in front of the test), json +0.001%, the rest flat. Filetest
   `rangefold_tree_arms`.
+- `PLIRON_MERGETHREAD=1` (opt-in, 2026-11-21) — step `mergethread` after
+  `brthread`: a merge block of at most six pure ops and plain stores,
+  ending in `brif` on one of its parameters that every incoming edge
+  passes as a constant, is copied into each edge (a new block on a `brif`
+  edge), each copy jumping to the successor its constant selects; uses
+  of the merge's values under each successor read that copy's (both
+  successors must have the merge as their only predecessor, each picked
+  by at most one edge). lol_html's tag scanner consumes a byte as
+  `Option<u8>` and bumps the stored position in the merge before the
+  `match`: `jumpthread` takes pure merges only. `tag_open_state` 103 ->
+  88 instructions. Exact counts: json -0.21%, html -0.047%, none worse.
+  Filetest `mergethread_consume`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

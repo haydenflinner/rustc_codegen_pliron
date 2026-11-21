@@ -41,6 +41,7 @@ pub mod deadslot;
 pub mod sibcall;
 pub mod ivsr;
 pub mod brthread;
+pub mod mergethread;
 pub mod cmpmerge;
 pub mod selset;
 pub mod selxor;

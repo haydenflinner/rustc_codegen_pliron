@@ -101,6 +101,19 @@ fn pass(name: &str) -> Pass {
                     brif: true,
                     escape: true,
                     edge: true,
+                    store: false,
+                },
+            )
+        },
+        "taildup_store" => |f| {
+            pliron_clif_opt::taildup::run_opts(
+                f,
+                &rustc_hash::FxHashMap::default(),
+                pliron_clif_opt::taildup::Opts {
+                    brif: true,
+                    escape: true,
+                    edge: true,
+                    store: true,
                 },
             )
         },
@@ -150,6 +163,7 @@ fn pass(name: &str) -> Pass {
         },
         "rangefold" => rangefold::run,
         "rangefold_tree" => |f| rangefold::run_with(f, 3),
+        "mergethread" => pliron_clif_opt::mergethread::run,
         "rebase" => |f| {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::rebase::run(f, &mut an)

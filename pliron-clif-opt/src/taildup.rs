@@ -30,6 +30,28 @@ pub struct Opts {
     pub brif: bool,
     pub escape: bool,
     pub edge: bool,
+    /// `PLIRON_TAILDUP_STORE=1`: plain stores in a `brif` candidate whose
+    /// condition is one of its own parameters, copied only along edges that
+    /// pass a constant for it (the branch then folds: jump threading through
+    /// a merge with a side effect). lol_html's `consume_ch`: `pos += 1` is
+    /// stored in the merge of `Some(ch)`/`None` before the `match`.
+    pub store: bool,
+}
+
+/// The parameter index of `b`'s `brif` condition, when it is a parameter.
+fn cond_param(func: &Function, b: Block) -> Option<usize> {
+    let t = func.layout.last_inst(b)?;
+    let InstructionData::Brif { arg, .. } = func.dfg.insts[t] else { return None };
+    let arg = func.dfg.resolve_aliases(arg);
+    func.dfg.block_params(b).iter().position(|&p| p == arg)
+}
+
+fn plain_store(op: Opcode) -> bool {
+    matches!(op, Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32)
+}
+
+fn has_store(func: &Function, b: Block) -> bool {
+    func.layout.block_insts(b).any(|i| plain_store(func.dfg.insts[i].opcode()))
 }
 
 fn candidate(
@@ -56,11 +78,12 @@ fn candidate(
             continue;
         }
         let op = func.dfg.insts[i].opcode();
+        let store_ok = opts.store && brif && plain_store(op) && cond_param(func, b).is_some();
         // `iconst` is free to duplicate (remat sinks or hoists them
         // anyway); don't charge it against the size bound — late in the
         // pipeline it is what makes a 4-op check tail look "too big".
         if op.is_call()
-            || op.can_store()
+            || (op.can_store() && !store_ok)
             || op.can_load()
             || op.can_trap()
             || op.other_side_effects()
@@ -413,6 +436,7 @@ pub fn run(func: &mut Function, prof: &FxHashMap<Block, u64>) -> usize {
             brif: pliron_cfg::env_is("PLIRON_TAILDUP_BRIF", "1"),
             escape: pliron_cfg::env_is("PLIRON_TAILDUP_ESCAPE", "1"),
             edge: pliron_cfg::env_is("PLIRON_TAILDUP_EDGE", "1"),
+            store: pliron_cfg::env_is("PLIRON_TAILDUP_STORE", "1"),
         },
     )
 }
@@ -541,6 +565,18 @@ pub fn run_opts(func: &mut Function, prof: &FxHashMap<Block, u64>, opts: Opts) -
                 })
             {
                 continue;
+            }
+            // A candidate with a store (`Opts::store`) is copied only along
+            // an edge that passes a constant for its branch condition.
+            if has_store(func, r) {
+                let folds = cond_param(func, r).is_some_and(|k| {
+                    matches!(dest.args(&func.dfg.value_lists).nth(k), Some(BlockArg::Value(v))
+                        if func.dfg.resolved_value_def(v).inst()
+                            .is_some_and(|i| func.dfg.insts[i].opcode() == Opcode::Iconst))
+                });
+                if !folds {
+                    continue;
+                }
             }
             // The clone lands next in emitted order only as the brif's
             // second successor, so an edge-0 latch clone needs a freely
@@ -915,6 +951,7 @@ mod tests {
                 brif: true,
                 escape: false,
                 edge: true,
+                store: false,
             },
         );
         assert!(n >= 2, "expected both clones, ran {n}:\n{}", func.display());

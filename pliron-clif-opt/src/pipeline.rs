@@ -3532,6 +3532,19 @@ fn s_brthread(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// Edges through a small merge every incoming edge decides with a constant,
+// stores included — see `mergethread`.
+fn s_mergethread(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::mergethread::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("mergethread");
+        }
+    }
+    k
+}
+
 // `base + i * stride` onto a pointer IV — see `ivsr`.
 fn s_ivsr(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::ivsr::run(&mut p.clctx.func, an);
@@ -5521,6 +5534,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // `brif v` blocks appear from `bcheck` on). Before bittab2, which
         // may then see one membership chain. Opt-in.
         step("brthread", "", Gate::OptIn("PLIRON_BRTHREAD"), s_brthread).needs(shape::CONDBR),
+        // `Option<u8>` consumed then matched, the position stored in the
+        // merge (lol_html's `consume_ch`). Opt-in.
+        step("mergethread", "", Gate::OptIn("PLIRON_MERGETHREAD"), s_mergethread).needs(shape::CONDBR),
         // Membership trees the late threading assembled (serde_json's
         // whitespace skip `x - 9 in {0, 1, 4, 23}` only becomes one chain
         // after brchain/mergechain/jtround).
