@@ -1403,6 +1403,12 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    through a small storing merge every edge decides with a constant
    (`Option<u8>` consumed then matched): json -0.21%, html -0.047%, none
    worse.
+   **Done (default on, 2026-11-21): `PLIRON_MEMCPYOPT_SRCFWD`**: a stack
+   temporary only a copy of a `noalias` param writes reads the param
+   (`LimitedVec::push`'s by-value item, `Vec::extend_with`): html -0.354%,
+   compression -0.174%, the rest within noise. Open: lol_html's
+   `exec_without_attrs` keeps its 144-byte copy because `ctx` reaches
+   cross-CGU `RawVec::grow_one` (not known nocapture).
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain

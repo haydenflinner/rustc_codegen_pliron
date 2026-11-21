@@ -1147,7 +1147,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   (`parse_block`: the changed frame moves which values spill; requiring
   writers in the copy's block or disjoint writers kept that loss and lost
   html's win). Stanza `solecopy`.
-- `PLIRON_MEMCPYOPT_SRCFWD=1` (opt-in, 2026-11-21) — a stack temporary
+- `PLIRON_MEMCPYOPT_SRCFWD` (default on since 2026-11-21, `=0` off) — a stack temporary
   that only a copy of an entry param's bytes writes (rustc `noalias`: a
   by-value aggregate passed by pointer, a `&mut`, a frozen `&T`) reads the
   param instead, and the copy and the temporary go

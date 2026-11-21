@@ -71,6 +71,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // html -0.047%, none worse (`docs/history/2026-11-20-ivsr.md`).
     // `PLIRON_MERGETHREAD=0` off.
     "PLIRON_MERGETHREAD",
+    // 2026-11-21: a temp only a copy of a noalias param writes reads the
+    // param (memcpyopt::run_srcfwd). Exact counts: html -0.354%,
+    // compression -0.174%, the rest within noise
+    // (`docs/history/2026-11-20-ivsr.md`). `PLIRON_MEMCPYOPT_SRCFWD=0` off.
+    "PLIRON_MEMCPYOPT_SRCFWD",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
