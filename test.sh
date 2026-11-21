@@ -11,7 +11,7 @@
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 halfclob regionsplit bigtmp fragcopyout
-#   partinline
+#   partinline solecopy
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -998,6 +998,21 @@ t_partinline() {
   done
 }
 
+t_solecopy() {
+  # PLIRON_MEMCPYOPT_SOLECOPY: memcpyopt's "tmp could promote" guard does not
+  # protect a temporary whose only reader is the copy into its destination
+  # (144-byte items built in temps and pushed). Output pinned by stock rustc,
+  # the knob off, on, and on with 4 CGUs.
+  rustc --edition 2021 -O tests/solecopy/main.rs -o $out/solecopy-stock$exe || return 1
+  local v i=0
+  for v in "PLIRON_MEMCPYOPT_SOLECOPY=0 CGU=1" "PLIRON_MEMCPYOPT_SOLECOPY=1 CGU=1" "PLIRON_MEMCPYOPT_SOLECOPY=1 CGU=4"; do
+    i=$((i + 1))
+    env ${v% CGU=*} rustc $BE --edition 2021 -O -C codegen-units=${v##*CGU=} tests/solecopy/main.rs -o $out/solecopy$i$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/solecopy-stock$exe) <($out/solecopy$i$exe) || { echo "solecopy: output differs ($v)" >&2; return 1; }
+  done
+}
+
 t_x18() {
   # PLIRON_X18=1 (opt-in, aarch64): the platform register is allocatable on
   # Linux ELF only. Until 2026-11-19 the knob also took x18 on Darwin, where
@@ -1682,6 +1697,7 @@ want sibcall && t_sibcall
 want x18 && t_x18
 want halfclob && t_halfclob
 want partinline && t_partinline
+want solecopy && t_solecopy
 want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi

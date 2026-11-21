@@ -1140,6 +1140,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   `match`: `jumpthread` takes pure merges only. `tag_open_state` 103 ->
   88 instructions. Exact counts: json -0.21%, html -0.047%, none worse.
   Filetest `mergethread_consume`.
+- `PLIRON_MEMCPYOPT_SOLECOPY=1` (opt-in, 2026-11-21) — memcpyopt's "tmp
+  could promote" guard does not protect a temporary whose only reader is
+  the copy into its destination. Exact counts: html -0.16%, blind-sig
+  -0.12%, regex -0.02%, json -0.005%, but pulldown-cmark +0.15%
+  (`parse_block`: the changed frame moves which values spill; requiring
+  writers in the copy's block or disjoint writers kept that loss and lost
+  html's win). Stanza `solecopy`.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,

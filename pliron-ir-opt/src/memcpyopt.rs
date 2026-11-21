@@ -778,7 +778,19 @@ fn try_forward(
         // `drift::sort` receives, kept both 4 KiB slots (frame 8 KiB
         // against LLVM's 4 KiB; stanza `bigtmp`).
         let bigtmp = pliron_cfg::env_is("PLIRON_MEMCPYOPT_BIGTMP", "1");
-        let tmp_esc = writers
+        // `PLIRON_MEMCPYOPT_SOLECOPY=1` (opt-in): a `tmp` whose only reader
+        // is this copy is not protected (promotion would leave its scalars
+        // to be stored into `dst` by the copy anyway). Exact counts: html
+        // -0.16%, blind-sig -0.12%, but pulldown-cmark +0.15% (`parse_block`:
+        // the changed frame moves which values spill). Requiring writers in
+        // the copy's block or writing disjoint bytes kept pulldown's loss
+        // and lost html's win.
+        // lol_html's selector VM built each 144-byte `StackItem` in a temp,
+        // copied it into a second temp and pushed that: three `memcpy`
+        // calls per element where LLVM has none.
+        let solecopy = readers.is_empty() && pliron_cfg::env_is("PLIRON_MEMCPYOPT_SOLECOPY", "1");
+        let tmp_esc = solecopy
+            || writers
             .iter()
             .any(|&(w, _, _)| st.calls.get(w).is_some() || st.invokes.contains(w))
             || (bigtmp && st.allocas.get(src).is_some_and(|x| x.0 > crate::sroa::MAX_SIZE));
