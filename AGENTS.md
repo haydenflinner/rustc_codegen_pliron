@@ -1128,7 +1128,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   registers on every call, and a later pass hoists the landing block's hash
   step back in front of the test), json +0.001%, the rest flat. Filetest
   `rangefold_tree_arms`.
-- `PLIRON_MERGETHREAD=1` (opt-in, 2026-11-21) — step `mergethread` after
+- `PLIRON_MERGETHREAD` (default on since 2026-11-21, `=0` off) — step `mergethread` after
   `brthread`: a merge block of at most six pure ops and plain stores,
   ending in `brif` on one of its parameters that every incoming edge
   passes as a constant, is copied into each edge (a new block on a `brif`

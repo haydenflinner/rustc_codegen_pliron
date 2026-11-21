@@ -1399,6 +1399,10 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    **Done (default on, 2026-11-20): `PLIRON_PARTINLINE`** copies a kept
    callee's entry guard (enum drop glue) to its call sites: regex -0.10%,
    html -0.045%, blind-sig -0.03%, none worse.
+   **Done (default on, 2026-11-21): `PLIRON_MERGETHREAD`** threads edges
+   through a small storing merge every edge decides with a constant
+   (`Option<u8>` consumed then matched): json -0.21%, html -0.047%, none
+   worse.
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain

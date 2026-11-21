@@ -66,6 +66,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // glue). Exact counts: regex -0.10%, html -0.045%, blind-sig -0.03%,
     // none worse (`docs/history/2026-11-20-ivsr.md`). `PLIRON_PARTINLINE=0`.
     "PLIRON_PARTINLINE",
+    // 2026-11-21: mergethread copies a storing merge decided by constants
+    // into each edge (lol_html's `consume_ch`). Exact counts: json -0.21%,
+    // html -0.047%, none worse (`docs/history/2026-11-20-ivsr.md`).
+    // `PLIRON_MERGETHREAD=0` off.
+    "PLIRON_MERGETHREAD",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
