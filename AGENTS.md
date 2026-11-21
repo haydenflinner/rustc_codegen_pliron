@@ -1118,6 +1118,17 @@ time, memory, code size, stack frames) in ~20 min and writes
   the variant only through a join (html: 3 instructions per call left).
   `PLIRON_TRACE=pliron::partinline` names guards and sites. Stanza
   `partinline` (fails with the guard inverted).
+- `PLIRON_PARTINLINE_WIDE=1` (opt-in, 2026-11-21) — `partinline` also
+  takes drop glue guards that decode a niche (`select`, `sext`, integer
+  add/sub/and/or/xor before the compare: `Cow`'s drop glue) and guards
+  reached through jumps (block arguments followed), allocas and lifetime
+  markers, as inlining leaves a body's entry; the return side may pass
+  markers and jumps too. Sites in lol_html 4 -> 58. Exact counts: pulldown
+  -0.089%, html -0.079% (`Cow<[u8]>`/`Cow<str>` drops), protobuf -0.032%,
+  regex -0.004%, json -0.001%. Taken on plain functions too it cost json
+  +0.23% (`parse_str`'s callee usually does the work: the copied test runs
+  twice), so drop glue only. `PLIRON_TRACE=pliron::partinline=trace`
+  numbers the rule that refused a guard. Stanza `partinline` (`Name`).
 - `PLIRON_RANGEFOLD_TREE=1` (opt-in, 2026-11-20) — `rangefold` takes hit
   edges whose arguments are pure trees of up to three levels (lol_html's
   `b'a'..=b'z' | b'A'..=b'Z' => (c & 31) + 5`, a copy per arm), so both

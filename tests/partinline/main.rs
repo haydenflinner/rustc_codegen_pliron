@@ -3,7 +3,9 @@
 // kept. `Fb::Req` owns a boxed closure that holds a counted token (lol_html's
 // `TreeBuilderFeedback::RequestLexeme`), so `drop_glue::<Fb>` is the box's
 // drop behind a one-variant test. The output counts the token drops: a guard copied with the wrong
-// sense, or a call left out, changes it.
+// sense, or a call left out, changes it. `Name` is a `Cow`-like enum whose
+// owned variant sits in a niche of a `String`: its drop glue decodes the tag
+// with a `select` before the test (`PLIRON_PARTINLINE_WIDE=1`).
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static DROPS: AtomicU32 = AtomicU32::new(0);
@@ -79,6 +81,39 @@ fn drop_any(x: u32) {
     drop(make(x));
 }
 
+pub struct Counted(String);
+impl Drop for Counted {
+    fn drop(&mut self) {
+        DROPS.fetch_add(self.0.len() as u32 * 2 + 1, Ordering::Relaxed);
+    }
+}
+
+pub enum Name {
+    Borrowed(&'static str),
+    Owned(Vec<Counted>, Box<dyn FnMut(u32) -> u32>),
+}
+
+#[inline(never)]
+fn name(x: u32) -> Name {
+    if x % 7 == 3 {
+        let t = Tok(x);
+        Name::Owned((0..x % 5 + 1).map(|k| Counted(format!("n{x}.{k}"))).collect(), Box::new(move |y| y ^ t.get()))
+    } else {
+        Name::Borrowed("tag")
+    }
+}
+
+#[inline(never)]
+fn name_len(x: u32) -> usize {
+    let mut n = name(x);
+    let l = match &mut n {
+        Name::Borrowed(s) => s.len(),
+        Name::Owned(c, f) => c.len() + f(1) as usize % 3,
+    };
+    drop(n);
+    l
+}
+
 fn main() {
     let mut st = 0u64;
     let mut t = 0u64;
@@ -88,6 +123,7 @@ fn main() {
         }
         t += finish_known(i) as u64;
         drop_any(i);
+        t += name_len(i) as u64;
     }
     println!("{t} {st} {}", DROPS.load(Ordering::Relaxed));
 }

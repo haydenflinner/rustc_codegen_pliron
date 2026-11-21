@@ -987,10 +987,12 @@ t_partinline() {
   # PLIRON_PARTINLINE (default on): the entry guard of drop glue the inliner kept is
   # copied in front of each call. Output (with a drop count) pinned by stock
   # rustc, the pass off, on, and on with 4 CGUs (the drop glue is then a
-  # cross-CGU copy until `xcgu-home`).
+  # cross-CGU copy until `xcgu-home`); PLIRON_PARTINLINE_WIDE=1 adds guards
+  # behind jumps and niche decodes (`Name`).
   rustc --edition 2021 -O tests/partinline/main.rs -o $out/partinline-stock$exe || return 1
   local v i=0
-  for v in "PLIRON_PARTINLINE=0 CGU=1" "PLIRON_PARTINLINE=1 CGU=1" "PLIRON_PARTINLINE=1 CGU=4"; do
+  for v in "PLIRON_PARTINLINE=0 CGU=1" "PLIRON_PARTINLINE=1 CGU=1" "PLIRON_PARTINLINE=1 CGU=4" \
+      "PLIRON_PARTINLINE_WIDE=1 CGU=1" "PLIRON_PARTINLINE_WIDE=1 CGU=4"; do
     i=$((i + 1))
     env ${v% CGU=*} rustc $BE --edition 2021 -O -C codegen-units=${v##*CGU=} tests/partinline/main.rs -o $out/partinline$i$exe || return 1
     [[ -n "$exe" ]] && continue

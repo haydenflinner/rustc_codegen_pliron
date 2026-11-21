@@ -24,7 +24,9 @@
 //! from forwarding.
 //!
 //! Guards taken: the callee's entry block is only constants, `gep`s,
-//! non-volatile `load`s, `zext`/`trunc` and `icmp`s, ending in a
+//! non-volatile `load`s, `zext`/`trunc` and `icmp`s (with
+//! `PLIRON_PARTINLINE_WIDE=1` also `select`, `sext` and integer
+//! add/sub/and/or/xor), ending in a
 //! `cond_br` with no block arguments whose one side is a block holding only
 //! a bare `return`. Only void callees, direct calls, not recursive. Linear:
 //! one scan for guards, one over call sites.
@@ -36,7 +38,6 @@ use pliron::irbuild::cloning::{IrMapping, clone_operation};
 use pliron::irbuild::inserter::OpInsertionPoint;
 use pliron::irbuild::listener::DummyListener;
 use pliron::irbuild::rewriter::{IRRewriter, Rewriter};
-use pliron::linked_list::ContainsLinkedList;
 use pliron::location::Located;
 use pliron::op::Op;
 use pliron::operation::Operation;
@@ -53,10 +54,18 @@ const MAX_GUARD_OPS: usize = 8;
 /// Call sites rewritten per CGU.
 const MAX_SITES: usize = 4096;
 
+/// One step of a guard, in execution order.
+enum Step {
+    /// A pure op, cloned.
+    Op(Ptr<Operation>),
+    /// A jump binds block argument `.0` to value `.1`.
+    Bind(Value, Value),
+}
+
 /// A callee's entry guard.
 struct Guard {
-    /// The entry block's ops before the `cond_br`, in order.
-    ops: Vec<Ptr<Operation>>,
+    /// The ops before the `cond_br` (and the jumps' bindings), in order.
+    steps: Vec<Step>,
     /// The entry block's arguments (the parameters).
     params: Vec<Value>,
     /// The `cond_br`'s condition.
@@ -65,61 +74,149 @@ struct Guard {
     ret_on_true: bool,
 }
 
-fn bare_return(ctx: &Context, b: Ptr<BasicBlock>) -> bool {
-    if b.deref(ctx).get_num_arguments() != 0 {
-        return false;
+fn bare_return(ctx: &Context, st: &State, b: Ptr<BasicBlock>, wide: bool) -> bool {
+    if !wide {
+        if b.deref(ctx).get_num_arguments() != 0 {
+            return false;
+        }
+        let os = ops(ctx, b);
+        return os.len() == 1
+            && Operation::get_op::<ReturnOp>(os[0], ctx).is_some()
+            && os[0].deref(ctx).get_num_operands() == 0;
     }
-    let os = ops(ctx, b);
-    os.len() == 1
-        && Operation::get_op::<ReturnOp>(os[0], ctx).is_some()
-        && os[0].deref(ctx).get_num_operands() == 0
+    // `wide`: lifetime markers and jumps on the way to a void `return`.
+    let mut b = b;
+    for _ in 0..8 {
+        let os = ops(ctx, b);
+        let Some((&t, rest)) = os.split_last() else { return false };
+        if !rest.iter().all(|&o| skippable(ctx, st, o)) {
+            return false;
+        }
+        if Operation::get_op::<ReturnOp>(t, ctx).is_some() {
+            return t.deref(ctx).get_num_operands() == 0;
+        }
+        if Operation::get_op::<BrOp>(t, ctx).is_none() {
+            return false;
+        }
+        let Some(n) = t.deref(ctx).successors(ctx).next() else { return false };
+        if n == b {
+            return false;
+        }
+        b = n;
+    }
+    false
 }
 
-fn guard_of(ctx: &Context, st: &State, f: Ptr<Operation>) -> Option<Guard> {
+/// Ops a `wide` guard steps over without copying: the callee's allocas
+/// and their lifetime markers.
+fn skippable(ctx: &Context, st: &State, o: Ptr<Operation>) -> bool {
+    Operation::get_op::<AllocaOp>(o, ctx).is_some()
+        || matches!(st.intrinsics.get(o).map(|s| s.as_str()), Some("llvm.lifetime.start" | "llvm.lifetime.end"))
+}
+
+fn pure_guard_op(ctx: &Context, st: &State, o: Ptr<Operation>, wide: bool) -> bool {
+    let pure = Operation::get_op::<GetElementPtrOp>(o, ctx).is_some()
+        || Operation::get_op::<ICmpOp>(o, ctx).is_some()
+        || Operation::get_op::<ZExtOp>(o, ctx).is_some()
+        || Operation::get_op::<TruncOp>(o, ctx).is_some()
+        || (wide
+            && (Operation::get_op::<SelectOp>(o, ctx).is_some()
+                || Operation::get_op::<SExtOp>(o, ctx).is_some()
+                || Operation::get_op::<AddOp>(o, ctx).is_some()
+                || Operation::get_op::<SubOp>(o, ctx).is_some()
+                || Operation::get_op::<AndOp>(o, ctx).is_some()
+                || Operation::get_op::<OrOp>(o, ctx).is_some()
+                || Operation::get_op::<XorOp>(o, ctx).is_some()))
+        || (Operation::get_op::<LoadOp>(o, ctx).is_some() && !st.volatile.contains(o));
+    pure && o.deref(ctx).num_regions() == 0
+}
+
+/// `PLIRON_TRACE=pliron::partinline=trace`: which rule refused a guard.
+fn nog(why: u32) -> Option<Guard> {
+    if pliron_cfg::tracing_on() {
+        tracing::trace!(target: "pliron::partinline", "no guard: rule {why}");
+    }
+    None
+}
+
+fn guard_of(ctx: &Context, st: &State, f: Ptr<Operation>, wide: bool) -> Option<Guard> {
     let bs = blocks(ctx, f);
-    let entry = *bs.first()?;
-    let os = ops(ctx, entry);
-    let (&term, body) = os.split_last()?;
-    if body.len() > MAX_GUARD_OPS {
-        return None;
-    }
-    let cbr = Operation::get_op::<CondBrOp>(term, ctx)?;
-    let succs: Vec<Ptr<BasicBlock>> = term.deref(ctx).successors(ctx).collect();
-    if succs.len() != 2 || succs[0] == succs[1] || term.deref(ctx).get_num_operands() != 1 {
-        return None;
-    }
-    let ret_on_true = match (bare_return(ctx, succs[0]), bare_return(ctx, succs[1])) {
-        (true, false) => true,
-        (false, true) => false,
-        _ => return None,
-    };
-    for &o in body {
-        let pure = Operation::get_op::<GetElementPtrOp>(o, ctx).is_some()
-            || Operation::get_op::<ICmpOp>(o, ctx).is_some()
-            || Operation::get_op::<ZExtOp>(o, ctx).is_some()
-            || Operation::get_op::<TruncOp>(o, ctx).is_some()
-            || (Operation::get_op::<LoadOp>(o, ctx).is_some() && !st.volatile.contains(o));
-        if !pure || o.deref(ctx).num_regions() != 0 {
-            return None;
-        }
-    }
+    let Some(&entry) = bs.first() else { return None };
     let n = entry.deref(ctx).get_num_arguments();
     let params: Vec<Value> = (0..n).map(|i| entry.deref(ctx).get_argument(ctx, i)).collect();
-    // Every operand is a parameter, a constant or an earlier guard op's
+    // `wide`: the guard may run on through `br`s, each into a block whose
+    // only way in it is (inlining leaves a body's real entry a jump or
+    // two in, its params passed as block arguments), with pure ops and
+    // allocas (not copied) before each jump.
+    let mut steps: Vec<Step> = Vec::new();
+    let mut nops = 0usize;
+    let mut b = entry;
+    let term = loop {
+        let os = ops(ctx, b);
+        let Some((&t, rest)) = os.split_last() else { return nog(100) };
+        for &o in rest {
+            if wide && skippable(ctx, st, o) {
+                continue;
+            }
+            if !pure_guard_op(ctx, st, o, wide) {
+                return nog(1);
+            }
+            nops += 1;
+            steps.push(Step::Op(o));
+        }
+        if nops > MAX_GUARD_OPS {
+            return nog(2);
+        }
+        if Operation::get_op::<CondBrOp>(t, ctx).is_some() {
+            break t;
+        }
+        if !wide || Operation::get_op::<BrOp>(t, ctx).is_none() || steps.len() > 4 * MAX_GUARD_OPS {
+            return nog(3);
+        }
+        let Some(nb) = t.deref(ctx).successors(ctx).next() else { return nog(101) };
+        let na = nb.deref(ctx).get_num_arguments();
+        if nb == b || nb == entry || t.deref(ctx).get_num_operands() != na || nb.preds(ctx).len() != 1 {
+            return nog(4);
+        }
+        for i in 0..na {
+            steps.push(Step::Bind(nb.deref(ctx).get_argument(ctx, i), t.deref(ctx).get_operand(ctx, i)));
+        }
+        b = nb;
+    };
+    let succs: Vec<Ptr<BasicBlock>> = term.deref(ctx).successors(ctx).collect();
+    if succs.len() != 2 || succs[0] == succs[1] || term.deref(ctx).get_num_operands() != 1 {
+        return nog(5);
+    }
+    let ret_on_true = match (bare_return(ctx, st, succs[0], wide), bare_return(ctx, st, succs[1], wide)) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => return nog(6),
+    };
+    // Every operand is a parameter, a constant or an earlier step's
     // result: the clone can bind each of them at the call site.
     let mut known: rustc_hash::FxHashSet<Value> = params.iter().copied().collect();
-    for &o in body {
-        if o.deref(ctx).operands(ctx).any(|v| !known.contains(&v) && st.consts.get(v).is_none()) {
-            return None;
+    let ok = |v: &Value, known: &rustc_hash::FxHashSet<Value>| known.contains(v) || st.consts.get(*v).is_some();
+    for step in &steps {
+        match *step {
+            Step::Op(o) => {
+                if !o.deref(ctx).operands(ctx).all(|v| ok(&v, &known)) {
+                    return nog(7);
+                }
+                known.extend(o.deref(ctx).results(ctx));
+            }
+            Step::Bind(a, v) => {
+                if !ok(&v, &known) {
+                    return nog(8);
+                }
+                known.insert(a);
+            }
         }
-        known.extend(o.deref(ctx).results(ctx));
     }
-    let _ = cbr;
     let cond = term.deref(ctx).get_operand(ctx, 0);
     if !known.contains(&cond) {
-        return None;
+        return nog(9);
     }
-    Some(Guard { ops: body.to_vec(), params, cond, ret_on_true })
+    Some(Guard { steps, params, cond, ret_on_true })
 }
 
 pub fn run(ctx: &mut Context, st: &mut State) -> usize {
@@ -132,8 +229,18 @@ pub fn run(ctx: &mut Context, st: &mut State) -> usize {
         .map(|(s, fi)| (s.clone(), fi.op))
         .collect();
     let tron = pliron_cfg::tracing_on();
+    // `PLIRON_PARTINLINE_WIDE=1`: drop glue guards may also `select`,
+    // `sext` and add/sub/and/or/xor (a niche decoded before the compare:
+    // `Cow`'s drop glue is `tag = cap == MIN ? 1 : 0; if tag != 0 {
+    // return }`), and run on through jumps, allocas and lifetime markers.
+    let wide = crate::env_is("PLIRON_PARTINLINE_WIDE", "1");
     for (s, f) in &fns {
-        if let Some(g) = guard_of(ctx, st, *f) {
+        // Wide shapes on drop glue only: there the guard usually skips the
+        // call. On a plain function's fast-path test (serde_json's
+        // `parse_str`, pulldown-cmark's byte scanner) the copy mostly
+        // falls through to a call that tests again: json +0.23%.
+        let wide = wide && crate::inline::is_drop_glue_sym(s);
+        if let Some(g) = guard_of(ctx, st, *f, wide) {
             if tron {
                 tracing::debug!(target: "pliron::partinline", "guard {s}");
             }
@@ -194,18 +301,32 @@ pub fn run(ctx: &mut Context, st: &mut State) -> usize {
         for (&p, &a) in g.params.iter().zip(&args) {
             map.map_value(p, a);
         }
-        for &o in &g.ops {
-            let operands: Vec<Value> = o.deref(ctx).operands(ctx).collect();
-            for v in operands {
-                if let Some(cv) = st.consts.get(v).cloned()
-                    && map.lookup_value(v).is_none()
-                {
-                    let nv = crate::sroa::mk_const(ctx, st, v.get_type(ctx), cv);
-                    map.map_value(v, nv);
+        for step in &g.steps {
+            match *step {
+                Step::Bind(a, v) => {
+                    let nv = match map.lookup_value(v) {
+                        Some(nv) => nv,
+                        None => {
+                            let cv = st.consts.get(v).cloned().expect("guard_of checked the binding");
+                            crate::sroa::mk_const(ctx, st, v.get_type(ctx), cv)
+                        }
+                    };
+                    map.map_value(a, nv);
+                }
+                Step::Op(o) => {
+                    let operands: Vec<Value> = o.deref(ctx).operands(ctx).collect();
+                    for v in operands {
+                        if let Some(cv) = st.consts.get(v).cloned()
+                            && map.lookup_value(v).is_none()
+                        {
+                            let nv = crate::sroa::mk_const(ctx, st, v.get_type(ctx), cv);
+                            map.map_value(v, nv);
+                        }
+                    }
+                    let no = clone_operation(o, ctx, &mut rw, &mut map);
+                    no.insert_before(ctx, call);
                 }
             }
-            let no = clone_operation(o, ctx, &mut rw, &mut map);
-            no.insert_before(ctx, call);
         }
         let Some(cond) = map.lookup_value(g.cond) else { continue };
         // Split: `block` ends in the guard's branch, the call sits in its own
