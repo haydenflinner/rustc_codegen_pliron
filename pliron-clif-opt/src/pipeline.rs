@@ -2586,11 +2586,7 @@ fn s_unreach(p: &mut Pipe, _an: &mut Analysis) -> usize {
     // threading is wasm-only for the same reason.
     let wasm = p.target.is_wasm();
     let phi = wasm && pliron_cfg::env_is("PLIRON_UNREACH_PHI", "1");
-    // `PLIRON_UNREACH_FACTS=1` (opt-in): the fact fold on native too.
-    // hashbrown's `unwrap_unchecked` of `calculate_layout_for` left the
-    // `Option<Layout>` selects of the overflow test on its free path.
-    let facts = wasm || pliron_cfg::env_is("PLIRON_UNREACH_FACTS", "1");
-    let k = unreach::run_with(&mut p.clctx.func, facts, phi);
+    let k = unreach::run_with(&mut p.clctx.func, wasm, phi);
     p.stats.unreached += k;
     k
 }
