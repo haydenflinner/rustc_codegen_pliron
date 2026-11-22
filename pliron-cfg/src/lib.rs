@@ -684,6 +684,9 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // -0.057%, blind-sig -0.06% (noise), protobuf +0.037% (prost's
     // `merge_repeated` inlining reshuffle), the rest flat. `=8` the old walk.
     ("PLIRON_XCGU_LEAF_DEPTH", "12"),
+    // Native enum matches of 5+ cases as clustered trees (2026-11-22:
+    // regex -4.97%; `=2` the old wasm-only clustering).
+    ("PLIRON_SWITCH_GCC", "3"),
     // 2026-11-22: runtime-size copies in functions of at most 1024 IR ops
     // handle sizes below 16 inline, as loops already do (`MEMFAST_SMALL`'s
     // `loop` mode). Exact non-nop: protobuf -0.83%, json -0.41%, html

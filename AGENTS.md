@@ -909,7 +909,8 @@ time, memory, code size, stack frames) in ~20 min and writes
   aarch64 jump-table minimum) before these changes: regex -4.68%,
   protobuf -0.04%, but json +3.17%, pulldown +1.22%, html +0.43%,
   compression +0.31%.
-- `PLIRON_SWITCH_GCC=3` (2026-11-22) — wasm as before; on native, an
+- `PLIRON_SWITCH_GCC=3` (default since 2026-11-22, `=2` the old wasm-only
+  clustering, `=0` off) — wasm as before; on native, an
   enum `match` (the default is `unreachable`) of more than four cases is
   clustered (`switch_gcc`: bit tests, tables from `PLIRON_SWITCH_JT_MIN`
   ranges, default 8 in this mode, else a balanced compare tree), no
