@@ -2373,3 +2373,15 @@ regex +1.508%, html +0.187%. `PLIRON_RA2_USESPLIT_MULTIBLOCK=1`: noise.
 blake3 -0.211%, protobuf -0.128%) but is the rule patch 71 turned off for
 time: the shifted-operand ops' latency made blake3 1.39x LLVM. Fewer
 instructions, slower; stays off.
+
+## `PLIRON_COST_NOPAD` (default on since 2026-11-22, `=0` off)
+
+`src/machinst/vcode.rs`: the frequency-weighted code cost
+(`pliron_cost_begin`/`pliron_cost_take`, which `ivsr::pick` compares under
+`PLIRON_IVSR=2`) leaves out the loop alignment pads (`LOOPALIGN`, `ALIGN64`
+and the skipped-header-jump pad). Pads move with every byte emitted before a
+loop and with `PLIRON_PLACE_PHASE`, so the pick flipped on code placement
+alone: in one placement copy brotli's `BrotliCreateHqZopfliBackwardReferences`
+ran +906k instructions, in the other -53k. With the fix both phases give
+identical costs. Alone: noise on seven programs, blind-sig +0.084% (its
+copies under the old cost disagree; logged as accepted).

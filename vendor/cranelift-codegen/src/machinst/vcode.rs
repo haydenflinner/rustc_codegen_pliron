@@ -2005,7 +2005,15 @@ impl<I: VCodeInst> VCode<I> {
         // PLIRON: `pliron_cost_begin` — (block start, static frequency) of
         // every emitted block, for a frequency-weighted size of the code.
         let want_cost = PLIRON_COST_WANT.with(|c| c.get());
-        let mut cost_starts: Vec<(CodeOffset, f64)> = vec![];
+        let mut cost_starts: Vec<(CodeOffset, f64, u32)> = vec![];
+        // PLIRON (`PLIRON_COST_NOPAD`, default on, `=0` off): alignment pad
+        // bytes emitted so far, left out of the cost. Pads move with
+        // `PLIRON_PLACE_PHASE` and with every byte emitted before a loop, so
+        // a cost that counts them flips `ivsr::pick` on placement alone
+        // (brotli's `BrotliCreateHqZopfliBackwardReferences`: +906k
+        // instructions in one placement copy, -53k in the other).
+        let cost_nopad = want_cost && cost_nopad_on();
+        let mut pad_cum: u32 = 0;
 
         // The first M MachLabels are reserved for block indices.
         buffer.reserve_labels_for_blocks(self.num_blocks());
@@ -2891,6 +2899,9 @@ impl<I: VCodeInst> VCode<I> {
                 let j = I::gen_jump(MachLabel::from_block(block));
                 j.emit(&mut buffer, &self.emit_info, &mut Default::default());
             }
+            if cost_nopad {
+                pad_cum += new_offset - buffer.cur_offset();
+            }
             while new_offset > buffer.cur_offset() {
                 // Pad with NOPs up to the aligned block offset.
                 let nop = I::gen_nop((new_offset - buffer.cur_offset()) as usize);
@@ -3047,11 +3058,11 @@ impl<I: VCodeInst> VCode<I> {
                 // A branch the buffer deleted moves the offset back: the
                 // blocks starting at or after it emitted nothing (left).
                 let cur = buffer.cur_offset();
-                while cost_starts.last().is_some_and(|&(o, _)| o >= cur) {
+                while cost_starts.last().is_some_and(|&(o, _, _)| o >= cur) {
                     cost_starts.pop();
                 }
                 let f = self.block_freq.get(block.index()).copied().unwrap_or(1.0) as f64;
-                cost_starts.push((cur, f));
+                cost_starts.push((cur, f, pad_cum));
             }
 
             if flags.machine_code_cfg_info() {
@@ -4468,6 +4479,9 @@ impl<I: VCodeInst> VCode<I> {
             // PLIRON: for a skipped header jump, land the pad here — the
             // block falls through it to the aligned header label.
             if skip_jmp.is_some() {
+                if cost_nopad {
+                    pad_cum += (16 - (buffer.cur_offset() & 15)) & 15;
+                }
                 while buffer.cur_offset() & 15 != 0 {
                     let pad = 16 - (buffer.cur_offset() & 15) as usize;
                     let nop = I::gen_nop(pad);
@@ -4524,9 +4538,9 @@ impl<I: VCodeInst> VCode<I> {
         let func_body_len = buffer.cur_offset();
         if want_cost {
             let (mut cost, mut once) = (0.0, 0.0);
-            for (k, &(o, f)) in cost_starts.iter().enumerate() {
-                let end = cost_starts.get(k + 1).map_or(func_body_len, |x| x.0);
-                let c = f * f64::from(end.saturating_sub(o)) / 4.0;
+            for (k, &(o, f, p0)) in cost_starts.iter().enumerate() {
+                let (end, p1) = cost_starts.get(k + 1).map_or((func_body_len, pad_cum), |x| (x.0, x.2));
+                let c = f * f64::from(end.saturating_sub(o).saturating_sub(p1.saturating_sub(p0))) / 4.0;
                 cost += c;
                 // Blocks that run at most once per call (outside loops).
                 if f <= 1.0 + 1e-6 {
@@ -5731,6 +5745,13 @@ mod test {
         // With certain versions of Rust, each `HashMap` in `VCodeConstants` occupied at
         // least 48 bytes, making an empty `VCodeConstants` cost 120 bytes.
     }
+}
+
+/// PLIRON (`PLIRON_COST_NOPAD`, default on since 2026-11-22, `=0` off): the
+/// frequency-weighted cost leaves out alignment pads.
+fn cost_nopad_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_COST_NOPAD").as_deref() != Ok("0"))
 }
 
 /// PLIRON (`PLIRON_DEADCONST`, default on since 2026-11-22, `=0` off): drop dead rematerializable defs

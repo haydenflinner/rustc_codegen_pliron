@@ -102,7 +102,17 @@ fn bit_can_handle<D: Copy + Eq>(ranges: &[Range<D>], start: usize, end: usize) -
 }
 
 fn bit_uniq_count<D: Copy + Eq>(ranges: &[Range<D>], start: usize, end: usize) -> (usize, usize) {
-    let count = end - start + 1;
+    // LLVM's `isSuitableForBitTests` counts compares (two per range), GCC
+    // counts ranges. lol_html's whitespace / `/` / `>` byte switch is five
+    // ranges, seven compares: one LLVM bit-test cluster, a GCC tree of five
+    // leaves (`PLIRON_SWITCH_BT_GCC=1` restores GCC's count).
+    static GCC: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_SWITCH_BT_GCC", "1"));
+    let count = if *GCC {
+        end - start + 1
+    } else {
+        ranges[start..=end].iter().map(|r| r.cmp_count() as usize).sum()
+    };
     let mut dests = Vec::new();
     for r in &ranges[start..=end] {
         if !dests.iter().any(|&d| d == r.dest) {
@@ -127,6 +137,9 @@ fn make_bit_test<D: Copy + Eq>(ranges: &[Range<D>], start: usize, end: usize) ->
             None => by_dest.push((r.dest, bits)),
         }
     }
+    // Most cases first (LLVM's `buildBitTests` without a profile): the
+    // last edge's test is the one the default path runs past.
+    by_dest.sort_by_key(|&(_, m)| core::cmp::Reverse(m.count_ones()));
     Cluster::BitTest {
         lo,
         hi,

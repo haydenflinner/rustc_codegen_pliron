@@ -3688,10 +3688,28 @@ fn s_nfold2(p: &mut Pipe, an: &mut Analysis) -> usize {
         // `reserve_rehash` ran `mov w1, #0; cbz w1` twice per call.
         if pliron_cfg::env_is("PLIRON_NFOLD2_BR", "1") && jumpthread::fold_const_branches(&mut p.clctx.func) > 0 {
             jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
+            // A folded branch can leave a parameter block that only jumps
+            // into its sole successor (a loop header split in two).
+            jumpthread::merge_chains(&mut p.clctx.func, &mut jumpthread::Cd::new());
         }
         jumpthread::remove_dead_insts(&mut p.clctx.func, true);
         an.invalidate(&p.clctx.func);
         p.dump("nfold2");
+    }
+    k
+}
+
+// A compare on a join's parameter every incoming edge decides — see
+// `joincmp`.
+fn s_joincmp(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let (cfg, dt) = an.cfg_dt(&p.clctx.func);
+    let k = crate::joincmp::run(&mut p.clctx.func, cfg, dt);
+    if k > 0 {
+        jumpthread::remove_dead_insts(&mut p.clctx.func, true);
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("joincmp");
+        }
     }
     k
 }
@@ -5783,6 +5801,8 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         )
         .needs(shape::MULTI | shape::BPARAM),
         step("nfold2", "nfold2", Gate::OptIn("PLIRON_NFOLD2"), s_nfold2),
+        // A compare on a join's parameter that every incoming edge decides.
+        step("joincmp", "", Gate::OptIn("PLIRON_JOINCMP"), s_joincmp).needs(shape::BPARAM),
         // Interval-test chains `[lo,hi) → (x-lo u<w)` and same-width
         // range unions `(x|d)-k_hi u<w` — rustc's char classification
         // (a-z|A-Z) lands as a 4-branch chain; the offset form is one

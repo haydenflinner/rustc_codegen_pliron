@@ -4995,12 +4995,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             Cluster::BitTest { lo, hi, edges } => {
                 let ty = self.b.func.dfg.value_type(x);
-                // Widen to i64 so a span up to 63 fits the mask (an i32
-                // index with hi-lo > 31 would truncate `(1<<off)&mask`).
-                let mut off = if *lo == 0 {
+                // LLVM's bit tests (`PLIRON_SWITCH_BT_OLD=1`: the first
+                // form, `(1 << off) & mask != 0` per edge): a cluster below
+                // 64 tests `x` itself (no subtract), a one-case edge is an
+                // equality compare, and the others `(mask >> off) & 1`,
+                // which aarch64 lowers to `lsr; tbnz`.
+                static OLD: std::sync::LazyLock<bool> =
+                    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_SWITCH_BT_OLD", "1"));
+                let base = if !*OLD && *hi < 64 { 0 } else { *lo };
+                let shift = |m: u64| if base == *lo { m } else { m << (*lo - base) };
+                let mut off = if base == 0 {
                     x
                 } else {
-                    self.b.ins().iadd_imm_s(x, (*lo as i64).wrapping_neg())
+                    self.b.ins().iadd_imm_s(x, (base as i64).wrapping_neg())
                 };
                 if ty.bits() < 64 {
                     off = self.b.ins().uextend(clt::I64, off);
@@ -5009,20 +5016,28 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let oob = self.b.ins().icmp_imm_u(
                     IntCC::UnsignedGreaterThan,
                     off,
-                    (*hi - *lo) as i64,
+                    (*hi - base) as i64,
                 );
                 self.b.ins().brif(oob, d, &[], ok, &[]);
                 self.b.seal_block(ok);
                 self.b.switch_to_block(ok);
-                // Prefer `(1 << off) & mask` so the shift amount is `off`.
-                let one = self.b.ins().iconst(clt::I64, 1);
-                let sh = self.b.ins().ishl(one, off);
+                let one = if *OLD { Some(self.b.ins().iconst(clt::I64, 1)) } else { None };
+                let sh = one.map(|one| self.b.ins().ishl(one, off));
                 let n = edges.len();
                 for (i, &(mask, dest)) in edges.iter().enumerate() {
-                    // Bit-test masks span < 64; bit 63 may be set.
-                    let m = self.b.ins().iconst(clt::I64, mask as i64);
-                    let bit = self.b.ins().band(sh, m);
-                    let c = self.b.ins().icmp_imm_u(IntCC::NotEqual, bit, 0);
+                    let mask = shift(mask);
+                    let c = if let Some(sh) = sh {
+                        // Bit-test masks span < 64; bit 63 may be set.
+                        let m = self.b.ins().iconst(clt::I64, mask as i64);
+                        let bit = self.b.ins().band(sh, m);
+                        self.b.ins().icmp_imm_u(IntCC::NotEqual, bit, 0)
+                    } else if mask.count_ones() == 1 {
+                        self.b.ins().icmp_imm_u(IntCC::Equal, off, i64::from(mask.trailing_zeros()))
+                    } else {
+                        let m = self.b.ins().iconst(clt::I64, mask as i64);
+                        let s = self.b.ins().ushr(m, off);
+                        self.b.ins().band_imm_u(s, 1)
+                    };
                     if i + 1 == n {
                         self.b.ins().brif(c, dest, &[], d, &[]);
                     } else {

@@ -876,6 +876,38 @@ time, memory, code size, stack frames) in ~20 min and writes
   blind-sig -0.041%, the rest flat. Filetests `selargs_ext`,
   `selargs_ext_dom` (a block whose params are read past it stays: the
   first version broke SSA in serde_json).
+- `PLIRON_JOINCMP` and `PLIRON_NFOLD2_BR` (2026-11-22, opt-in; `=1`) —
+  step `joincmp` after `nfold2` (`pliron-clif-opt/src/joincmp.rs`): an
+  `icmp` on a join's block parameter that every incoming edge decides the
+  same way (the parameter replaced by the edge's argument; equal operands,
+  constants, the edge's own `brif` side and the predecessor's dominator
+  facts, `x == k` substituted) becomes a constant, and branches on it fold.
+  `NFOLD2_BR` folds the constant branches `nfold2` leaves. Both then merge
+  jump-only chains (a folded branch left a loop header split into a
+  parameter block and its body: +108k in lol_html's `exec_without_attrs`).
+  hashbrown's `new_uninitialized` (`len != size` after the allocation's
+  `Result` join) and `Vec::with_capacity` + extend. Exact counts together:
+  blind-sig -0.181%, compression -0.148%, html -0.099%, pulldown -0.013%,
+  json -0.012%, protobuf -0.010%, regex +0.002%. Tests
+  `pliron-clif-opt/tests/joincmp.rs`.
+- `PLIRON_COST_NOPAD` (vendored Cranelift, default on since 2026-11-22,
+  `=0` off) — the frequency-weighted code cost (`pliron_cost_take`, read by
+  `ivsr::pick` under `PLIRON_IVSR=2`) leaves out loop alignment pads. With
+  them the pick flipped on placement alone: brotli's
+  `BrotliCreateHqZopfliBackwardReferences` +906k instructions in one
+  placement copy and -53k in the other. Alone: noise on seven programs,
+  blind-sig +0.084% (its placement copies disagree under the old cost).
+- `PLIRON_SWITCH_BT_GCC=1`, `PLIRON_SWITCH_BT_OLD=1` (2026-11-22) — undo
+  two changes to `SWITCH_GCC`'s bit tests: a cluster's size is counted in
+  compares (two per range, LLVM's `isSuitableForBitTests`) rather than GCC's
+  ranges, edges go most cases first, a cluster below 64 tests `x` itself,
+  a one-case edge is an equality compare and the rest `(mask >> x) & 1`
+  (`lsr; tbnz`). Only native `PLIRON_SWITCH_GCC=1` with
+  `PLIRON_SWITCH_GCC_MAX=0` forms such clusters (wasm's default takes at
+  most two cases). Native `SWITCH_GCC=1,GCC_MAX=0,JT_MIN=13` (LLVM's
+  aarch64 jump-table minimum) before these changes: regex -4.68%,
+  protobuf -0.04%, but json +3.17%, pulldown +1.22%, html +0.43%,
+  compression +0.31%.
 - `PLIRON_EXNCONST=1` (opt-in, 2026-11-22, measured, no default) — step
   `exnconst` near the end: a constant a `try_call`'s exception edge
   passes (a drop flag `edgefwd` moved onto the call) is defined in a cold
