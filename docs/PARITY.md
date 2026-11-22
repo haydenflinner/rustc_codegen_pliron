@@ -1086,7 +1086,8 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    (2026-11-21 evening, exact callgrind counts with the defaults of
    `e8024e47`: html 1.133x, pulldown-cmark 1.103x, json 1.103x, blind-sig
    1.092x, regex 1.078x, protobuf 1.052x, blake3 1.047x, compression
-   1.044x; geomean 1.081x. Earlier figures below.)
+   1.044x; geomean 1.081x. 2026-11-22, `5803b61c`: html 1.124x, 96.44M
+   against 85.83M. Earlier figures below.)
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
