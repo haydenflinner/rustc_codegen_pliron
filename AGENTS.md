@@ -734,9 +734,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   (~650 insts, over the cap) shifted by the constants 0 and 64 with the
   generic sequence. Exact counts: html -0.060%, blind-sig +0.089%
   (allocator/RNG noise and `montgomery` +8.4k), the rest within noise.
-  Splitting every `i128` param took html to -0.194% but, with the folds
-  over the cap, blind-sig +12.7% (`montgomery`'s cascade). Filetest
-  `wide128_phi`.
+  Every eligible param is split (`PLIRON_WIDE128_PHI_ALL`, default on,
+  `=0` foldable ones only: html a further -0.107%, the rest within
+  noise), but over the cap only in a function with a foldable param:
+  `montgomery` has none, and the folds there cascaded (+12.7% blind-sig).
+  Filetest `wide128_phi`.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

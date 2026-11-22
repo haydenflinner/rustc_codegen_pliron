@@ -120,7 +120,7 @@ pub fn run(func: &mut Function, mulhi64: bool) -> usize {
     }
     let mut n = 0;
     if phi {
-        n += split_params(func);
+        n += split_params(func, mul);
         // Over the cap, fold only where a param split opened a chain:
         // montgomery splits nothing (its params are 128-bit adds), and the
         // folds alone cascaded there (+13% blind-sig).
@@ -433,11 +433,19 @@ fn pass(func: &mut Function, mulhi64: bool, mul: bool) -> usize {
 /// lol_html's `add_execution_branch` shifted by the constants 0 and 64
 /// with the generic `lsl/lsr/orr/tst/csel` sequence. Returns the params
 /// split.
-fn split_params(func: &mut Function) -> usize {
+fn split_params(func: &mut Function, under_cap: bool) -> usize {
     let cfg = ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
     let blocks: Vec<Block> = func.layout.blocks().collect();
+    // Which params: every eligible one (`PLIRON_WIDE128_PHI_ALL`, default
+    // on: blind-sig -0.365% and html's sponge loop -0.13% more than the
+    // foldable ones alone), but over the size cap only in a function with
+    // at least one foldable param (montgomery has none and cascades).
+    let all = !crate::env_is("PLIRON_WIDE128_PHI_ALL", "0");
     let keep = foldable_params(func, &cfg);
+    if !under_cap && keep.is_empty() {
+        return 0;
+    }
     let mut n = 0;
     for b in blocks {
         if Some(b) == entry {
@@ -448,7 +456,7 @@ fn split_params(func: &mut Function) -> usize {
             .block_params(b)
             .iter()
             .enumerate()
-            .filter(|(_, p)| func.dfg.value_type(**p) == types::I128 && keep.contains(p))
+            .filter(|(_, p)| func.dfg.value_type(**p) == types::I128 && (all || keep.contains(p)))
             .map(|(i, p)| (i, *p))
             .collect();
         if wide.is_empty() || func.layout.first_inst(b).is_none() {
