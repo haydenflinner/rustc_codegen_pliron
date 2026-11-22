@@ -777,6 +777,17 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_SELARGS_EXT` (default on since 2026-11-22, `=0` off) —
+  `selargs` also resolves `select c, a, b` edge arguments of a `brif` on
+  `uextend c` (lowering widens compares; the late egraph strips the
+  extension after `selargs` ran), then `clifpeep::edge_selfcmp` sends an
+  edge into a block that is only `icmp; brif` straight to the successor
+  when its arguments make both operands one value. `Vec::with_capacity(len)`
+  + extend kept `csel; csel; cbz` on the allocation's null test and the
+  `len > cap` grow test. Exact counts: json -0.165%, html -0.056%,
+  blind-sig -0.041%, the rest flat. Filetests `selargs_ext`,
+  `selargs_ext_dom` (a block whose params are read past it stays: the
+  first version broke SSA in serde_json).
 - `PLIRON_EXNCONST=1` (opt-in, 2026-11-22, measured, no default) — step
   `exnconst` near the end: a constant a `try_call`'s exception edge
   passes (a drop flag `edgefwd` moved onto the call) is defined in a cold

@@ -96,6 +96,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // a balanced search tree. Exact counts: html -0.384%, the rest within
     // noise. Gate/crates not run. `PLIRON_EQTREE=0` off.
     "PLIRON_EQTREE",
+    // 2026-11-22: selargs looks through `uextend` of a compare and then
+    // threads edges whose arguments decide the destination's compare
+    // (`Vec::with_capacity(len)` + extend: the reserve test). Exact
+    // non-nop: json -0.165%, html -0.056%, blind-sig -0.041%, the rest flat.
+    "PLIRON_SELARGS_EXT",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
