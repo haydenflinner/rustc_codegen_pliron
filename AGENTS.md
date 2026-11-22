@@ -724,6 +724,19 @@ time, memory, code size, stack frames) in ~20 min and writes
   `wide128`/`wide128b`: 128-bit ops on word halves. Use gate +
   `PLIRON_WIDE128_FNMAX` (default 512) keep montgomery out. Callgrind:
   html −0.043%, blind-sig −0.12%, no program worse.
+- `PLIRON_WIDE128_PHI=1` (opt-in, 2026-11-22) — `wide128` splits an
+  `i128` block param into two `i64` params when every incoming argument
+  is built from halves and every use folds (a greatest fixpoint over the
+  candidates); `select` of two `iconcat`s folds to two `i64` selects.
+  Over `PLIRON_WIDE128_FNMAX` the pass runs only where a split happened,
+  and without multiply splits. foldhash's `u128` sponge crossed the
+  flush/no-flush joins as a param, so lol_html's `add_execution_branch`
+  (~650 insts, over the cap) shifted by the constants 0 and 64 with the
+  generic sequence. Exact counts: html -0.060%, blind-sig +0.089%
+  (allocator/RNG noise and `montgomery` +8.4k), the rest within noise.
+  Splitting every `i128` param took html to -0.194% but, with the folds
+  over the cap, blind-sig +12.7% (`montgomery`'s cascade). Filetest
+  `wide128_phi`.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

@@ -180,6 +180,7 @@ fn pass(name: &str) -> Pass {
         },
         "tailmergep" => |f| pliron_clif_opt::tailmergep::run_with(f, false),
         "tailmergep_dedup" => |f| pliron_clif_opt::tailmergep::run_with(f, true),
+        "wide128_phi" => |f| pliron_clif_opt::wide128::run(f, true),
         "rgmerge" => clifpeep::rgmerge,
         "sameargs" => |f| clifpeep::sameargs(f).0,
         "selargs" => clifpeep::selargs,
@@ -232,6 +233,8 @@ fn filetests() {
     unsafe {
         std::env::set_var("PLIRON_PUNROLL_COUNTED", "1");
         std::env::set_var("PLIRON_PUNROLL_SEARCH", "1");
+        // `wide128_phi.clif`: the param split is what that file tests.
+        std::env::set_var("PLIRON_WIDE128_PHI", "1");
     }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("filetests");
     let flags = Flags::new(settings::builder());

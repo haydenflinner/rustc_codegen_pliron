@@ -45,7 +45,8 @@
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::EntityRef;
-use cranelift_codegen::ir::{Function, Inst, InstBuilder, InstructionData, Opcode, Value, types};
+use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::{Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Value, types};
 
 fn def(func: &Function, v: Value) -> Option<(Inst, InstructionData)> {
     let v = func.dfg.resolve_aliases(v);
@@ -97,6 +98,13 @@ pub fn run(func: &mut Function, mulhi64: bool) -> usize {
     let fnmax: usize = crate::env_get("PLIRON_WIDE128_FNMAX")
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
+    let phi = crate::env_is("PLIRON_WIDE128_PHI", "1");
+    // Over the cap, `PLIRON_WIDE128_PHI=1` still runs the param split and
+    // the shift/bitwise folds, with no multiply split: lol_html's
+    // `add_execution_branch` (~650 insts) builds a foldhash sponge from
+    // shifts by 0 and 64, while montgomery's cascade comes from the
+    // multiplies (+12.7% blind-sig when the cap alone was raised to 800).
+    let mut mul = true;
     if fnmax > 0 {
         let insts = func
             .layout
@@ -104,12 +112,24 @@ pub fn run(func: &mut Function, mulhi64: bool) -> usize {
             .flat_map(|b| func.layout.block_insts(b))
             .count();
         if insts > fnmax {
-            return 0;
+            if !phi {
+                return 0;
+            }
+            mul = false;
         }
     }
     let mut n = 0;
+    if phi {
+        n += split_params(func);
+        // Over the cap, fold only where a param split opened a chain:
+        // montgomery splits nothing (its params are 128-bit adds), and the
+        // folds alone cascaded there (+13% blind-sig).
+        if !mul && n == 0 {
+            return 0;
+        }
+    }
     for _ in 0..4 {
-        let k = pass(func, mulhi64);
+        let k = pass(func, mulhi64, mul);
         n += k;
         if k == 0 {
             break;
@@ -129,6 +149,7 @@ fn halves_consumed(
     uses: &crate::uses::Uses,
     v: Value,
     seen: &mut [u8],
+    mul: bool,
 ) -> bool {
     let v = func.dfg.resolve_aliases(v);
     let i = v.index();
@@ -159,13 +180,24 @@ fn halves_consumed(
                 let Some(r) = func.dfg.inst_results(inst).first().copied() else {
                     return false;
                 };
-                halves_consumed(func, uses, r, seen)
+                halves_consumed(func, uses, r, seen, mul)
             }
+            // A `select` whose chosen values are `iconcat`s picks halves
+            // (`PLIRON_WIDE128_PHI=1`); its condition is not a use of
+            // `v`'s bits.
+            Opcode::Select if phi_on() => {
+                let a = func.dfg.inst_args(inst);
+                if a.first().map(|&c| func.dfg.resolve_aliases(c)) == Some(v) {
+                    return false;
+                }
+                halves_consumed(func, uses, func.dfg.first_result(inst), seen, mul)
+            }
+            Opcode::Imul if !mul => false,
             Opcode::Bor | Opcode::Bxor | Opcode::Band | Opcode::Imul => {
                 let Some(r) = func.dfg.inst_results(inst).first().copied() else {
                     return false;
                 };
-                halves_consumed(func, uses, r, seen)
+                halves_consumed(func, uses, r, seen, mul)
             }
             _ => false,
         }
@@ -263,7 +295,11 @@ fn uextend_ok(func: &Function, uses: &crate::uses::Uses, v: Value) -> bool {
     })
 }
 
-fn pass(func: &mut Function, mulhi64: bool) -> usize {
+/// `mul`: `imul` splits (and `uextend`s feeding an `imul`) are allowed;
+/// off for bodies over `PLIRON_WIDE128_FNMAX`, where only the shift and
+/// bitwise folds run (`PLIRON_WIDE128_PHI=1`).
+fn pass(func: &mut Function, mulhi64: bool, mul: bool) -> usize {
+    let mulhi64 = mulhi64 && mul;
     let uses = crate::uses::Uses::new(func);
     let mut seen = vec![0u8; func.dfg.num_values()];
     let mut n = 0;
@@ -285,15 +321,24 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
                 InstructionData::Unary { opcode: Opcode::Uextend, arg }
                     if rty == types::I128
                         && pos.func.dfg.value_type(arg) == types::I64
-                        && halves_consumed(pos.func, &uses, res, &mut seen)
+                        && halves_consumed(pos.func, &uses, res, &mut seen, mul)
                         && uextend_ok(pos.func, &uses, res) =>
                 {
                     let z = pos.ins().iconst(types::I64, 0);
                     pos.func.replace(inst).iconcat(arg, z);
                     n += 1;
                 }
+                InstructionData::Ternary { opcode: Opcode::Select, args }
+                    if rty == types::I128 && phi_on() && halves_consumed(pos.func, &uses, res, &mut seen, mul) =>
+                {
+                    let (Some((a1, b1)), Some((a2, b2))) = (cat(pos.func, args[1]), cat(pos.func, args[2])) else { continue };
+                    let lo = pos.ins().select(args[0], a1, a2);
+                    let hi = pos.ins().select(args[0], b1, b2);
+                    pos.func.replace(inst).iconcat(lo, hi);
+                    n += 1;
+                }
                 InstructionData::Binary { opcode: op @ (Opcode::Ishl | Opcode::Ushr), args }
-                    if rty == types::I128 && halves_consumed(pos.func, &uses, res, &mut seen) =>
+                    if rty == types::I128 && halves_consumed(pos.func, &uses, res, &mut seen, mul) =>
                 {
                     let Some((a, b)) = cat(pos.func, args[0]) else { continue };
                     let Some(k) = konst(pos.func, args[1]) else { continue };
@@ -317,7 +362,7 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
                     n += 1;
                 }
                 InstructionData::Binary { opcode: op @ (Opcode::Bor | Opcode::Bxor | Opcode::Band), args }
-                    if rty == types::I128 && halves_consumed(pos.func, &uses, res, &mut seen) =>
+                    if rty == types::I128 && halves_consumed(pos.func, &uses, res, &mut seen, mul) =>
                 {
                     let (Some((a1, b1)), Some((a2, b2))) = (cat(pos.func, args[0]), cat(pos.func, args[1])) else {
                         continue;
@@ -336,7 +381,7 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
                 InstructionData::Binary { opcode: Opcode::Imul, args }
                     if rty == types::I128
                         && mulhi64
-                        && halves_consumed(pos.func, &uses, res, &mut seen)
+                        && halves_consumed(pos.func, &uses, res, &mut seen, mul)
                         && hi_uses_light(pos.func, &uses, res) =>
                 {
                     let (Some((a, ah)), Some((b, bh))) = (cat(pos.func, args[0]), cat(pos.func, args[1])) else {
@@ -377,4 +422,235 @@ fn pass(func: &mut Function, mulhi64: bool) -> usize {
         }
     }
     n
+}
+
+/// `PLIRON_WIDE128_PHI=1`: an `i128` block param whose incoming edges are
+/// all `jump`/`brif` arguments becomes two `i64` params. Each edge passes
+/// `isplit arg` and the block rebuilds `iconcat lo, hi` at its top, which
+/// the folds above see through. foldhash's `u128` sponge (`sponge |= x <<
+/// sponge_len`, flushed when full) reaches the join after each write as a
+/// block param, and that one non-fold use kept the whole chain `i128`:
+/// lol_html's `add_execution_branch` shifted by the constants 0 and 64
+/// with the generic `lsl/lsr/orr/tst/csel` sequence. Returns the params
+/// split.
+fn split_params(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let entry = func.layout.entry_block();
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    let keep = foldable_params(func, &cfg);
+    let mut n = 0;
+    for b in blocks {
+        if Some(b) == entry {
+            continue;
+        }
+        let wide: Vec<(usize, Value)> = func
+            .dfg
+            .block_params(b)
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| func.dfg.value_type(**p) == types::I128 && keep.contains(p))
+            .map(|(i, p)| (i, *p))
+            .collect();
+        if wide.is_empty() || func.layout.first_inst(b).is_none() {
+            continue;
+        }
+        // Every edge into `b`: a `jump`/`brif` destination whose args are
+        // plain values.
+        let mut edges: Vec<(Inst, usize)> = Vec::new();
+        let mut ok = true;
+        for pr in cfg.pred_iter(b) {
+            if !matches!(func.dfg.insts[pr.inst].opcode(), Opcode::Jump | Opcode::Brif) {
+                ok = false;
+                break;
+            }
+            let dests = func.dfg.insts[pr.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for (d, bc) in dests.iter().enumerate() {
+                if bc.block(&func.dfg.value_lists) == b {
+                    if !bc.args(&func.dfg.value_lists).all(|a| matches!(a, BlockArg::Value(_))) {
+                        ok = false;
+                    }
+                    edges.push((pr.inst, d));
+                }
+            }
+        }
+        if !ok || edges.is_empty() {
+            continue;
+        }
+        edges.sort();
+        edges.dedup();
+        // Highest index first: removing an argument keeps the lower ones in
+        // place; the halves go to the end, params and args in one order.
+        for &(ix, p) in wide.iter().rev() {
+            if !pliron_cfg::bisect("wide128-phi") {
+                continue;
+            }
+            let lo = func.dfg.append_block_param(b, types::I64);
+            let hi = func.dfg.append_block_param(b, types::I64);
+            for &(t, d) in &edges {
+                let arg = {
+                    let bc = func.dfg.insts[t].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[d];
+                    match bc.args(&func.dfg.value_lists).nth(ix) {
+                        Some(BlockArg::Value(v)) => v,
+                        _ => unreachable!("checked above"),
+                    }
+                };
+                let (alo, ahi) = FuncCursor::new(func).at_inst(t).ins().isplit(arg);
+                let dfg = &mut func.dfg;
+                let bc = &mut dfg.insts[t].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[d];
+                bc.remove(ix, &mut dfg.value_lists);
+                bc.append_argument(alo, &mut dfg.value_lists);
+                bc.append_argument(ahi, &mut dfg.value_lists);
+            }
+            let first = func.layout.first_inst(b).unwrap();
+            let cv = FuncCursor::new(func).at_inst(first).ins().iconcat(lo, hi);
+            func.dfg.remove_block_param(p);
+            func.dfg.change_to_alias(p, cv);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The `i128` block params worth splitting: every incoming argument is
+/// built from halves (`uextend` of a word, `iconcat`, a shift by 0 or 64,
+/// a bitwise op of such, or another kept param) and every use is a fold
+/// (`ireduce`, `isplit`, such a shift or bitwise op) or an argument to a
+/// kept param. A param fed by a real 128-bit add (montgomery's carry)
+/// stays: splitting it only wraps the add in `isplit`/`iconcat` (+12.7%
+/// blind-sig when every param was split). A greatest fixpoint: start from
+/// all params, drop violators until nothing changes.
+fn foldable_params(func: &Function, cfg: &ControlFlowGraph) -> rustc_hash::FxHashSet<Value> {
+    use rustc_hash::FxHashSet;
+    let entry = func.layout.entry_block();
+    // Incoming args per param, and the params each value is passed to.
+    let mut args_of: rustc_hash::FxHashMap<Value, Vec<Value>> = Default::default();
+    let mut cand: FxHashSet<Value> = FxHashSet::default();
+    for b in func.layout.blocks() {
+        if Some(b) == entry {
+            continue;
+        }
+        let params = func.dfg.block_params(b);
+        if !params.iter().any(|p| func.dfg.value_type(*p) == types::I128) {
+            continue;
+        }
+        let mut ok = true;
+        let mut per: Vec<Vec<Value>> = vec![Vec::new(); params.len()];
+        for pr in cfg.pred_iter(b) {
+            if !matches!(func.dfg.insts[pr.inst].opcode(), Opcode::Jump | Opcode::Brif) {
+                ok = false;
+                break;
+            }
+            for bc in func.dfg.insts[pr.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                if bc.block(&func.dfg.value_lists) != b {
+                    continue;
+                }
+                for (k, a) in bc.args(&func.dfg.value_lists).enumerate() {
+                    match a {
+                        BlockArg::Value(v) if k < per.len() => per[k].push(func.dfg.resolve_aliases(v)),
+                        _ => ok = false,
+                    }
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        for (k, &p) in params.iter().enumerate() {
+            if func.dfg.value_type(p) == types::I128 {
+                cand.insert(p);
+                args_of.insert(p, std::mem::take(&mut per[k]));
+            }
+        }
+    }
+    if cand.is_empty() {
+        return cand;
+    }
+    let uses = crate::uses::Uses::new(func);
+    // `v` is built from halves, through at most `depth` producers.
+    fn built(func: &Function, cand: &FxHashSet<Value>, v: Value, depth: u32) -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        if cand.contains(&v) {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let Some((_, d)) = def(func, v) else { return false };
+        match d {
+            InstructionData::Unary { opcode: Opcode::Uextend, arg } => func.dfg.value_type(arg) == types::I64,
+            InstructionData::Binary { opcode: Opcode::Iconcat, .. } => true,
+            InstructionData::Binary { opcode: Opcode::Ishl | Opcode::Ushr, args } => {
+                konst(func, args[1]).is_some_and(|k| k & 63 == 0) && built(func, cand, args[0], depth - 1)
+            }
+            InstructionData::Binary { opcode: Opcode::Bor | Opcode::Bxor | Opcode::Band, args } => {
+                built(func, cand, args[0], depth - 1) && built(func, cand, args[1], depth - 1)
+            }
+            InstructionData::Ternary { opcode: Opcode::Select, args } => {
+                built(func, cand, args[1], depth - 1) && built(func, cand, args[2], depth - 1)
+            }
+            _ => false,
+        }
+    }
+    // Every use of `v` folds or passes it to a kept param.
+    fn folds(func: &Function, uses: &crate::uses::Uses, cand: &FxHashSet<Value>, v: Value, depth: u32) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        uses.sites(func.dfg.resolve_aliases(v)).iter().all(|&(_, inst)| {
+            if func.layout.inst_block(inst).is_none() {
+                return true;
+            }
+            let d = &func.dfg.insts[inst];
+            match d.opcode() {
+                Opcode::Ireduce | Opcode::Isplit => true,
+                Opcode::Ishl | Opcode::Ushr => {
+                    let a = func.dfg.inst_args(inst);
+                    a.len() == 2
+                        && konst(func, a[1]).is_some_and(|k| k & 63 == 0)
+                        && folds(func, uses, cand, func.dfg.first_result(inst), depth - 1)
+                }
+                Opcode::Bor | Opcode::Bxor | Opcode::Band => folds(func, uses, cand, func.dfg.first_result(inst), depth - 1),
+                Opcode::Select => {
+                    let a = func.dfg.inst_args(inst);
+                    a.first().map(|&c| func.dfg.resolve_aliases(c)) != Some(func.dfg.resolve_aliases(v))
+                        && folds(func, uses, cand, func.dfg.first_result(inst), depth - 1)
+                }
+                Opcode::Jump | Opcode::Brif => {
+                    // Every param this value reaches must be kept.
+                    let v = func.dfg.resolve_aliases(v);
+                    d.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables).iter().all(|bc| {
+                        let b = bc.block(&func.dfg.value_lists);
+                        bc.args(&func.dfg.value_lists).enumerate().all(|(k, a)| match a {
+                            BlockArg::Value(x) if func.dfg.resolve_aliases(x) == v => {
+                                func.dfg.block_params(b).get(k).is_some_and(|p| cand.contains(p))
+                            }
+                            _ => true,
+                        })
+                    })
+                }
+                _ => false,
+            }
+        })
+    }
+    for _ in 0..8 {
+        let drop: Vec<Value> = cand
+            .iter()
+            .copied()
+            .filter(|&p| {
+                !args_of.get(&p).is_some_and(|a| a.iter().all(|&v| built(func, &cand, v, 8)))
+                    || !folds(func, &uses, &cand, p, 8)
+            })
+            .collect();
+        if drop.is_empty() {
+            break;
+        }
+        for p in drop {
+            cand.remove(&p);
+        }
+    }
+    cand
+}
+
+fn phi_on() -> bool {
+    crate::env_is("PLIRON_WIDE128_PHI", "1")
 }

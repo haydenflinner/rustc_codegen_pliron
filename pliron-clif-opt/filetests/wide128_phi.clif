@@ -1,0 +1,26 @@
+; test wide128_phi
+; foldhash's `u128` sponge reaches a join as a block param: one path
+; shifts the second word in by 64, the other leaves the sponge as the
+; first word. Split into two `i64` params, the shifts by 0 and 64 fold to
+; `iconcat`s and the final `isplit` reads the halves: no `i128` param,
+; shift or `isplit` stays.
+; check-not: : i128
+; check-not: ishl
+; check-not: isplit
+function %f(i64, i64, i8) -> i64, i64 {
+block0(v0: i64, v1: i64, v2: i8):
+    v3 = uextend.i128 v0
+    brif v2, block1, block2(v3)
+
+block1:
+    v4 = uextend.i128 v1
+    v5 = iconst.i64 64
+    v6 = uextend.i128 v5
+    v7 = ishl v4, v6
+    v8 = bor v3, v7
+    jump block2(v8)
+
+block2(v9: i128):
+    v10, v11 = isplit v9
+    return v10, v11
+}
