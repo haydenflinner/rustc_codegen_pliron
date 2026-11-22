@@ -1444,8 +1444,19 @@ impl Context {
         if mode == 0 {
             return;
         }
-        let is_multi = |d: &InstructionData| match d {
-            InstructionData::Brif { .. } => mode == 1,
+        // `=3`: `brif` too, but only outside loops (in a loop the edge
+        // block's copy moved a register around regex's `Fsm::next_state`
+        // varint loop: +0.9% under `=1`).
+        // A local analysis: the pass changes the CFG, and `self`'s must not
+        // be left looking valid.
+        let mut la = crate::loop_analysis::LoopAnalysis::new();
+        if mode == 3 {
+            let cfg = crate::flowgraph::ControlFlowGraph::with_function(&self.func);
+            let dt = crate::dominator_tree::DominatorTree::with_function(&self.func, &cfg);
+            la.compute(&self.func, &cfg, &dt);
+        }
+        let is_multi = |d: &InstructionData, b: crate::ir::Block, la: &crate::loop_analysis::LoopAnalysis| match d {
+            InstructionData::Brif { .. } => mode == 1 || (mode == 3 && la.innermost_loop(b).is_none()),
             InstructionData::BranchTable { .. } => true,
             _ => false,
         };
@@ -1453,7 +1464,7 @@ impl Context {
         let mut cands = Vec::new();
         for b in self.func.layout.blocks() {
             let Some(t) = self.func.layout.last_inst(b) else { continue };
-            if !is_multi(&self.func.dfg.insts[t]) {
+            if !is_multi(&self.func.dfg.insts[t], b, &la) {
                 continue;
             }
             let f = &self.func;
