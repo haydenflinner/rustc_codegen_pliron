@@ -92,6 +92,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // (`montgomery` +8.4k, the rest noise). Gate/crates not run.
     // `PLIRON_WIDE128_PHI=0` off.
     "PLIRON_WIDE128_PHI",
+    // 2026-11-22: equality chains against six or more sparse constants as
+    // a balanced search tree. Exact counts: html -0.384%, the rest within
+    // noise. Gate/crates not run. `PLIRON_EQTREE=0` off.
+    "PLIRON_EQTREE",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
