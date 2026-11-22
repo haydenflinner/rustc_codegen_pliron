@@ -1487,16 +1487,16 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
 
     /// PLIRON (`PLIRON_MINMAXIMM=1`): min/max against a small constant
     /// compares with the immediate (and selects `xzr` for zero).
-    /// PLIRON (`PLIRON_PAIRWISE_ISLE=1`): `umax`/`iadd` of a vector's even
+    /// PLIRON (`PLIRON_PAIRWISE_ISLE`, default on, `=0` off): `umax`/`iadd` of a vector's even
     /// and odd lanes (`uzp1`/`uzp2` shuffles) as one `umaxp`/`addp`.
     fn pliron_pairwise_isle(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_PAIRWISE_ISLE").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_PAIRWISE_ISLE").as_deref() != Ok("0"))
     }
 
     fn pliron_minmax_imm(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_MINMAXIMM").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_MINMAXIMM").as_deref() != Ok("0"))
     }
 
     /// PLIRON (`PLIRON_AMODENEG=1`): `-off` as an `Imm12` for a negative

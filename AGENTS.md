@@ -777,6 +777,18 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_BITCAST2` (default on since 2026-11-22, `=0` off), and in
+  vendored Cranelift `PLIRON_PAIRWISE_ISLE` and `PLIRON_MINMAXIMM` (both
+  default on since then, `=0` off) — memchr's NEON path:
+  `bitcast.T (bitcast.U x)` with `x: T` folds (`clifpeep::bitcast_pairs`;
+  the round trip of `vshrn_n_u16` and `vreinterpret_u64_u8` kept the
+  aarch64 `shrn` rule from matching: `ushr; movi; and; sqxtun` instead of
+  `shrn`), `umax`/`iadd` of a vector's `uzp1`/`uzp2` halves is one
+  `umaxp`/`addp` (`neon_pairwise`'s `vpmaxq_u8`), and `smax`/`umin`.. of a
+  12-bit constant compare against the immediate. Together: html -0.312%,
+  pulldown -0.338%, the rest flat (json +0.079% non-nop is one alignment
+  nop in `parse_str` turned into a callee save). Stanza `simdshift`
+  accepts `shrn`.
 - `PLIRON_MEMFAST_SMALLFN=<ops>` (default `1024` since 2026-11-22, `=0`
   off) — a function of at most that many IR ops inlines its runtime-size
   copies below 16 bytes too, as `PLIRON_MEMFAST_SMALL`'s default `loop`

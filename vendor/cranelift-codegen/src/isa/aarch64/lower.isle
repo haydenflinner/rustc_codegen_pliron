@@ -1640,7 +1640,7 @@
       (with_flags_reg (cmp (operand_size ty) x y)
                       (csel cc x y))))
 
-;; PLIRON (`PLIRON_MINMAXIMM=1`): a constant operand that fits 12 bits
+;; PLIRON (`PLIRON_MINMAXIMM`, default on since 2026-11-22, `=0` off): a constant operand that fits 12 bits
 ;; is the compare's immediate, and zero is `xzr` in the select: `smax x,
 ;; 0` was `mov x1, #0; cmp x0, x1; csel x0, x0, x1, gt` (pulldown-cmark's
 ;; `scan_nextline`), now `cmp x0, #0; csel x0, x0, xzr, gt`.
@@ -1697,7 +1697,7 @@
 ;; `vpmaxq_u8(a, b)` / `vpaddq_*` as the lane-wise op of the even and the odd
 ;; lanes of `a ++ b` (two shuffles, `uzp1` and `uzp2`); one `umaxp`/`addp`
 ;; does it (memchr's NEON search loop tests its compare results with
-;; `vpmaxq_u8(x, x)`). Opt-in: `PLIRON_PAIRWISE_ISLE=1`. Either operand
+;; `vpmaxq_u8(x, x)`). Default on, `PLIRON_PAIRWISE_ISLE=0` off. Either operand
 ;; order: the egraph may commute.
 (decl pure pliron_pairwise_isle () bool)
 (extern constructor pliron_pairwise_isle pliron_pairwise_isle)

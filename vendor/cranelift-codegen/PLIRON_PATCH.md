@@ -2239,7 +2239,7 @@ length through scratch registers on every byte (`tag_name_state` 9
 instructions per byte, LLVM 3). Exact counts: html -0.396%, protobuf
 -0.144%, json +0.007%, blind-sig +0.020%, the rest within noise.
 
-## Pairwise max/add as `umaxp`/`addp` (`PLIRON_PAIRWISE_ISLE=1`, opt-in)
+## Pairwise max/add as `umaxp`/`addp` (`PLIRON_PAIRWISE_ISLE`, default on since 2026-11-22, `=0` off)
 
 `src/isa/aarch64/lower.isle` (rules at priority 31 before the `uextend`
 section), `src/isa/aarch64/lower/isle.rs` (`pliron_pairwise_isle`):
@@ -2248,3 +2248,7 @@ section), `src/isa/aarch64/lower/isle.rs` (`pliron_pairwise_isle`):
 order, is one `umaxp`/`addp`. pliron-clif-lower's `neon_pairwise` emits
 `vpmaxq_u8(a, b)` that way; memchr's NEON search tests its compare masks
 with it (`uzp1; uzp2; umax` was three instructions per 16 or 64 bytes).
+
+`PLIRON_MINMAXIMM` (the `cmp_and_choose_imm` rule in `lower.isle`) is
+default on since 2026-11-22 (`=0` off), flipped with `PLIRON_BITCAST2`
+and `PLIRON_PAIRWISE_ISLE`: html -0.312%, pulldown -0.338% exact non-nop.

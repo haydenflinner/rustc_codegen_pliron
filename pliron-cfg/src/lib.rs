@@ -101,6 +101,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // (`Vec::with_capacity(len)` + extend: the reserve test). Exact
     // non-nop: json -0.165%, html -0.056%, blind-sig -0.041%, the rest flat.
     "PLIRON_SELARGS_EXT",
+    // 2026-11-22: `bitcast.T (bitcast.U x: T)` folds, so aarch64's `shrn`
+    // rule sees memchr's NEON match mask (with the vendored
+    // `PLIRON_PAIRWISE_ISLE` and `PLIRON_MINMAXIMM`, flipped together):
+    // html -0.312%, pulldown -0.338%, json +0.079% non-nop (`parse_str`
+    // swaps an alignment nop for a callee save; same total), the rest flat.
+    "PLIRON_BITCAST2",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
