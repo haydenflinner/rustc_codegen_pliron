@@ -333,6 +333,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // Late null-test fold for cursors whose inbounds marks were lost
     // (regex's varint loop; docs/history/2026-10-31-tune-heldout.md).
     "PLIRON_NFOLD2",
+    // Constant branches nfold2 decided fold; compares a join's edges all
+    // decide fold (2026-11-22, docs/history/2026-11-20-ivsr.md).
+    "PLIRON_NFOLD2_BR",
+    "PLIRON_JOINCMP",
     // Dead-default switches dispatch on the raw tag; tables keep the
     // `unreachable` default and drop their bounds clamp (vendored
     // Cranelift reads PLIRON_SWITCH_KEEPDEAD itself, `!= "0"`).

@@ -876,7 +876,8 @@ time, memory, code size, stack frames) in ~20 min and writes
   blind-sig -0.041%, the rest flat. Filetests `selargs_ext`,
   `selargs_ext_dom` (a block whose params are read past it stays: the
   first version broke SSA in serde_json).
-- `PLIRON_JOINCMP` and `PLIRON_NFOLD2_BR` (2026-11-22, opt-in; `=1`) —
+- `PLIRON_JOINCMP` and `PLIRON_NFOLD2_BR` (default on since 2026-11-22,
+  `=0` off) —
   step `joincmp` after `nfold2` (`pliron-clif-opt/src/joincmp.rs`): an
   `icmp` on a join's block parameter that every incoming edge decides the
   same way (the parameter replaced by the edge's argument; equal operands,

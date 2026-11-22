@@ -3683,7 +3683,7 @@ fn s_nfold2(p: &mut Pipe, an: &mut Analysis) -> usize {
     let nn = jumpthread::NonNull::new_ext(&p.clctx.func, an.cfg_dt(&p.clctx.func).0, p.nonnull, p.derived, true);
     let k = niche::run_with(&mut p.clctx.func, &nn, true);
     if k > 0 {
-        // `PLIRON_NFOLD2_BR=1` (opt-in): a test this fold decided leaves
+        // `PLIRON_NFOLD2_BR` (default on, `=0` off): a test this fold decided leaves
         // `brif` on a constant, and no later step folds branches: hashbrown's
         // `reserve_rehash` ran `mov w1, #0; cbz w1` twice per call.
         if pliron_cfg::env_is("PLIRON_NFOLD2_BR", "1") && jumpthread::fold_const_branches(&mut p.clctx.func) > 0 {

@@ -1,5 +1,5 @@
 //! A compare on a join's parameter that every incoming edge decides
-//! (`PLIRON_JOINCMP=1`, opt-in).
+//! (`PLIRON_JOINCMP`, default on since 2026-11-22, `=0` off).
 //!
 //! hashbrown's `RawTableInner::new_uninitialized` allocates, then rebuilds
 //! its bucket count from the length the allocator returned when that is not
