@@ -783,6 +783,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   every byte), but compression +1.93% (brotli's
   `BrotliCreateHqZopfliBackwardReferences` spills under the new linear
   order), regex +0.44% (jumps in `follow_epsilons`), pulldown +0.08%.
+  The narrow form `PLIRON_EXITLAST=1` (opt-in, measured mixed: a chain
+  outside loops that ends in a function exit and dominates nothing outside
+  itself goes last, only while a placed loop still has unplaced blocks):
+  json -0.078%, html -0.018%, protobuf +0.072%, pulldown +0.069%.
 - `PLIRON_JT_DIRECT` (vendored Cranelift, default on since 2026-11-22,
   `=0` off) — an aarch64 jump table's entry load indexes with the index
   register itself: no copy and no Spectre clamp (`csel idx, xzr, idx, hs`)
