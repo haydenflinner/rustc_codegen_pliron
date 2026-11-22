@@ -1766,9 +1766,15 @@ impl Context {
                 };
             }
             let lvl = self.loop_analysis.loop_level(b).level();
+            // `PLIRON_AMODESPLIT_MAX` (default 16; was 4, which kept serde_json's
+            // escape scan out: its escape path uses the address in 5+ blocks).
+            static MAXB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let maxb = *MAXB.get_or_init(|| {
+                std::env::var("PLIRON_AMODESPLIT_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+            });
             if local != 1
                 || others.is_empty()
-                || others.len() > 4
+                || others.len() > maxb
                 || others.iter().any(|&ub| self.loop_analysis.loop_level(ub).level() > lvl)
             {
                 continue;
