@@ -502,6 +502,9 @@ impl BlockLoweringOrder {
                     op.is_return() || op == crate::ir::Opcode::ReturnCall
                         || op == crate::ir::Opcode::ReturnCallIndirect || op.is_terminator() && op.can_trap() && !op.is_branch()
                 };
+                // Deferred chains, blocks in order. They are claimed at
+                // once (in `emitted`), so no later chain flows into one of
+                // their blocks ahead of its dominator.
                 let mut deferred: Vec<Block> = Vec::new();
                 for &block in &rpo {
                     if emitted.contains(&block) {
@@ -523,15 +526,17 @@ impl BlockLoweringOrder {
                     // dominator: no block of the chain may dominate a
                     // block outside it.
                     let closed = seen.iter().all(|&c| domtree.children(c).all(|k| seen.contains(&k)));
-                    if la.innermost_loop(block).is_none() && exits(last) && closed && !orig_order.is_empty() {
-                        deferred.push(block);
+                    let whole = !best_succ[last].expand().is_some_and(|n| !emitted.contains(&n) && !seen.contains(&n));
+                    if la.innermost_loop(block).is_none() && exits(last) && closed && whole && !orig_order.is_empty() {
+                        for &c in &seen {
+                            emitted.insert(c);
+                            deferred.push(c);
+                        }
                         continue;
                     }
                     let _ = emit_chain(block, &mut emitted, &mut orig_order);
                 }
-                for block in deferred {
-                    let _ = emit_chain(block, &mut emitted, &mut orig_order);
-                }
+                orig_order.extend(deferred);
             } else {
                 for &block in &rpo {
                     let _ = emit_chain(block, &mut emitted, &mut orig_order);
