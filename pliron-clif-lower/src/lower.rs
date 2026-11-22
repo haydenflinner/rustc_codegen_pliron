@@ -2343,6 +2343,7 @@ pub fn lower_module<'a>(
                     undef: Vec::new(),
                     ltloops: FxHashSet::default(),
                 cycles: FxHashSet::default(),
+                small_fn: false,
                     ltdom: None,
                     dbg_slots: Default::default(),
                 };
@@ -3478,6 +3479,7 @@ pub fn lower_clif_wasm(
                 undef: Vec::new(),
                 ltloops: FxHashSet::default(),
                 cycles: FxHashSet::default(),
+                small_fn: false,
                 ltdom: None,
                 dbg_slots: Default::default(),
             };
@@ -4091,6 +4093,13 @@ struct FnLower<'a, 'b> {
     /// `PLIRON_MEMFAST_SMALL=loop`: the blocks on a CFG cycle
     /// (`cycle_blocks`); empty unless that mode is on.
     cycles: FxHashSet<Ptr<BasicBlock>>,
+    /// `PLIRON_MEMFAST_SMALLFN=<ops>` (opt-in): the function has at most
+    /// that many IR ops, so its runtime-size copies are inline at every
+    /// size like a loop's (`loop` mode). A small function that survives
+    /// inlining is called often: lol_html's output sink closure (one
+    /// `extend_from_slice` behind `&mut dyn FnMut`, 62.8k calls) paid
+    /// libc's `memcpy` for each chunk of a few bytes.
+    small_fn: bool,
     /// The zeros `ltundef` emits at markers. They are skipped when a later
     /// marker picks its anchor: a zero no read uses dies in the pipeline,
     /// and a marker anchored on a dead inst falls back to its whole block,
@@ -4263,6 +4272,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
         }
         if matches!(pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hotloop").unwrap_or("loop"), "loop" | "hotloop") {
             self.cycles = cycle_blocks(ctx, &pblocks);
+            static SMALLFN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let lim = *SMALLFN
+                .get_or_init(|| crate::env_get("PLIRON_MEMFAST_SMALLFN").and_then(|s| s.parse().ok()).unwrap_or(0));
+            if lim > 0 {
+                let mut ops = 0usize;
+                for b in &pblocks {
+                    ops += b.deref(ctx).iter(ctx).count();
+                    if ops > lim {
+                        break;
+                    }
+                }
+                self.small_fn = ops <= lim;
+            }
         }
         if self.ltundef && !crate::env_is("PLIRON_LTUNDEF_ALL", "1") {
             self.ltloops = lt_loop_blocks(ctx, self.st, &pblocks, &self.vars);
@@ -8950,7 +8972,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             let b = op.deref(self.ctx).get_parent_block();
                             let c = b.and_then(|b| crate::pgo::block_count(self.st, b));
                             c.zip(self.st.prof_hot).is_some_and(|(c, h)| c >= h)
-                                || (b.is_some_and(|b| self.cycles.contains(&b)) && c != Some(0))
+                                || ((self.small_fn || b.is_some_and(|b| self.cycles.contains(&b))) && c != Some(0))
                         }
                         Some("1") => true,
                         Some("hot") => op
@@ -8972,7 +8994,8 @@ impl<'a, 'b> FnLower<'a, 'b> {
                         // cycle of this function (after inlining). Most
                         // of `=1`'s speed for a fraction of its size.
                         Some("loop") => {
-                            op.deref(self.ctx).get_parent_block().is_some_and(|b| self.cycles.contains(&b))
+                            self.small_fn
+                                || op.deref(self.ctx).get_parent_block().is_some_and(|b| self.cycles.contains(&b))
                         }
                         _ => false,
                     };
