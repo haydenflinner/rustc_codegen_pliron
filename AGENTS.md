@@ -777,6 +777,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_EXNCONST=1` (opt-in, 2026-11-22, measured, no default) — step
+  `exnconst` near the end: a constant a `try_call`'s exception edge
+  passes (a drop flag `edgefwd` moved onto the call) is defined in a cold
+  landing block instead of being live across the call. html -0.10%, json
+  -0.065%, compression +0.30% (one brotli loop's register assignment),
+  pulldown +0.044%. Filetest `exnconst`.
 - `PLIRON_XCGU_LEAF_DEPTH` (default `12` since 2026-11-22, `8` the old
   walk) and `_BUDGET` (64) — how deep and wide `xcgu`'s leaf test
   (`PLIRON_XCGU_LEAF`, 100) follows callees. A by-value `Vec::push`

@@ -15,6 +15,13 @@
 //! (not the normal return) that passes an `iconst`, the edge goes to a new
 //! cold block taking the other arguments as parameters, which defines the
 //! constants afresh and jumps on. One extra `b` on the unwind path.
+//!
+//! Measured 2026-11-22 (exact non-nop): html -0.10%, json -0.065%, but
+//! compression +0.30% (brotli's `BrotliCreateHqZopfliBackwardReferences`:
+//! regalloc spilled a loop bound that kept `x23` before, 120k reloads) and
+//! pulldown +0.044%. Restricted to constants used only on exception
+//! edges (their live range goes entirely): html +0.03%, the rest noise.
+//! Not for default until regalloc's assignment stops moving with it.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{Block, BlockArg, BlockCall, Function, InstBuilder, InstructionData, Opcode, Value};
