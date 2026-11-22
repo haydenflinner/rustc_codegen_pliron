@@ -777,6 +777,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_XCGU_LEAF_DEPTH` (default `12` since 2026-11-22, `8` the old
+  walk) and `_BUDGET` (64) — how deep and wide `xcgu`'s leaf test
+  (`PLIRON_XCGU_LEAF`, 100) follows callees. A by-value `Vec::push`
+  reaches the allocator through ten levels of unwind drop glue, so
+  lol_html's `LimitedVec::push` stayed a call. Exact counts: html
+  -0.094%, pulldown -0.057%, protobuf +0.037%, the rest flat.
+  `PLIRON_XCGU_COLDPATH=1` (opt-in, measured a loss: html +0.12%): the
+  `cold_path` intrinsic needs no body in a copy.
+  `PLIRON_STATS_XCGU=<substr>` with `PLIRON_TRACE=pliron::stats` says
+  why a function is not copied (`notleaf`, `toobig`, `reject`).
 - `PLIRON_XNEED=0` — stage-B release falls back to the full ordinal
   prefix instead of waiting only on the ords that own this CGU's
   bodiless decls (adopt's lookups only read those ords' facts, so

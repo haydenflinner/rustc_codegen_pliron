@@ -662,6 +662,13 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // `PLIRON_XCGU_LEAF=0` / `PLIRON_XCGU_LASTCALL=0` off.
     ("PLIRON_XCGU_LEAF", "100"),
     ("PLIRON_XCGU_LASTCALL", "20"),
+    // 2026-11-22: the leaf walk goes 12 levels deep (was 8): a by-value
+    // `Vec::push` reaches the allocator through ten levels of unwind
+    // drop glue, so lol_html's `LimitedVec::push` (10.4k calls from
+    // another CGU) stayed a call. Exact non-nop: html -0.094%, pulldown
+    // -0.057%, blind-sig -0.06% (noise), protobuf +0.037% (prost's
+    // `merge_repeated` inlining reshuffle), the rest flat. `=8` the old walk.
+    ("PLIRON_XCGU_LEAF_DEPTH", "12"),
     // 2026-11-18: wide128 skips functions over this many CLIF instructions
     // (montgomery ~1.7k). `=0` no size cap. Foldhash `build_state` is a
     // few hundred.
