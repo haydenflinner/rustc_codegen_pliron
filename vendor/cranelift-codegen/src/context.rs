@@ -1421,7 +1421,7 @@ impl Context {
         }
     }
 
-    /// PLIRON (`PLIRON_EDGECONST=1`, opt-in): constants that are only
+    /// PLIRON (`PLIRON_EDGECONST`, default `2` since 2026-11-22: `br_table`s only; `=1` also `brif`, `=0` off): constants that are only
     /// arguments of a conditional branch's or a `br_table`'s edges are
     /// materialized on those edges. Every argument of a branch is evaluated
     /// before it, so a `match` that passes a different tag to one join per
@@ -1439,7 +1439,7 @@ impl Context {
         use crate::ir::{BlockArg, BlockCall, InstBuilder, InstructionData, Opcode, Value};
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let mode = *MODE.get_or_init(|| {
-            std::env::var("PLIRON_EDGECONST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            std::env::var("PLIRON_EDGECONST").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
         });
         if mode == 0 {
             return;

@@ -777,6 +777,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_EDGECONST` (vendored, default `2` since 2026-11-22: `br_table`
+  edges only; `=1` also `brif`, `=0` off) — a constant a multi-way branch
+  passes to a join is materialized on its edge instead of ahead of the
+  branch for every arm (pulldown-cmark's `item_to_event` jump table). `=2`:
+  pulldown -1.202%, blind-sig -0.148%, the rest flat. `=1` adds html
+  -0.335%, protobuf -0.372%, json -0.188% but costs regex +0.912%
+  (`Fsm::next_state`).
 - `PLIRON_ARGPARAM` (vendored lowering, default `1` since 2026-11-22, `=0`
   off, `=2` any block) — an entry-block parameter whose only use is a call
   argument is passed without the `arg_detach` copy: protobuf -0.048%, html

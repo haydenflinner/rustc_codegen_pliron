@@ -2055,7 +2055,7 @@ second operand is a 12-bit constant now compares with the immediate, and
 a zero operand is `xzr` in the `csel` (no constant at all). pulldown-cmark
 `scan_nextline`'s `max(0, ..)`.
 
-## `PLIRON_EDGECONST=1` (opt-in): constant branch arguments on their edges (2026-11-17)
+## `PLIRON_EDGECONST` (default `2` since 2026-11-22, `=1` brif too, `=0` off): constant branch arguments on their edges (2026-11-17)
 
 `src/context.rs` (`edge_const_sink`, after `exit_const_sink` in the
 aarch64 post-egraph section): every argument of a branch is evaluated
@@ -2337,3 +2337,7 @@ compression flat. Default on.
 `PLIRON_EDGECONST=1` pulldown -1.391%, protobuf -0.372%, html -0.335%, json
 -0.188%, blind-sig -0.175%, but regex +0.912% (`Fsm::next_state`) and
 compression +0.018%.
+
+`PLIRON_EDGECONST=2` (jump tables only) exact non-nop: pulldown -1.202%,
+blind-sig -0.148%, the rest flat (regex's `brif` loss is mode 1 only).
+Default `2`.
