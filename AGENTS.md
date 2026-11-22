@@ -1248,6 +1248,15 @@ time, memory, code size, stack frames) in ~20 min and writes
   pointer and length on every byte). Exact counts: html -0.396%, protobuf
   -0.144%, json +0.007%, blind-sig +0.020%. Flipped without the
   gate/crates runs (stanzas sibcall, std, unwind, neonpair, halfclob pass).
+- `PLIRON_EQTREE` (default on since 2026-11-22, `=0` off) — step
+  `eqtree` after `bittab2`: a chain of blocks each testing `icmp eq|ne
+  x, K` on one value against at least six distinct sparse constants
+  becomes a balanced search tree (`x u< K_mid` splits, leaves of up to
+  three tests), as LLVM lowers a sparse switch. lol_html's
+  `get_feedback_for_start_tag` tested a tag-name hash against a dozen
+  64-bit constants one by one. Exact counts: html -0.384%, the rest within
+  noise. Gate/crates not run. Test `pliron-clif-opt/tests/eqtree.rs`
+  (every `i8` input against the interpreter).
 - `PLIRON_INLINE_GLUET=<n>` (opt-in) — drop-glue call-site threshold at
   least n (after the `DROPLIM` cap). At 90: html-rewriter -0.84%,
   pulldown -0.31%, protobuf -0.34%, but compression +1.25%, regex +0.35%.

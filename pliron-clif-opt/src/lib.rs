@@ -48,6 +48,7 @@ pub mod selxor;
 pub mod commute;
 pub mod config;
 pub mod undefphi;
+pub mod eqtree;
 pub mod guardsink;
 pub mod wide128;
 pub mod slotconst;

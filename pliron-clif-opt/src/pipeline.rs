@@ -3902,6 +3902,17 @@ fn s_commonret(p: &mut Pipe, _an: &mut Analysis) -> usize {
     n
 }
 
+fn s_eqtree(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::eqtree::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("eqtree");
+        }
+    }
+    k
+}
+
 fn s_guardsink(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::guardsink::run(&mut p.clctx.func);
     if k > 0 {
@@ -5552,6 +5563,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // whitespace skip `x - 9 in {0, 1, 4, 23}` only becomes one chain
         // after brchain/mergechain/jtround).
         cstep("bittab2", "bittab", Gate::Env("PLIRON_BITTAB2"), s_bittab).needs(shape::CONDBR),
+        // Equality chains against six or more sparse constants (after
+        // bittab2 took the small-window ones) become a balanced search
+        // tree, as LLVM lowers a sparse switch (`PLIRON_EQTREE=1`).
+        step("eqtree", "eqtree", Gate::OptIn("PLIRON_EQTREE"), s_eqtree).needs(shape::CONDBR),
         // Loops the late threading simplified (an `Option` niche test
         // folded away) can rotate now: top test + `jump` back becomes one
         // bottom `brif`.
