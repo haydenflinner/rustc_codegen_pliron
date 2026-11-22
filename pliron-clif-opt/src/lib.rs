@@ -18,6 +18,7 @@ pub mod bunroll;
 pub mod latchspec;
 pub mod mergejump;
 pub mod bittab;
+pub mod brbits;
 pub mod brifsel;
 pub mod demand;
 pub mod demanded;

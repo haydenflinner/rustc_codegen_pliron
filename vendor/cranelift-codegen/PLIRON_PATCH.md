@@ -2252,3 +2252,14 @@ with it (`uzp1; uzp2; umax` was three instructions per 16 or 64 bytes).
 `PLIRON_MINMAXIMM` (the `cmp_and_choose_imm` rule in `lower.isle`) is
 default on since 2026-11-22 (`=0` off), flipped with `PLIRON_BITCAST2`
 and `PLIRON_PAIRWISE_ISLE`: html -0.312%, pulldown -0.338% exact non-nop.
+
+## Wide constants keep their hoist (`PLIRON_ELABKEEP_WIDE=1`, opt-in)
+
+`src/egraph/elaborate.rs` (`wide_const`, a `wide` argument to
+`keep_out_of_loop`), `src/egraph/mod.rs` (`orig_block` also records such a
+constant): an `iconst` of three or four `mov`/`movk` instructions (no
+repeating pattern a logical immediate could encode) stays ahead of the
+loop the pipeline hoisted it out of. `ELABKEEP`'s rule needs an operand
+the loop does not otherwise use, which a constant never has, so
+elaboration put a bit test's 64-bit mask back into lol_html's
+`tag_name_state` byte loop.

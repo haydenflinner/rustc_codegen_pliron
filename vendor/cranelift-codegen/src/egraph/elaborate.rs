@@ -49,6 +49,31 @@ pub(crate) fn elab_hot_on() -> bool {
 /// PLIRON: `PLIRON_ELABKEEP` (default on; `=0` off) — elaboration does
 /// not move a pure instruction into a loop the incoming function had it
 /// outside of. See `Elaborator::keep_out_of_loop`.
+/// PLIRON (`PLIRON_ELABKEEP_WIDE=1`, opt-in): an `iconst` that takes
+/// three or four `mov`/`movk` instructions on a 64-bit target (three or
+/// more 16-bit chunks that are neither all zeros nor all ones, and no
+/// repeating pattern a logical immediate could encode) stays where the
+/// pipeline hoisted it, ahead of the loop: `ELABKEEP`'s operand rule
+/// never holds for a constant, and elaboration put a bit test's 64-bit
+/// mask back into lol_html's `tag_name_state` byte loop (four
+/// instructions a byte, LLVM: none).
+pub(crate) fn wide_const(func: &Function, inst: Inst) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP_WIDE").as_deref() == Ok("1")) {
+        return false;
+    }
+    let crate::ir::InstructionData::UnaryImm { opcode: crate::ir::Opcode::Iconst, imm } = func.dfg.insts[inst] else {
+        return false;
+    };
+    let v = imm.bits() as u64;
+    let chunks = |x: u64| (0..4).filter(|i| (x >> (16 * i)) & 0xffff != 0).count();
+    let n = chunks(v).min(chunks(!v));
+    // A repeating 2-, 4-, 8-, 16- or 32-bit pattern may be a logical
+    // immediate (one instruction): leave those to the old rule.
+    let repeats = [32u32, 16, 8, 4, 2].iter().any(|&p| v.rotate_right(p) == v);
+    n >= 3 && !repeats
+}
+
 pub(crate) fn elab_keep_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP").as_deref() != Ok("0"))
@@ -389,6 +414,7 @@ impl<'a> Elaborator<'a> {
         inst: Inst,
         insert_block: Block,
         args: &[ElaboratedValue],
+        wide: bool,
     ) -> Option<LoopStackEntry> {
         let (orig, ops) = orig_block.get(&inst)?;
         let mut best = None;
@@ -396,7 +422,7 @@ impl<'a> Elaborator<'a> {
         while let Some(l) = lp {
             if loop_analysis.is_in_loop(*orig, l)
                 || args.iter().any(|a| loop_analysis.is_in_loop(a.in_block, l))
-                || !ops.iter().any(|&x| use_blocks[x].none_in(loop_analysis, l))
+                || (!wide && !ops.iter().any(|&x| use_blocks[x].none_in(loop_analysis, l)))
             {
                 break;
             }
@@ -1019,6 +1045,7 @@ impl<'a> Elaborator<'a> {
                         inst,
                         insert_block,
                         arg_values,
+                        wide_const(self.func, inst),
                     ) {
                         Some(e) => {
                             self.stats.elaborate_licm_hoist += 1;

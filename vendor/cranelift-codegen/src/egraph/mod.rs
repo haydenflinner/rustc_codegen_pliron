@@ -1057,7 +1057,9 @@ impl<'a> EgraphPass<'a> {
 
                 if is_pure_for_egraph(ctx.func, inst) {
                     // PLIRON: remember where the pipeline had it.
-                    if !kept_ops.is_empty() {
+                    // `PLIRON_ELABKEEP_WIDE`: a wide constant has no
+                    // operands, but its hoist is kept too.
+                    if !kept_ops.is_empty() || elaborate::wide_const(ctx.func, inst) {
                         self.orig_block.insert(inst, (block, kept_ops));
                     }
                     // Insert into GVN map and optimize any new nodes

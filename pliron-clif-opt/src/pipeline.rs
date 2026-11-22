@@ -3920,6 +3920,17 @@ fn s_commonret(p: &mut Pipe, _an: &mut Analysis) -> usize {
     n
 }
 
+fn s_brbits(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::brbits::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("brbits");
+        }
+    }
+    k
+}
+
 fn s_eqtree(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::eqtree::run(&mut p.clctx.func);
     if k > 0 {
@@ -5241,6 +5252,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_ldrot,
         )
         .needs(shape::LOOPS | shape::MEM),
+        // A `br_table` of at most 64 entries and three destinations as bit
+        // tests (LLVM's bit test clusters). Ahead of licm, which hoists the
+        // masks out of a byte loop. Opt-in: `PLIRON_BRBITS=1`.
+        step("brbits", "brbits", Gate::OptIn("PLIRON_BRBITS"), s_brbits),
         cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm)
             .needs(shape::LOOPS)
             .creates_all(),
