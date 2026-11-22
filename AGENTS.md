@@ -1201,7 +1201,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   `parse_block`, which LLVM keeps a call; but compression +0.93%: miniz's
   `transfer` into `decompress`), `=1` drops both (also blake3 +0.16%: its
   recursive `compress_subtree_wide` went into its own closures).
-- `PLIRON_TMPARAM_DEDUP=1` (opt-in, 2026-11-22) — `tailmergep` gives
+- `PLIRON_TMPARAM_DEDUP` (default on since 2026-11-22, `=0` off) — `tailmergep` gives
   external operands that agree member by member one shared-block param
   instead of one per occurrence. lol_html's `finish_tag_name` merged two
   "store a 56-byte result through the `sret` pointer and return" tails

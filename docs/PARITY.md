@@ -1422,6 +1422,9 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    -0.030%. Open: under `=2` pulldown is -2.24% (`scan_containers` into
    `parse_block`, a call LLVM keeps), so our call there costs far more
    than LLVM's.
+   **Done (default on, 2026-11-22): `PLIRON_TMPARAM_DEDUP`**: merged tails
+   take one param per distinct operand (`finish_tag_name`'s seven copies
+   of the `sret` pointer): html -0.160%, pulldown -0.077%, regex -0.064%.
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain

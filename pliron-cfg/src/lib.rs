@@ -81,6 +81,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // -0.032%, the rest within noise (`docs/history/2026-11-20-ivsr.md`).
     // `PLIRON_PARTINLINE_WIDE=0` off.
     "PLIRON_PARTINLINE_WIDE",
+    // 2026-11-22: tailmergep shares one param per distinct operand tuple
+    // (a merged tail storing through one `sret` pointer seven times).
+    // Exact counts: html -0.160%, pulldown -0.077%, regex -0.064%,
+    // protobuf -0.018% (`docs/history/2026-11-20-ivsr.md`).
+    // `PLIRON_TMPARAM_DEDUP=0` off.
+    "PLIRON_TMPARAM_DEDUP",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
