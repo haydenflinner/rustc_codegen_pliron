@@ -2263,3 +2263,11 @@ loop the pipeline hoisted it out of. `ELABKEEP`'s rule needs an operand
 the loop does not otherwise use, which a constant never has, so
 elaboration put a bit test's 64-bit mask back into lol_html's
 `tag_name_state` byte loop.
+
+## Jump tables index with the unclamped index (`PLIRON_JT_DIRECT=1`, opt-in)
+
+`src/isa/aarch64/inst/emit.rs` (`JTSequence`): with the deferred narrow
+table, the entry load indexes with `ridx` itself (`uxtw`); the copy into
+`rtmp2` (unchecked tables) and the Spectre clamp `csel rtmp2, xzr, ridx,
+hs` after the bounds branch are not emitted. LLVM emits no such clamp for
+native code.

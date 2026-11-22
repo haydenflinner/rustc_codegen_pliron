@@ -3394,7 +3394,16 @@ impl MachInstEmit for Inst {
                 ref targets,
                 checked,
             } => {
-                if !checked {
+                // PLIRON (`PLIRON_JT_DIRECT=1`, opt-in): the deferred narrow
+                // table indexes with `ridx` itself (`uxtw`), so the index is
+                // neither copied (`!checked`) nor clamped to zero after the
+                // bounds branch (`csel`, a Spectre mitigation LLVM does not
+                // emit for native code). One instruction per dispatch:
+                // lol_html's `tag_name_state` switches on every byte.
+                static JT_DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let direct = *JT_DIRECT.get_or_init(|| std::env::var("PLIRON_JT_DIRECT").as_deref() == Ok("1"))
+                    && sink.can_defer_jump_table(LabelUse::Adr21);
+                if !checked && !direct {
                     // PLIRON: unreachable default. The index is in range,
                     // so just copy it into rtmp2 (32-bit: `ridx` is
                     // zero-extended).
@@ -3416,6 +3425,7 @@ impl MachInstEmit for Inst {
                 sink.use_label_at_offset(default_br_offset, default, LabelUse::Branch19);
                 sink.put4(br);
 
+                if !direct {
                 // Overwrite the index with a zero when the above
                 // branch misspeculates (Spectre mitigation). Save the
                 // resulting index in rtmp2.
@@ -3434,6 +3444,7 @@ impl MachInstEmit for Inst {
                     Inst::Csdb.emit(sink, emit_info, state);
                 }
                 }
+                }
 
                 // PLIRON: deferred narrow table (`PLIRON_JT_NARROW=1`). The
                 // table goes after all code; `MachBuffer::finish` picks 1-,
@@ -3447,10 +3458,11 @@ impl MachInstEmit for Inst {
                 'jt: {
                     if sink.can_defer_jump_table(LabelUse::Adr21) {
                         let (r1, r2) = (rtmp1.to_reg(), rtmp2.to_reg());
+                        let ix = if direct { ridx } else { r2 };
                         let uxtw = Some(ExtendOp::UXTW);
                         let enc = |op: u32, scaled: bool| -> SmallVec<[u8; 8]> {
                             SmallVec::from_slice(
-                                &enc_ldst_reg(op, r1, r2, scaled, uxtw, r2).to_le_bytes(),
+                                &enc_ldst_reg(op, r1, ix, scaled, uxtw, r2).to_le_bytes(),
                             )
                         };
                         let load_enc = [
