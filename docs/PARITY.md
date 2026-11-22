@@ -1090,7 +1090,8 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    against 85.83M; `5bd011ac`: html 1.106x, 94.94M (deeper xcgu leaf
    walk, `SELARGS_EXT`, `MEMFAST_SMALLFN`, memchr's NEON `shrn`/`umaxp`);
    `1561780d`: html 1.104x, 94.77M (`JT_DIRECT`, `MINCMP`,
-   `ELABKEEP_WIDE`). Earlier figures below.)
+   `ELABKEEP_WIDE`); `89d1db31`: html 1.097x, 94.12M (`A64_PUSHFOLD`,
+   `AMODENEG`, `EDGECONST=2`, `ARGPARAM=1`). Earlier figures below.)
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
