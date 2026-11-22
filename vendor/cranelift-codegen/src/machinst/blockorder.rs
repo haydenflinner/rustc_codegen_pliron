@@ -489,8 +489,10 @@ impl BlockLoweringOrder {
                 // outside every loop and ends in a function exit (`return`,
                 // `return_call`, a trap) goes after everything else, so it
                 // does not separate a loop's chains (the narrow form of
-                // `PLIRON_LOOPCHAIN`). Its blocks are dominated by blocks
-                // already placed, so the dominator-first order holds.
+                // `PLIRON_LOOPCHAIN`). Only a chain none of whose blocks
+                // dominates a block outside it, so the dominator-first order
+                // lowering relies on holds (deferring others broke SSA in
+                // `dtoa_short::restrict_prec`).
                 let cfg = crate::flowgraph::ControlFlowGraph::with_function(f);
                 let mut la = crate::loop_analysis::LoopAnalysis::new();
                 la.compute(f, &cfg, domtree);
@@ -517,7 +519,11 @@ impl BlockLoweringOrder {
                             None => break,
                         }
                     }
-                    if la.innermost_loop(block).is_none() && exits(last) && !orig_order.is_empty() {
+                    // Deferring must keep every block after its
+                    // dominator: no block of the chain may dominate a
+                    // block outside it.
+                    let closed = seen.iter().all(|&c| domtree.children(c).all(|k| seen.contains(&k)));
+                    if la.innermost_loop(block).is_none() && exits(last) && closed && !orig_order.is_empty() {
                         deferred.push(block);
                         continue;
                     }
