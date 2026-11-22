@@ -216,6 +216,12 @@ enum Slot {
 
 /// Returns the number of stubs installed.
 pub fn run(func: &mut Function) -> usize {
+    run_with(func, pliron_cfg::env_is("PLIRON_TMPARAM_DEDUP", "1"))
+}
+
+/// [`run`], with `dedup`: external operands that agree member by member
+/// share one param.
+pub fn run_with(func: &mut Function, dedup: bool) -> usize {
     let mut groups: FxHashMap<String, Vec<Member>> = FxHashMap::default();
     for b in func.layout.blocks() {
         if let Some((k, m)) = key_of(func, b) {
@@ -343,12 +349,32 @@ pub fn run(func: &mut Function) -> usize {
         if func.layout.is_cold(m0.block) {
             func.layout.set_cold(mb);
         }
-        let params: Vec<Value> = slots
-            .iter()
-            .map(|s| match s {
-                Slot::Local(_, ty) | Slot::Ext(_, ty) => func.dfg.append_block_param(mb, *ty),
-            })
-            .collect();
+        // One param per distinct value tuple: external operands that
+        // agree member by member (a tail storing a struct through one
+        // `sret` pointer seven times) share a param instead of taking
+        // one each, which regalloc then gives seven registers and moves
+        // (`PLIRON_TMPARAM_DEDUP=1`, opt-in).
+        let mut uniq: Vec<usize> = Vec::new();
+        let mut by_key: FxHashMap<Vec<Value>, usize> = FxHashMap::default();
+        let mut params: Vec<Value> = Vec::with_capacity(slots.len());
+        for (si, s) in slots.iter().enumerate() {
+            match s {
+                Slot::Ext(j, _) if dedup => {
+                    let key: Vec<Value> = members.iter().map(|m| m.exts[*j].3).collect();
+                    if let Some(&first) = by_key.get(&key) {
+                        params.push(params[first]);
+                        continue;
+                    }
+                    by_key.insert(key, si);
+                }
+                _ => {}
+            }
+            let ty = match s {
+                Slot::Local(_, ty) | Slot::Ext(_, ty) => *ty,
+            };
+            params.push(func.dfg.append_block_param(mb, ty));
+            uniq.push(si);
+        }
         // Clone member 0's body into `mb`: differing local iconsts are
         // skipped and their results seed the value map with the param;
         // differing ext-const operands are rewritten by position after.
@@ -443,8 +469,8 @@ pub fn run(func: &mut Function) -> usize {
             }
             let mut pos = FuncCursor::new(func).at_bottom(m.block);
             let mut args = vec![];
-            for s in &slots {
-                match s {
+            for &si in &uniq {
+                match &slots[si] {
                     Slot::Local(j, _) => {
                         let ni = pos.func.dfg.clone_inst(m.locals[*j].1);
                         pos.insert_inst(ni);

@@ -1201,6 +1201,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   `parse_block`, which LLVM keeps a call; but compression +0.93%: miniz's
   `transfer` into `decompress`), `=1` drops both (also blake3 +0.16%: its
   recursive `compress_subtree_wide` went into its own closures).
+- `PLIRON_TMPARAM_DEDUP=1` (opt-in, 2026-11-22) — `tailmergep` gives
+  external operands that agree member by member one shared-block param
+  instead of one per occurrence. lol_html's `finish_tag_name` merged two
+  "store a 56-byte result through the `sret` pointer and return" tails
+  into a 14-param block; regalloc gave the pointer's seven params seven
+  registers (`mov x1..x8, x0` before the stores). Exact counts: html
+  -0.160%, pulldown -0.077%, regex -0.064%, protobuf -0.018%, json
+  -0.007%, the rest within noise. Filetest `tailmergep_dedup`.
 - `PLIRON_INLINE_GLUET=<n>` (opt-in) — drop-glue call-site threshold at
   least n (after the `DROPLIM` cap). At 90: html-rewriter -0.84%,
   pulldown -0.31%, protobuf -0.34%, but compression +1.25%, regex +0.35%.

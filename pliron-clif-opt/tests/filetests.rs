@@ -178,7 +178,8 @@ fn pass(name: &str) -> Pass {
             let mut an = pliron_clif_opt::pipeline::Analysis::default();
             pliron_clif_opt::cmpmerge::run(f, &mut an)
         },
-        "tailmergep" => pliron_clif_opt::tailmergep::run,
+        "tailmergep" => |f| pliron_clif_opt::tailmergep::run_with(f, false),
+        "tailmergep_dedup" => |f| pliron_clif_opt::tailmergep::run_with(f, true),
         "rgmerge" => clifpeep::rgmerge,
         "sameargs" => |f| clifpeep::sameargs(f).0,
         "selargs" => clifpeep::selargs,
