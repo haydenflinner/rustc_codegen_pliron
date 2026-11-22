@@ -119,8 +119,21 @@ fn leaf_copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, size: usize) -> 
     if leaf == 0 || size > leaf {
         return false;
     }
-    let mut budget = 64usize;
-    is_leaf(tcx, inst, leaf, 8, &mut budget)
+    // `PLIRON_XCGU_LEAF_DEPTH` / `_BUDGET` (default 64): how deep and how
+    // wide the walk goes. A by-value push reaches the allocator through
+    // ten levels of unwind-cleanup drop glue (`push` -> `push_mut` ->
+    // drop glue of the item, its fields, `Cow`, `Vec`, `RawVec` ->
+    // `RawVec::drop` -> `deallocate`): lol_html's `LimitedVec::push`
+    // stayed a call at the old depth 8.
+    static DB: std::sync::OnceLock<(u32, usize)> = std::sync::OnceLock::new();
+    let (depth, budget0) = *DB.get_or_init(|| {
+        (
+            crate::env_get("PLIRON_XCGU_LEAF_DEPTH").and_then(|s| s.parse().ok()).unwrap_or(8),
+            crate::env_get("PLIRON_XCGU_LEAF_BUDGET").and_then(|s| s.parse().ok()).unwrap_or(64),
+        )
+    });
+    let mut budget = budget0;
+    is_leaf(tcx, inst, leaf, depth, &mut budget)
 }
 
 /// Every function `inst` calls is `#[cold]`, or itself a leaf of at most
@@ -158,6 +171,19 @@ fn is_leaf<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, leaf: usize, depth: u3
     })
 }
 
+/// `PLIRON_XCGU_COLDPATH=1` (opt-in): `core::intrinsics::cold_path` needs
+/// no body (`rustc_codegen_ssa` lowers it to nothing, a hint).
+/// `Vec::push`'s growth branch calls it, and the fallback body is
+/// `Internal` per CGU, so a copy of a push made in another CGU was
+/// uncoverable. Measured a loss (2026-11-22, exact non-nop): html +0.12%
+/// (`Element::get_attribute` takes in ~0.85M and is no longer inlined
+/// into its callers), json -0.03%; with `PLIRON_XCGU_LEAF_DEPTH=14` json
+/// +1.08% (serde's `next_element_seed`).
+fn coldpath_free() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| crate::env_is("PLIRON_XCGU_COLDPATH", "1"))
+}
+
 fn used<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>) -> Option<&'tcx [Spanned<MonoItem<'tcx>>]> {
     tcx.items_of_instance((inst, CollectionMode::UsedItems))
         .ok()
@@ -187,7 +213,8 @@ fn needs_body<'tcx>(tcx: TyCtxt<'tcx>, m: &MonoItem<'tcx>) -> bool {
         // that was internal in its home CGU: undefined symbol at link
         // (nushell `nu-cmd-lang` tests, 2026-10-22).
         InstanceKind::Item(def_id) => !(tcx.intrinsic(def_id).is_some()
-            && matches!(
+            && (coldpath_free() && tcx.opt_item_name(def_id) == Some(rustc_span::sym::cold_path)
+            || matches!(
                 tcx.opt_item_name(def_id),
                 Some(
                     rustc_span::sym::rotate_left
@@ -195,7 +222,7 @@ fn needs_body<'tcx>(tcx: TyCtxt<'tcx>, m: &MonoItem<'tcx>) -> bool {
                         | rustc_span::sym::unchecked_funnel_shl
                         | rustc_span::sym::unchecked_funnel_shr
                 )
-            )),
+            ))),
         InstanceKind::Shim(_) => true,
         _ => false,
     }
