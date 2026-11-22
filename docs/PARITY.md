@@ -1416,6 +1416,12 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    **Done (default on, 2026-11-21): `PLIRON_PARTINLINE_WIDE`**: drop glue
    guards that decode a niche or sit behind the jumps inlining leaves
    (`Cow` drops): pulldown -0.089%, html -0.079%, protobuf -0.032%.
+   **Done (default 2026-11-22): `PLIRON_INLINE_WARMCALLW=3`**: no inline
+   call charge for the cold calls of a normal-path leaf that fits the base
+   limit (`Vec::extend_trusted` into `from_iter`): html -0.179%, pulldown
+   -0.030%. Open: under `=2` pulldown is -2.24% (`scan_containers` into
+   `parse_block`, a call LLVM keeps), so our call there costs far more
+   than LLVM's.
 11. **Native: pulldown-cmark 1.153x, cross-CGU inlining of its
    scanners** (partially fixed 2026-11-18: `PLIRON_XCGU_LEAF=100` +
    `PLIRON_XCGU_LASTCALL=20` default-on; scanners still past plain

@@ -504,6 +504,12 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // 2026-11-21: the inliner charges no `call_w` for the cold calls of a
+    // callee with no warm call whose ops fit the base limit
+    // (`Vec::extend_trusted`). Exact counts: html -0.179%, pulldown
+    // -0.030%, the rest within 0.002% (`docs/history/2026-11-20-ivsr.md`).
+    // `=0` off.
+    ("PLIRON_INLINE_WARMCALLW", "3"),
     // 2026-11-20: `ivsr` decided per function after allocation (aarch64):
     // the backend compiles the function with and without the pointer IV
     // and keeps the rewrite when its frequency-weighted code is smaller and
