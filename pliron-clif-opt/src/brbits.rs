@@ -17,6 +17,12 @@
 //! then against each destination's set, most entries first; the last
 //! destination takes what remains. Destination and default arguments are
 //! kept as they were.
+//!
+//! Measured 2026-11-22 (exact non-nop), not for default: html +0.34%,
+//! pulldown +0.52% together with `PLIRON_ELABKEEP_WIDE=1` (without it the
+//! 64-bit mask is rebuilt in the loop on every byte: `mov; movk x3`), regex
+//! -0.12%. lol_html's lexer and `TagScanner` switches hit their special
+//! bytes often enough that the chain of tests costs more than the table.
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::IntCC;

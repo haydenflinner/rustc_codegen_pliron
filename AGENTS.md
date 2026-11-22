@@ -777,6 +777,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_BRBITS=1`, `PLIRON_ELABKEEP_WIDE=1` (opt-in, 2026-11-22,
+  measured losses) — a `br_table` of at most 64 entries and three
+  destinations as bit tests (`brbits`, test `tests/brbits.rs`), and the
+  final egraph keeping a 3-4 instruction `iconst` where the pipeline
+  hoisted it (vendored elaborator). Together html +0.34%, pulldown +0.52%,
+  regex -0.12%; `ELABKEEP_WIDE` alone pulldown +0.45% (hoisted masks
+  spill in `scalar_iterate_special_bytes`).
 - `PLIRON_BITCAST2` (default on since 2026-11-22, `=0` off), and in
   vendored Cranelift `PLIRON_PAIRWISE_ISLE` and `PLIRON_MINMAXIMM` (both
   default on since then, `=0` off) — memchr's NEON path:
