@@ -999,7 +999,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
     /// Likewise, but for a `return_call`.
     ///
-    /// PLIRON (`PLIRON_TAILARGCOPY=1`, opt-in): `arg_detach` for tail calls
+    /// PLIRON (`PLIRON_TAILARGCOPY`, default on, `=0` off): `arg_detach` for tail calls
     /// too. lol_html's tag scanner state functions loop over the input and
     /// leave through `return_call next(self, input, len)` (`x1`, `x2`) and
     /// calls taking the same values in `x2`, `x3`: the input's whole-function
@@ -1014,7 +1014,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         skip_uext: &[bool],
     ) -> CallArgList {
         static TAILARGCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let copied = if *TAILARGCOPY.get_or_init(|| std::env::var("PLIRON_TAILARGCOPY").as_deref() == Ok("1")) {
+        let copied = if *TAILARGCOPY.get_or_init(|| std::env::var("PLIRON_TAILARGCOPY").as_deref() != Ok("0")) {
             self.arg_detach(args)
         } else {
             None
