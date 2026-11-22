@@ -2086,7 +2086,7 @@ Edges with exception payload arguments are left alone; four rounds at
 most. Static loop-weighted instructions: html corpus 6.970M -> 6.966M,
 std 6.659M -> 6.647M.
 
-## `PLIRON_ARGPARAM=1|2` (opt-in): forwarded parameters skip the argument copy (2026-11-17)
+## `PLIRON_ARGPARAM=1|2` (default `1` since 2026-11-22, `=0` off): forwarded parameters skip the argument copy (2026-11-17)
 
 `src/machinst/lower.rs` (`arg_detach`, `argparam_mode`): patch 75 copies
 every block parameter passed to a call into a fresh vreg first. The
@@ -2328,3 +2328,12 @@ html -0.508%, json -0.152%, blind-sig -0.106%, regex -0.049%, compression
 `PLIRON_AMODENEG` exact non-nop (2026-11-22): pulldown -0.863%, json
 -0.315%, protobuf -0.234%, html -0.166%, blind-sig -0.161%, regex -0.014%,
 compression flat. Default on.
+
+2026-11-22 measurements of the 2026-11-17 opt-ins (exact non-nop):
+`PLIRON_ARGPARAM=1` protobuf -0.048%, html -0.010%, regex -0.006%, blind-sig
+-0.166% (noisy), the rest flat: default `1`. `PLIRON_DUPPARAM=1` flat
+(pulldown +0.026%, blind-sig -0.088%): stays opt-in. `PLIRON_RA2_COPYHINT=1`
+(regalloc2) protobuf +0.123%, html +0.080%, compression +0.056%: stays off.
+`PLIRON_EDGECONST=1` pulldown -1.391%, protobuf -0.372%, html -0.335%, json
+-0.188%, blind-sig -0.175%, but regex +0.912% (`Fsm::next_state`) and
+compression +0.018%.

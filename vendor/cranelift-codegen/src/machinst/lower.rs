@@ -2457,9 +2457,9 @@ mod tests {
     }
 }
 
-/// PLIRON (`PLIRON_ARGPARAM=1|2`, opt-in): see `arg_detach`. `1`: entry
+/// PLIRON (`PLIRON_ARGPARAM=1|2`, default `1` since 2026-11-22, `=0` off): see `arg_detach`. `1`: entry
 /// block parameters only; `2`: any block's.
 fn argparam_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| std::env::var("PLIRON_ARGPARAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    *MODE.get_or_init(|| std::env::var("PLIRON_ARGPARAM").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
 }

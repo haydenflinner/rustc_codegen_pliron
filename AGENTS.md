@@ -777,6 +777,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_ARGPARAM` (vendored lowering, default `1` since 2026-11-22, `=0`
+  off, `=2` any block) — an entry-block parameter whose only use is a call
+  argument is passed without the `arg_detach` copy: protobuf -0.048%, html
+  -0.010%, the rest flat. Measured the same day and left off:
+  `PLIRON_DUPPARAM=1` (flat), `PLIRON_RA2_COPYHINT=1` (protobuf +0.123%).
 - `PLIRON_AMODENEG` (vendored aarch64, written 2026-11-17, default on since
   2026-11-22, `=0` off) — a reg+reg access with a negative constant offset
   subtracts it as an immediate (`sub x, x, #k`) instead of `mov xK, #-k;
