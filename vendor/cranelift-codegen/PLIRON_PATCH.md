@@ -2285,3 +2285,10 @@ chain RPO reached after the loop's exits was laid out behind them, and a
 value split at a call in an exit block kept its second register over that
 body (linear ranges): lol_html's `tag_name_state` moved its input slice to
 `x4`/`x5` and back on every byte.
+
+## Function-exit chains last (`PLIRON_EXITLAST=1`, opt-in)
+
+`src/machinst/blockorder.rs`: a chain that starts outside every loop and
+ends in `return`/`return_call`/a trap is emitted after all other chains.
+The narrow form of `PLIRON_LOOPCHAIN` (which cost compression +1.9% and
+regex +0.4% by regrouping every loop).

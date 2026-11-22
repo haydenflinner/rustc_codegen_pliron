@@ -414,6 +414,7 @@ impl BlockLoweringOrder {
             // remaining chains follow (in RPO, inner loops first), then
             // the enclosing loop's, before anything outside.
             static LOOPCHAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static EXITLAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let loopchain =
                 *LOOPCHAIN.get_or_init(|| std::env::var("PLIRON_LOOPCHAIN").as_deref() == Ok("1"));
             // Emits the chain from `start`; returns its last block.
@@ -482,6 +483,48 @@ impl BlockLoweringOrder {
                             stack.extend(nest(last, Some(l)));
                         }
                     }
+                }
+            } else if *EXITLAST.get_or_init(|| std::env::var("PLIRON_EXITLAST").as_deref() == Ok("1")) {
+                // PLIRON (`PLIRON_EXITLAST=1`, opt-in): a chain that starts
+                // outside every loop and ends in a function exit (`return`,
+                // `return_call`, a trap) goes after everything else, so it
+                // does not separate a loop's chains (the narrow form of
+                // `PLIRON_LOOPCHAIN`). Its blocks are dominated by blocks
+                // already placed, so the dominator-first order holds.
+                let cfg = crate::flowgraph::ControlFlowGraph::with_function(f);
+                let mut la = crate::loop_analysis::LoopAnalysis::new();
+                la.compute(f, &cfg, domtree);
+                let exits = |b: Block| -> bool {
+                    let Some(t) = f.layout.last_inst(b) else { return false };
+                    let op = f.dfg.insts[t].opcode();
+                    op.is_return() || op == crate::ir::Opcode::ReturnCall
+                        || op == crate::ir::Opcode::ReturnCallIndirect || op.is_terminator() && op.can_trap() && !op.is_branch()
+                };
+                let mut deferred: Vec<Block> = Vec::new();
+                for &block in &rpo {
+                    if emitted.contains(&block) {
+                        continue;
+                    }
+                    // Walk the would-be chain without emitting it.
+                    let mut cur = block;
+                    let mut last = block;
+                    let mut seen: SmallVec<[Block; 8]> = SmallVec::new();
+                    while !emitted.contains(&cur) && !seen.contains(&cur) && seen.len() < 64 {
+                        seen.push(cur);
+                        last = cur;
+                        match best_succ[cur].expand() {
+                            Some(n) => cur = n,
+                            None => break,
+                        }
+                    }
+                    if la.innermost_loop(block).is_none() && exits(last) && !orig_order.is_empty() {
+                        deferred.push(block);
+                        continue;
+                    }
+                    let _ = emit_chain(block, &mut emitted, &mut orig_order);
+                }
+                for block in deferred {
+                    let _ = emit_chain(block, &mut emitted, &mut orig_order);
                 }
             } else {
                 for &block in &rpo {
