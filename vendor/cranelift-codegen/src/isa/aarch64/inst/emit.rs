@@ -3394,14 +3394,14 @@ impl MachInstEmit for Inst {
                 ref targets,
                 checked,
             } => {
-                // PLIRON (`PLIRON_JT_DIRECT=1`, opt-in): the deferred narrow
+                // PLIRON (`PLIRON_JT_DIRECT`, default on, `=0` off): the deferred narrow
                 // table indexes with `ridx` itself (`uxtw`), so the index is
                 // neither copied (`!checked`) nor clamped to zero after the
                 // bounds branch (`csel`, a Spectre mitigation LLVM does not
                 // emit for native code). One instruction per dispatch:
                 // lol_html's `tag_name_state` switches on every byte.
                 static JT_DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let direct = *JT_DIRECT.get_or_init(|| std::env::var("PLIRON_JT_DIRECT").as_deref() == Ok("1"))
+                let direct = *JT_DIRECT.get_or_init(|| std::env::var("PLIRON_JT_DIRECT").as_deref() != Ok("0"))
                     && sink.can_defer_jump_table(LabelUse::Adr21);
                 if !checked && !direct {
                     // PLIRON: unreachable default. The index is in range,

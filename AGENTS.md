@@ -777,6 +777,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_JT_DIRECT` (vendored Cranelift, default on since 2026-11-22,
+  `=0` off) — an aarch64 jump table's entry load indexes with the index
+  register itself: no copy and no Spectre clamp (`csel idx, xzr, idx, hs`)
+  after the bounds branch, which LLVM does not emit for native code. Exact
+  counts: pulldown -0.342%, protobuf -0.138%, html -0.093%, json -0.039%,
+  the rest flat.
 - `PLIRON_BRBITS=1`, `PLIRON_ELABKEEP_WIDE=1` (opt-in, 2026-11-22,
   measured losses) — a `br_table` of at most 64 entries and three
   destinations as bit tests (`brbits`, test `tests/brbits.rs`), and the

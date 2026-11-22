@@ -2264,10 +2264,13 @@ the loop does not otherwise use, which a constant never has, so
 elaboration put a bit test's 64-bit mask back into lol_html's
 `tag_name_state` byte loop.
 
-## Jump tables index with the unclamped index (`PLIRON_JT_DIRECT=1`, opt-in)
+## Jump tables index with the unclamped index (`PLIRON_JT_DIRECT`, default on since 2026-11-22, `=0` off)
 
 `src/isa/aarch64/inst/emit.rs` (`JTSequence`): with the deferred narrow
 table, the entry load indexes with `ridx` itself (`uxtw`); the copy into
 `rtmp2` (unchecked tables) and the Spectre clamp `csel rtmp2, xzr, ridx,
 hs` after the bounds branch are not emitted. LLVM emits no such clamp for
 native code.
+
+`PLIRON_JT_DIRECT` exact non-nop: pulldown -0.342%, protobuf -0.138%, html
+-0.093%, json -0.039%, the rest flat.
