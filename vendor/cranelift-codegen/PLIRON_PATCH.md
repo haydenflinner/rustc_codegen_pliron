@@ -2300,3 +2300,9 @@ compared against `y` (and the `umax`/`smin`/`smax` mirrors) folds to a
 constant. Upstream's `(ule ty (umin ty x y) x)` family binds one `ty` to the
 compare result and the operands, so it never matches a scalar compare.
 lol_html's `Bytes::slice` clamps then bounds-checks against the same length.
+
+`PLIRON_ELABKEEP_WIDE` narrowed (2026-11-22): a wide constant keeps its
+hoist only when the incoming function used it outside the loop alone (its
+users were hoisted with it: a division's magic multiplier, whose `umulhi`
+followed it back into lol_html's `init_items` loop). The first form, every
+wide constant, cost pulldown +0.45% (bit-test masks used in the loop).

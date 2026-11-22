@@ -53,10 +53,12 @@ pub(crate) fn elab_hot_on() -> bool {
 /// three or four `mov`/`movk` instructions on a 64-bit target (three or
 /// more 16-bit chunks that are neither all zeros nor all ones, and no
 /// repeating pattern a logical immediate could encode) stays where the
-/// pipeline hoisted it, ahead of the loop: `ELABKEEP`'s operand rule
-/// never holds for a constant, and elaboration put a bit test's 64-bit
-/// mask back into lol_html's `tag_name_state` byte loop (four
-/// instructions a byte, LLVM: none).
+/// pipeline hoisted it, ahead of the loop, when the incoming function used
+/// it outside the loop only (its users were hoisted with it: a division's
+/// magic multiplier and its `umulhi`, which followed the constant back into
+/// lol_html's `init_items` loop). `ELABKEEP`'s operand rule never holds for a
+/// constant. Keeping every wide constant hoisted (also bit-test masks used
+/// in the loop) cost pulldown +0.45%.
 pub(crate) fn wide_const(func: &Function, inst: Inst) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP_WIDE").as_deref() == Ok("1")) {
@@ -414,7 +416,7 @@ impl<'a> Elaborator<'a> {
         inst: Inst,
         insert_block: Block,
         args: &[ElaboratedValue],
-        wide: bool,
+        wide: Option<Value>,
     ) -> Option<LoopStackEntry> {
         let (orig, ops) = orig_block.get(&inst)?;
         let mut best = None;
@@ -422,7 +424,13 @@ impl<'a> Elaborator<'a> {
         while let Some(l) = lp {
             if loop_analysis.is_in_loop(*orig, l)
                 || args.iter().any(|a| loop_analysis.is_in_loop(a.in_block, l))
-                || (!wide && !ops.iter().any(|&x| use_blocks[x].none_in(loop_analysis, l)))
+                || match wide {
+                    // A wide constant keeps its hoist only where the
+                    // incoming function used it outside the loop alone
+                    // (its users were hoisted with it).
+                    Some(r) => !use_blocks[r].none_in(loop_analysis, l),
+                    None => !ops.iter().any(|&x| use_blocks[x].none_in(loop_analysis, l)),
+                }
             {
                 break;
             }
@@ -1045,7 +1053,7 @@ impl<'a> Elaborator<'a> {
                         inst,
                         insert_block,
                         arg_values,
-                        wide_const(self.func, inst),
+                        wide_const(self.func, inst).then(|| self.func.dfg.first_result(inst)),
                     ) {
                         Some(e) => {
                             self.stats.elaborate_licm_hoist += 1;
