@@ -998,12 +998,28 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     /// Likewise, but for a `return_call`.
+    ///
+    /// PLIRON (`PLIRON_TAILARGCOPY=1`, opt-in): `arg_detach` for tail calls
+    /// too. lol_html's tag scanner state functions loop over the input and
+    /// leave through `return_call next(self, input, len)` (`x1`, `x2`) and
+    /// calls taking the same values in `x2`, `x3`: the input's whole-function
+    /// bundle carried both fixed requirements, split at the tail call inside
+    /// the loop, and the pieces moved the pointer and length through scratch
+    /// registers on every byte (`tag_name_state`: 9 instructions per byte
+    /// against LLVM's 3).
     pub fn gen_return_call_args(
         &mut self,
         sig: Sig,
         args: &[ValueRegs<Reg>],
         skip_uext: &[bool],
     ) -> CallArgList {
+        static TAILARGCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let copied = if *TAILARGCOPY.get_or_init(|| std::env::var("PLIRON_TAILARGCOPY").as_deref() == Ok("1")) {
+            self.arg_detach(args)
+        } else {
+            None
+        };
+        let args: &[ValueRegs<Reg>] = copied.as_deref().unwrap_or(args);
         let (uses, insts) = self.vcode.abi().gen_call_args(
             self.vcode.sigs(),
             sig,

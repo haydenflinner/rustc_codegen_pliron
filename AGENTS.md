@@ -1239,6 +1239,15 @@ time, memory, code size, stack frames) in ~20 min and writes
   reads them. Exact counts: html -0.046%, but compression +1.62% and
   pulldown +0.55% (loads +294k / +262k in their hottest functions: not
   yet understood). Tests `pliron-clif-opt/tests/guardsink.rs`.
+- `PLIRON_TAILARGCOPY` (default on since 2026-11-22, `=0` off; vendored
+  Cranelift) — `arg_detach` for `return_call` too: a tail call's
+  multi-use arguments are copied into fresh vregs so the long-lived value
+  carries no fixed register. lol_html's state functions tail-call the next
+  state with the input in `x1`/`x2` and call helpers with it in `x2`/`x3`;
+  the conflict split the input's bundle inside the byte loop (`mov`s of
+  pointer and length on every byte). Exact counts: html -0.396%, protobuf
+  -0.144%, json +0.007%, blind-sig +0.020%. Flipped without the
+  gate/crates runs (stanzas sibcall, std, unwind, neonpair, halfclob pass).
 - `PLIRON_INLINE_GLUET=<n>` (opt-in) — drop-glue call-site threshold at
   least n (after the `DROPLIM` cap). At 90: html-rewriter -0.84%,
   pulldown -0.31%, protobuf -0.34%, but compression +1.25%, regex +0.35%.

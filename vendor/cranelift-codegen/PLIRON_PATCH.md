@@ -2225,3 +2225,16 @@ and reloads count because they are emitted; a branch the buffer deletes
 moves the next start back, and the emptied blocks drop out. Used by
 `pliron_clif_opt::ivsr::pick` (`PLIRON_IVSR=2`) to choose between two CLIF
 versions of a function.
+
+## `PLIRON_TAILARGCOPY` (default on since 2026-11-22, `=0` off): detach tail-call arguments
+
+`src/machinst/lower.rs` (`gen_return_call_args`): `arg_detach` runs for
+`return_call` as it does for calls, so a multi-use argument's fixed
+register binds only a copy made at the tail call. lol_html's tag scanner
+state functions leave their byte loop through `return_call next(self,
+input, len)` (`x1`, `x2`) and through calls taking the same values in
+`x2`, `x3`; the input's whole-function bundle carried both requirements,
+was split at the tail call inside the loop, and moved the pointer and
+length through scratch registers on every byte (`tag_name_state` 9
+instructions per byte, LLVM 3). Exact counts: html -0.396%, protobuf
+-0.144%, json +0.007%, blind-sig +0.020%, the rest within noise.
