@@ -1097,8 +1097,11 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    protobuf 1.033x; geomean 1.065x (1.081x on 2026-11-21). Then
    `AMODESPLIT` (json -5.0%). Time at `8e8398f9` (`ab.py`, macOS, 7
    rounds): html 1.031x LLVM (cycles 1.037x; was 1.091x time that
-   morning), json 0.979x (cycles 0.994x), pulldown-cmark 1.045x. Earlier
-   figures below.)
+   morning), json 0.979x (cycles 0.994x), pulldown-cmark 1.045x. All
+   eight at `0a8caedb` (`JOINCMP`, `NFOLD2_BR`, `COST_NOPAD`,
+   `SWITCH_GCC=3`): html 1.096x, blind-sig 1.088x, blake3 1.047x,
+   pulldown-cmark 1.042x, compression 1.042x, json 1.037x, protobuf
+   1.032x, regex 1.018x; geomean 1.050x. Earlier figures below.)
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
