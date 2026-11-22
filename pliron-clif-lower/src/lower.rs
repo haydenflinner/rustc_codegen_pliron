@@ -4795,6 +4795,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// GCC-style switch clustering (`docs` / xoranth.net/gcc-switch):
     /// bit-test packs, density jump tables (with outlier peel via DP),
     /// then a balanced decision tree of leftover ranges.
+    /// `PLIRON_SWITCH_GCC=3`: as unset on wasm; on native, enum matches
+    /// (dead default) of more than four cases, uncapped, tables from
+    /// `PLIRON_SWITCH_JT_MIN` (default 8) ranges.
     /// Unset is on for wasm and off for native (`PLIRON_SWITCH_GCC=1`
     /// forces on, `=0` off). Wasm `parse_only` needs the sign split
     /// (`byte < '+'`) together with `WBRIF` to land at or under LLVM;
@@ -4814,17 +4817,23 @@ impl<'a, 'b> FnLower<'a, 'b> {
         d: Block,
         dead_default: bool,
     ) -> bool {
-        // 0 off, 1 on, 2 wasm only.
+        // 0 off, 1 on, 2 wasm only, 3 wasm and, on native, switches whose
+        // default cannot happen (enum matches: regex's DFA `match inst`, whose
+        // arms later passes know through the `brif` edges a table hides).
         static MODE: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
             match pliron_cfg::env_get("PLIRON_SWITCH_GCC") {
                 Some("0") => 0,
                 Some("1") => 1,
+                Some("3") => 3,
                 _ => 2,
             }
         });
         let on = match *MODE {
             0 => false,
             1 => true,
+            // Four cases or fewer: `small_switch`'s chain drops the last
+            // test of a dead default (lol_html's `track_start_tag`).
+            3 => self.wasm || (dead_default && vals.len() > 4),
             _ => self.wasm,
         };
         let ty = self.b.func.dfg.value_type(x);
@@ -4841,10 +4850,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5)
         });
+        // Mode 3's native enum matches: no `GCC_MAX` cap, and tables from 8
+        // ranges (regex's 8-variant `match inst` has 5: a tree; LLVM's
+        // aarch64 minimum is 13, which cost serde_json's 8-case escape
+        // match and pulldown-cmark's `item_to_event`).
+        let native_dd = !self.wasm && *MODE == 3;
         let jt_min = if self.wasm {
             pliron_cfg::env_get("PLIRON_SWITCH_JT_MIN")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4)
+        } else if native_dd {
+            pliron_cfg::env_get("PLIRON_SWITCH_JT_MIN")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8)
         } else {
             *JT_MIN_N
         };
@@ -4870,7 +4888,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 None => 2,
             }
         });
-        if pairs.len() > *MAX {
+        if !native_dd && pairs.len() > *MAX {
             return false;
         }
         let clusters = crate::switch_gcc::clusterize(&pairs, *RATIO, jt_min);

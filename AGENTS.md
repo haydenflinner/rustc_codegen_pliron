@@ -909,6 +909,19 @@ time, memory, code size, stack frames) in ~20 min and writes
   aarch64 jump-table minimum) before these changes: regex -4.68%,
   protobuf -0.04%, but json +3.17%, pulldown +1.22%, html +0.43%,
   compression +0.31%.
+- `PLIRON_SWITCH_GCC=3` (2026-11-22) — wasm as before; on native, an
+  enum `match` (the default is `unreachable`) of more than four cases is
+  clustered (`switch_gcc`: bit tests, tables from `PLIRON_SWITCH_JT_MIN`
+  ranges, default 8 in this mode, else a balanced compare tree), no
+  `GCC_MAX` cap; four cases or fewer keep `small_switch`'s chain. regex's
+  DFA `match inst` (8 variants, 5 ranges) dispatched through a table:
+  `next_state`, `cached_state`, `follow_epsilons` -2.5M instructions. Exact
+  counts: regex -4.968%, html +0.063% (`handle_token`'s 5-variant `Token`
+  match as a tree, as LLVM's), the other six within noise. Thresholds: `JT_MIN=13`
+  (LLVM's aarch64 minimum) cost json +0.15% and pulldown +0.31% (8-12
+  range matches), 10 json +0.15%, 6 regex only -3.6%. All switches
+  (`SWITCH_GCC=1,GCC_MAX=0`): byte switches lose (pulldown +1.2%).
+  `PLIRON_SHRINKWRAP=1` measured the same day: noise on all eight.
 - `PLIRON_EXNCONST=1` (opt-in, 2026-11-22, measured, no default) — step
   `exnconst` near the end: a constant a `try_call`'s exception edge
   passes (a drop flag `edgefwd` moved onto the call) is defined in a cold
