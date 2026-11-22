@@ -1693,6 +1693,51 @@
 (rule 1 (lower (umax $I64X2 x y))
       (bsl $I64X2 (vec_rrr (VecALUOp.Cmhi) x y (VectorSize.Size64x2)) x y))
 
+;; PLIRON: pairwise ops. `neon_pairwise` (pliron-clif-lower) emits
+;; `vpmaxq_u8(a, b)` / `vpaddq_*` as the lane-wise op of the even and the odd
+;; lanes of `a ++ b` (two shuffles, `uzp1` and `uzp2`); one `umaxp`/`addp`
+;; does it (memchr's NEON search loop tests its compare results with
+;; `vpmaxq_u8(x, x)`). Opt-in: `PLIRON_PAIRWISE_ISLE=1`. Either operand
+;; order: the egraph may commute.
+(decl pure pliron_pairwise_isle () bool)
+(extern constructor pliron_pairwise_isle pliron_pairwise_isle)
+(rule 31 (lower (umax $I8X16 (shuffle _ a b (u128_from_immediate 0x1e1c_1a18_1614_1210_0e0c_0a08_0604_0200)) (shuffle _ a b (u128_from_immediate 0x1f1d_1b19_1715_1311_0f0d_0b09_0705_0301))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Umaxp) a b (VectorSize.Size8x16)))
+(rule 31 (lower (umax $I8X16 (shuffle _ a b (u128_from_immediate 0x1f1d_1b19_1715_1311_0f0d_0b09_0705_0301)) (shuffle _ a b (u128_from_immediate 0x1e1c_1a18_1614_1210_0e0c_0a08_0604_0200))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Umaxp) a b (VectorSize.Size8x16)))
+(rule 31 (lower (umax $I16X8 (bitcast $I16X8 _ (shuffle _ a b (u128_from_immediate 0x1d1c_1918_1514_1110_0d0c_0908_0504_0100))) (bitcast $I16X8 _ (shuffle _ a b (u128_from_immediate 0x1f1e_1b1a_1716_1312_0f0e_0b0a_0706_0302)))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Umaxp) a b (VectorSize.Size16x8)))
+(rule 31 (lower (umax $I16X8 (bitcast $I16X8 _ (shuffle _ a b (u128_from_immediate 0x1f1e_1b1a_1716_1312_0f0e_0b0a_0706_0302))) (bitcast $I16X8 _ (shuffle _ a b (u128_from_immediate 0x1d1c_1918_1514_1110_0d0c_0908_0504_0100)))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Umaxp) a b (VectorSize.Size16x8)))
+(rule 31 (lower (umax $I32X4 (bitcast $I32X4 _ (shuffle _ a b (u128_from_immediate 0x1b1a1918_13121110_0b0a0908_03020100))) (bitcast $I32X4 _ (shuffle _ a b (u128_from_immediate 0x1f1e1d1c_17161514_0f0e0d0c_07060504)))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Umaxp) a b (VectorSize.Size32x4)))
+(rule 31 (lower (umax $I32X4 (bitcast $I32X4 _ (shuffle _ a b (u128_from_immediate 0x1f1e1d1c_17161514_0f0e0d0c_07060504))) (bitcast $I32X4 _ (shuffle _ a b (u128_from_immediate 0x1b1a1918_13121110_0b0a0908_03020100)))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Umaxp) a b (VectorSize.Size32x4)))
+(rule 31 (lower (iadd $I8X16 (shuffle _ a b (u128_from_immediate 0x1e1c_1a18_1614_1210_0e0c_0a08_0604_0200)) (shuffle _ a b (u128_from_immediate 0x1f1d_1b19_1715_1311_0f0d_0b09_0705_0301))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Addp) a b (VectorSize.Size8x16)))
+(rule 31 (lower (iadd $I8X16 (shuffle _ a b (u128_from_immediate 0x1f1d_1b19_1715_1311_0f0d_0b09_0705_0301)) (shuffle _ a b (u128_from_immediate 0x1e1c_1a18_1614_1210_0e0c_0a08_0604_0200))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Addp) a b (VectorSize.Size8x16)))
+(rule 31 (lower (iadd $I16X8 (bitcast $I16X8 _ (shuffle _ a b (u128_from_immediate 0x1d1c_1918_1514_1110_0d0c_0908_0504_0100))) (bitcast $I16X8 _ (shuffle _ a b (u128_from_immediate 0x1f1e_1b1a_1716_1312_0f0e_0b0a_0706_0302)))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Addp) a b (VectorSize.Size16x8)))
+(rule 31 (lower (iadd $I16X8 (bitcast $I16X8 _ (shuffle _ a b (u128_from_immediate 0x1f1e_1b1a_1716_1312_0f0e_0b0a_0706_0302))) (bitcast $I16X8 _ (shuffle _ a b (u128_from_immediate 0x1d1c_1918_1514_1110_0d0c_0908_0504_0100)))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Addp) a b (VectorSize.Size16x8)))
+(rule 31 (lower (iadd $I32X4 (bitcast $I32X4 _ (shuffle _ a b (u128_from_immediate 0x1b1a1918_13121110_0b0a0908_03020100))) (bitcast $I32X4 _ (shuffle _ a b (u128_from_immediate 0x1f1e1d1c_17161514_0f0e0d0c_07060504)))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Addp) a b (VectorSize.Size32x4)))
+(rule 31 (lower (iadd $I32X4 (bitcast $I32X4 _ (shuffle _ a b (u128_from_immediate 0x1f1e1d1c_17161514_0f0e0d0c_07060504))) (bitcast $I32X4 _ (shuffle _ a b (u128_from_immediate 0x1b1a1918_13121110_0b0a0908_03020100)))))
+      (if-let true (pliron_pairwise_isle))
+      (vec_rrr (VecALUOp.Addp) a b (VectorSize.Size32x4)))
+
 ;;;; Rules for `uextend` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; General rule for extending input to an output which fits in a single

@@ -2238,3 +2238,13 @@ was split at the tail call inside the loop, and moved the pointer and
 length through scratch registers on every byte (`tag_name_state` 9
 instructions per byte, LLVM 3). Exact counts: html -0.396%, protobuf
 -0.144%, json +0.007%, blind-sig +0.020%, the rest within noise.
+
+## Pairwise max/add as `umaxp`/`addp` (`PLIRON_PAIRWISE_ISLE=1`, opt-in)
+
+`src/isa/aarch64/lower.isle` (rules at priority 31 before the `uextend`
+section), `src/isa/aarch64/lower/isle.rs` (`pliron_pairwise_isle`):
+`umax`/`iadd` of the `uzp1` and `uzp2` shuffles of one pair of vectors,
+`i8x16` directly or `i16x8`/`i32x4` through bitcasts, either operand
+order, is one `umaxp`/`addp`. pliron-clif-lower's `neon_pairwise` emits
+`vpmaxq_u8(a, b)` that way; memchr's NEON search tests its compare masks
+with it (`uzp1; uzp2; umax` was three instructions per 16 or 64 bytes).

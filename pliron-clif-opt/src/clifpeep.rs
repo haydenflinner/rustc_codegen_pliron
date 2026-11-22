@@ -7580,8 +7580,50 @@ fn bitmerge(func: &mut Function) -> usize {
 }
 
 /// Returns the number of rewrites.
+/// `bitcast.T (bitcast.U x)` with `x: T` and both casts in one byte order
+/// is `x` (`PLIRON_BITCAST2=1`). The vector truncation lowering ends in
+/// `bitcast.i8x8 (extractlane.i64 ..)` and memchr's `vreinterpret_u64_u8`
+/// casts it straight back: with the round trip in the way, aarch64 lowered
+/// the inner cast with the `movi; and; sqxtun` rule before the `shrn` rule
+/// for the `extractlane` could match (the NEON match mask in every
+/// `memchr` call).
+pub fn bitcast_pairs(func: &mut Function) -> usize {
+    let mut n = 0;
+    let mut pos = FuncCursor::new(func);
+    while pos.next_block().is_some() {
+        while let Some(inst) = pos.next_inst() {
+            let InstructionData::LoadNoOffset { opcode: Opcode::Bitcast, flags: f1, arg } = pos.func.dfg.insts[inst] else {
+                continue;
+            };
+            let a = pos.func.dfg.resolve_aliases(arg);
+            let Some(d) = pos.func.dfg.value_def(a).inst() else { continue };
+            let InstructionData::LoadNoOffset { opcode: Opcode::Bitcast, flags: f2, arg: x } = pos.func.dfg.insts[d] else {
+                continue;
+            };
+            let x = pos.func.dfg.resolve_aliases(x);
+            let res = pos.func.dfg.first_result(inst);
+            if pos.func.dfg.value_type(x) != pos.func.dfg.value_type(res)
+                || pos.func.dfg.mem_flags[f1] != pos.func.dfg.mem_flags[f2]
+            {
+                continue;
+            }
+            if !pliron_cfg::bisect("bitcast2") {
+                continue;
+            }
+            pos.func.dfg.clear_results(inst);
+            pos.remove_inst_and_step_back();
+            pos.func.dfg.change_to_alias(res, x);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub fn run(func: &mut Function, x64: bool) -> usize {
     let mut n = 0;
+    if pliron_cfg::env_is("PLIRON_BITCAST2", "1") {
+        n += bitcast_pairs(func);
+    }
     if crate::pass_enabled("PLIRON_DEFLAG") {
         n += deflag(func);
     }
