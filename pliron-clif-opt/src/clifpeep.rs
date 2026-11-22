@@ -6080,8 +6080,13 @@ pub fn selargs_with(func: &mut Function, ext: bool) -> usize {
 /// the same value (or two constants): `selargs` passing `len` for the
 /// capacity a `len > cap` reserve test reads (`Vec::with_capacity(len)`
 /// followed by an extend). The successor's arguments must be the block's
-/// params or values from outside it (those dominate the edge's source).
+/// params or values from outside it (those dominate the edge's source),
+/// and nothing outside the block may read its params or the compare: the
+/// blocks it dominated are reachable around it afterwards.
 pub fn edge_selfcmp(func: &mut Function) -> usize {
+    // Retargeting adds no uses of a block's own values, so one snapshot
+    // serves the whole walk.
+    let uses = crate::uses::Uses::new(func);
     let mut n = 0;
     for p in func.layout.blocks().collect::<Vec<_>>() {
         let Some(term) = func.layout.last_inst(p) else { continue };
@@ -6108,6 +6113,9 @@ pub fn edge_selfcmp(func: &mut Function) -> usize {
                 continue;
             }
             let params: Vec<Value> = func.dfg.block_params(d).to_vec();
+            if params.iter().chain(std::iter::once(&cv)).any(|&v| uses.sites(v).iter().any(|&(ub, _)| ub != d)) {
+                continue;
+            }
             // `None`: not expressible at the edge.
             let map = |func: &Function, v: Value| -> Option<Value> {
                 let v = func.dfg.resolve_aliases(v);
