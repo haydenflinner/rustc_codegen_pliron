@@ -2293,7 +2293,7 @@ ends in `return`/`return_call`/a trap is emitted after all other chains.
 The narrow form of `PLIRON_LOOPCHAIN` (which cost compression +1.9% and
 regex +0.4% by regrouping every loop).
 
-## Clamp compares (`PLIRON_MINCMP=1`, opt-in)
+## Clamp compares (`PLIRON_MINCMP`, default on since 2026-11-22, `=0` off)
 
 `src/opts/pliron.isle`, `src/opts.rs` (`pliron_mincmp_on`): `umin x, y`
 compared against `y` (and the `umax`/`smin`/`smax` mirrors) folds to a
@@ -2306,3 +2306,5 @@ hoist only when the incoming function used it outside the loop alone (its
 users were hoisted with it: a division's magic multiplier, whose `umulhi`
 followed it back into lol_html's `init_items` loop). The first form, every
 wide constant, cost pulldown +0.45% (bit-test masks used in the loop).
+
+`PLIRON_MINCMP` exact non-nop: html -0.083%, the rest within noise.

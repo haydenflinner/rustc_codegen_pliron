@@ -98,7 +98,7 @@
       (if-let true (pliron_fmul1_on))
       (subsume x))
 
-;;;; PLIRON (`PLIRON_MINCMP=1`, opt-in): a value clamped to `y` is never
+;;;; PLIRON (`PLIRON_MINCMP`, default on since 2026-11-22, `=0` off): a value clamped to `y` is never
 ;; above it, and `y` never below it — the negations of upstream's
 ;; `ule (umin x y) y` rules. lol_html's `Bytes::slice` clamps a range to the
 ;; input's length with `min` and then bounds-checks the clamped value

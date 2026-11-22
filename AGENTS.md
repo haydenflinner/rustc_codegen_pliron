@@ -777,6 +777,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_MINCMP` (vendored egraph, default on since 2026-11-22, `=0` off)
+  — `umin x, y` compared with `y` (and the `umax`/`smin`/`smax` mirrors)
+  is a constant. Upstream's family binds one type to the compare result and
+  its operands and never matches a scalar compare. lol_html's `Bytes::slice`
+  bounds-checks its own clamp: html -0.083%, the rest flat. Test
+  `egraph_rules::mincmp_*`. `PLIRON_ELABKEEP_WIDE` (opt-in) since narrowed
+  to wide constants the loop does not use (a division's magic multiplier
+  followed back into `init_items`' loop with its `umulhi`).
 - `PLIRON_LOOPCHAIN=1` (opt-in, vendored block order, measured loss) —
   a loop's chains are emitted together, inner loops first. html -0.087%
   (`tag_name_state`'s input slice no longer moves to `x4`/`x5` and back on

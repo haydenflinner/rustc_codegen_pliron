@@ -317,11 +317,11 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
     /// fields, which only lose a neutral remat.
     /// PLIRON: `opts/pliron.isle` rules (migrated clifpeep rewrites).
     /// Default since 11-04; `PLIRON_EGRAPH_RULES=0` disables.
-    /// PLIRON (`PLIRON_MINCMP=1`, opt-in): `min(x, y) > y` and its
+    /// PLIRON (`PLIRON_MINCMP`, default on, `=0` off): `min(x, y) > y` and its
     /// mirrors fold to false (`opts/pliron.isle`).
     fn pliron_mincmp_on(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_MINCMP").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_MINCMP").as_deref() != Ok("0"))
     }
 
     fn pliron_rules_on(&mut self) -> bool {
