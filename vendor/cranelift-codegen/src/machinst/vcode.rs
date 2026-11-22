@@ -3808,7 +3808,7 @@ impl<I: VCodeInst> VCode<I> {
             t_fuse += ti.elapsed();
             // PLIRON: code follows this block, so a call that cannot
             // return needs no trap after it (`TrapCode::NORETURN_CALL`).
-            // PLIRON (`PLIRON_DEADCONST=1`, opt-in): a constant or
+            // PLIRON (`PLIRON_DEADCONST`, default on, `=0` off): a constant or
             // address definition whose register nothing reads before it is
             // overwritten is not emitted. A spilled constant is
             // rematerialized at every reload and its spill store is dropped
@@ -5733,9 +5733,9 @@ mod test {
     }
 }
 
-/// PLIRON (`PLIRON_DEADCONST=1`, opt-in): drop dead rematerializable defs
+/// PLIRON (`PLIRON_DEADCONST`, default on since 2026-11-22, `=0` off): drop dead rematerializable defs
 /// at emission (see the emission loop).
 fn deadconst_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_DEADCONST").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_DEADCONST").as_deref() != Ok("0"))
 }

@@ -2124,7 +2124,7 @@ frame record to save it (rust-json +46k executed instructions in one
 `Deserialize` leaf). `=2` allocates it only when the body already makes
 a regular call, or frame pointers are preserved. `=0` off.
 
-## `PLIRON_DEADCONST=1` (opt-in): drop dead rematerializable definitions (2026-11-17)
+## `PLIRON_DEADCONST` (default on since 2026-11-22, `=0` off): drop dead rematerializable definitions (2026-11-17)
 
 `src/machinst/vcode.rs` (`deadconst_on`, the emission walk): a constant
 or address definition whose register is overwritten before anything
@@ -2132,7 +2132,9 @@ reads it is not emitted. A spilled constant is rematerialized at every
 reload, so its spill store is already dropped and the definition itself
 is dead (`parse_block`'s `mov x22, #0x12; mov x22, #0x19`). Backward
 liveness starts with every register live at the block end, so a value
-live into a successor stays. `=0` is the default.
+live into a successor stays. Default on since 2026-11-22 (exact counts:
+pulldown -0.42%, html -0.173%, the rest within noise; lol_html's
+`add_execution_branch` ran eleven dead `adrp; ldr` GOT loads per call).
 
 ## `PLIRON_VTRUEBR=1` (opt-in): branch on the reduced lane of `vall_true`/`vany_true` (2026-11-17)
 

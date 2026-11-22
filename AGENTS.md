@@ -1217,8 +1217,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   a function that already makes a regular call, or when frame pointers
   are kept. With X17, `=1` is blake3 `compress_in_place` −669k but
   pulldown +0.42%; `=2` helps pulldown, costs blind-sig.
-- `PLIRON_DEADCONST=1` (opt-in) — at emission, drop a rematerializable
-  definition whose register is overwritten before it is read.
+- `PLIRON_DEADCONST` (default on since 2026-11-22, `=0` off; vendored
+  Cranelift) — at emission, drop a rematerializable definition whose
+  register is overwritten before it is read (lol_html's
+  `add_execution_branch` ran eleven dead `adrp; ldr` GOT loads per call).
+  Exact counts: pulldown -0.42%, html -0.173%, the rest within noise.
+  Flipped without the gate/crates runs (stanzas std, unwind, asm,
+  sibcall, halfclob, neonpair, regionsplit pass).
 - `PLIRON_ELABLOOPS=2` (opt-in) — `=1`'s egraph loop hoisting, but
   cheap invariants stay inside loops that contain a call.
 - `PLIRON_HOT_LAYOUT=1` — type-layout table in each object for the
