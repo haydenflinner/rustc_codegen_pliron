@@ -1531,6 +1531,7 @@ pub fn run(
     // on them costs those kernels 1.5 and 1.4 points (2026-11-17).
     let hot_cap_min: usize = crate::env_get("PLIRON_INLINE_HOTCAP_MIN").and_then(|s| s.parse().ok()).unwrap_or(0);
     let glue_warm = crate::env_is("PLIRON_INLINE_GLUEWARM", "1");
+    let warm_callw: u8 = crate::env_get("PLIRON_INLINE_WARMCALLW").and_then(|v| v.parse().ok()).unwrap_or(0);
     // `PLIRON_INLINE_FREEMAX=<n>` (opt-in): a single-site callee over n ops
     // gets no "free" threshold. memchr's 809-op search closure, inlined
     // into its one site in `search_slice_with_raw`, made pulldown's
@@ -2046,7 +2047,27 @@ pub fn run(
                     };
                     let mut cost = sn;
                     if model {
-                        cost = sn.saturating_add(scalls.saturating_mul(call_w));
+                        // `PLIRON_INLINE_WARMCALLW=1`: only calls that can run
+                        // on a normal path pay `call_w`. A panic or unwind
+                        // call moves no call traffic into the caller; its
+                        // ops still count. `Vec::extend_trusted` for
+                        // `to_ascii_lowercase` is 317 ops with 6 calls, all
+                        // cold: 437 against t=320 kept it a call in html's
+                        // `from_iter` (7.5k calls, ~33 instructions each).
+                        // `=2`: only for callees with no warm call at all
+                        // (a normal-path leaf; blake3's recursive
+                        // `compress_subtree_wide` has 7 and was inlined
+                        // into its own closures); `=3`: and only when the
+                        // ops alone fit the base limit (miniz's `transfer`,
+                        // 682 ops, went into the 8.5k-op `decompress`).
+                        let waive = match warm_callw {
+                            1 => true,
+                            2 => ci.nwarm == 0,
+                            3 => ci.nwarm == 0 && sn <= limit,
+                            _ => false,
+                        };
+                        let ncalls_w = if waive { scalls.min(ci.nwarm) } else { scalls };
+                        cost = sn.saturating_add(ncalls_w.saturating_mul(call_w));
                         if warm_cost && !spec {
                             cost = ci.nwarm_ops.saturating_add(ci.nwarm.saturating_mul(call_w));
                         }

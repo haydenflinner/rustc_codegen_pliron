@@ -1191,6 +1191,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   stores into slots nothing reads) exact counts: html-rewriter -0.74%,
   pulldown-cmark -0.56%, protobuf -0.41%, json -0.25%, regex -0.15%, the
   rest equal. Stanza `sibcall`; `docs/history/2026-11-19-sibcall.md`.
+- `PLIRON_INLINE_WARMCALLW=3` (opt-in, 2026-11-21) — the inliner's
+  per-call charge (`call_w`, 20 per nested call) is waived for a callee's
+  cold calls (panic and unwind paths) when the callee has no warm call
+  at all and its ops alone fit the base limit: `Vec::extend_trusted` for
+  `to_ascii_lowercase` (317 ops, 6 calls, all cold) goes into `from_iter`.
+  Exact counts: html -0.179%, pulldown -0.030%, the rest within 0.002%.
+  `=2` drops the size rule (pulldown -2.24%: `scan_containers` into
+  `parse_block`, which LLVM keeps a call; but compression +0.93%: miniz's
+  `transfer` into `decompress`), `=1` drops both (also blake3 +0.16%: its
+  recursive `compress_subtree_wide` went into its own closures).
 - `PLIRON_INLINE_GLUET=<n>` (opt-in) — drop-glue call-site threshold at
   least n (after the `DROPLIM` cap). At 90: html-rewriter -0.84%,
   pulldown -0.31%, protobuf -0.34%, but compression +1.25%, regex +0.35%.
