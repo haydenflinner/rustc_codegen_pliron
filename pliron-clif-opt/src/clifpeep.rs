@@ -6000,6 +6000,33 @@ fn emit_key(func: &mut Function, order: &mut Vec<Inst>, key: &crate::proots::Key
 /// known-false — without this the `csel` materializes a value that is
 /// just `cursor` on that edge.
 pub fn selargs(func: &mut Function) -> usize {
+    selargs_with(func, pliron_cfg::env_is("PLIRON_SELARGS_EXT", "1"))
+}
+
+/// `ext`: a `brif` on `uextend c` (lowering's `i8`/`i32` widening of a
+/// compare) decides selects on `c` too: the extension of a 0/1 value is
+/// nonzero exactly when it is (`PLIRON_SELARGS_EXT=1`). The late egraph
+/// strips the extension after `selargs` ran, which left `alloc`'s null
+/// test in `Vec::with_capacity` as `csel; csel; cbz` on the same compare
+/// (lol_html's `as_lowercase_string`, 15k calls).
+pub fn selargs_with(func: &mut Function, ext: bool) -> usize {
+    let strip = |func: &Function, mut v: Value| -> Value {
+        v = func.dfg.resolve_aliases(v);
+        while ext {
+            let Some(i) = func.dfg.value_def(v).inst() else { break };
+            let InstructionData::Unary { opcode: Opcode::Uextend, arg } = func.dfg.insts[i] else { break };
+            let a = func.dfg.resolve_aliases(arg);
+            // Only an extended compare is 0/1.
+            let is_cmp = func.dfg.value_def(a).inst().is_some_and(|d| {
+                matches!(func.dfg.insts[d].opcode(), Opcode::Icmp | Opcode::Fcmp)
+            });
+            if !is_cmp {
+                break;
+            }
+            v = a;
+        }
+        v
+    };
     let mut n = 0;
     for b in func.layout.blocks().collect::<Vec<_>>() {
         let Some(term) = func.layout.last_inst(b) else {
@@ -6008,7 +6035,7 @@ pub fn selargs(func: &mut Function) -> usize {
         let InstructionData::Brif { arg: c, blocks, .. } = func.dfg.insts[term] else {
             continue;
         };
-        let c = func.dfg.resolve_aliases(c);
+        let c = strip(func, c);
         let bcs = blocks;
         for (ei, bc) in bcs.iter().enumerate() {
             let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
@@ -6027,7 +6054,7 @@ pub fn selargs(func: &mut Function) -> usize {
                     else {
                         return a;
                     };
-                    if func.dfg.resolve_aliases(sa[0]) != c {
+                    if strip(func, sa[0]) != c {
                         return a;
                     }
                     changed = true;
@@ -6043,6 +6070,98 @@ pub fn selargs(func: &mut Function) -> usize {
                 blocks[ei] = nc;
                 n += 1;
             }
+        }
+    }
+    n
+}
+
+/// An edge into a block that is only `c = icmp cc a, b; brif c, T, F`
+/// goes straight to `T` or `F` when the edge's arguments make `a` and `b`
+/// the same value (or two constants): `selargs` passing `len` for the
+/// capacity a `len > cap` reserve test reads (`Vec::with_capacity(len)`
+/// followed by an extend). The successor's arguments must be the block's
+/// params or values from outside it (those dominate the edge's source).
+pub fn edge_selfcmp(func: &mut Function) -> usize {
+    let mut n = 0;
+    for p in func.layout.blocks().collect::<Vec<_>>() {
+        let Some(term) = func.layout.last_inst(p) else { continue };
+        let ndest = match func.dfg.insts[term] {
+            InstructionData::Jump { .. } => 1,
+            InstructionData::Brif { .. } => 2,
+            _ => continue,
+        };
+        for ei in 0..ndest {
+            let bc = func.dfg.insts[term].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[ei];
+            let d = bc.block(&func.dfg.value_lists);
+            if d == p {
+                continue;
+            }
+            let eargs: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+            let insts: Vec<Inst> = func.layout.block_insts(d).collect();
+            if insts.len() != 2 {
+                continue;
+            }
+            let InstructionData::IntCompare { cond, args: ca, .. } = func.dfg.insts[insts[0]] else { continue };
+            let InstructionData::Brif { arg, blocks: dbs, .. } = func.dfg.insts[insts[1]] else { continue };
+            let cv = func.dfg.first_result(insts[0]);
+            if func.dfg.resolve_aliases(arg) != cv {
+                continue;
+            }
+            let params: Vec<Value> = func.dfg.block_params(d).to_vec();
+            // `None`: not expressible at the edge.
+            let map = |func: &Function, v: Value| -> Option<Value> {
+                let v = func.dfg.resolve_aliases(v);
+                if let Some(k) = params.iter().position(|&q| q == v) {
+                    return match eargs[k] {
+                        BlockArg::Value(x) => Some(func.dfg.resolve_aliases(x)),
+                        _ => None,
+                    };
+                }
+                match func.dfg.value_def(v).inst() {
+                    Some(i) if func.layout.inst_block(i) == Some(d) => None,
+                    _ => Some(v),
+                }
+            };
+            let (Some(a), Some(b)) = (map(func, ca[0]), map(func, ca[1])) else { continue };
+            let taken = if a == b {
+                matches!(
+                    cond,
+                    IntCC::Equal
+                        | IntCC::UnsignedLessThanOrEqual
+                        | IntCC::UnsignedGreaterThanOrEqual
+                        | IntCC::SignedLessThanOrEqual
+                        | IntCC::SignedGreaterThanOrEqual
+                )
+            } else {
+                continue;
+            };
+            let succ = dbs[if taken { 0 } else { 1 }];
+            let sb = succ.block(&func.dfg.value_lists);
+            let sargs: Vec<BlockArg> = succ.args(&func.dfg.value_lists).collect();
+            let mut nargs = Vec::with_capacity(sargs.len());
+            let mut ok = true;
+            for sa in sargs {
+                match sa {
+                    BlockArg::Value(v) => match map(func, v) {
+                        Some(x) => nargs.push(BlockArg::Value(x)),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    },
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || !pliron_cfg::bisect("selfcmp") {
+                continue;
+            }
+            let nc = BlockCall::new(sb, nargs, &mut func.dfg.value_lists);
+            let dfg = &mut func.dfg;
+            dfg.insts[term].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[ei] = nc;
+            n += 1;
         }
     }
     n

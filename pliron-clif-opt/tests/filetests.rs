@@ -185,6 +185,7 @@ fn pass(name: &str) -> Pass {
         "rgmerge" => clifpeep::rgmerge,
         "sameargs" => |f| clifpeep::sameargs(f).0,
         "selargs" => clifpeep::selargs,
+        "selargs_ext" => |f| clifpeep::selargs_with(f, true) + clifpeep::edge_selfcmp(f),
         "selfarg" => clifpeep::selfarg,
         "sgntest" => clifpeep::sgntest,
         "slp" => |f| {

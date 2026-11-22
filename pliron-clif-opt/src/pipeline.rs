@@ -3695,12 +3695,23 @@ fn s_nfold2(p: &mut Pipe, an: &mut Analysis) -> usize {
 fn s_selargs(p: &mut Pipe, an: &mut Analysis) -> usize {
     // `selargs` only rewrites `brif` edge args — keep the dead-inst
     // sweep unguarded.
-    let k = if an.shape_bits(&p.clctx.func) & shape::CONDBR != 0 {
+    let mut k = if an.shape_bits(&p.clctx.func) & shape::CONDBR != 0 {
         clifpeep::selargs(&mut p.clctx.func)
     } else {
         0
-    } + jumpthread::remove_dead_insts(&mut p.clctx.func, true);
+    };
+    // `PLIRON_SELARGS_EXT=1`: the arguments selargs picked can decide a
+    // compare the destination block makes of them.
+    if k > 0 && pliron_cfg::env_is("PLIRON_SELARGS_EXT", "1") {
+        let t = clifpeep::edge_selfcmp(&mut p.clctx.func);
+        if t > 0 {
+            jumpthread::remove_unreachable_blocks(&mut p.clctx.func);
+        }
+        k += t;
+    }
+    k += jumpthread::remove_dead_insts(&mut p.clctx.func, true);
     if k > 0 {
+        an.invalidate(&p.clctx.func);
         p.dump("selargs");
     }
     k
