@@ -64,3 +64,22 @@ block0(v0: i64, v1: i64):
     assert!(t.contains("icmp eq v0, v1"), "{t}");
     assert_eq!(t.lines().filter(|l| l.contains("= isub")).count(), 0, "{t}");
 }
+
+/// `PLIRON_MINCMP`: a value clamped with `umin` to `y` compares against `y`
+/// as a constant (lol_html's `Bytes::slice` bounds check after its clamp).
+#[test]
+fn mincmp_folds_a_clamp_compared_with_its_bound() {
+    unsafe { std::env::set_var("PLIRON_MINCMP", "1") };
+    let t = opt("function %f(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = umin v0, v1
+    v3 = icmp ule v2, v1
+    v4 = icmp ugt v2, v1
+    v5 = smax v1, v0
+    v6 = icmp slt v5, v0
+    v7 = bor v3, v4
+    v8 = bor v7, v6
+    return v8
+}");
+    assert!(!t.contains("icmp"), "every compare folds:\n{t}");
+}

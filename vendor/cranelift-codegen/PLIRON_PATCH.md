@@ -2292,3 +2292,11 @@ body (linear ranges): lol_html's `tag_name_state` moved its input slice to
 ends in `return`/`return_call`/a trap is emitted after all other chains.
 The narrow form of `PLIRON_LOOPCHAIN` (which cost compression +1.9% and
 regex +0.4% by regrouping every loop).
+
+## Clamp compares (`PLIRON_MINCMP=1`, opt-in)
+
+`src/opts/pliron.isle`, `src/opts.rs` (`pliron_mincmp_on`): `umin x, y`
+compared against `y` (and the `umax`/`smin`/`smax` mirrors) folds to a
+constant. Upstream's `(ule ty (umin ty x y) x)` family binds one `ty` to the
+compare result and the operands, so it never matches a scalar compare.
+lol_html's `Bytes::slice` clamps then bounds-checks against the same length.

@@ -97,3 +97,39 @@
 (rule (simplify (fmul $F64 (f64const $F64 (u64_from_ieee64 0x3ff0000000000000)) x))
       (if-let true (pliron_fmul1_on))
       (subsume x))
+
+;;;; PLIRON (`PLIRON_MINCMP=1`, opt-in): a value clamped to `y` is never
+;; above it, and `y` never below it — the negations of upstream's
+;; `ule (umin x y) y` rules. lol_html's `Bytes::slice` clamps a range to the
+;; input's length with `min` and then bounds-checks the clamped value
+;; against the same length: three dead `cmp; b.hi` per attribute in
+;; `Attributes::init_items`.
+(decl pure pliron_mincmp_on () bool)
+(extern constructor pliron_mincmp_on pliron_mincmp_on)
+(rule (simplify (ugt (ty_int ty) (umin _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (ugt (ty_int ty) (umin _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (ult (ty_int ty) y (umin _ x y))) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (ult (ty_int ty) y (umin _ y x))) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (ult (ty_int ty) (umax _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (ult (ty_int ty) (umax _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (ugt (ty_int ty) y (umax _ x y))) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (ugt (ty_int ty) y (umax _ y x))) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+;; The true forms. Upstream's `(ule ty (umin ty x y) x)` family binds one
+;; `ty` to the compare's result type and the operands' type, so it never
+;; matches a scalar compare (`i8` result, `i64` operands).
+(rule (simplify (ule (ty_int ty) (umin _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (ule (ty_int ty) (umin _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (uge (ty_int ty) y (umin _ x y))) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (uge (ty_int ty) y (umin _ y x))) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (uge (ty_int ty) (umax _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (uge (ty_int ty) (umax _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (ule (ty_int ty) y (umax _ x y))) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (ule (ty_int ty) y (umax _ y x))) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (sle (ty_int ty) (smin _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (sle (ty_int ty) (smin _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (sge (ty_int ty) (smax _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (sge (ty_int ty) (smax _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 1))
+(rule (simplify (sgt (ty_int ty) (smin _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (sgt (ty_int ty) (smin _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (slt (ty_int ty) (smax _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+(rule (simplify (slt (ty_int ty) (smax _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
