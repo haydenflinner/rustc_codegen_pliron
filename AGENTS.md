@@ -777,6 +777,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_AMODENEG` (vendored aarch64, written 2026-11-17, default on since
+  2026-11-22, `=0` off) — a reg+reg access with a negative constant offset
+  subtracts it as an immediate (`sub x, x, #k`) instead of `mov xK, #-k;
+  add`. Exact counts: pulldown -0.863%, json -0.315%, protobuf -0.234%,
+  html -0.166%, blind-sig -0.161%, regex -0.014%, compression flat.
 - `PLIRON_A64_PUSHFOLD` (vendored aarch64 ABI, default on since 2026-11-22,
   `=0` off) — a function whose frame holds only callee saves allocates it
   with the pre-indexed store of the save at offset 0 (`str x19, [sp,

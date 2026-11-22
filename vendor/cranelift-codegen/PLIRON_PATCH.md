@@ -2036,7 +2036,7 @@ default's laid out as if `phase` bytes preceded it: loop pads and line
 crossings change, nothing else. `harness/placement.py` builds copies
 under several phases to measure what placement alone moves.
 
-## `PLIRON_AMODENEG=1` (opt-in): negative amode offsets as `sub` (2026-11-17)
+## `PLIRON_AMODENEG` (default on since 2026-11-22, `=0` off): negative amode offsets as `sub` (2026-11-17)
 
 `src/isa/aarch64/inst.isle` (`amode_add` rule 3, `amode_neg_imm12`),
 `src/isa/aarch64/lower/isle.rs` (`amode_neg_imm12`): a reg+reg access
@@ -2324,3 +2324,7 @@ str x19, [sp, #-16]!`). Same layout and unwind offsets.
 `PLIRON_A64_PUSHFOLD` exact non-nop: pulldown -0.855%, protobuf -0.576%,
 html -0.508%, json -0.152%, blind-sig -0.106%, regex -0.049%, compression
 -0.022%, blake3 flat.
+
+`PLIRON_AMODENEG` exact non-nop (2026-11-22): pulldown -0.863%, json
+-0.315%, protobuf -0.234%, html -0.166%, blind-sig -0.161%, regex -0.014%,
+compression flat. Default on.
