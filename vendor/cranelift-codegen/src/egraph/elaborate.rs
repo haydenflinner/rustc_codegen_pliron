@@ -49,7 +49,7 @@ pub(crate) fn elab_hot_on() -> bool {
 /// PLIRON: `PLIRON_ELABKEEP` (default on; `=0` off) — elaboration does
 /// not move a pure instruction into a loop the incoming function had it
 /// outside of. See `Elaborator::keep_out_of_loop`.
-/// PLIRON (`PLIRON_ELABKEEP_WIDE=1`, opt-in): an `iconst` that takes
+/// PLIRON (`PLIRON_ELABKEEP_WIDE`, default on, `=0` off): an `iconst` that takes
 /// three or four `mov`/`movk` instructions on a 64-bit target (three or
 /// more 16-bit chunks that are neither all zeros nor all ones, and no
 /// repeating pattern a logical immediate could encode) stays where the
@@ -61,7 +61,7 @@ pub(crate) fn elab_hot_on() -> bool {
 /// in the loop) cost pulldown +0.45%.
 pub(crate) fn wide_const(func: &Function, inst: Inst) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP_WIDE").as_deref() == Ok("1")) {
+    if !*ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP_WIDE").as_deref() != Ok("0")) {
         return false;
     }
     let crate::ir::InstructionData::UnaryImm { opcode: crate::ir::Opcode::Iconst, imm } = func.dfg.insts[inst] else {

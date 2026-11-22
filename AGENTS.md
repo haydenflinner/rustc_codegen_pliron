@@ -782,9 +782,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   is a constant. Upstream's family binds one type to the compare result and
   its operands and never matches a scalar compare. lol_html's `Bytes::slice`
   bounds-checks its own clamp: html -0.083%, the rest flat. Test
-  `egraph_rules::mincmp_*`. `PLIRON_ELABKEEP_WIDE` (opt-in) since narrowed
-  to wide constants the loop does not use (a division's magic multiplier
-  followed back into `init_items`' loop with its `umulhi`).
+  `egraph_rules::mincmp_*`. `PLIRON_ELABKEEP_WIDE` (default on since
+  2026-11-22, `=0` off), narrowed to wide constants the loop does not use
+  (a division's magic multiplier followed back into `init_items`' loop
+  with its `umulhi`): html -0.019%, the rest flat.
 - `PLIRON_LOOPCHAIN=1` (opt-in, vendored block order, measured loss) —
   a loop's chains are emitted together, inner loops first. html -0.087%
   (`tag_name_state`'s input slice no longer moves to `x4`/`x5` and back on
@@ -801,7 +802,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   after the bounds branch, which LLVM does not emit for native code. Exact
   counts: pulldown -0.342%, protobuf -0.138%, html -0.093%, json -0.039%,
   the rest flat.
-- `PLIRON_BRBITS=1`, `PLIRON_ELABKEEP_WIDE=1` (opt-in, 2026-11-22,
+- `PLIRON_BRBITS=1` and the first, unnarrowed `ELABKEEP_WIDE` (2026-11-22,
   measured losses) — a `br_table` of at most 64 entries and three
   destinations as bit tests (`brbits`, test `tests/brbits.rs`), and the
   final egraph keeping a 3-4 instruction `iconst` where the pipeline

@@ -2253,7 +2253,7 @@ with it (`uzp1; uzp2; umax` was three instructions per 16 or 64 bytes).
 default on since 2026-11-22 (`=0` off), flipped with `PLIRON_BITCAST2`
 and `PLIRON_PAIRWISE_ISLE`: html -0.312%, pulldown -0.338% exact non-nop.
 
-## Wide constants keep their hoist (`PLIRON_ELABKEEP_WIDE=1`, opt-in)
+## Wide constants keep their hoist (`PLIRON_ELABKEEP_WIDE`, default on since 2026-11-22, `=0` off)
 
 `src/egraph/elaborate.rs` (`wide_const`, a `wide` argument to
 `keep_out_of_loop`), `src/egraph/mod.rs` (`orig_block` also records such a
@@ -2308,3 +2308,6 @@ followed it back into lol_html's `init_items` loop). The first form, every
 wide constant, cost pulldown +0.45% (bit-test masks used in the loop).
 
 `PLIRON_MINCMP` exact non-nop: html -0.083%, the rest within noise.
+
+Narrowed `PLIRON_ELABKEEP_WIDE` exact non-nop: html -0.019%, the rest within
+noise; default on since 2026-11-22.
