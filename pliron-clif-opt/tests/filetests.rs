@@ -181,6 +181,7 @@ fn pass(name: &str) -> Pass {
         "tailmergep" => |f| pliron_clif_opt::tailmergep::run_with(f, false),
         "tailmergep_dedup" => |f| pliron_clif_opt::tailmergep::run_with(f, true),
         "wide128_phi" => |f| pliron_clif_opt::wide128::run(f, true),
+        "exnconst" => pliron_clif_opt::exnconst::run,
         "rgmerge" => clifpeep::rgmerge,
         "sameargs" => |f| clifpeep::sameargs(f).0,
         "selargs" => clifpeep::selargs,

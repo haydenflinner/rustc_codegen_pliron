@@ -4968,6 +4968,17 @@ fn s_vrp(p: &mut Pipe, an: &mut Analysis) -> usize {
 
 // Cold `call f(..); trap` tails of one callee share one block per
 // function (`panicstub`); members keep their argument setup and jump.
+fn s_exnconst(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::exnconst::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("exnconst");
+        }
+    }
+    k
+}
+
 fn s_panicstub(p: &mut Pipe, an: &mut Analysis) -> usize {
     // Native only: never run or measured on wasm.
     if p.target.is_wasm() {
@@ -6118,6 +6129,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // emitter can `local.tee` it (`stkorder.rs`). After every
         // placement pass. Opt-in: `PLIRON_WASM_STKORDER=1`.
         step("stkorder", "stkorder", Gate::OptIn("PLIRON_WASM_STKORDER"), s_stkorder),
+        // Constants an exception edge passes (drop flags, after edgefwd
+        // dropped their forwarder pads) are defined in a cold landing
+        // block of their own instead of being live across the call.
+        // After every pass that reshapes edges. Opt-in: `PLIRON_EXNCONST=1`.
+        step("exnconst", "exnconst", Gate::OptIn("PLIRON_EXNCONST"), s_exnconst).needs(shape::CALL),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

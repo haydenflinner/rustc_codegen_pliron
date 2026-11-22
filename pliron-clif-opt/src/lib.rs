@@ -49,6 +49,7 @@ pub mod commute;
 pub mod config;
 pub mod undefphi;
 pub mod eqtree;
+pub mod exnconst;
 pub mod guardsink;
 pub mod wide128;
 pub mod slotconst;

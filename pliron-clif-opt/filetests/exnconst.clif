@@ -1,0 +1,32 @@
+; test exnconst
+; A loop of calls whose unwind edges pass a drop flag to a shared
+; cleanup block: `edgefwd` left the constant `v2 = 1` on each try_call's
+; exception edge, so it was live across both calls. Each edge gets a cold
+; landing block that defines the constant itself; the call keeps passing
+; only `exn0`. The plain value `v0` on the second edge stays an argument.
+; check-not: block3(exn0, v2)
+; check-not: block6(exn0, v0, v2)
+; check: tag0: block7(exn0) ]
+; check: tag0: block8(exn0, v0) ]
+; check: iconst.i8 1
+; check: jump block3(
+function %f(i64, i64) {
+    sig0 = (i64) apple_aarch64
+    fn0 = %g sig0
+
+block0(v0: i64, v1: i64):
+    v2 = iconst.i8 1
+    jump block1
+
+block1:
+    try_call fn0(v0), sig0, block2, [ tag0: block3(exn0, v2) ]
+
+block2:
+    try_call fn0(v1), sig0, block1, [ tag0: block6(exn0, v0, v2) ]
+
+block6(v10: i64, v11: i64, v12: i8) cold:
+    jump block3(v10, v12)
+
+block3(v20: i64, v21: i8) cold:
+    trap user1
+}
