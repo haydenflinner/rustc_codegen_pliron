@@ -777,6 +777,15 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_MEMFAST_SMALLFN=<ops>` (default `1024` since 2026-11-22, `=0`
+  off) — a function of at most that many IR ops inlines its runtime-size
+  copies below 16 bytes too, as `PLIRON_MEMFAST_SMALL`'s default `loop`
+  mode does for copies on a cycle: a function that small and still out of
+  line is called often (lol_html's output sink closure behind `&mut dyn
+  FnMut`, 62.8k `memcpy` calls of a few bytes). Exact counts: protobuf
+  -0.83%, json -0.41%, html -0.29%, pulldown -0.18%, the rest flat; .text
+  +0.04%..+1.44% (regex). `MEMFAST_SMALL=1` adds json -1.6% more for up
+  to +2.17% .text.
 - `PLIRON_SELARGS_EXT` (default on since 2026-11-22, `=0` off) —
   `selargs` also resolves `select c, a, b` edge arguments of a `brif` on
   `uextend c` (lowering widens compares; the late egraph strips the

@@ -674,6 +674,13 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // -0.057%, blind-sig -0.06% (noise), protobuf +0.037% (prost's
     // `merge_repeated` inlining reshuffle), the rest flat. `=8` the old walk.
     ("PLIRON_XCGU_LEAF_DEPTH", "12"),
+    // 2026-11-22: runtime-size copies in functions of at most 1024 IR ops
+    // handle sizes below 16 inline, as loops already do (`MEMFAST_SMALL`'s
+    // `loop` mode). Exact non-nop: protobuf -0.83%, json -0.41%, html
+    // -0.29%, pulldown -0.18%, the rest flat; .text +0.04% (protobuf) to
+    // +1.44% (regex). `MEMFAST_SMALL=1` (every copy): json -1.99% but
+    // .text up to +2.17%. `=0` off.
+    ("PLIRON_MEMFAST_SMALLFN", "1024"),
     // 2026-11-18: wide128 skips functions over this many CLIF instructions
     // (montgomery ~1.7k). `=0` no size cap. Foldhash `build_state` is a
     // few hundred.
