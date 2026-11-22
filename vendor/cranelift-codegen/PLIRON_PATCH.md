@@ -2362,3 +2362,14 @@ instructions a byte, LLVM's), pulldown -0.518%, regex -0.389%, html
 
 Measured 2026-11-22 and left off: `PLIRON_CONSTSINK=1` pulldown +0.683%,
 html +0.058%, json +0.021%; `PLIRON_LOADREMAT=1` html +0.606%.
+
+More opt-ins measured 2026-11-22 (exact non-nop), all left off:
+`PLIRON_ARGUEXT=1`, `PLIRON_CINC=1`, `PLIRON_FLAGX=1`: no change.
+`PLIRON_OUTCOPY=1`: protobuf -0.111%, blind-sig -0.137%, regex -0.042%, but
+json +0.197%, pulldown +0.158%, compression +0.096%.
+`PLIRON_REMATLOOP=1`: html +0.156%, regex +0.121%; `PLIRON_REMAT_CARRIED=1`:
+regex +1.508%, html +0.187%. `PLIRON_RA2_USESPLIT_MULTIBLOCK=1`: noise.
+`PLIRON_RORFOLD_MULTI=1` saves instructions everywhere (regex -0.328%,
+blake3 -0.211%, protobuf -0.128%) but is the rule patch 71 turned off for
+time: the shifted-operand ops' latency made blake3 1.39x LLVM. Fewer
+instructions, slower; stays off.
