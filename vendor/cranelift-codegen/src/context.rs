@@ -1444,9 +1444,9 @@ impl Context {
         if mode == 0 {
             return;
         }
-        // `=3`: `brif` too, but only outside loops (in a loop the edge
-        // block's copy moved a register around regex's `Fsm::next_state`
-        // varint loop: +0.9% under `=1`).
+        // `=3`: `brif` too, but only outside loops and not into a loop
+        // header (regex's `Fsm::next_state` varint loop gained register
+        // moves: +0.9% under `=1`, still with the loop rule alone).
         // A local analysis: the pass changes the CFG, and `self`'s must not
         // be left looking valid.
         let mut la = crate::loop_analysis::LoopAnalysis::new();
@@ -1531,7 +1531,12 @@ impl Context {
                 let target = bc.block(&self.func.dfg.value_lists);
                 let args: Vec<BlockArg> = bc.args(&self.func.dfg.value_lists).collect();
                 let moves = args.iter().any(|a| matches!(a, BlockArg::Value(v) if movable(&self.func, self.func.dfg.resolve_aliases(*v))));
-                if !moves || in_edges.get(&target).copied().unwrap_or(0) < 2 {
+                // `=3`: not into a loop header either (a loop variable's
+                // initial value).
+                let into_loop = mode == 3
+                    && matches!(self.func.dfg.insts[t], InstructionData::Brif { .. })
+                    && la.is_loop_header(target).is_some();
+                if !moves || into_loop || in_edges.get(&target).copied().unwrap_or(0) < 2 {
                     slot_group.push(None);
                     continue;
                 }

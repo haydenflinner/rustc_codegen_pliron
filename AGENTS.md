@@ -783,7 +783,8 @@ time, memory, code size, stack frames) in ~20 min and writes
   branch for every arm (pulldown-cmark's `item_to_event` jump table). `=2`:
   pulldown -1.202%, blind-sig -0.148%, the rest flat. `=1` adds html
   -0.335%, protobuf -0.372%, json -0.188% but costs regex +0.912%
-  (`Fsm::next_state`).
+  (`Fsm::next_state`); `=3` (`brif` outside loops, not into a header) still
+  regex +0.907% though a replay of `next_state` shows no change: open.
 - `PLIRON_ARGPARAM` (vendored lowering, default `1` since 2026-11-22, `=0`
   off, `=2` any block) — an entry-block parameter whose only use is a call
   argument is passed without the `arg_detach` copy: protobuf -0.048%, html

@@ -2341,3 +2341,9 @@ compression +0.018%.
 `PLIRON_EDGECONST=2` (jump tables only) exact non-nop: pulldown -1.202%,
 blind-sig -0.148%, the rest flat (regex's `brif` loss is mode 1 only).
 Default `2`.
+
+`PLIRON_EDGECONST=3` (`brif` edges outside loops and not into a loop
+header, opt-in): html -0.287%, protobuf -0.161%, json -0.130%, blind-sig
+-0.105%, but regex +0.907% (`Fsm::next_state`, the same loss as `=1`) and
+pulldown +0.035%. Unexplained: a `clif-check vcode` replay of the recorded
+`next_state` gives mode 3 the code of mode 2. Left opt-in.
