@@ -1224,6 +1224,21 @@ time, memory, code size, stack frames) in ~20 min and writes
   registers (`mov x1..x8, x0` before the stores). Exact counts: html
   -0.160%, pulldown -0.077%, regex -0.064%, protobuf -0.018%, json
   -0.007%, the rest within noise. Filetest `tailmergep_dedup`.
+- `PLIRON_CSE_SYM` (default `2` since 2026-11-22, `=0` off, `=1` also
+  across dominator scopes) — one `symbol_value` per global within a
+  block (`lcse`). hashbrown's `reserve_rehash` (lol_html) loaded
+  foldhash's seed address five times in one block, copies `licm` had
+  hoisted side by side. Exact counts `=2`: html -0.149%, every other
+  program flat. `=1` also merges across the dominator tree (`dgvn`):
+  pulldown +0.051% (`parse_block`: one long-lived copy spills and
+  reloads, +14k loads). Flipped without the gate/crates runs.
+- `PLIRON_GUARDSINK=1` (opt-in, 2026-11-22, measured, not for default) —
+  step `guardsink` after `edgesink`: pure values and `notrap` loads that
+  `licm` left in a preheader `looprot` turned into the zero-trip guard
+  move past the guard's `brif` into the loop side when only that side
+  reads them. Exact counts: html -0.046%, but compression +1.62% and
+  pulldown +0.55% (loads +294k / +262k in their hottest functions: not
+  yet understood). Tests `pliron-clif-opt/tests/guardsink.rs`.
 - `PLIRON_INLINE_GLUET=<n>` (opt-in) — drop-glue call-site threshold at
   least n (after the `DROPLIM` cap). At 90: html-rewriter -0.84%,
   pulldown -0.31%, protobuf -0.34%, but compression +1.25%, regex +0.35%.

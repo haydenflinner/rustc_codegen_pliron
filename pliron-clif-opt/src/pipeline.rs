@@ -3902,6 +3902,17 @@ fn s_commonret(p: &mut Pipe, _an: &mut Analysis) -> usize {
     n
 }
 
+fn s_guardsink(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::guardsink::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("guardsink");
+        }
+    }
+    k
+}
+
 fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgesink::run(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -5862,6 +5873,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // The `brif` sink loop needs CONDBR; `push_to_use_blocks` only
         // needs a second block to push into.
         .needs_any(shape::CONDBR | shape::BLOCKS2),
+        // Invariants `licm` hoisted into a preheader that `looprot` then
+        // made the zero-trip guard: sink them past the guard's `brif` into
+        // the loop side (`PLIRON_GUARDSINK=1`).
+        step("guardsink", "guardsink", Gate::OptIn("PLIRON_GUARDSINK"), s_guardsink).needs(shape::CONDBR),
         // `acc + a + b + c` chains rooted at a block param keep only
         // one add on the loop-carried edge; runs late so it sees the
         // final chain shapes.

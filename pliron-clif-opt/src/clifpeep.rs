@@ -10923,8 +10923,15 @@ fn cse_key(func: &Function, i: Inst) -> Option<CseKey> {
     }
 }
 
-static CSE_SYM: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_CSE_SYM", "1"));
+static CSE_SYM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    pliron_cfg::env_is("PLIRON_CSE_SYM", "1") || pliron_cfg::env_is("PLIRON_CSE_SYM", "2")
+});
+/// `PLIRON_CSE_SYM=2`: one `symbol_value` per global within a block only
+/// (`lcse`), not across a dominator scope (`dgvn`): one copy that lives
+/// through a large function spills and reloads where separate copies are
+/// rematerialized (pulldown's `parse_block`, +14k loads with `=1`).
+static CSE_SYM_BLOCK: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_CSE_SYM", "2"));
 
 /// Per-block CSE with the shared keying: later insts in a block alias
 /// the earliest equivalent def, which dominates them.
@@ -11627,6 +11634,9 @@ pub fn dgvn(func: &mut Function, dt: &DominatorTree) -> usize {
                 continue;
             }
             let Some(k) = cse_key(func, i) else { continue };
+            if *CSE_SYM_BLOCK && matches!(k, CseKey::G(_)) {
+                continue;
+            }
             match seen.entry(k) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     let v = func.dfg.resolve_aliases(*e.get());
