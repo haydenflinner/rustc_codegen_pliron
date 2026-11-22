@@ -777,6 +777,15 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_A64_PUSHFOLD` (vendored aarch64 ABI, default on since 2026-11-22,
+  `=0` off) — a function whose frame holds only callee saves allocates it
+  with the pre-indexed store of the save at offset 0 (`str x19, [sp,
+  #-16]!`) and frees it with that save's post-indexed load, instead of a
+  separate `sub sp`/`add sp`. Found by counting executed instruction
+  bigrams against LLVM's binary (`add sp; ldp [sp], #16` ran 533k times
+  for us, never for LLVM). Exact counts: pulldown -0.855%, protobuf
+  -0.576%, html -0.508%, json -0.152%, blind-sig -0.106%, regex -0.049%,
+  compression -0.022%.
 - `PLIRON_MINCMP` (vendored egraph, default on since 2026-11-22, `=0` off)
   — `umin x, y` compared with `y` (and the `umax`/`smin`/`smax` mirrors)
   is a constant. Upstream's family binds one type to the compare result and

@@ -91,7 +91,7 @@ fn flat_save_slots(
 
 /// Bytes the flat save allocates at once: the clobber area, plus the fixed
 /// frame when every save slot stays within `stp`'s +504 offset range.
-/// PLIRON (`PLIRON_A64_PUSHFOLD=1`, opt-in): with no fixed frame in the
+/// PLIRON (`PLIRON_A64_PUSHFOLD`, default on, `=0` off): with no fixed frame in the
 /// flat allocation (`alloc == clobber_size`), the save at offset 0 is a
 /// pre-indexed store that does the `sub sp`, and its restore a
 /// post-indexed load that does the `add sp`: `str x19, [sp, #-16]!` for
@@ -99,7 +99,7 @@ fn flat_save_slots(
 /// unwind offsets (the frame pointer defines the CFA).
 fn pushfold(slot: &SaveSlot, alloc: u32, clobber: u32) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_A64_PUSHFOLD").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_A64_PUSHFOLD").as_deref() != Ok("0"))
         && alloc == clobber
         && match slot {
             SaveSlot::Int(_) | SaveSlot::Vec(_) => alloc <= 256,
