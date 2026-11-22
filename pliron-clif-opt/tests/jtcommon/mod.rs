@@ -173,11 +173,12 @@ mod arch {
         w & 0xffff_fc1f == 0xd61f_0000
     }
 
-    /// `cmp wN, #n; b.hs; csel; adr; ldr{b,h,}; adr; add; br`; the table
-    /// length is the `cmp` immediate.
+    /// `cmp wN, #n; b.hs; [csel;] adr; ldr{b,h,}; adr; add; br`; the table
+    /// length is the `cmp` immediate. The `csel` clamp is gone under
+    /// `PLIRON_JT_DIRECT` (default on).
     pub fn decode_all(code: &Code) -> Vec<Dispatch> {
         let mut out = Vec::new();
-        for i in 7..code.bytes.len() / 4 {
+        for i in 6..code.bytes.len() / 4 {
             let at = |k: usize| code.word(4 * (i - k));
             if !is_br(at(0)) {
                 continue;
@@ -193,8 +194,9 @@ mod arch {
                 0xb8 => 4,
                 _ => continue,
             };
-            let cmp = at(7);
-            assert_eq!(cmp & 0xff80_001f, 0x7100_001f, "expected cmp w, #imm");
+            let is_cmp = |w: u32| w & 0xff80_001f == 0x7100_001f;
+            let cmp = if is_cmp(at(6)) || i < 7 { at(6) } else { at(7) };
+            assert!(is_cmp(cmp), "expected cmp w, #imm");
             let n = ((cmp >> 10) & 0xfff) as usize;
             let entries = read_entries(code, table, width, n);
             out.push(Dispatch {
