@@ -2311,3 +2311,12 @@ wide constant, cost pulldown +0.45% (bit-test masks used in the loop).
 
 Narrowed `PLIRON_ELABKEEP_WIDE` exact non-nop: html -0.019%, the rest within
 noise; default on since 2026-11-22.
+
+## Pre/post-indexed save at offset 0 (`PLIRON_A64_PUSHFOLD=1`, opt-in)
+
+`src/isa/aarch64/abi.rs` (`pushfold`, flat save/restore): when the flat
+allocation holds only the callee saves, the save at offset 0 is a
+pre-indexed store that does the `sub sp` and its restore a post-indexed load
+that does the `add sp`. Two instructions per call of a function with callee
+saves and no locals (lol_html's state functions: `stp fp, lr; mov fp, sp;
+str x19, [sp, #-16]!`). Same layout and unwind offsets.

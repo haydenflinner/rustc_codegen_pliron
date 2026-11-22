@@ -91,6 +91,22 @@ fn flat_save_slots(
 
 /// Bytes the flat save allocates at once: the clobber area, plus the fixed
 /// frame when every save slot stays within `stp`'s +504 offset range.
+/// PLIRON (`PLIRON_A64_PUSHFOLD=1`, opt-in): with no fixed frame in the
+/// flat allocation (`alloc == clobber_size`), the save at offset 0 is a
+/// pre-indexed store that does the `sub sp`, and its restore a
+/// post-indexed load that does the `add sp`: `str x19, [sp, #-16]!` for
+/// `sub sp, sp, #16; str x19, [sp]` (LLVM's form). Same layout, same
+/// unwind offsets (the frame pointer defines the CFA).
+fn pushfold(slot: &SaveSlot, alloc: u32, clobber: u32) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_A64_PUSHFOLD").as_deref() == Ok("1"))
+        && alloc == clobber
+        && match slot {
+            SaveSlot::Int(_) | SaveSlot::Vec(_) => alloc <= 256,
+            SaveSlot::IntPair(..) | SaveSlot::VecPair(..) => alloc <= 504,
+        }
+}
+
 fn flat_alloc(frame_layout: &FrameLayout) -> (u32, bool) {
     let fixed = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
     let total = frame_layout.clobber_size + fixed;
@@ -896,18 +912,36 @@ impl ABIMachineSpec for AArch64MachineDeps {
         if let Some(slots) = flat_save_slots(call_conv, frame_layout) {
             let (alloc, with_fixed) = flat_alloc(frame_layout);
             let below = alloc - frame_layout.clobber_size;
-            insts.extend(Self::gen_sp_reg_adjust(-(alloc as i32)));
             let n = slots.len() as u32;
-            for (k, slot) in slots.iter().enumerate() {
+            // The slot at offset 0 is the last one.
+            let fold = pushfold(&slots[n as usize - 1], alloc, frame_layout.clobber_size);
+            if !fold {
+                insts.extend(Self::gen_sp_reg_adjust(-(alloc as i32)));
+            }
+            let order: Vec<usize> =
+                if fold { core::iter::once(n as usize - 1).chain(0..n as usize - 1).collect() } else { (0..n as usize).collect() };
+            for k in order {
+                let slot = &slots[k];
                 let off = i64::from(below + frame_layout.clobber_size - 16 * (k as u32 + 1));
                 let clobber_offset = 16 * (n - 1 - k as u32);
-                let pair = |ty| PairAMode::SignedOffset {
-                    reg: regs::stack_reg(),
-                    simm7: SImm7Scaled::maybe_from_i64(off, ty).unwrap(),
+                let pre = fold && k == n as usize - 1;
+                let pair = |ty| {
+                    if pre {
+                        PairAMode::SPPreIndexed { simm7: SImm7Scaled::maybe_from_i64(-i64::from(alloc), ty).unwrap() }
+                    } else {
+                        PairAMode::SignedOffset { reg: regs::stack_reg(), simm7: SImm7Scaled::maybe_from_i64(off, ty).unwrap() }
+                    }
+                };
+                let one = || {
+                    if pre {
+                        AMode::SPPreIndexed { simm9: SImm9::maybe_from_i64(-i64::from(alloc)).unwrap() }
+                    } else {
+                        AMode::SPOffset { off }
+                    }
                 };
                 let (inst, saved): (Inst, SmallVec<[(Reg, u32); 2]>) = match *slot {
                     SaveSlot::Int(rd) => (
-                        Inst::Store64 { rd, mem: AMode::SPOffset { off }, flags: MemFlagsData::trusted() },
+                        Inst::Store64 { rd, mem: one(), flags: MemFlagsData::trusted() },
                         smallvec![(rd, 0)],
                     ),
                     SaveSlot::IntPair(rt, rt2) => (
@@ -915,7 +949,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                         smallvec![(rt, 0), (rt2, 8)],
                     ),
                     SaveSlot::Vec(rd) => (
-                        Inst::FpuStore64 { rd, mem: AMode::SPOffset { off }, flags: MemFlagsData::trusted() },
+                        Inst::FpuStore64 { rd, mem: one(), flags: MemFlagsData::trusted() },
                         smallvec![(rd, 0)],
                     ),
                     SaveSlot::VecPair(rt, rt2) => (
@@ -1140,29 +1174,44 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 insts.extend(Self::gen_sp_reg_adjust(stack_size as i32));
             }
             let below = alloc - frame_layout.clobber_size;
+            let n = slots.len();
+            let fold = pushfold(&slots[n - 1], alloc, frame_layout.clobber_size);
             for (k, slot) in slots.iter().enumerate() {
                 let off = i64::from(below + frame_layout.clobber_size - 16 * (k as u32 + 1));
-                let pair = |ty| PairAMode::SignedOffset {
-                    reg: regs::stack_reg(),
-                    simm7: SImm7Scaled::maybe_from_i64(off, ty).unwrap(),
+                let post = fold && k == n - 1;
+                let pair = |ty| {
+                    if post {
+                        PairAMode::SPPostIndexed { simm7: SImm7Scaled::maybe_from_i64(i64::from(alloc), ty).unwrap() }
+                    } else {
+                        PairAMode::SignedOffset { reg: regs::stack_reg(), simm7: SImm7Scaled::maybe_from_i64(off, ty).unwrap() }
+                    }
+                };
+                let one = || {
+                    if post {
+                        AMode::SPPostIndexed { simm9: SImm9::maybe_from_i64(i64::from(alloc)).unwrap() }
+                    } else {
+                        AMode::SPOffset { off }
+                    }
                 };
                 let w = |r: Reg| Writable::from_reg(r);
                 insts.push(match *slot {
                     SaveSlot::Int(rd) => {
-                        Inst::ULoad64 { rd: w(rd), mem: AMode::SPOffset { off }, flags: MemFlagsData::trusted() }
+                        Inst::ULoad64 { rd: w(rd), mem: one(), flags: MemFlagsData::trusted() }
                     }
                     SaveSlot::IntPair(rt, rt2) => {
                         Inst::LoadP64 { rt: w(rt), rt2: w(rt2), mem: pair(types::I64), flags: MemFlagsData::trusted() }
                     }
                     SaveSlot::Vec(rd) => {
-                        Inst::FpuLoad64 { rd: w(rd), mem: AMode::SPOffset { off }, flags: MemFlagsData::trusted() }
+                        Inst::FpuLoad64 { rd: w(rd), mem: one(), flags: MemFlagsData::trusted() }
                     }
                     SaveSlot::VecPair(rt, rt2) => {
                         Inst::FpuLoadP64 { rt: w(rt), rt2: w(rt2), mem: pair(F64), flags: MemFlagsData::trusted() }
                     }
                 });
             }
-            insts.extend(Self::gen_sp_reg_adjust(alloc as i32));
+            if !fold {
+                insts.extend(Self::gen_sp_reg_adjust(alloc as i32));
+            }
             return insts;
         }
 
