@@ -2274,3 +2274,14 @@ native code.
 
 `PLIRON_JT_DIRECT` exact non-nop: pulldown -0.342%, protobuf -0.138%, html
 -0.093%, json -0.039%, the rest flat.
+
+## Loop chains stay together (`PLIRON_LOOPCHAIN=1`, opt-in)
+
+`src/machinst/blockorder.rs` (chained order): after a chain that ends
+inside a loop, the loop's remaining chains (its blocks in RPO, inner loops
+included, one cursor per loop) are emitted before anything outside it,
+then the enclosing loop's. Chains start at RPO positions, so a loop body
+chain RPO reached after the loop's exits was laid out behind them, and a
+value split at a call in an exit block kept its second register over that
+body (linear ranges): lol_html's `tag_name_state` moved its input slice to
+`x4`/`x5` and back on every byte.

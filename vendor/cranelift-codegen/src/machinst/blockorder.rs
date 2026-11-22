@@ -403,14 +403,89 @@ impl BlockLoweringOrder {
                 }
             }
             let mut emitted = FxHashSet::default();
-            for &block in &rpo {
-                let mut cur = block;
+            // PLIRON (`PLIRON_LOOPCHAIN=1`, opt-in): a loop's chains stay
+            // together. Chains start at RPO positions, so a loop body
+            // chain that RPO reaches after the loop's exit blocks was laid
+            // out behind them, and a value split at a call in an exit
+            // block took its second register over that loop body too (the
+            // linear ranges cover every block after the split): lol_html's
+            // `tag_name_state` copied its input slice to `x4`/`x5` and back
+            // on every byte. After a chain inside a loop, the loop's
+            // remaining chains follow (in RPO, inner loops first), then
+            // the enclosing loop's, before anything outside.
+            static LOOPCHAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let loopchain =
+                *LOOPCHAIN.get_or_init(|| std::env::var("PLIRON_LOOPCHAIN").as_deref() == Ok("1"));
+            // Emits the chain from `start`; returns its last block.
+            let emit_chain = |start: Block, emitted: &mut FxHashSet<Block>, orig_order: &mut Vec<Block>| -> Block {
+                let mut cur = start;
+                let mut last = start;
                 while emitted.insert(cur) {
                     orig_order.push(cur);
+                    last = cur;
                     cur = match best_succ[cur].expand() {
                         Some(next) => next,
                         None => break,
                     };
+                }
+                last
+            };
+            if loopchain {
+                let cfg = crate::flowgraph::ControlFlowGraph::with_function(f);
+                let mut la = crate::loop_analysis::LoopAnalysis::new();
+                la.compute(f, &cfg, domtree);
+                // Per loop, its blocks (inner loops' included) in RPO.
+                let mut queue: FxHashMap<crate::loop_analysis::Loop, (Vec<Block>, usize)> = FxHashMap::default();
+                for &b in &rpo {
+                    let mut l = la.innermost_loop(b);
+                    while let Some(x) = l {
+                        queue.entry(x).or_default().0.push(b);
+                        l = la.loop_parent(x);
+                    }
+                }
+                let nest = |b: Block, above: Option<crate::loop_analysis::Loop>| {
+                    // Loops of `b` strictly inside `above`, outermost first.
+                    let mut v: SmallVec<[crate::loop_analysis::Loop; 4]> = SmallVec::new();
+                    let mut l = la.innermost_loop(b);
+                    while let Some(x) = l {
+                        if Some(x) == above {
+                            break;
+                        }
+                        v.push(x);
+                        l = la.loop_parent(x);
+                    }
+                    v.reverse();
+                    v
+                };
+                let mut stack: Vec<crate::loop_analysis::Loop> = Vec::new();
+                for &block in &rpo {
+                    if emitted.contains(&block) {
+                        continue;
+                    }
+                    let last = emit_chain(block, &mut emitted, &mut orig_order);
+                    stack.extend(nest(last, None));
+                    while let Some(&l) = stack.last() {
+                        let (q, c) = queue.get_mut(&l).unwrap();
+                        while *c < q.len() && emitted.contains(&q[*c]) {
+                            *c += 1;
+                        }
+                        if *c == q.len() {
+                            stack.pop();
+                            continue;
+                        }
+                        let nb = q[*c];
+                        *c += 1;
+                        let last = emit_chain(nb, &mut emitted, &mut orig_order);
+                        // The chain may leave `l`: only loops inside `l` that
+                        // its last block is in.
+                        if la.is_in_loop(last, l) {
+                            stack.extend(nest(last, Some(l)));
+                        }
+                    }
+                }
+            } else {
+                for &block in &rpo {
+                    let _ = emit_chain(block, &mut emitted, &mut orig_order);
                 }
             }
         } else {
