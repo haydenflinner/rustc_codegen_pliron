@@ -506,6 +506,39 @@ impl BlockLoweringOrder {
                 // once (in `emitted`), so no later chain flows into one of
                 // their blocks ahead of its dominator.
                 let mut deferred: Vec<Block> = Vec::new();
+                // Loops whose header is placed and some block is not: an
+                // exit chain placed now would split such a loop's body.
+                let mut remaining: FxHashMap<crate::loop_analysis::Loop, u32> = FxHashMap::default();
+                for &b in &rpo {
+                    let mut l = la.innermost_loop(b);
+                    while let Some(x) = l {
+                        *remaining.entry(x).or_default() += 1;
+                        l = la.loop_parent(x);
+                    }
+                }
+                let mut open: u32 = 0;
+                let mut placed = 0usize;
+                let note = |order: &[Block], placed: &mut usize, remaining: &mut FxHashMap<crate::loop_analysis::Loop, u32>, open: &mut u32| {
+                    for &b in &order[*placed..] {
+                        if let Some(h) = la.is_loop_header(b) {
+                            if remaining[&h] > 0 {
+                                *open += 1;
+                            }
+                        }
+                        let mut l = la.innermost_loop(b);
+                        while let Some(x) = l {
+                            let r = remaining.get_mut(&x).unwrap();
+                            *r -= 1;
+                            // The header precedes its body, so a loop that
+                            // empties here was counted open at its header.
+                            if *r == 0 {
+                                *open -= 1;
+                            }
+                            l = la.loop_parent(x);
+                        }
+                    }
+                    *placed = order.len();
+                };
                 for &block in &rpo {
                     if emitted.contains(&block) {
                         continue;
@@ -527,7 +560,7 @@ impl BlockLoweringOrder {
                     // block outside it.
                     let closed = seen.iter().all(|&c| domtree.children(c).all(|k| seen.contains(&k)));
                     let whole = !best_succ[last].expand().is_some_and(|n| !emitted.contains(&n) && !seen.contains(&n));
-                    if la.innermost_loop(block).is_none() && exits(last) && closed && whole && !orig_order.is_empty() {
+                    if open > 0 && la.innermost_loop(block).is_none() && exits(last) && closed && whole && !orig_order.is_empty() {
                         for &c in &seen {
                             emitted.insert(c);
                             deferred.push(c);
@@ -535,6 +568,7 @@ impl BlockLoweringOrder {
                         continue;
                     }
                     let _ = emit_chain(block, &mut emitted, &mut orig_order);
+                    note(&orig_order, &mut placed, &mut remaining, &mut open);
                 }
                 orig_order.extend(deferred);
             } else {
