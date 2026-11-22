@@ -515,6 +515,11 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // 2026-11-22: one `symbol_value` per global within a block (foldhash's
+    // seed address loaded five times in `reserve_rehash`). Exact counts:
+    // html -0.149%, the rest flat. `=1` also across dominator scopes,
+    // `=0` off. Gate/crates not run.
+    ("PLIRON_CSE_SYM", "2"),
     // 2026-11-21: the inliner charges no `call_w` for the cold calls of a
     // callee with no warm call whose ops fit the base limit
     // (`Vec::extend_trusted`). Exact counts: html -0.179%, pulldown
