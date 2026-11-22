@@ -2359,3 +2359,6 @@ left out). Exact non-nop: json -4.996% (`format_escaped_str_contents`: six
 instructions a byte, LLVM's), pulldown -0.518%, regex -0.389%, html
 -0.061%, blind-sig +0.092% (allocator functions and `sub2`), compression
 +0.026% (brotli's register-assignment swing), protobuf and blake3 flat.
+
+Measured 2026-11-22 and left off: `PLIRON_CONSTSINK=1` pulldown +0.683%,
+html +0.058%, json +0.021%; `PLIRON_LOADREMAT=1` html +0.606%.
