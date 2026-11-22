@@ -724,7 +724,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   `wide128`/`wide128b`: 128-bit ops on word halves. Use gate +
   `PLIRON_WIDE128_FNMAX` (default 512) keep montgomery out. Callgrind:
   html −0.043%, blind-sig −0.12%, no program worse.
-- `PLIRON_WIDE128_PHI=1` (opt-in, 2026-11-22) — `wide128` splits an
+- `PLIRON_WIDE128_PHI` (default on since 2026-11-22, `=0` off) — `wide128` splits an
   `i128` block param into two `i64` params when every incoming argument
   is built from halves and every use folds (a greatest fixpoint over the
   candidates); `select` of two `iconcat`s folds to two `i64` selects.

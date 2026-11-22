@@ -87,6 +87,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // protobuf -0.018% (`docs/history/2026-11-20-ivsr.md`).
     // `PLIRON_TMPARAM_DEDUP=0` off.
     "PLIRON_TMPARAM_DEDUP",
+    // 2026-11-22: wide128 splits foldable i128 block params (foldhash's
+    // sponge across joins). Exact counts: html -0.060%, blind-sig +0.089%
+    // (`montgomery` +8.4k, the rest noise). Gate/crates not run.
+    // `PLIRON_WIDE128_PHI=0` off.
+    "PLIRON_WIDE128_PHI",
     // 2026-11-19: deadslot deletes the stores into a slot nothing reads
     // (every address use is a plain notrap store's address), then the
     // slot. Exact counts: pulldown-cmark -0.37%, html-rewriter -0.09%, the
