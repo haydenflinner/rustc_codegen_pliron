@@ -2347,3 +2347,15 @@ header, opt-in): html -0.287%, protobuf -0.161%, json -0.130%, blind-sig
 -0.105%, but regex +0.907% (`Fsm::next_state`, the same loss as `=1`) and
 pulldown +0.035%. Unexplained: a `clif-check vcode` replay of the recorded
 `next_state` gives mode 3 the code of mode 2. Left opt-in.
+
+## `PLIRON_AMODESPLIT` (default on since 2026-11-22, `=0` off)
+
+`src/context.rs` (`amode_split`, written 2026-10-31): a loop block's
+`p = iadd a, b` whose one use there is a zero-offset load/store address gets
+a copy in each other use block, so the load folds `[a, b]`. The limit on
+other use blocks is `PLIRON_AMODESPLIT_MAX` (default 16; at the old 4
+serde_json's escape scan, whose escape path uses `p` in more blocks, was
+left out). Exact non-nop: json -4.996% (`format_escaped_str_contents`: six
+instructions a byte, LLVM's), pulldown -0.518%, regex -0.389%, html
+-0.061%, blind-sig +0.092% (allocator functions and `sub2`), compression
++0.026% (brotli's register-assignment swing), protobuf and blake3 flat.

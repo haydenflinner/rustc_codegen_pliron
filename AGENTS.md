@@ -777,6 +777,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   lookup/store/record counters per CGU.
 - `PLIRON_XCGU=0`, `PLIRON_XFACTS=0` — cross-CGU body copies / fact
   sharing.
+- `PLIRON_AMODESPLIT` (vendored post-egraph, written 2026-10-31, default
+  on since 2026-11-22, `=0` off; `PLIRON_AMODESPLIT_MAX`, default 16 use
+  blocks) — a loop's `p = a + b` address whose one use in its block is a
+  zero-offset load/store gets a copy in each other use block, so the hot
+  load folds `[a, b]` (serde_json's escape scan: `add; ldurb` per byte, LLVM
+  `ldrb [s, i]`). Exact counts: json -4.996%, pulldown -0.518%, regex
+  -0.389%, html -0.061%, blind-sig +0.092% (allocator noise and `sub2`),
+  compression +0.026% (logged as accepted).
 - `PLIRON_EDGECONST` (vendored, default `2` since 2026-11-22: `br_table`
   edges only; `=1` also `brif`, `=0` off) — a constant a multi-way branch
   passes to a join is materialized on its edge instead of ahead of the

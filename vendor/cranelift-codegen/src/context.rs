@@ -1700,7 +1700,7 @@ impl Context {
     }
 
     /// PLIRON: give a loop's shared `base + index` address a copy per
-    /// outside use block (`PLIRON_AMODESPLIT=1`, opt-in). Lowering folds
+    /// outside use block (`PLIRON_AMODESPLIT`, default on since 2026-11-22, `=0` off). Lowering folds
     /// `p = iadd a, b` into a load's `[a, b]` amode only when the load is
     /// its one direct use (patch 86). serde_json's escape scan loads each
     /// byte through `p = s + i` and also uses `p` on its exit and escape
@@ -1712,7 +1712,7 @@ impl Context {
         use crate::ir::{InstructionData, Opcode, Value};
         use crate::{FxHashMap, FxHashSet};
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_AMODESPLIT").as_deref() == Ok("1")) {
+        if !*ON.get_or_init(|| std::env::var("PLIRON_AMODESPLIT").as_deref() != Ok("0")) {
             return;
         }
         fn others_dominated(
