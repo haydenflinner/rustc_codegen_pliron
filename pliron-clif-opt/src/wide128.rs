@@ -172,10 +172,15 @@ fn halves_consumed(
             Opcode::Ishl | Opcode::Ushr => {
                 let amt = func.dfg.inst_args(inst).get(1).copied();
                 let Some(amt) = amt else { return false };
-                let Some(k) = konst(func, amt) else { return false };
-                let k = k & 127;
-                if k != 0 && k != 64 {
-                    return false;
+                // `PLIRON_WIDE128_VARSHIFT=1`: any amount, when `v` is the
+                // shifted value (not the amount).
+                let var = varshift_on()
+                    && func.dfg.inst_args(inst).first().map(|&x| func.dfg.resolve_aliases(x)) == Some(v)
+                    && func.dfg.resolve_aliases(amt) != v;
+                match konst(func, amt) {
+                    Some(k) if (k & 127) == 0 || (k & 127) == 64 => {}
+                    Some(_) | None if var => {}
+                    _ => return false,
                 }
                 let Some(r) = func.dfg.inst_results(inst).first().copied() else {
                     return false;
@@ -338,7 +343,9 @@ fn pass(func: &mut Function, mulhi64: bool, mul: bool) -> usize {
                     n += 1;
                 }
                 InstructionData::Binary { opcode: op @ (Opcode::Ishl | Opcode::Ushr), args }
-                    if rty == types::I128 && halves_consumed(pos.func, &uses, res, &mut seen, mul) =>
+                    if rty == types::I128
+                        && konst(pos.func, args[1]).is_some()
+                        && halves_consumed(pos.func, &uses, res, &mut seen, mul) =>
                 {
                     let Some((a, b)) = cat(pos.func, args[0]) else { continue };
                     let Some(k) = konst(pos.func, args[1]) else { continue };
@@ -359,6 +366,44 @@ fn pass(func: &mut Function, mulhi64: bool, mul: bool) -> usize {
                         }
                         _ => continue,
                     }
+                    n += 1;
+                }
+                // `PLIRON_WIDE128_VARSHIFT=1`: a shift by an unknown amount
+                // `s` (CLIF masks it to 7 bits), as aarch64 lowers it: the
+                // bits crossing the halves are `(a >> 1) >> !s` (zero for
+                // `s = 0` without a select), and `s & 64` picks the
+                // swapped form.
+                InstructionData::Binary { opcode: op @ (Opcode::Ishl | Opcode::Ushr), args }
+                    if rty == types::I128
+                        && varshift_on()
+                        && konst(pos.func, args[1]).is_none()
+                        && halves_consumed(pos.func, &uses, res, &mut seen, mul) =>
+                {
+                    let Some((a, b)) = cat(pos.func, args[0]) else { continue };
+                    let Some(s) = amount64(&mut pos, args[1]) else { continue };
+                    let ns = pos.ins().bnot(s);
+                    let big = pos.ins().band_imm_u(s, 64);
+                    let z = pos.ins().iconst(types::I64, 0);
+                    let (lo, hi) = if op == Opcode::Ishl {
+                        let lo_s = pos.ins().ishl(a, s);
+                        let b_s = pos.ins().ishl(b, s);
+                        let a1 = pos.ins().ushr_imm(a, 1);
+                        let cross = pos.ins().ushr(a1, ns);
+                        let hi_s = pos.ins().bor(b_s, cross);
+                        let lo = pos.ins().select(big, z, lo_s);
+                        let hi = pos.ins().select(big, lo_s, hi_s);
+                        (lo, hi)
+                    } else {
+                        let hi_s = pos.ins().ushr(b, s);
+                        let a_s = pos.ins().ushr(a, s);
+                        let b1 = pos.ins().ishl_imm(b, 1);
+                        let cross = pos.ins().ishl(b1, ns);
+                        let lo_s = pos.ins().bor(a_s, cross);
+                        let lo = pos.ins().select(big, hi_s, lo_s);
+                        let hi = pos.ins().select(big, z, hi_s);
+                        (lo, hi)
+                    };
+                    pos.func.replace(inst).iconcat(lo, hi);
                     n += 1;
                 }
                 InstructionData::Binary { opcode: op @ (Opcode::Bor | Opcode::Bxor | Opcode::Band), args }
@@ -657,6 +702,31 @@ fn foldable_params(func: &Function, cfg: &ControlFlowGraph) -> rustc_hash::FxHas
         }
     }
     cand
+}
+
+fn varshift_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_WIDE128_VARSHIFT", "1"));
+    *ON
+}
+
+/// A shift amount as an `i64` (only its low 7 bits matter): through a
+/// `uextend.i128` or the low half of an `iconcat`, else extended or reduced.
+fn amount64(pos: &mut FuncCursor, v: Value) -> Option<Value> {
+    let v = pos.func.dfg.resolve_aliases(v);
+    let src = match def(pos.func, v).map(|d| d.1) {
+        Some(InstructionData::Unary { opcode: Opcode::Uextend, arg }) if pos.func.dfg.value_type(v) == types::I128 => arg,
+        Some(InstructionData::Binary { opcode: Opcode::Iconcat, args }) => args[0],
+        _ => v,
+    };
+    let src = pos.func.dfg.resolve_aliases(src);
+    let ty = pos.func.dfg.value_type(src);
+    Some(match ty.bits() {
+        64 => src,
+        b if b < 64 && ty.is_int() => pos.ins().uextend(types::I64, src),
+        128 => pos.ins().ireduce(types::I64, src),
+        _ => return None,
+    })
 }
 
 fn phi_on() -> bool {

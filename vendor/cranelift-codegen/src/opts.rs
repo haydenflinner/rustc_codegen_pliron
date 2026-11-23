@@ -319,6 +319,33 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
     /// Default since 11-04; `PLIRON_EGRAPH_RULES=0` disables.
     /// PLIRON (`PLIRON_MINCMP`, default on, `=0` off): `min(x, y) > y` and its
     /// mirrors fold to false (`opts/pliron.isle`).
+    fn pliron_lowbits_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_LOWBITS").as_deref() == Ok("1"))
+    }
+
+    fn pliron_lowbits_mask(&mut self, k: u64, c: u64, m: u64) -> bool {
+        let t = k.trailing_zeros();
+        if k == 0 || t == 0 || t >= 64 {
+            return false;
+        }
+        // `m` is `-(2^s)`: ones from bit `s` up.
+        let s = m.trailing_zeros();
+        if s == 0 || s > t || m != (!0u64) << s {
+            return false;
+        }
+        c < (1u64 << s)
+    }
+
+    fn pliron_lowbits_nowrap(&mut self, k: u64, c: u64) -> bool {
+        let t = k.trailing_zeros();
+        k != 0 && t > 0 && t < 64 && c > 0 && c < (1u64 << t)
+    }
+
+    fn pliron_shl_factor(&mut self, sh: u64) -> u64 {
+        if sh > 0 && sh < 64 { 1u64 << sh } else { 0 }
+    }
+
     fn pliron_mincmp_on(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("PLIRON_MINCMP").as_deref() != Ok("0"))

@@ -133,3 +133,63 @@
 (rule (simplify (sgt (ty_int ty) (smin _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
 (rule (simplify (slt (ty_int ty) (smax _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
 (rule (simplify (slt (ty_int ty) (smax _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
+
+;; PLIRON (`PLIRON_LOWBITS=1`, opt-in, 2026-11-22): known low zero bits of
+;; a product or a shift. hashbrown's `calculate_layout_for` rounds `48 * n +
+;; 7` down to 8 (`& -8`) and tests the `+ 7` for overflow: `48 * n` ends in
+;; four zero bits, so the mask is a no-op and the add cannot wrap (LLVM's
+;; known bits fold both). i64 only.
+(decl pure pliron_lowbits_on () bool)
+(extern constructor pliron_lowbits_on pliron_lowbits_on)
+;; `k` (the product's constant factor) has a trailing-zero count `t`; true
+;; when `c < 2^t` and `m` clears only bits below `2^t` that `c` may set
+;; (`m = -(2^s)`, `c < 2^s <= 2^t`).
+(decl pure pliron_lowbits_mask (u64 u64 u64) bool)
+(extern constructor pliron_lowbits_mask pliron_lowbits_mask)
+;; True when `0 < c < 2^tz(k)`: `x * k + c` never wraps.
+(decl pure pliron_lowbits_nowrap (u64 u64) bool)
+(extern constructor pliron_lowbits_nowrap pliron_lowbits_nowrap)
+(decl pure pliron_shl_factor (u64) u64)
+(extern constructor pliron_shl_factor pliron_shl_factor)
+
+(rule (simplify (band $I64 (iadd $I64 p @ (imul $I64 _ (iconst_u _ k)) (iconst_u _ c)) (iconst_u _ m)))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_mask k c m))
+      (subsume p))
+(rule (simplify (band $I64 (iadd $I64 p @ (ishl $I64 _ (iconst_u _ sh)) (iconst_u _ c)) (iconst_u _ m)))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_mask (pliron_shl_factor sh) c m))
+      (subsume p))
+(rule (simplify (ult (ty_int ty) (iadd $I64 p @ (imul $I64 _ (iconst_u _ k)) (iconst_u _ c)) p))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_nowrap k c))
+      (iconst_u ty 0))
+(rule (simplify (uge (ty_int ty) (iadd $I64 p @ (imul $I64 _ (iconst_u _ k)) (iconst_u _ c)) p))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_nowrap k c))
+      (iconst_u ty 1))
+(rule (simplify (ugt (ty_int ty) p @ (imul $I64 _ (iconst_u _ k)) (iadd $I64 p (iconst_u _ c))))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_nowrap k c))
+      (iconst_u ty 0))
+(rule (simplify (ult (ty_int ty) (iadd $I64 p @ (ishl $I64 _ (iconst_u _ sh)) (iconst_u _ c)) p))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_nowrap (pliron_shl_factor sh) c))
+      (iconst_u ty 0))
+;; The same with the constant factor on the left (`imul 48, n`).
+(rule (simplify (band $I64 (iadd $I64 p @ (imul $I64 (iconst_u _ k) _) (iconst_u _ c)) (iconst_u _ m)))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_mask k c m))
+      (subsume p))
+(rule (simplify (ult (ty_int ty) (iadd $I64 p @ (imul $I64 (iconst_u _ k) _) (iconst_u _ c)) p))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_nowrap k c))
+      (iconst_u ty 0))
+(rule (simplify (uge (ty_int ty) (iadd $I64 p @ (imul $I64 (iconst_u _ k) _) (iconst_u _ c)) p))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_nowrap k c))
+      (iconst_u ty 1))
+(rule (simplify (ugt (ty_int ty) p @ (imul $I64 (iconst_u _ k) _) (iadd $I64 p (iconst_u _ c))))
+      (if-let true (pliron_lowbits_on))
+      (if-let true (pliron_lowbits_nowrap k c))
+      (iconst_u ty 0))

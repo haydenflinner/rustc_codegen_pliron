@@ -83,3 +83,26 @@ block0(v0: i64, v1: i64):
 }");
     assert!(!t.contains("icmp"), "every compare folds:\n{t}");
 }
+
+#[test]
+fn lowbits_layout_rounding_folds() {
+    unsafe { std::env::set_var("PLIRON_LOWBITS", "1") };
+    let t = opt("function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 48
+    v2 = imul v1, v0
+    v3 = iconst.i64 7
+    v4 = iadd v2, v3
+    v5 = icmp ult v4, v2
+    brif v5, block1, block2
+block1:
+    v9 = iconst.i64 0
+    return v9
+block2:
+    v6 = iconst.i64 -8
+    v7 = band v4, v6
+    return v7
+}");
+    assert!(!t.contains("band"), "48n + 7 rounded down to 8 is 48n:\n{t}");
+    assert!(!t.contains("icmp"), "48n + 7 cannot wrap:\n{t}");
+}
