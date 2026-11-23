@@ -125,7 +125,11 @@ pub fn run(func: &mut Function, mulhi64: bool) -> usize {
         // montgomery splits nothing (its params are 128-bit adds), and the
         // folds alone cascaded there (+13% blind-sig).
         if !mul && n == 0 {
-            return 0;
+            if crate::env_is("PLIRON_WIDE128_MULUNLOCK", "1") && only_muls_left(func) {
+                mul = true;
+            } else {
+                return 0;
+            }
         }
     }
     for _ in 0..4 {
@@ -133,6 +137,20 @@ pub fn run(func: &mut Function, mulhi64: bool) -> usize {
         n += k;
         if k == 0 {
             break;
+        }
+    }
+    // `PLIRON_WIDE128_MULUNLOCK=1`: over the cap, when the only `i128`
+    // producers left are widening multiplies and their `uextend`/`iconcat`
+    // operands (foldhash's `folded_multiply` in lol_html's
+    // `add_execution_branch`), split those too: with no `i128` left the
+    // function gets the egraph. montgomery keeps `i128` adds and params.
+    if !mul && crate::env_is("PLIRON_WIDE128_MULUNLOCK", "1") && only_muls_left(func) {
+        for _ in 0..4 {
+            let k = pass(func, mulhi64, true);
+            n += k;
+            if k == 0 {
+                break;
+            }
         }
     }
     if n > 0 && std::env::var_os("PLIRON_WIDE128_STATS").is_some() {
@@ -702,6 +720,28 @@ fn foldable_params(func: &Function, cfg: &ControlFlowGraph) -> rustc_hash::FxHas
         }
     }
     cand
+}
+
+/// Every live `i128` value is a `uextend`, `imul` or `iconcat` result.
+fn only_muls_left(func: &Function) -> bool {
+    let mut any = false;
+    for blk in func.layout.blocks() {
+        if func.dfg.block_params(blk).iter().any(|&p| func.dfg.value_type(p) == types::I128) {
+            return false;
+        }
+        for i in func.layout.block_insts(blk) {
+            for &r in func.dfg.inst_results(i) {
+                if func.dfg.value_type(r) != types::I128 {
+                    continue;
+                }
+                match func.dfg.insts[i].opcode() {
+                    Opcode::Uextend | Opcode::Imul | Opcode::Iconcat => any = true,
+                    _ => return false,
+                }
+            }
+        }
+    }
+    any
 }
 
 fn varshift_on() -> bool {

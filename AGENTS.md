@@ -959,6 +959,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   -0.119%, protobuf -0.013%, blind-sig +0.024% (allocator functions; logged
   as accepted), the rest flat. Tests `pliron-clif-opt/tests/wide128_varshift.rs`,
   `egraph_rules::lowbits_layout_rounding_folds`.
+- `PLIRON_WIDE128_MULUNLOCK` (2026-11-22, opt-in `=1`) — over
+  `WIDE128_FNMAX`, when the only `i128` producers left are widening
+  multiplies and their `uextend`/`iconcat` operands, `wide128` splits those
+  too, so the function holds no `i128` and gets the egraph (lol_html's
+  `add_execution_branch`). montgomery keeps `i128` adds and params and is
+  left alone. Exact counts: html -0.007%, the rest within noise.
 - `PLIRON_EXNCONST=1` (opt-in, 2026-11-22, measured, no default) — step
   `exnconst` near the end: a constant a `try_call`'s exception edge
   passes (a drop flag `edgefwd` moved onto the call) is defined in a cold
