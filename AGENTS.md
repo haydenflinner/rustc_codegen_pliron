@@ -923,7 +923,7 @@ time, memory, code size, stack frames) in ~20 min and writes
   range matches), 10 json +0.15%, 6 regex only -3.6%. All switches
   (`SWITCH_GCC=1,GCC_MAX=0`): byte switches lose (pulldown +1.2%).
   `PLIRON_SHRINKWRAP=1` measured the same day: noise on all eight.
-- `PLIRON_MERGETHREAD2` (2026-11-22, opt-in `=1`) — step `mergethread2`
+- `PLIRON_MERGETHREAD2` (default on since 2026-11-22, `=0` off) — step `mergethread2`
   after `wide128b`: `mergethread` again, also on merges whose branch tests a
   value the merge computes from its parameters (decided through its body by
   `jumpthread::eval` with each edge's constants; `PLIRON_MERGETHREAD_EVAL=1`

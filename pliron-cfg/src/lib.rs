@@ -337,6 +337,9 @@ pub const DEFAULT_ON: &[&str] = &[
     // decide fold (2026-11-22, docs/history/2026-11-20-ivsr.md).
     "PLIRON_NFOLD2_BR",
     "PLIRON_JOINCMP",
+    // Late merge threading through conditions computed from constant edges
+    // (foldhash's sponge; 2026-11-22, html -0.075%).
+    "PLIRON_MERGETHREAD2",
     // Dead-default switches dispatch on the raw tag; tables keep the
     // `unreachable` default and drop their bounds clamp (vendored
     // Cranelift reads PLIRON_SWITCH_KEEPDEAD itself, `!= "0"`).
