@@ -321,7 +321,7 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
     /// mirrors fold to false (`opts/pliron.isle`).
     fn pliron_lowbits_on(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_LOWBITS").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_LOWBITS").as_deref() != Ok("0"))
     }
 
     fn pliron_lowbits_mask(&mut self, k: u64, c: u64, m: u64) -> bool {

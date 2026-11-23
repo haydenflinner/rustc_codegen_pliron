@@ -2396,3 +2396,13 @@ kept `self + k` (a field address passed on or stored) had every later use of
 non-nop: pulldown -1.267%, html -0.289%, protobuf -0.135%, blind-sig
 -0.071%, json -0.067%, regex -0.049%, compression and blake3 flat. Test
 `pliron-clif-opt/tests/bumphoist_entry.rs`.
+
+## `PLIRON_LOWBITS` (default on since 2026-11-22, `=0` off)
+
+`src/opts/pliron.isle`, `src/opts.rs`: known low zero bits of `x * k` or
+`x << sh` (i64): `(x * k + c) & -(2^s)` is `x * k`, and `x * k + c <u x * k`
+(the overflow test) is false, when `k` has at least `s` trailing zeros and
+`0 < c < 2^s`. hashbrown's `calculate_layout_for` (`48 * n + 7` rounded down
+to 8, then tested for wrapping). Measured with `PLIRON_WIDE128_VARSHIFT`
+(which lets the egraph see hashbrown's rehash closures at all): html
+-0.119%, protobuf -0.013%, blind-sig +0.024% (allocator noise).

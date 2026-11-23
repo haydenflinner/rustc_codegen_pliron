@@ -134,7 +134,7 @@
 (rule (simplify (slt (ty_int ty) (smax _ x y) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
 (rule (simplify (slt (ty_int ty) (smax _ y x) y)) (if-let true (pliron_mincmp_on)) (iconst_u ty 0))
 
-;; PLIRON (`PLIRON_LOWBITS=1`, opt-in, 2026-11-22): known low zero bits of
+;; PLIRON (`PLIRON_LOWBITS`, default on since 2026-11-22, `=0` off): known low zero bits of
 ;; a product or a shift. hashbrown's `calculate_layout_for` rounds `48 * n +
 ;; 7` down to 8 (`& -8`) and tests the `+ 7` for overflow: `48 * n` ends in
 ;; four zero bits, so the mask is a no-op and the add cannot wrap (LLVM's

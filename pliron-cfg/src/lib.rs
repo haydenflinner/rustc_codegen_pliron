@@ -340,6 +340,10 @@ pub const DEFAULT_ON: &[&str] = &[
     // Late merge threading through conditions computed from constant edges
     // (foldhash's sponge; 2026-11-22, html -0.075%).
     "PLIRON_MERGETHREAD2",
+    // Variable i128 shifts on halves: functions hashing with foldhash keep
+    // no i128 and get the egraph (2026-11-22, with vendored `LOWBITS`:
+    // html -0.119%).
+    "PLIRON_WIDE128_VARSHIFT",
     // Dead-default switches dispatch on the raw tag; tables keep the
     // `unreachable` default and drop their bounds clamp (vendored
     // Cranelift reads PLIRON_SWITCH_KEEPDEAD itself, `!= "0"`).

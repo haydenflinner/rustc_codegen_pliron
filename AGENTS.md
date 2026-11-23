@@ -945,8 +945,8 @@ time, memory, code size, stack frames) in ~20 min and writes
   pulldown -1.267%, html -0.289%, protobuf -0.135%, blind-sig -0.071%, json
   -0.067%, regex -0.049%, the rest flat. Test
   `pliron-clif-opt/tests/bumphoist_entry.rs`.
-- `PLIRON_WIDE128_VARSHIFT` and `PLIRON_LOWBITS` (2026-11-22, opt-in
-  `=1`) — `wide128` also splits an `i128` shift by an unknown amount into
+- `PLIRON_WIDE128_VARSHIFT` and `PLIRON_LOWBITS` (default on since
+  2026-11-22, `=0` off) — `wide128` also splits an `i128` shift by an unknown amount into
   word halves (`(a >> 1) >> !s` for the crossing bits, selects on `s & 64`,
   as aarch64 lowers it), taking the amount from below its `uextend.i128`.
   foldhash's `sponge |= x << sponge_len` was the last `i128` left in
