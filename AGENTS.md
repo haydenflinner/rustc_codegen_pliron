@@ -923,6 +923,20 @@ time, memory, code size, stack frames) in ~20 min and writes
   range matches), 10 json +0.15%, 6 regex only -3.6%. All switches
   (`SWITCH_GCC=1,GCC_MAX=0`): byte switches lose (pulldown +1.2%).
   `PLIRON_SHRINKWRAP=1` measured the same day: noise on all eight.
+- `PLIRON_MERGETHREAD2` (2026-11-22, opt-in `=1`) — step `mergethread2`
+  after `wide128b`: `mergethread` again, also on merges whose branch tests a
+  value the merge computes from its parameters (decided through its body by
+  `jumpthread::eval` with each edge's constants; `PLIRON_MERGETHREAD_EVAL=1`
+  allows that in the early step too, measured no change), then the values
+  that became constant fold, branches fold, and it goes again (up to four
+  rounds), with `wide128` rerun when anything threaded. foldhash's sponge in
+  lol_html's `add_execution_branch` / `finish_tag_name` (`sponge_len` a
+  constant on every edge into the flush test). Exact counts: html -0.075%,
+  pulldown +0.017% (`handle_inline_pass1`: a merge's two stores copied onto
+  both paths; logged as accepted), the rest within noise. `mergethread` now
+  drops the unreachable successor a decided merge leaves (it could keep
+  reading the merge's values: regalloc2's `slot_pair_layout`). Tests
+  `pliron-clif-opt/tests/mergethread_eval.rs`.
 - `PLIRON_EXNCONST=1` (opt-in, 2026-11-22, measured, no default) — step
   `exnconst` near the end: a constant a `try_call`'s exception edge
   passes (a drop flag `edgefwd` moved onto the call) is defined in a cold

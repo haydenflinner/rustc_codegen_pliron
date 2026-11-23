@@ -3545,6 +3545,61 @@ fn s_mergethread(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// The late `mergethread` round: thread, fold what the copies made constant
+// (their compares and the arithmetic feeding the next merge's edges), fold
+// branches, and go again while something threads.
+fn s_mergethread2(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let mut total = 0;
+    for _ in 0..4 {
+        let k = crate::mergethread::run_with(&mut p.clctx.func, true);
+        if k == 0 {
+            break;
+        }
+        total += k;
+        let func = &mut p.clctx.func;
+        // A successor no edge picked is unreachable, with uses of the
+        // removed merge's values in it.
+        jumpthread::remove_unreachable_blocks(func);
+        let env = jumpthread::known_values(func);
+        let mut folds: Vec<(Inst, i64)> = Vec::new();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                let rs = func.dfg.inst_results(i);
+                if rs.len() != 1 || func.dfg.insts[i].opcode() == cranelift_codegen::ir::Opcode::Iconst {
+                    continue;
+                }
+                let ty = func.dfg.value_type(rs[0]);
+                if !ty.is_int() || ty.bits() > 64 {
+                    continue;
+                }
+                if let Some(&c) = env.get(&rs[0]) {
+                    folds.push((i, c as i64));
+                }
+            }
+        }
+        for (i, c) in folds {
+            let ty = func.dfg.value_type(func.dfg.first_result(i));
+            cranelift_codegen::ir::InstBuilder::iconst(func.replace(i), ty, c);
+        }
+        if jumpthread::fold_const_branches(func) > 0 {
+            jumpthread::remove_unreachable_blocks(func);
+            jumpthread::merge_chains(func, &mut jumpthread::Cd::new());
+        }
+        jumpthread::remove_dead_insts(func, true);
+    }
+    if total > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("mergethread2");
+        }
+        // Shift amounts the folds made constant (`x << 64` on `i128`).
+        if crate::pass_enabled("PLIRON_WIDE128") {
+            s_wide128(p, an);
+        }
+    }
+    total
+}
+
 // `base + i * stride` onto a pointer IV — see `ivsr`.
 fn s_ivsr(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::ivsr::run(&mut p.clctx.func, an);
@@ -6025,6 +6080,10 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Again once the late steps made loop-carried shift amounts
         // (foldhash's `sponge_len`) constant.
         step("wide128b", "wide128", Gate::Env("PLIRON_WIDE128"), s_wide128),
+        // `PLIRON_MERGETHREAD2=1`: merges whose branch the edges'
+        // constants decide through the body, once the late steps made those
+        // constants (foldhash's `sponge_len` joins after `wide128b`).
+        step("mergethread2", "", Gate::OptIn("PLIRON_MERGETHREAD2"), s_mergethread2).needs(shape::CONDBR),
         Step {
             name: "egraph2",
             bisect: Some("egraph2"),

@@ -69,11 +69,18 @@ struct Plan {
     succ: [Block; 2],
 }
 
-fn plan(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, r: Block, uses: &FxHashMap<Value, Vec<Block>>) -> Option<Plan> {
+fn plan(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, r: Block, uses: &FxHashMap<Value, Vec<Block>>, eval: bool) -> Option<Plan> {
     let t = func.layout.last_inst(r)?;
     let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t] else { return None };
     let arg = func.dfg.resolve_aliases(arg);
-    let k = func.dfg.block_params(r).iter().position(|&p| p == arg)?;
+    // `PLIRON_MERGETHREAD_EVAL=1`: the branch may test a value `r`
+    // computes from its parameters (foldhash's sponge: `len + 64 >= 129`
+    // with `len` a constant on every edge); each edge's constants are
+    // evaluated through `r`'s body.
+    let k = func.dfg.block_params(r).iter().position(|&p| p == arg);
+    if k.is_none() && !eval {
+        return None;
+    }
     let succ = [blocks[0].block(&func.dfg.value_lists), blocks[1].block(&func.dfg.value_lists)];
     if succ[0] == succ[1] || succ.contains(&r) || Some(r) == func.layout.entry_block() {
         return None;
@@ -121,9 +128,12 @@ fn plan(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, r: Block, u
                 continue;
             }
             let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
-            let c = match args.get(k) {
-                Some(BlockArg::Value(v)) => iconst(func, *v)?,
-                _ => return None,
+            let c = match k {
+                Some(k) => match args.get(k) {
+                    Some(BlockArg::Value(v)) => iconst(func, *v)?,
+                    _ => return None,
+                },
+                None => decide(func, r, &args, arg, t)? as i64,
             };
             let pick = if c != 0 { 0 } else { 1 };
             picked[pick] += 1;
@@ -149,6 +159,32 @@ fn plan(func: &Function, cfg: &ControlFlowGraph, dt: &DominatorTree, r: Block, u
         }
     }
     Some(Plan { r, ins, succ })
+}
+
+/// `r`'s branch condition `arg` on an edge passing `args`: `r`'s body
+/// evaluated with the constant arguments bound to its parameters.
+fn decide(func: &Function, r: Block, args: &[BlockArg], arg: Value, t: Inst) -> Option<u64> {
+    let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+    for (&p, a) in func.dfg.block_params(r).iter().zip(args) {
+        if let BlockArg::Value(v) = a
+            && let Some(c) = crate::jumpthread::known(func, &env, *v)
+        {
+            env.insert(p, c);
+        }
+    }
+    for i in func.layout.block_insts(r) {
+        if i == t {
+            break;
+        }
+        let rs = func.dfg.inst_results(i);
+        if rs.len() != 1 || func.dfg.insts[i].opcode().can_store() {
+            continue;
+        }
+        if let Some(c) = crate::jumpthread::eval(func, &env, &|_| false, &|_| None, i) {
+            env.insert(rs[0], c);
+        }
+    }
+    crate::jumpthread::known(func, &env, arg).map(|c| u64::from(c != 0))
 }
 
 /// Copy `r`'s body before `at`, params bound to `args`; returns the map of
@@ -238,6 +274,14 @@ fn apply(func: &mut Function, dt: &DominatorTree, p: Plan, uses_at: &FxHashMap<V
 }
 
 pub fn run(func: &mut Function) -> usize {
+    static EVAL: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_MERGETHREAD_EVAL", "1"));
+    run_with(func, *EVAL)
+}
+
+/// `run`, with `eval` choosing whether a branch on a value the merge
+/// computes from its parameters is threaded too.
+pub fn run_with(func: &mut Function, eval: bool) -> usize {
     let mut n = 0;
     for _ in 0..MAX_ROUNDS {
         let cfg = ControlFlowGraph::with_function(func);
@@ -258,7 +302,7 @@ pub fn run(func: &mut Function) -> usize {
             .layout
             .blocks()
             .filter(|&b| dt.is_reachable(b))
-            .find_map(|b| plan(func, &cfg, &dt, b, &uses))
+            .find_map(|b| plan(func, &cfg, &dt, b, &uses, eval))
         else {
             break;
         };
@@ -266,6 +310,9 @@ pub fn run(func: &mut Function) -> usize {
             break;
         }
         apply(func, &dt, p, &uses_at);
+        // A successor no edge picked is unreachable and may still use the
+        // removed merge's values.
+        crate::jumpthread::remove_unreachable_blocks(func);
         n += 1;
     }
     n
