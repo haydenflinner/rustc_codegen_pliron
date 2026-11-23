@@ -1101,7 +1101,13 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    eight at `0a8caedb` (`JOINCMP`, `NFOLD2_BR`, `COST_NOPAD`,
    `SWITCH_GCC=3`): html 1.096x, blind-sig 1.088x, blake3 1.047x,
    pulldown-cmark 1.042x, compression 1.042x, json 1.037x, protobuf
-   1.032x, regex 1.018x; geomean 1.050x. Earlier figures below.)
+   1.032x, regex 1.018x; geomean 1.050x. At `c361276f`
+   (`MERGETHREAD2`, `BUMPHOIST_LOOPONLY`, `WIDE128_VARSHIFT`, `LOWBITS`,
+   `WIDE128_MULUNLOCK`): html 1.090x, blind-sig 1.086x, blake3 1.047x,
+   compression 1.042x, json 1.037x, protobuf 1.031x, pulldown-cmark 1.030x,
+   regex 1.018x; geomean 1.047x. Time (`ab.py`, 9 rounds, load average 11,
+   cycles): html 1.054x, pulldown-cmark 0.962x, regex 0.997x. Earlier
+   figures below.)
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
