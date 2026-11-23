@@ -456,6 +456,10 @@ pub struct State {
     /// `PLIRON_XFACTS_ALL`): per bodied function, per param, captured here
     /// or the bodiless callee params it reaches (nocapture.rs).
     pub capsum: SymMap<Vec<crate::nocapture::CapSum>>,
+    /// Params whose depth-1 pointers (pointers loaded straight out of the
+    /// memory they point at) are not retained either (`PLIRON_NOCAP_DEEP`,
+    /// or adopted from the crate-wide solve). Only `nocapture` reads it.
+    pub deepnocap: SymMap<rustc_hash::FxHashSet<u32>>,
     /// Bodies inferred to return a non-null pointer (nnret.rs); lowering
     /// seeds their call results into `FnLower::nonnull` for jumpthread.
     pub nnret: SymSet,
@@ -1102,11 +1106,19 @@ impl State {
             }
             // The crate-wide solve: what the copies keep once their own
             // cross-CGU callees are known. Both sets are sound; take both.
+            if !filt.is_empty() && sym.contains(&filt) && solved.is_some() {
+                tracing::info!(target: "pliron::stats", "xfacts {} capsum {sym}: solved {:?}, summary {:?}",
+                    self.cgu, solved.as_ref().and_then(|s| s.get(&key)), g.capsum.get(&key));
+            }
+            // Nodes: `2i` is param `i`, `2i+1` its depth-1 pointers.
             if let Some(v) = solved.as_ref().and_then(|s| s.get(&key)) {
                 let mut e = self.nocapture.get(sym).cloned().unwrap_or_default();
-                e.extend(v.iter().copied());
+                e.extend(v.iter().filter(|&&x| x % 2 == 0).map(|&x| x / 2));
                 hit |= !e.is_empty();
                 self.nocapture.insert(sym.clone(), e);
+                let mut d = self.deepnocap.get(sym).cloned().unwrap_or_default();
+                d.extend(v.iter().filter(|&&x| x % 2 == 1).map(|&x| x / 2));
+                self.deepnocap.insert(sym.clone(), d);
             }
             if let Some(v) = g.nowrite(&key) {
                 self.nowrite.insert(sym.clone(), v);

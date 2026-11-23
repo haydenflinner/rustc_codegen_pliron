@@ -76,6 +76,10 @@ impl ascent::Lattice for Mask {
 /// pointer instead of to each load (see the store case in `run`).
 const SLOT_FANOUT: usize = 8;
 
+/// `CapNode`'s slot flows compare byte ranges up to this many loads per slot
+/// (`slot_flows`), and route slot-wide past it.
+const SLOT_PRECISE: usize = 256;
+
 fn bits(m: Mask) -> impl Iterator<Item = u32> {
     (0..MAX_PARAMS).filter(move |i| m.0 & (1 << i) != 0)
 }
@@ -111,43 +115,77 @@ ascent::ascent! {
 }
 
 ascent::ascent! {
-    /// The summary form of `Capture` (`PLIRON_NOCAPSUM`): a call to a callee
-    /// with no body here is not a capture but an edge, `dep(f, i, c, k)`:
-    /// param `i` of `f` is captured iff argument `k` of `c` is. Edges go
-    /// through bodied callees transitively, so each param ends as captured
-    /// here or as the set of bodiless callee params it reaches.
-    struct CapSumProg;
+    /// Capture over nodes (`PLIRON_NOCAP_DEEP`, and the summaries of
+    /// `PLIRON_NOCAPSUM`): node `2i` is param `i` itself, node `2i+1` the
+    /// pointers loaded straight out of the memory it points at (depth 1).
+    /// A pointer stored into a stack slot whose address only goes to
+    /// loads and call arguments (`slotarg`) is at depth 1 of that slot, so
+    /// it is captured only if a callee getting the slot captures its
+    /// depth-1 pointers. hashbrown's scope guards and closure environments
+    /// hold a table pointer that way; LLVM's `captures(none)` has no
+    /// depth-1 form and calls every such store a capture.
+    ///
+    /// `local(_)`: a callee with no body and no adopted facts (`opaque`)
+    /// captures every node. `summary(_)`: it becomes an edge,
+    /// `dep(f, x, c, z)`, solved crate-wide behind the LTO barrier.
+    struct CapNode;
     relation param(Value, u32);
     relation flow(Value, Value);
+    /// `ld(address, result)` for every load.
+    relation ld(Value, Value);
     relation retain(u32, Value);
+    /// `f` copies memory out of `v` (memcpy/memmove source).
+    relation memsrc(u32, Value);
     relation arg(u32, u32, u32, Value);
+    /// `f` stores `v` into a slot passed as argument `k` of a call to `c`.
+    relation slotarg(u32, Value, u32, u32);
     relation nparams(u32, u32);
+    relation opaque(u32);
+    relation capin(u32, u32);
+    relation local(u8);
+    relation summary(u8);
 
     lattice der(Value, Mask);
     der(v, Mask(1 << i)) <-- param(v, i);
     der(d, m) <-- flow(s, d), der(s, m);
+    lattice dd(Value, Mask);
+    dd(r, m) <-- ld(a, r), der(a, m);
+    dd(d, m) <-- flow(s, d), dd(s, m);
 
-    relation keeps(u32, u32);
-    keeps(c, k) <-- arg(_, c, k, _), nparams(c, n), if *k >= *n;
-    keeps(c, k) <-- arg(_, c, k, _), captured(c, k);
+    /// Node `x` of `f` is captured if node `z` of `c` is.
+    relation pass(u32, u32, u32, u32);
+    pass(f, 2 * i, c, 2 * k) <-- arg(f, c, k, v), der(v, m), for i in bits(*m);
+    pass(f, 2 * i + 1, c, 2 * k + 1) <-- arg(f, c, k, v), der(v, m), for i in bits(*m);
+    pass(f, 2 * i + 1, c, 2 * k) <-- arg(f, c, k, v), dd(v, m), for i in bits(*m);
+    // a stored pointer sits at depth 1 of the slot; if the slot's address
+    // escapes, so does what it holds
+    pass(f, 2 * i, c, 2 * k + 1) <-- slotarg(f, v, c, k), der(v, m), for i in bits(*m);
+    pass(f, 2 * i, c, 2 * k) <-- slotarg(f, v, c, k), der(v, m), for i in bits(*m);
+    pass(f, 2 * i + 1, c, 2 * k + 1) <-- slotarg(f, v, c, k), dd(v, m), for i in bits(*m);
+    pass(f, 2 * i + 1, c, 2 * k) <-- slotarg(f, v, c, k), dd(v, m), for i in bits(*m);
 
-    relation captured(u32, u32);
-    captured(f, i) <-- retain(f, v), der(v, m), for i in bits(*m);
-    captured(f, i) <-- arg(f, c, k, v), keeps(c, k), der(v, m), for i in bits(*m);
+    relation cap(u32, u32);
+    cap(c, x) <-- capin(c, x);
+    cap(f, 2 * i) <-- retain(f, v), der(v, m), for i in bits(*m);
+    cap(f, 2 * i + 1) <-- retain(f, v), dd(v, m), for i in bits(*m);
+    cap(f, 2 * i + 1) <-- memsrc(f, v), der(v, m), for i in bits(*m);
+    cap(f, x) <-- pass(f, x, c, z), nparams(c, n), if *z >= 2 * *n;
+    cap(f, x) <-- pass(f, x, c, z), cap(c, z);
+    cap(f, x) <-- pass(f, x, c, _), opaque(c), local(_);
 
     relation dep(u32, u32, u32, u32);
-    dep(f, i, c, k) <-- arg(f, c, k, v), !nparams(c, _), der(v, m), for i in bits(*m);
-    dep(f, i, c2, k2) <-- arg(f, c, k, v), nparams(c, n), if *k < *n, der(v, m),
-        dep(c, k, c2, k2), for i in bits(*m);
+    dep(f, x, c, z) <-- pass(f, x, c, z), opaque(c), summary(_);
+    dep(f, x, c2, y) <-- pass(f, x, c, z), nparams(c, n), if *z < 2 * *n, dep(c, z, c2, y);
 }
 
-/// One param's capture summary (`PLIRON_NOCAPSUM`).
+/// One node's capture summary (`PLIRON_NOCAPSUM`; node `2i` is param `i`,
+/// `2i+1` the pointers loaded from it, see `CapNode`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapSum {
     /// Captured by the function itself (or through a callee with a body).
     Captured,
     /// Captured iff one of these is: (callee symbol, its fn type as this
-    /// CGU declares it, argument index). Empty: never captured.
+    /// CGU declares it, callee node). Empty: never captured.
     Deps(Vec<(String, String, u32)>),
 }
 
@@ -234,6 +272,135 @@ pub fn solve_capsum(
         out.insert(key.clone(), free);
     }
     out
+}
+
+/// `p`'s byte offset from the stack slot it points into, through constant
+/// GEPs; `None` when a GEP is variable or the chain does not reach a slot.
+fn slot_off(ctx: &Context, st: &State, mut p: Value) -> Option<i64> {
+    let mut off = 0i64;
+    for _ in 0..16 {
+        if st.allocas.contains(p) {
+            return Some(off);
+        }
+        let d = p.defining_op()?;
+        if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
+            return None;
+        }
+        off = off.checked_add(crate::sroa::gep_offset(ctx, st, d)?)?;
+        p = d.deref(ctx).get_operand(ctx, 0);
+    }
+    None
+}
+
+/// `CapNode`'s store -> load flows for a store of `sv` through `dp` into a
+/// frame slot read by `loads`: only to loads whose bytes overlap the
+/// store's. hashbrown's scope guard holds `&alloc` (derived from the table)
+/// next to the new table's control pointer; slot-wide flows made the
+/// control pointer "derived from" the table, and writing it back into
+/// `self` a capture. Unknown offsets overlap everything; past
+/// `SLOT_FANOUT` loads the slot-wide route through `dp` is kept.
+fn slot_flows(
+    ctx: &Context,
+    st: &State,
+    sv: Value,
+    dp: Value,
+    loads: &[Value],
+    via: &mut FxHashSet<Value>,
+    lmemo: &mut FxHashMap<Value, Option<(i64, i64)>>,
+    out: &mut Vec<(Value, Value)>,
+) {
+    // Byte ranges are compared pairwise up to this many loads; only the
+    // overlapping pairs become flows, so the flow count stays small.
+    if loads.len() > SLOT_PRECISE {
+        out.push((sv, dp));
+        if via.insert(dp) {
+            out.extend(loads.iter().map(|&r| (dp, r)));
+        }
+        return;
+    }
+    let sz = |v: Value| crate::types::size_align(ctx, v.get_type(ctx)).0 as i64;
+    let so = slot_off(ctx, st, dp).map(|o| (o, o + sz(sv)));
+    for &r in loads {
+        let lo = *lmemo.entry(r).or_insert_with(|| {
+            r.defining_op()
+                .and_then(|l| slot_off(ctx, st, l.deref(ctx).get_operand(ctx, 0)))
+                .map(|o| (o, o + sz(r)))
+        });
+        let disjoint = matches!((so, lo), (Some((a, b)), Some((c, d))) if b <= c || d <= a);
+        if !disjoint {
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::nocapture", tracing::Level::TRACE) {
+                tracing::trace!(target: "pliron::nocapture", "slotflow {sv:?} -> {r:?}: store {so:?} load {lo:?}");
+            }
+            out.push((sv, r));
+        }
+    }
+}
+
+/// When the stack slot `dp` points into is seen only by loads, stores into
+/// it, lifetime markers, mem* writes into it and call arguments (direct, or
+/// indirect with resolved callees): its loads and every (callee, argument)
+/// it is passed as. `None` for anything else (the address stored as a
+/// value, copied out of, passed to an unresolved indirect call).
+fn slot_calls(ctx: &Context, st: &State, dp: Value, ids: &mut Syms) -> Option<(Vec<Value>, Vec<(u32, u32)>)> {
+    let mut root = dp;
+    for _ in 0..8 {
+        if st.allocas.contains(root) {
+            break;
+        }
+        let d = root.defining_op()?;
+        if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
+            return None;
+        }
+        root = d.deref(ctx).get_operand(ctx, 0);
+    }
+    if !st.allocas.contains(root) {
+        return None;
+    }
+    let (mut loads, mut calls) = (Vec::new(), Vec::new());
+    let mut work = vec![root];
+    let mut budget = 512usize;
+    while let Some(v) = work.pop() {
+        for u in v.uses_iter(ctx) {
+            budget = budget.checked_sub(1)?;
+            let o = u.user_op();
+            let i = u.find_index(ctx);
+            if st.volatile.contains(o) {
+                return None;
+            }
+            if Operation::is_op::<GetElementPtrOp>(o, ctx) && i == 0 {
+                work.push(o.deref(ctx).get_result(ctx, 0));
+            } else if Operation::is_op::<LoadOp>(o, ctx) {
+                loads.push(o.deref(ctx).get_result(ctx, 0));
+            } else if Operation::is_op::<StoreOp>(o, ctx) && i == 1 {
+            } else if Operation::is_op::<ICmpOp>(o, ctx) {
+            } else if let Some(n) = st.intrinsics.get(o).map(|s| s.as_str()) {
+                let ok = n.starts_with("llvm.lifetime.")
+                    || (matches!(n, "llvm.memcpy" | "llvm.memmove" | "llvm.memset") && i == 0);
+                if !ok {
+                    return None;
+                }
+            } else if let Some(c) = Operation::get_op::<CallOp>(o, ctx) {
+                let direct = c.get_attr_llvm_call_callee(ctx).is_some();
+                if !direct && i == 0 {
+                    return None;
+                }
+                let k = (i - usize::from(!direct)) as u32;
+                match direct_callee(ctx, st, o) {
+                    Some(c) if alloc_shim(c) => {}
+                    Some(c) => calls.push((ids.id(c), k)),
+                    None => {
+                        let CallOpCallable::Indirect(cv) = c.callee(ctx) else { return None };
+                        for c in indirect_callees(ctx, st, cv)? {
+                            calls.push((ids.id(&c), k));
+                        }
+                    }
+                }
+            } else {
+                return None;
+            }
+        }
+    }
+    Some((loads, calls))
 }
 
 /// `c` is the callee of an indirect call. If it is a load from a
@@ -365,12 +532,51 @@ fn extract_src(ctx: &Context, op: pliron::context::Ptr<Operation>) -> Option<Val
 }
 
 // r[impl iropt.ipo.nocapture]
+thread_local! {
+    /// Which `run` this is in the current CGU (`NOCAPDBG` lines say).
+    static RUN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static RUN_CGU: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 pub fn run(ctx: &Context, st: &mut State) {
+    run_with(ctx, st, crate::env_is("PLIRON_NOCAP_DEEP", "1"), crate::env_is("PLIRON_NOCAPSUM", "1"))
+}
+
+/// `run` with the knobs given: `deep` (`PLIRON_NOCAP_DEEP`) and `capsum_on`
+/// (`PLIRON_NOCAPSUM`).
+pub fn run_with(ctx: &Context, st: &mut State, deep: bool, capsum_on: bool) {
+    RUN_CGU.with(|c| {
+        let mut c = c.borrow_mut();
+        if *c != st.cgu {
+            *c = st.cgu.clone();
+            RUN.with(|r| r.set(0));
+        }
+    });
+    RUN.with(|r| r.set(r.get() + 1));
     let bodied = bodied(ctx, st);
     let mut ids = Syms::default();
     let mut p = Capture::default();
     let dbg = crate::env_get("PLIRON_NOCAPDBG");
     let fields = crate::env_get("PLIRON_NOCAP_FIELDS") == Some("1");
+    // `PLIRON_NOCAP_DEEP=1`: the local verdicts come from `CapNode` (depth-1
+    // facts, slots passed to calls); `PLIRON_NOCAPSUM=1`: summaries for the
+    // crate-wide solve, from the same program. The inputs only `CapNode`
+    // reads are kept apart so the default `Capture` run sees what it always
+    // did.
+    let node_on = deep || capsum_on;
+    let mut node_retain: Vec<(u32, Value)> = Vec::new();
+    let mut node_flow: Vec<(Value, Value)> = Vec::new();
+    let mut old_only_retain: Vec<(u32, Value)> = Vec::new();
+    let mut ld: Vec<(Value, Value)> = Vec::new();
+    let mut memsrc: Vec<(u32, Value)> = Vec::new();
+    let mut slotarg: Vec<(u32, Value, u32, u32)> = Vec::new();
+    // Store -> load flows through frame slots: the default `Capture` keeps
+    // its slot-wide form (every load of a slot gets every stored value);
+    // `CapNode` gets them by byte range (`slot_flows`). Neither goes into
+    // `p.flow` until each program's inputs are assembled.
+    let mut old_slot_flow: Vec<(Value, Value)> = Vec::new();
+    let mut via_slot_node: FxHashSet<Value> = FxHashSet::default();
+    let mut load_ranges: FxHashMap<Value, Option<(i64, i64)>> = FxHashMap::default();
     let mut dbgrets: Vec<(String, Value, String)> = Vec::new();
     let mut dbgargs: Vec<(String, Value, String, u32, u32)> = Vec::new();
     // `slot_loads`'s nested `accesses` walks — one memo for the whole
@@ -423,6 +629,9 @@ pub fn run(ctx: &Context, st: &mut State) {
                     };
                 }
                 let d = op.deref(ctx);
+                if node_on && (is!(LoadOp) || is!(AtomicLoadOp)) {
+                    ld.push((d.get_operand(ctx, 0), d.get_result(ctx, 0)));
+                }
                 // Comparisons encode nothing, and a load yields the
                 // pointee, not the pointer: memory only holds a derived
                 // pointer if a store put it there, which is a capture
@@ -498,6 +707,9 @@ pub fn run(ctx: &Context, st: &mut State) {
                 }
                 let mut retain = |v: Value| {
                     p.retain.push((f, v));
+                    if node_on {
+                        node_retain.push((f, v));
+                    }
                     if dbg.is_some_and(|d| s.contains(d)) {
                         dbgrets.push((s.clone(), v, OpDbg { op, ctx }.to_string()));
                     }
@@ -521,14 +733,29 @@ pub fn run(ctx: &Context, st: &mut State) {
                     // mask, whatever its type: memory is an int <-> ptr
                     // bridge (`int_copy_through_slot_captures`).
                     match crate::sroa::slot_loads(ctx, st, dp, 0, &mut accmemo) {
-                        Some(ls) if ls.len() > SLOT_FANOUT => {
-                            p.flow.push((sv, dp));
-                            if via_slot.insert(dp) {
-                                p.flow.extend(ls.into_iter().map(|r| (dp, r)));
+                        Some(ls) => {
+                            if node_on {
+                                slot_flows(ctx, st, sv, dp, &ls, &mut via_slot_node, &mut load_ranges, &mut node_flow);
+                            }
+                            if ls.len() > SLOT_FANOUT {
+                                old_slot_flow.push((sv, dp));
+                                if via_slot.insert(dp) {
+                                    old_slot_flow.extend(ls.into_iter().map(|r| (dp, r)));
+                                }
+                            } else {
+                                old_slot_flow.extend(ls.into_iter().map(|r| (sv, r)));
                             }
                         }
-                        Some(ls) => p.flow.extend(ls.into_iter().map(|r| (sv, r))),
-                        None => retain(sv),
+                        None => match node_on.then(|| slot_calls(ctx, st, dp, &mut ids)).flatten() {
+                            // `CapNode` only: the pointer sits at depth 1 of a
+                            // slot that only loads and calls see.
+                            Some((ls, calls)) => {
+                                old_only_retain.push((f, sv));
+                                slot_flows(ctx, st, sv, dp, &ls, &mut via_slot_node, &mut load_ranges, &mut node_flow);
+                                slotarg.extend(calls.into_iter().map(|(c, k)| (f, sv, c, k)));
+                            }
+                            None => retain(sv),
+                        },
                     }
                 } else if is!(AtomicStoreOp) {
                     retain(d.get_operand(ctx, 0));
@@ -586,7 +813,13 @@ pub fn run(ctx: &Context, st: &mut State) {
                         // retained — the bytes move, but every derived
                         // pointer inside was already retained by the store
                         // (or memcpy chain head) that put it in memory.
-                        Some("llvm.memcpy") | Some("llvm.memmove") | Some("llvm.memset") => {}
+                        Some("llvm.memcpy") | Some("llvm.memmove") | Some("llvm.memset") => {
+                            // `CapNode`: copying a param's memory elsewhere
+                            // carries its depth-1 pointers along.
+                            if node_on && st.intrinsics.get(op).map(|s| s.as_str()) != Some("llvm.memset") {
+                                memsrc.push((f, d.get_operand(ctx, 1)));
+                            }
+                        }
                         Some(n)
                             if n.starts_with("llvm.lifetime.")
                                 || n.starts_with("llvm.dbg.")
@@ -610,37 +843,111 @@ pub fn run(ctx: &Context, st: &mut State) {
         );
         pliron_cfg::trace(&sizes, 0.0, &st.cgu);
     }
-    // `PLIRON_NOCAPSUM=1`: the same facts as summaries for the crate-wide
-    // solve (published with this CGU's facts, solved behind the LTO
-    // barrier under `PLIRON_XFACTS_ALL`).
-    if crate::env_is("PLIRON_NOCAPSUM", "1") {
-        let mut sp = CapSumProg::default();
-        sp.param = p.param.clone();
-        sp.flow = p.flow.clone();
-        sp.retain = p.retain.clone();
-        sp.arg = p.arg.clone();
-        sp.nparams = p.nparams.clone();
-        sp.captured = p.captured.clone();
-        sp.run();
+    p.retain.extend(old_only_retain);
+    // `CapNode` runs: one local (`PLIRON_NOCAP_DEEP`), one summary
+    // (`PLIRON_NOCAPSUM`), over the shared inputs plus the node-only ones.
+    let node_run = |summary: bool, ids: &mut Syms| -> CapNode {
+        let mut q = CapNode::default();
+        q.param = p.param.clone();
+        q.flow = p.flow.iter().chain(&node_flow).copied().collect();
+        q.ld = ld.clone();
+        q.retain = node_retain.clone();
+        q.memsrc = memsrc.clone();
+        q.arg = p.arg.clone();
+        q.slotarg = slotarg.clone();
+        q.nparams = p.nparams.clone();
+        let known: FxHashSet<u32> = q.nparams.iter().map(|&(c, _)| c).collect();
+        let mut opaque: FxHashSet<u32> = FxHashSet::default();
+        opaque.extend(q.arg.iter().map(|&(_, c, _, _)| c).filter(|c| !known.contains(c)));
+        opaque.extend(q.slotarg.iter().map(|&(_, _, c, _)| c).filter(|c| !known.contains(c)));
+        q.opaque = opaque.into_iter().map(|c| (c,)).collect();
+        // adopted callees: shallow from `nocapture`, depth 1 from `deepnocap`
+        // (none known: every depth-1 node captures)
+        for (sym, set) in &imported {
+            let c = ids.id(sym);
+            let dset = st.deepnocap.get(sym);
+            for k in 0..MAX_PARAMS {
+                if !set.contains(&k) {
+                    q.capin.push((c, 2 * k));
+                }
+                if !dset.is_some_and(|d| d.contains(&k)) {
+                    q.capin.push((c, 2 * k + 1));
+                }
+            }
+        }
+        if summary {
+            q.summary.push((0,));
+        } else {
+            q.local.push((0,));
+        }
+        q.run();
+        // `PLIRON_NOCAPDBG=<fn>`: why each captured node of a matching fn is
+        if let Some(want) = dbg
+            && pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::nocapture", tracing::Level::DEBUG)
+        {
+            let names = ids.names();
+            let der: FxHashMap<Value, Mask> = q.der.iter().map(|(v, m)| (*v, *m)).collect();
+            let ddm: FxHashMap<Value, Mask> = q.dd.iter().map(|(v, m)| (*v, *m)).collect();
+            let cap: FxHashSet<(u32, u32)> = q.cap.iter().copied().collect();
+            let opq: FxHashSet<u32> = q.opaque.iter().map(|&(c,)| c).collect();
+            let mode = if summary { "sum" } else { "loc" };
+            for &(f, x) in &q.cap {
+                let fname = &names[f as usize];
+                if !fname.contains(want) || x >= 4 {
+                    continue;
+                }
+                let (i, depth) = (x / 2, x % 2);
+                let mut why: Vec<String> = Vec::new();
+                for &(g, v) in &q.retain {
+                    let m = if depth == 0 { der.get(&v) } else { ddm.get(&v) };
+                    if g == f && m.is_some_and(|m| m.0 & (1 << i) != 0) {
+                        let at = dbgrets.iter().find(|(_, w, _)| *w == v).map(|(_, _, o)| o.as_str()).unwrap_or("?");
+                        // two levels of incoming flow, the ones carrying bit i
+                        let carrying = |w: Value| -> Vec<Value> {
+                            q.flow.iter().filter(|&&(a, b)| b == w && der.get(&a).is_some_and(|m| m.0 & (1 << i) != 0)).map(|&(a, _)| a).take(3).collect()
+                        };
+                        let up: Vec<(Value, Vec<Value>)> = carrying(v).into_iter().map(|a| (a, carrying(a))).collect();
+                        why.push(format!("retain at {} from {up:?}", &at[..at.len().min(100)]));
+                    }
+                }
+                for &(g, v) in &q.memsrc {
+                    if depth == 1 && g == f && der.get(&v).is_some_and(|m| m.0 & (1 << i) != 0) {
+                        why.push(format!("memcpy from {v:?}"));
+                    }
+                }
+                for &(g, xx, c, z) in &q.pass {
+                    if g == f && xx == x && (cap.contains(&(c, z)) || (opq.contains(&c) && !summary)) {
+                        why.push(format!("pass to {} node {z}{}", &names[c as usize][..names[c as usize].len().min(110)], if opq.contains(&c) { " (opaque)" } else { "" }));
+                    }
+                }
+                why.truncate(6);
+                tracing::debug!(target: "pliron::nocapture", "NODEDBG {mode} run{} {fname}: node {x} captured: {why:?}", RUN.with(|r| r.get()));
+            }
+        }
+        q
+    };
+    if capsum_on {
+        let q = node_run(true, &mut ids);
         let names = ids.names();
-        let cap: FxHashSet<(u32, u32)> = sp.captured.iter().copied().collect();
+        let cap: FxHashSet<(u32, u32)> = q.cap.iter().copied().collect();
         let mut deps: FxHashMap<(u32, u32), Vec<(String, String, u32)>> = FxHashMap::default();
-        for &(f, i, c, k) in &sp.dep {
+        for &(f, x, c, z) in &q.dep {
             let cs = &names[c as usize];
             let cty = st.funcs.get(cs).map(|cf| cf.ty.disp(ctx).to_string()).unwrap_or_default();
-            deps.entry((f, i)).or_default().push((cs.clone(), cty, k));
+            deps.entry((f, x)).or_default().push((cs.clone(), cty, z));
         }
-        let nparams: FxHashMap<u32, u32> = sp.nparams.iter().copied().collect();
+        let nparams: FxHashMap<u32, u32> = q.nparams.iter().copied().collect();
         st.capsum = Default::default();
         for s in &bodied {
             let f = ids.id(s);
             let n = nparams.get(&f).copied().unwrap_or(0);
-            let v = (0..n)
-                .map(|i| {
-                    if cap.contains(&(f, i)) {
+            let v = (0..2 * n)
+                .map(|x| {
+                    if cap.contains(&(f, x)) {
                         CapSum::Captured
                     } else {
-                        let mut d = deps.remove(&(f, i)).unwrap_or_default();
+                        let mut d = deps.remove(&(f, x)).unwrap_or_default();
                         d.sort();
                         d.dedup();
                         CapSum::Deps(d)
@@ -650,10 +957,15 @@ pub fn run(ctx: &Context, st: &mut State) {
             st.capsum.insert(s.clone(), v);
         }
     }
+    let local_nodes = deep.then(|| node_run(false, &mut ids));
+    p.flow.extend(old_slot_flow);
     let trun = std::time::Instant::now();
-    p.run();
+    if local_nodes.is_none() {
+        p.run();
+    }
     pliron_cfg::trace("nocap-fixpoint", trun.elapsed().as_secs_f64() * 1e3, &st.cgu);
     if dbg.is_some()
+        && local_nodes.is_none()
         && pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::nocapture", tracing::Level::DEBUG)
     {
@@ -661,7 +973,7 @@ pub fn run(ctx: &Context, st: &mut State) {
         for (s, v, o) in &dbgrets {
             for i in bits(*der.get(v).unwrap_or(&Mask(0))) {
                 if pliron_cfg::tracing_on() {
-                    tracing::debug!(target: "pliron::nocapture", "NOCAPDBG {s}: param{i} retained via {v:?} at {o}")
+                    tracing::debug!(target: "pliron::nocapture", "NOCAPDBG run{} {s}: param{i} retained via {v:?} at {o}", RUN.with(|r| r.get()))
                 };
             }
         }
@@ -670,22 +982,40 @@ pub fn run(ctx: &Context, st: &mut State) {
         for (s, v, o, c, k) in &dbgargs {
             for i in bits(*der.get(v).unwrap_or(&Mask(0))) {
                 if pliron_cfg::tracing_on() {
-                    tracing::debug!(target: "pliron::nocapture", "NOCAPDBG {s}: param{i} via call-arg {v:?} (callee known={} keeps={}) at {o}", nparams.contains_key(c), keeps.contains(&(*c, *k)))
+                    tracing::debug!(target: "pliron::nocapture", "NOCAPDBG run{} {s}: param{i} via call-arg {v:?} (callee known={} keeps={}) at {o}", RUN.with(|r| r.get()), nparams.contains_key(c), keeps.contains(&(*c, *k)))
                 };
             }
         }
     }
     let mut nc: FxHashMap<String, FxHashSet<u32>> = FxHashMap::default();
-    let cap: FxHashSet<(u32, u32)> = p.captured.iter().copied().collect();
     // `nparams` is a relation Vec — linear `find` per fn is O(fns²).
     let nparams: FxHashMap<u32, u32> = p.nparams.iter().copied().collect();
-    for s in &bodied {
-        let f = ids.id(s);
-        let n = nparams.get(&f).copied().unwrap_or(0);
-        nc.insert(
-            s.clone(),
-            (0..n).filter(|&i| !cap.contains(&(f, i))).collect(),
-        );
+    if let Some(q) = &local_nodes {
+        let cap: FxHashSet<(u32, u32)> = q.cap.iter().copied().collect();
+        let mut dn: Vec<(String, FxHashSet<u32>)> = Vec::new();
+        for s in &bodied {
+            let f = ids.id(s);
+            let n = nparams.get(&f).copied().unwrap_or(0);
+            nc.insert(s.clone(), (0..n).filter(|&i| !cap.contains(&(f, 2 * i))).collect());
+            dn.push((s.clone(), (0..n).filter(|&i| !cap.contains(&(f, 2 * i + 1))).collect()));
+        }
+        // bodiless decls keep their adopted depth-1 sets
+        let mut keep: Vec<(String, FxHashSet<u32>)> = imported
+            .iter()
+            .filter_map(|(sym, _)| st.deepnocap.get(sym).map(|d| (sym.clone(), d.clone())))
+            .collect();
+        keep.extend(dn);
+        st.deepnocap = keep.into_iter().collect();
+    } else {
+        let cap: FxHashSet<(u32, u32)> = p.captured.iter().copied().collect();
+        for s in &bodied {
+            let f = ids.id(s);
+            let n = nparams.get(&f).copied().unwrap_or(0);
+            nc.insert(
+                s.clone(),
+                (0..n).filter(|&i| !cap.contains(&(f, i))).collect(),
+            );
+        }
     }
     if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
     {
@@ -759,6 +1089,10 @@ mod tests {
     /// Parse `input`, register every `llvm.func` (and its allocas) in a
     /// fresh `State`, run the pass, and return `@f`'s nocapture set.
     fn analyze_f(input: &str, nparams: usize) -> FxHashSet<u32> {
+        analyze_f_with(input, nparams, false)
+    }
+
+    fn analyze_f_with(input: &str, nparams: usize, deep: bool) -> FxHashSet<u32> {
         let ctx = &mut Context::new();
         let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect("parse");
         let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
@@ -802,8 +1136,80 @@ mod tests {
                 },
             );
         }
-        run(ctx, &mut st);
+        run_with(ctx, &mut st, deep, false);
         st.nocapture.get("f").expect("f analyzed").clone()
+    }
+
+    /// `PLIRON_NOCAP_DEEP`: `p` stored into a slot that only `@reads` sees,
+    /// which loads it back and reads through it (hashbrown's scope guards
+    /// and closure environments). Depth 1 of the slot is not retained, so
+    /// `p` is not either; the default analysis calls the store a capture.
+    #[test]
+    fn deep_slot_to_a_reader_does_not_capture() {
+        let input = r#"
+        builtin.module @m {
+        ^b():
+          llvm.func @reads: llvm.func <builtin.integer i64(llvm.ptr (0)) variadic = false> [] {
+          ^e(q: llvm.ptr (0)):
+            r = llvm.load q : llvm.ptr (0);
+            x = llvm.load r : builtin.integer i64;
+            llvm.return x
+          };
+          llvm.func @f: llvm.func <builtin.integer i64(llvm.ptr (0)) variadic = false> [] {
+          ^e(p: llvm.ptr (0)):
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            s = llvm.alloca [llvm.ptr (0) x one] : llvm.ptr (0);
+            llvm.store *s <- p;
+            v = llvm.call @reads (s) : llvm.func <builtin.integer i64(llvm.ptr (0)) variadic = false>;
+            llvm.return v
+          }
+        }"#;
+        assert!(analyze_f_with(input, 1, true).contains(&0), "deep");
+        assert!(!analyze_f_with(input, 1, false).contains(&0), "default");
+    }
+
+    /// The callee keeps what it loads out of the slot (stores it through
+    /// another param): `p` is captured, deep or not.
+    #[test]
+    fn deep_slot_to_a_keeper_captures() {
+        let input = r#"
+        builtin.module @m {
+        ^b():
+          llvm.func @keeps: llvm.func <llvm.void(llvm.ptr (0), llvm.ptr (0)) variadic = false> [] {
+          ^e(q: llvm.ptr (0), out: llvm.ptr (0)):
+            r = llvm.load q : llvm.ptr (0);
+            llvm.store *out <- r;
+            llvm.return
+          };
+          llvm.func @f: llvm.func <llvm.void(llvm.ptr (0), llvm.ptr (0)) variadic = false> [] {
+          ^e(p: llvm.ptr (0), out: llvm.ptr (0)):
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            s = llvm.alloca [llvm.ptr (0) x one] : llvm.ptr (0);
+            llvm.store *s <- p;
+            c = llvm.call @keeps (s, out) : llvm.func <llvm.void(llvm.ptr (0), llvm.ptr (0)) variadic = false>;
+            llvm.return
+          }
+        }"#;
+        assert!(!analyze_f_with(input, 2, true).contains(&0));
+    }
+
+    /// The slot goes to a function with no body: depth 1 is unknown.
+    #[test]
+    fn deep_slot_to_an_unknown_callee_captures() {
+        let input = r#"
+        builtin.module @m {
+        ^b():
+          llvm.func @f: llvm.func <llvm.void(llvm.ptr (0)) variadic = false> [] {
+          ^e(p: llvm.ptr (0)):
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            s = llvm.alloca [llvm.ptr (0) x one] : llvm.ptr (0);
+            llvm.store *s <- p;
+            c = llvm.call @ext (s) : llvm.func <llvm.void(llvm.ptr (0)) variadic = false>;
+            llvm.return
+          };
+          llvm.func @ext: llvm.func <llvm.void(llvm.ptr (0)) variadic = false> []
+        }"#;
+        assert!(!analyze_f_with(input, 1, true).contains(&0));
     }
 
     #[test]

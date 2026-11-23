@@ -248,6 +248,24 @@ pub fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>, images: &mut
             continue;
         }
         let Some((sym, off)) = sym_off(ctx, st, op.deref(ctx).get_operand(ctx, 0)) else {
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::constload", tracing::Level::TRACE) {
+                // what the address chain roots at, when a gep chain ends at a constant
+                let mut p = op.deref(ctx).get_operand(ctx, 0);
+                let mut why = String::new();
+                for _ in 0..4 {
+                    if let Some(c) = st.consts.get(p) {
+                        why = format!("root const {c:?}");
+                        break;
+                    }
+                    let Some(d) = p.defining_op() else { why = "block arg".into(); break };
+                    if !Operation::is_op::<GetElementPtrOp>(d, ctx) { why = format!("op {}", Operation::get_opid(d, ctx)); break; }
+                    if gep_offset(ctx, st, d).is_none() { why = "variable gep".into(); break; }
+                    p = d.deref(ctx).get_operand(ctx, 0);
+                }
+                if why.starts_with("root const") || why == "variable gep" {
+                    tracing::trace!(target: "pliron::constload", "constload unresolved: {why}");
+                }
+            }
             continue;
         };
         let img = images.0.entry(sym.clone()).or_insert_with(|| {
@@ -261,6 +279,17 @@ pub fn run_fn(ctx: &mut Context, st: &mut State, f: Ptr<Operation>, images: &mut
         });
         let r = op.deref(ctx).get_result(ctx, 0);
         let Some(cv) = img.as_ref().and_then(|img| fold(ctx, img, off, r.get_type(ctx))) else {
+            if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::constload", tracing::Level::DEBUG) {
+                let why = match st.globals.get(&sym) {
+                    None => "no global".to_string(),
+                    Some(g) => format!(
+                        "mutable {} tls {} linkage {:?} init {} image {}",
+                        g.mutable, g.tls, g.linkage, g.init.is_some(), img.is_some()
+                    ),
+                };
+                let fname = f.deref(ctx).attributes.0.iter().find_map(|(k, v)| (k.to_string() == "sym_name").then(|| format!("{v:?}"))).unwrap_or_default();
+                tracing::debug!(target: "pliron::constload", "constload miss: {sym}+{off} in {fname}: {why}");
+            }
             continue;
         };
         if !crate::bisect_in("constload", "") {
