@@ -37,6 +37,12 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-23: mintrip reads a header param's step through latch block
+    // params (`clin`). blind-sig's `SmallVec::extend(repeat(x).take(n))`
+    // gets its umin pre-loop and LLVM's `stp q0, q0` fill: -0.95% macOS
+    // retired instructions; the other seven programs' __text is
+    // byte-identical. `PLIRON_MINTRIP_CANON=0` off.
+    "PLIRON_MINTRIP_CANON",
     // 2026-11-19: `call; return` as `return_call` on aarch64 (step
     // `sibcall`; the vendored Cranelift reads the same knob, on unless
     // `=0`). Exact counts: html-rewriter -0.60%, protobuf -0.40%, json
