@@ -344,6 +344,7 @@ pub const DEFAULT_ON: &[&str] = &[
     // no i128 and get the egraph (2026-11-22, with vendored `LOWBITS`:
     // html -0.119%).
     "PLIRON_WIDE128_VARSHIFT",
+    "PLIRON_WIDE128_MULUNLOCK",
     // Dead-default switches dispatch on the raw tag; tables keep the
     // `unreachable` default and drop their bounds clamp (vendored
     // Cranelift reads PLIRON_SWITCH_KEEPDEAD itself, `!= "0"`).
