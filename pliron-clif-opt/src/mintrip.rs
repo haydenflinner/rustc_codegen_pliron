@@ -25,6 +25,7 @@
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
 use cranelift_codegen::ir::{Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Type, Value, ValueDef};
+use cranelift_codegen::flowgraph::ControlFlowGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ivptr::{Lin, lin};
@@ -77,6 +78,32 @@ fn edge_args(func: &Function, inst: Inst, slot: usize) -> Option<Vec<Value>> {
         .collect()
 }
 
+/// `lin`, with every leaf followed through block params of single-predecessor
+/// blocks (`bittab::canon`) and expanded again when it lands on an add.
+/// Unrolling and jump threading leave a latch block with params of its own
+/// (`block14(v84, ..)`, entered only from `jump block14(v16, ..)`), so the
+/// back edge's `v84 + 1` is `v16 + 1`: without this the header param did not
+/// count as stepping and `SmallVec::extend(repeat(x).take(n))` kept its two
+/// exit tests per element (blind-sig). `PLIRON_MINTRIP_CANON=1`.
+fn clin(func: &Function, cfg: &ControlFlowGraph, v: Value, depth: u32) -> Lin {
+    let f = lin(func, crate::bittab::canon(func, cfg, v), 0);
+    if !canon_on() || depth >= 4 {
+        return f;
+    }
+    let mut out = Lin { k: f.k, t: Vec::new() };
+    for &(leaf, c) in &f.t {
+        let cl = crate::bittab::canon(func, cfg, leaf);
+        let g = if cl != leaf { clin(func, cfg, cl, depth + 1) } else { Lin { k: 0, t: vec![(leaf, 1)] } };
+        out = out.add(&g.scale(c), 1);
+    }
+    out
+}
+
+fn canon_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_MINTRIP_CANON", "1"));
+    *ON
+}
+
 macro_rules! bail {
     ($($t:tt)*) => {{
         if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::mintrip", tracing::Level::DEBUG) {
@@ -115,7 +142,7 @@ fn plan(func: &Function, cfg: &cranelift_codegen::flowgraph::ControlFlowGraph, d
     // Header params stepping by a constant: p' = p + s.
     let mut step: FxHashMap<Value, i64> = FxHashMap::default();
     for (k, &p) in params.iter().enumerate() {
-        let f = lin(func, crate::bittab::canon(func, cfg, bargs[k]), 0);
+        let f = clin(func, cfg, bargs[k], 0);
         if f.t == [(p, 1)] {
             step.insert(p, f.k);
         }
@@ -139,7 +166,7 @@ fn plan(func: &Function, cfg: &cranelift_codegen::flowgraph::ControlFlowGraph, d
         let (x, y) = (crate::bittab::canon(func, cfg, args[0]), crate::bittab::canon(func, cfg, args[1]));
         // `a cc n` with `n` invariant; the exit is the true arm when es == 0.
         let inv_lin = |v: Value| {
-            let f = lin(func, v, 0);
+            let f = clin(func, cfg, v, 0);
             f.t.iter().all(|&(l, _)| invariant(l)).then_some(f)
         };
         let (a, n, cc) = match (inv_lin(x), inv_lin(y)) {
@@ -148,7 +175,7 @@ fn plan(func: &Function, cfg: &cranelift_codegen::flowgraph::ControlFlowGraph, d
             _ => bail!("{h}: no invariant side"),
         };
         let cc = if es == 0 { cc.complement() } else { cc };
-        let f = lin(func, a, 0);
+        let f = clin(func, cfg, a, 0);
         let mut d = 0i64;
         for &(v, c) in &f.t {
             if let Some(&s) = step.get(&v) {
@@ -213,6 +240,9 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
     };
     let n = plans.len();
     for p in plans {
+        if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::mintrip", tracing::Level::DEBUG) {
+            tracing::debug!(target: "pliron::mintrip", "mintrip fn {} {}: {} exits, {} blocks", func.name, p.h, p.exits.len(), p.region.len());
+        }
         let params: Vec<Value> = func.dfg.block_params(p.h).to_vec();
         let entry_args = edge_args(func, p.entry.0, p.entry.1).unwrap();
         let sub: FxHashMap<Value, Value> = params.iter().copied().zip(entry_args.iter().copied()).collect();

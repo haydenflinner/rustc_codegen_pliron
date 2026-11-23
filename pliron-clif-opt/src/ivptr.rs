@@ -40,7 +40,7 @@ impl Lin {
         t.sort_unstable_by_key(|&(v, _)| v.as_u32());
         Lin { k: self.k.wrapping_add(o.k.wrapping_mul(sign)), t }
     }
-    fn scale(&self, s: i64) -> Lin {
+    pub(crate) fn scale(&self, s: i64) -> Lin {
         Lin { k: self.k.wrapping_mul(s), t: self.t.iter().map(|&(v, c)| (v, c.wrapping_mul(s))).collect() }
     }
 }
