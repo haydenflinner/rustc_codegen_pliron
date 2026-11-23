@@ -2386,7 +2386,7 @@ ran +906k instructions, in the other -53k. With the fix both phases give
 identical costs. Alone: noise on seven programs, blind-sig +0.084% (its
 copies under the old cost disagree; logged as accepted).
 
-## `PLIRON_BUMPHOIST_LOOPONLY` (2026-11-22)
+## `PLIRON_BUMPHOIST_LOOPONLY` (default on since 2026-11-22, `=0` off)
 
 `src/context.rs` (`bump_hoist`): only parameters of blocks inside loops are
 post-index candidates. Entry-block parameters qualified, so a function that

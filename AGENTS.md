@@ -937,6 +937,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   drops the unreachable successor a decided merge leaves (it could keep
   reading the merge's values: regalloc2's `slot_pair_layout`). Tests
   `pliron-clif-opt/tests/mergethread_eval.rs`.
+- `PLIRON_BUMPHOIST_LOOPONLY` (vendored, default on since 2026-11-22, `=0`
+  off) — `bump_hoist`'s post-index rewriting takes parameters of blocks
+  inside loops only. Entry parameters qualified: a function keeping `self +
+  k` had every later use of `self` rebuilt as `(self + k) - k` (lol_html's
+  `handle_end_tag_hint`: five `sub x, x21, #0x1e1` a call). Exact counts:
+  pulldown -1.267%, html -0.289%, protobuf -0.135%, blind-sig -0.071%, json
+  -0.067%, regex -0.049%, the rest flat. Test
+  `pliron-clif-opt/tests/bumphoist_entry.rs`.
 - `PLIRON_EXNCONST=1` (opt-in, 2026-11-22, measured, no default) — step
   `exnconst` near the end: a constant a `try_call`'s exception edge
   passes (a drop flag `edgefwd` moved onto the call) is defined in a cold

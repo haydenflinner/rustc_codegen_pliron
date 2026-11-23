@@ -565,12 +565,12 @@ impl Context {
         }
 
         // Params used as a load/store base in their own block.
-        // PLIRON (`PLIRON_BUMPHOIST_LOOPONLY=1`, opt-in;
+        // PLIRON (`PLIRON_BUMPHOIST_LOOPONLY`, default on since 2026-11-22;
         // `=0` the old rule): params of blocks inside loops only. Entry params qualified too: lol_html's
         // `handle_end_tag_hint` kept `self + 481` and rebuilt `self` as
         // `x21 - 481` before each of five uses.
         static LOOPONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let looponly = *LOOPONLY.get_or_init(|| std::env::var("PLIRON_BUMPHOIST_LOOPONLY").as_deref() == Ok("1"));
+        let looponly = *LOOPONLY.get_or_init(|| std::env::var("PLIRON_BUMPHOIST_LOOPONLY").as_deref() != Ok("0"));
         if looponly {
             self.compute_loop_analysis();
         }
