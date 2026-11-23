@@ -148,6 +148,15 @@ impl Syms {
         self.0.insert(s.to_string(), i);
         i
     }
+
+    /// Every symbol, indexed by its id.
+    pub fn names(&self) -> Vec<String> {
+        let mut v = vec![String::new(); self.0.len()];
+        for (s, &i) in &self.0 {
+            v[i as usize] = s.clone();
+        }
+        v
+    }
 }
 
 /// Erase every block no longer reachable from the entry (over CFG + invoke

@@ -1488,7 +1488,7 @@ pub(crate) fn iropt_tail(
     // when an adopted set is non-empty: otherwise the recompute equals
     // nocap2's.
     if adopt_ord.is_some()
-        && env_is("PLIRON_NOCAP3", "1")
+        && (env_is("PLIRON_NOCAP3", "1") || env_is("PLIRON_NOCAPSUM", "1"))
         && pass_enabled("PLIRON_NOCAP")
         && st.funcs.iter().any(|(s, f)| {
             !pliron_ir_opt::has_body(ctx, f.op) && st.nocapture.get(s).is_some_and(|v| !v.is_empty())

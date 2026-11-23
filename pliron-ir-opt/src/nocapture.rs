@@ -22,6 +22,7 @@ use pliron::context::Context;
 use pliron::linked_list::ContainsLinkedList;
 use pliron::op::op_cast;
 use pliron::operation::{OpDbg, Operation};
+use pliron::printable::Printable;
 use pliron::r#type::Typed;
 use pliron::value::Value;
 use pliron_llvm::ops::{
@@ -107,6 +108,132 @@ ascent::ascent! {
     relation captured(u32, u32);
     captured(f, i) <-- retain(f, v), der(v, m), for i in bits(*m);
     captured(f, i) <-- arg(f, c, k, v), keeps(c, k), der(v, m), for i in bits(*m);
+}
+
+ascent::ascent! {
+    /// The summary form of `Capture` (`PLIRON_NOCAPSUM`): a call to a callee
+    /// with no body here is not a capture but an edge, `dep(f, i, c, k)`:
+    /// param `i` of `f` is captured iff argument `k` of `c` is. Edges go
+    /// through bodied callees transitively, so each param ends as captured
+    /// here or as the set of bodiless callee params it reaches.
+    struct CapSumProg;
+    relation param(Value, u32);
+    relation flow(Value, Value);
+    relation retain(u32, Value);
+    relation arg(u32, u32, u32, Value);
+    relation nparams(u32, u32);
+
+    lattice der(Value, Mask);
+    der(v, Mask(1 << i)) <-- param(v, i);
+    der(d, m) <-- flow(s, d), der(s, m);
+
+    relation keeps(u32, u32);
+    keeps(c, k) <-- arg(_, c, k, _), nparams(c, n), if *k >= *n;
+    keeps(c, k) <-- arg(_, c, k, _), captured(c, k);
+
+    relation captured(u32, u32);
+    captured(f, i) <-- retain(f, v), der(v, m), for i in bits(*m);
+    captured(f, i) <-- arg(f, c, k, v), keeps(c, k), der(v, m), for i in bits(*m);
+
+    relation dep(u32, u32, u32, u32);
+    dep(f, i, c, k) <-- arg(f, c, k, v), !nparams(c, _), der(v, m), for i in bits(*m);
+    dep(f, i, c2, k2) <-- arg(f, c, k, v), nparams(c, n), if *k < *n, der(v, m),
+        dep(c, k, c2, k2), for i in bits(*m);
+}
+
+/// One param's capture summary (`PLIRON_NOCAPSUM`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapSum {
+    /// Captured by the function itself (or through a callee with a body).
+    Captured,
+    /// Captured iff one of these is: (callee symbol, its fn type as this
+    /// CGU declares it, argument index). Empty: never captured.
+    Deps(Vec<(String, String, u32)>),
+}
+
+impl CapSum {
+    /// `have` and `other` describe copies of one symbol: a param is captured
+    /// if any copy captures it, and otherwise depends on the union of the
+    /// copies' edges. A param one copy does not list is captured.
+    pub fn merge(have: &mut Vec<CapSum>, other: &[CapSum]) {
+        let n = have.len().max(other.len());
+        for i in 0..n {
+            let merged = match (have.get(i), other.get(i)) {
+                (Some(CapSum::Deps(a)), Some(CapSum::Deps(b))) => {
+                    let mut d = a.clone();
+                    for e in b {
+                        if !d.contains(e) {
+                            d.push(e.clone());
+                        }
+                    }
+                    CapSum::Deps(d)
+                }
+                _ => CapSum::Captured,
+            };
+            if i < have.len() {
+                have[i] = merged;
+            } else {
+                have.push(merged);
+            }
+        }
+    }
+}
+
+/// The crate-wide capture solve over every CGU's merged summaries: the
+/// least set of captured (copy, param) closed under the edges, where an
+/// edge to a symbol no CGU emitted under that type (an import, an
+/// ABI-divergent copy) or to an argument past its summary captures.
+/// Returns each copy's non-captured params.
+// r[impl iropt.ipo.nocapsum]
+pub fn solve_capsum(
+    sums: &FxHashMap<(String, String), Vec<CapSum>>,
+) -> FxHashMap<(String, String), FxHashSet<u32>> {
+    type Node<'a> = (&'a (String, String), u32);
+    let mut captured: FxHashSet<Node> = FxHashSet::default();
+    let mut users: FxHashMap<Node, Vec<Node>> = FxHashMap::default();
+    let mut work: Vec<Node> = Vec::new();
+    for (key, ps) in sums {
+        for (i, s) in ps.iter().enumerate() {
+            let node = (key, i as u32);
+            match s {
+                CapSum::Captured => {
+                    if captured.insert(node) {
+                        work.push(node);
+                    }
+                }
+                CapSum::Deps(ds) => {
+                    for (cs, cty, k) in ds {
+                        match sums.get_key_value(&(cs.clone(), cty.clone())) {
+                            Some((ck, cps)) if (*k as usize) < cps.len() => {
+                                users.entry((ck, *k)).or_default().push(node);
+                            }
+                            _ => {
+                                if captured.insert(node) {
+                                    work.push(node);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    while let Some(n) = work.pop() {
+        if let Some(us) = users.get(&n) {
+            for &u in us {
+                if captured.insert(u) {
+                    work.push(u);
+                }
+            }
+        }
+    }
+    let mut out = FxHashMap::default();
+    for (key, ps) in sums {
+        let free: FxHashSet<u32> =
+            (0..ps.len() as u32).filter(|&i| !captured.contains(&(key, i))).collect();
+        out.insert(key.clone(), free);
+    }
+    out
 }
 
 /// `c` is the callee of an indirect call. If it is a load from a
@@ -483,6 +610,46 @@ pub fn run(ctx: &Context, st: &mut State) {
         );
         pliron_cfg::trace(&sizes, 0.0, &st.cgu);
     }
+    // `PLIRON_NOCAPSUM=1`: the same facts as summaries for the crate-wide
+    // solve (published with this CGU's facts, solved behind the LTO
+    // barrier under `PLIRON_XFACTS_ALL`).
+    if crate::env_is("PLIRON_NOCAPSUM", "1") {
+        let mut sp = CapSumProg::default();
+        sp.param = p.param.clone();
+        sp.flow = p.flow.clone();
+        sp.retain = p.retain.clone();
+        sp.arg = p.arg.clone();
+        sp.nparams = p.nparams.clone();
+        sp.captured = p.captured.clone();
+        sp.run();
+        let names = ids.names();
+        let cap: FxHashSet<(u32, u32)> = sp.captured.iter().copied().collect();
+        let mut deps: FxHashMap<(u32, u32), Vec<(String, String, u32)>> = FxHashMap::default();
+        for &(f, i, c, k) in &sp.dep {
+            let cs = &names[c as usize];
+            let cty = st.funcs.get(cs).map(|cf| cf.ty.disp(ctx).to_string()).unwrap_or_default();
+            deps.entry((f, i)).or_default().push((cs.clone(), cty, k));
+        }
+        let nparams: FxHashMap<u32, u32> = sp.nparams.iter().copied().collect();
+        st.capsum = Default::default();
+        for s in &bodied {
+            let f = ids.id(s);
+            let n = nparams.get(&f).copied().unwrap_or(0);
+            let v = (0..n)
+                .map(|i| {
+                    if cap.contains(&(f, i)) {
+                        CapSum::Captured
+                    } else {
+                        let mut d = deps.remove(&(f, i)).unwrap_or_default();
+                        d.sort();
+                        d.dedup();
+                        CapSum::Deps(d)
+                    }
+                })
+                .collect();
+            st.capsum.insert(s.clone(), v);
+        }
+    }
     let trun = std::time::Instant::now();
     p.run();
     pliron_cfg::trace("nocap-fixpoint", trun.elapsed().as_secs_f64() * 1e3, &st.cgu);
@@ -698,5 +865,64 @@ mod tests {
         assert!(!nc.contains(&0), "p reaches `out` through the slot's 12th load");
         assert!(nc.contains(&1), "q sits in its own slot, never loaded");
         assert!(nc.contains(&2), "out is only written through");
+    }
+}
+
+#[cfg(test)]
+mod capsum_tests {
+    use super::*;
+
+    fn key(s: &str) -> (String, String) {
+        (s.to_string(), "fn".to_string())
+    }
+    fn dep(s: &str, k: u32) -> (String, String, u32) {
+        (s.to_string(), "fn".to_string(), k)
+    }
+
+    /// `a` -> `b` -> `c` across three CGUs, each hop through a callee with
+    /// no body where the summary was made: the chain resolves only when
+    /// every link is known not to capture.
+    #[test]
+    fn chain_resolves_through_every_hop() {
+        let mut sums = FxHashMap::default();
+        sums.insert(key("a"), vec![CapSum::Deps(vec![dep("b", 0)])]);
+        sums.insert(key("b"), vec![CapSum::Deps(vec![dep("c", 1)])]);
+        sums.insert(key("c"), vec![CapSum::Captured, CapSum::Deps(vec![])]);
+        let s = solve_capsum(&sums);
+        assert!(s[&key("a")].contains(&0));
+        assert!(s[&key("b")].contains(&0));
+        assert!(!s[&key("c")].contains(&0) && s[&key("c")].contains(&1));
+        // the last link captures: everything up the chain does
+        sums.insert(key("c"), vec![CapSum::Captured, CapSum::Captured]);
+        let s = solve_capsum(&sums);
+        assert!(s[&key("a")].is_empty() && s[&key("b")].is_empty());
+    }
+
+    /// An edge to a symbol no CGU summarized (an import), or past its
+    /// params, captures; a cycle with no capture in it does not.
+    #[test]
+    fn unknown_edges_capture_and_cycles_do_not() {
+        let mut sums = FxHashMap::default();
+        sums.insert(key("x"), vec![CapSum::Deps(vec![dep("ext", 0)])]);
+        sums.insert(key("y"), vec![CapSum::Deps(vec![dep("z", 3)])]);
+        sums.insert(key("z"), vec![CapSum::Deps(vec![dep("w", 0)])]);
+        sums.insert(key("w"), vec![CapSum::Deps(vec![dep("z", 0)])]);
+        let s = solve_capsum(&sums);
+        assert!(s[&key("x")].is_empty(), "import");
+        assert!(s[&key("y")].is_empty(), "past the params");
+        assert!(s[&key("z")].contains(&0) && s[&key("w")].contains(&0), "cycle");
+    }
+
+    /// Copies merge param by param: captured in one copy is captured, a
+    /// param one copy lacks is captured, edges union.
+    #[test]
+    fn merge_is_conservative() {
+        let mut a = vec![CapSum::Deps(vec![dep("p", 0)]), CapSum::Deps(vec![])];
+        CapSum::merge(&mut a, &[CapSum::Deps(vec![dep("q", 0)])]);
+        assert_eq!(a[0], CapSum::Deps(vec![dep("p", 0), dep("q", 0)]));
+        assert_eq!(a[1], CapSum::Captured);
+        let mut b = vec![CapSum::Deps(vec![])];
+        CapSum::merge(&mut b, &[CapSum::Captured]);
+        assert_eq!(b[0], CapSum::Captured);
     }
 }

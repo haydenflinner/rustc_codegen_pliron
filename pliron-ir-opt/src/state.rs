@@ -452,6 +452,10 @@ pub struct State {
     /// Per-callee body-level capture analysis: param indices provably not
     /// retained past the call (nocapture.rs).
     pub nocapture: SymMap<rustc_hash::FxHashSet<u32>>,
+    /// Capture summaries for the crate-wide solve (`PLIRON_NOCAPSUM`, under
+    /// `PLIRON_XFACTS_ALL`): per bodied function, per param, captured here
+    /// or the bodiless callee params it reaches (nocapture.rs).
+    pub capsum: SymMap<Vec<crate::nocapture::CapSum>>,
     /// Bodies inferred to return a non-null pointer (nnret.rs); lowering
     /// seeds their call results into `FnLower::nonnull` for jumpthread.
     pub nnret: SymSet,
@@ -855,6 +859,8 @@ struct CguFacts {
     nnret: FxHashMap<CopyKey, u32>,
     willreturn: FxHashMap<CopyKey, u32>,
     nounwind: FxHashMap<CopyKey, u32>,
+    /// Per-copy capture summaries, merged param by param (`CapSum::merge`).
+    capsum: FxHashMap<CopyKey, Vec<crate::nocapture::CapSum>>,
 }
 
 /// Process-global callee-contract facts merged across codegen units
@@ -878,12 +884,24 @@ struct GlobalFacts {
     by_ord: std::collections::BTreeMap<u32, CguFacts>,
     /// Next ordinal for the serial path (`share_facts`).
     next_ord: u32,
+    /// The crate-wide capture solve over every ordinal's summaries
+    /// (`PLIRON_NOCAPSUM`): computed once, by the first `facts_adopt_all`,
+    /// which runs behind the LTO barrier with every CGU published.
+    capsolved: Option<FxHashMap<CopyKey, FxHashSet<u32>>>,
 }
 
 impl CguFacts {
     fn publish(&mut self, ctx: &Context, sym: &str, ty: TypeHandle, st: &State, nounwind: bool) {
         let key = (sym.to_string(), ty.disp(ctx).to_string());
         *self.copies.entry(key.clone()).or_default() += 1;
+        // A copy without a summary (no nocapture run) captures every param.
+        let sum = st.capsum.get(sym).cloned().unwrap_or_default();
+        match self.capsum.get_mut(&key) {
+            Some(have) => crate::nocapture::CapSum::merge(have, &sum),
+            None => {
+                self.capsum.insert(key.clone(), sum);
+            }
+        }
         let nc = self
             .nocapture
             .entry(key.clone())
@@ -918,6 +936,14 @@ impl CguFacts {
                 .entry(s.clone())
                 .or_insert_with(|| v.clone())
                 .retain(|a| v.contains(a));
+        }
+        for (s, v) in &other.capsum {
+            match self.capsum.get_mut(s) {
+                Some(have) => crate::nocapture::CapSum::merge(have, v),
+                None => {
+                    self.capsum.insert(s.clone(), v.clone());
+                }
+            }
         }
         for (m, o) in [
             (&mut self.nowrite_strict, &other.nowrite_strict),
@@ -1037,12 +1063,24 @@ impl State {
     fn facts_adopt_from(&mut self, ctx: &Context, ord: u32, all: bool) {
         let filt = pliron_cfg::env_get("PLIRON_STATS_XCGU").unwrap_or("");
         let mut g = CguFacts::default();
+        let mut solved: Option<FxHashMap<CopyKey, FxHashSet<u32>>> = None;
         {
-            let global = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut global = GLOBAL_FACTS.lock().unwrap_or_else(|e| e.into_inner());
             for (&o, cf) in global.by_ord.iter() {
                 if o < ord || (all && o != ord) {
                     g.merge(cf);
                 }
+            }
+            // r[impl par.facts.capsum]
+            if all && pliron_cfg::env_is("PLIRON_NOCAPSUM", "1") {
+                if global.capsolved.is_none() {
+                    let mut every = CguFacts::default();
+                    for cf in global.by_ord.values() {
+                        every.merge(cf);
+                    }
+                    global.capsolved = Some(crate::nocapture::solve_capsum(&every.capsum));
+                }
+                solved = global.capsolved.clone();
             }
         }
         let mut imported = 0usize;
@@ -1061,6 +1099,14 @@ impl State {
             if let Some(v) = g.nocapture.get(&key) {
                 self.nocapture.insert(sym.clone(), v.clone());
                 hit = !v.is_empty();
+            }
+            // The crate-wide solve: what the copies keep once their own
+            // cross-CGU callees are known. Both sets are sound; take both.
+            if let Some(v) = solved.as_ref().and_then(|s| s.get(&key)) {
+                let mut e = self.nocapture.get(sym).cloned().unwrap_or_default();
+                e.extend(v.iter().copied());
+                hit |= !e.is_empty();
+                self.nocapture.insert(sym.clone(), e);
             }
             if let Some(v) = g.nowrite(&key) {
                 self.nowrite.insert(sym.clone(), v);

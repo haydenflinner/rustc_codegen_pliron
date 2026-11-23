@@ -3312,16 +3312,16 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
     true
 }
 
-/// Every op that touches param `s` (`size` dereferenceable bytes) through
-/// GEPs, with the byte ranges it may read or write, and whether its
-/// address may outlive an op (a call that may keep it, a store of it as a
-/// value, a block argument, an integer). Drop glue reads and writes.
-/// `None` when the walk runs out of budget.
 thread_local! {
     /// What made the last `src_touches` walk call its param captured (for the `srcfwd` trace).
     static CAPTURE_WHY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Every op that touches param `s` (`size` dereferenceable bytes) through
+/// GEPs, with the byte ranges it may read or write, and whether its
+/// address may outlive an op (a call that may keep it, a store of it as a
+/// value, a block argument, an integer). Drop glue reads and writes.
+/// `None` when the walk runs out of budget.
 fn src_touches(
     ctx: &Context,
     st: &State,
