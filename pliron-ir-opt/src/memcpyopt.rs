@@ -3287,7 +3287,8 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
                         .take(4)
                         .map(|&w| format!("{} {:?}", Operation::get_opid(w, ctx), st.calls.get(w).and_then(|c| c.callee.as_deref()).map(|c| &c[..c.len().min(90)])))
                         .collect();
-                    sfno!(name, "source may be written between a copy and a read (captured {captured}; {} writes: {what:?})", hit.len());
+                    let why = CAPTURE_WHY.with(|w| w.borrow().clone());
+                    sfno!(name, "source may be written between a copy and a read (captured {captured} by {why:?}; {} writes: {what:?})", hit.len());
                 }
             }
         }
@@ -3316,6 +3317,11 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
 /// address may outlive an op (a call that may keep it, a store of it as a
 /// value, a block argument, an integer). Drop glue reads and writes.
 /// `None` when the walk runs out of budget.
+thread_local! {
+    /// What made the last `src_touches` walk call its param captured (for the `srcfwd` trace).
+    static CAPTURE_WHY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn src_touches(
     ctx: &Context,
     st: &State,
@@ -3324,6 +3330,7 @@ fn src_touches(
 ) -> Option<(FxHashMap<Ptr<Operation>, Vec<Touch>>, bool)> {
     let mut out: FxHashMap<Ptr<Operation>, Vec<Touch>> = FxHashMap::default();
     let mut captured = false;
+    let mut why: Option<String> = None;
     // (pointer, its offset when constant)
     let mut work: Vec<(Value, Option<u64>)> = vec![(s, Some(0))];
     let mut seen = 0usize;
@@ -3342,6 +3349,7 @@ fn src_touches(
             if Operation::is_op::<GetElementPtrOp>(op, ctx) {
                 if i != 0 {
                     captured = true;
+                    if why.is_none() { why = Some(format!("gep index {}{}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()).map(|c| format!(" {}", &c[..c.len().min(100)])).unwrap_or_default())); }
                     continue;
                 }
                 let nb = match (base, gep_offset(ctx, st, op)) {
@@ -3355,6 +3363,7 @@ fn src_touches(
             } else if Operation::is_op::<StoreOp>(op, ctx) {
                 if i != 1 {
                     captured = true;
+                    if why.is_none() { why = Some(format!("stored as a value {}{}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()).map(|c| format!(" {}", &c[..c.len().min(100)])).unwrap_or_default())); }
                     continue;
                 }
                 let w = size_align(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx)).0;
@@ -3371,6 +3380,7 @@ fn src_touches(
                     }
                     _ => {
                         captured = true;
+                    if why.is_none() { why = Some(format!("intrinsic {}{}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()).map(|c| format!(" {}", &c[..c.len().min(100)])).unwrap_or_default())); }
                         out.entry(op).or_default().push(touch(true, true, None, None));
                     }
                 }
@@ -3392,15 +3402,20 @@ fn src_touches(
                 let ext = info.and_then(|i| i.arg_extent.as_ref()).and_then(|e| e.get(ai)).map(|e| e.0).filter(|&n| n > 0);
                 if !nocap {
                     captured = true;
+                    if why.is_none() { why = Some(format!("call {}{}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()).map(|c| format!(" {}", &c[..c.len().min(100)])).unwrap_or_default())); }
                 }
                 out.entry(op).or_default().push(touch(true, true, base, ext));
             } else {
                 // A block argument, a select, an integer: the address goes
                 // where this walk does not follow.
                 captured = true;
+                    if why.is_none() { why = Some(format!("other use {}{}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()).map(|c| format!(" {}", &c[..c.len().min(100)])).unwrap_or_default())); }
                 out.entry(op).or_default().push(touch(true, true, None, None));
             }
         }
+    }
+    if captured {
+        CAPTURE_WHY.with(|w| *w.borrow_mut() = why);
     }
     Some((out, captured))
 }
