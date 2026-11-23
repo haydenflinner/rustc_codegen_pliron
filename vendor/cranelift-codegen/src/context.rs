@@ -565,10 +565,22 @@ impl Context {
         }
 
         // Params used as a load/store base in their own block.
+        // PLIRON (`PLIRON_BUMPHOIST_LOOPONLY=1`, opt-in;
+        // `=0` the old rule): params of blocks inside loops only. Entry params qualified too: lol_html's
+        // `handle_end_tag_hint` kept `self + 481` and rebuilt `self` as
+        // `x21 - 481` before each of five uses.
+        static LOOPONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let looponly = *LOOPONLY.get_or_init(|| std::env::var("PLIRON_BUMPHOIST_LOOPONLY").as_deref() == Ok("1"));
+        if looponly {
+            self.compute_loop_analysis();
+        }
         let mut membase: FxHashMap<crate::ir::Value, crate::ir::Block> = FxHashMap::default();
         for b in self.func.layout.blocks() {
             let params = self.func.dfg.block_params(b);
             if params.is_empty() {
+                continue;
+            }
+            if looponly && self.loop_analysis.innermost_loop(b).is_none() {
                 continue;
             }
             for i in self.func.layout.block_insts(b) {

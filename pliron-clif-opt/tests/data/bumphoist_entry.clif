@@ -1,0 +1,180 @@
+function u0:0(i64 sret, i64, i64) apple_aarch64 {
+ss0 = explicit_slot 0, align = 8
+ss1 = explicit_slot 24, align = 8
+ss2 = explicit_slot 0, align = 8
+ss3 = explicit_slot 24, align = 8
+ss4 = explicit_slot 16, align = 8
+ss5 = explicit_slot 0, align = 8
+ss6 = explicit_slot 0, align = 8
+gv0 = symbol colocated userextname0
+sig0 = (i64 sret, i64, i64, i8 uext, i64, i64) apple_aarch64
+sig1 = (i64) apple_aarch64
+sig2 = (i64, i64, i64) apple_aarch64
+sig3 = () apple_aarch64
+sig4 = (i64) apple_aarch64
+fn0 = colocated u0:95 sig0
+fn1 = colocated u0:63 sig1
+fn2 = colocated u0:114 sig2
+fn3 = colocated u0:93 sig3
+fn4 = colocated u0:94 sig4
+block0(v0: i64, v1: i64, v2: i64):
+v8 = stack_addr.i64 ss4
+store notrap v1, v8
+v12 = iconst.i64 481
+v13 = iadd v1, v12  ; v12 = 481
+store notrap v13, v8+8
+v18 = load.i8 notrap v1+392
+v19 = iconst.i8 -1
+v20 = icmp eq v18, v19  ; v19 = -1
+brif v20, block8, block2
+block2:
+v28 = load.i64 notrap v1+448
+v29 = iconst.i64 1
+v5 = stack_addr.i64 ss1
+store notrap v29, v5  ; v29 = 1
+v32 = iconst.i64 0
+store notrap v32, v5+8  ; v32 = 0
+store notrap v28, v5+16
+v7 = stack_addr.i64 ss3
+v10 = iconst.i64 368
+v11 = iadd.i64 v1, v10  ; v10 = 368
+v9 = iconst.i8 1
+v563 = stack_addr.i64 ss4
+v36 = symbol_value.i64 gv0
+try_call fn0(v7, v11, v5, v9, v563, v36), sig0, block88, [ tag0: block89(exn0) ]  ; v9 = 1
+block89(v37: i64) cold:
+v380 = load.i64 notrap v2
+jump block25
+block88:
+v564 = stack_addr.i64 ss3
+v38 = load.i64 notrap v564
+v39 = iconst.i64 -1
+v566 -> v39
+v40 = icmp eq v38, v39  ; v39 = -1
+brif v40, block8, block10
+block8:
+v62 = load.i64 notrap v1+208
+v570 = iconst.i64 -1
+v64 = icmp eq v62, v570  ; v570 = -1
+brif v64, block30, block29
+block30:
+v74 = load.i64 notrap v1+24
+v84 = load.i64 notrap v1+56
+v94 = load.i64 notrap v1+88
+v104 = load.i64 notrap v1+120
+v114 = load.i64 notrap v1+152
+v121 = load.i64 notrap v2
+v573 = iconst.i64 -2
+v123 = icmp eq v121, v573  ; v573 = -2
+v574 = iconst.i8 16
+v575 = iconst.i8 0
+v457 = select v74, v574, v575  ; v574 = 16, v575 = 0
+v576 = iconst.i8 2
+v327 = bor v457, v576  ; v576 = 2
+v461 = select v84, v327, v457
+v577 = iconst.i8 1
+v330 = bor v461, v577  ; v577 = 1
+v465 = select v94, v330, v461
+v578 = iconst.i8 8
+v333 = bor v465, v578  ; v578 = 8
+v469 = select v104, v333, v465
+v579 = iconst.i8 4
+v336 = bor v469, v579  ; v579 = 4
+v473 = select v114, v336, v469
+brif v123, block37(v473), block69
+block69:
+v131 = icmp.i64 eq v121, v570  ; v570 = -1
+brif v131, block37(v473), block84
+block84 cold:
+try_call fn1(v2), sig1, block37(v473), [ tag0: block91(exn0) ]
+block91(v137: i64) cold:
+jump block24(v137)
+block29:
+v142 = load.i64 notrap v2+16
+v523 = load.i64x2 notrap v2
+v571 = stack_addr.i64 ss1
+store notrap v523, v571
+store notrap v142, v571+16
+v60 = iconst.i64 208
+v561 = iadd.i64 v1, v60  ; v60 = 208
+try_call fn2(v561, v571, v1), sig2, block92, [ tag0: block93(exn0) ]
+block93(v145: i64) cold:
+try_call fn4(v145), sig4, block96, [ tag0: block97(exn0) ]
+block92:
+v149 = load.i64 notrap v1+24
+v159 = load.i64 notrap v1+56
+v169 = load.i64 notrap v1+88
+v179 = load.i64 notrap v1+120
+v189 = load.i64 notrap v1+152
+v338 = iconst.i8 16
+v56 = iconst.i8 0
+v405 = select v149, v338, v56  ; v338 = 16, v56 = 0
+v341 = iconst.i8 2
+v342 = bor v405, v341  ; v341 = 2
+v417 = select v159, v342, v405
+v572 = iconst.i8 1
+v345 = bor v417, v572  ; v572 = 1
+v429 = select v169, v345, v417
+v347 = iconst.i8 8
+v348 = bor v429, v347  ; v347 = 8
+v441 = select v179, v348, v429
+v350 = iconst.i8 4
+v351 = bor v441, v350  ; v350 = 4
+v453 = select v189, v351, v441
+jump block37(v453)
+block37(v196: i8):
+v199 = load.i8 notrap v1+360
+brif v199, block17(v196), block13
+block13:
+v202 = load.i64 notrap v1+192
+v580 = iconst.i8 8
+v354 = bor.i8 v196, v580  ; v580 = 8
+v477 = select.i8 v202, v196, v354
+jump block17(v477)
+block17(v212: i8):
+store notrap v212, v1+361
+v581 = iconst.i8 1
+store notrap v581, v1+480  ; v581 = 1
+v582 = iconst.i8 0
+v479 = icmp ne v212, v582  ; v582 = 0
+store notrap v479, v0+8
+store.i64 notrap v570, v0  ; v570 = -1
+return
+block97(v251: i64) cold:
+jump block24(v251)
+block96:
+trap user250
+block10:
+v565 = stack_addr.i64 ss3
+v562 = load.i64x2 notrap v565+8
+store.i64 notrap v38, v0
+store notrap v562, v0+8
+v257 = load.i64 notrap v2
+v258 = iconst.i64 -2
+v259 = icmp eq v257, v258  ; v258 = -2
+brif v259, block22, block77
+block77:
+v567 = icmp.i64 eq v257, v566  ; v566 = -1
+brif v567, block22, block86
+block86 cold:
+call fn1(v2)
+return
+block22:
+return
+block25 cold:
+v568 = iconst.i64 -2
+v279 = icmp.i64 eq v380, v568  ; v568 = -2
+brif v279, block24(v37), block82
+block82 cold:
+v569 = iconst.i64 -1
+v287 = icmp.i64 eq v380, v569  ; v569 = -1
+brif v287, block24(v37), block87
+block87 cold:
+try_call fn1(v2), sig1, block24(v37), [ tag0: block99 ]
+block99 cold:
+call fn3()
+trap user250
+block24(v559: i64) cold:
+call fn4(v559)
+trap user250
+}

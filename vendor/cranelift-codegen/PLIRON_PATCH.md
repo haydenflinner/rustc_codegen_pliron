@@ -2385,3 +2385,14 @@ alone: in one placement copy brotli's `BrotliCreateHqZopfliBackwardReferences`
 ran +906k instructions, in the other -53k. With the fix both phases give
 identical costs. Alone: noise on seven programs, blind-sig +0.084% (its
 copies under the old cost disagree; logged as accepted).
+
+## `PLIRON_BUMPHOIST_LOOPONLY` (2026-11-22)
+
+`src/context.rs` (`bump_hoist`): only parameters of blocks inside loops are
+post-index candidates. Entry-block parameters qualified, so a function that
+kept `self + k` (a field address passed on or stored) had every later use of
+`self` rewritten as `(self + k) - k` in its block: lol_html's
+`handle_end_tag_hint` ran `sub xN, x21, #0x1e1` five times per call. Exact
+non-nop: pulldown -1.267%, html -0.289%, protobuf -0.135%, blind-sig
+-0.071%, json -0.067%, regex -0.049%, compression and blake3 flat. Test
+`pliron-clif-opt/tests/bumphoist_entry.rs`.
