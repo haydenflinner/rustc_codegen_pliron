@@ -1106,8 +1106,12 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    `WIDE128_MULUNLOCK`): html 1.090x, blind-sig 1.086x, blake3 1.047x,
    compression 1.042x, json 1.037x, protobuf 1.031x, pulldown-cmark 1.030x,
    regex 1.018x; geomean 1.047x. Time (`ab.py`, 9 rounds, load average 11,
-   cycles): html 1.054x, pulldown-cmark 0.962x, regex 0.997x. Earlier
-   figures below.)
+   cycles): html 1.054x, pulldown-cmark 0.962x, regex 0.997x. 2026-11-24
+   `98f36846` (xcgu-home keeps data-taken copies — vtable-slot copies
+   like `impls::call_mut` survive to the post-constload devirt window):
+   html (`ab.py`, 15 rounds) 1.063x instr / 1.009x cycles, all `bl`
+   call_mut/shim sites inlined; protobuf +0.1% instr (still ~4% faster
+   cycles than LLVM), blind-sig unchanged. Earlier figures below.)
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
