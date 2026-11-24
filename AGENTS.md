@@ -1125,9 +1125,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   each site's `coldargs` wrapper, `PLIRON_PANICSTUB_FWD=0` keeps
   forwarder blocks. Sites on different source lines stay apart when the
   build has line tables.
-- `PLIRON_SCOPED_NOALIAS=1` (opt-in; measured ready for default-on but
-  the 2000-seed fuzz sweep it needs first did not complete, see the
-  handoff section of `docs/history/2026-11-13-six-features.md`): an
+- `PLIRON_SCOPED_NOALIAS` (default on since 2026-11-24, `=0` off; the
+  fuzz sweep it waited for ran on 2026-11-23/24: 2,000+ usable seeds with
+  the knob on, no failure, `docs/history/2026-11-23-night.md`): an
   inlined callee's `&mut` param keeps its `noalias` fact for
   the span of the inlined body: a first pipeline step (`scopedfwd`)
   runs `loadfwd` on the function as lowered, where locs reached through

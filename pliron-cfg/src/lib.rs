@@ -37,6 +37,14 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-24: an inlined callee's `&mut` param keeps its `noalias`
+    // fact for the inlined body (step `scopedfwd`, phisimp's clone-entry
+    // args). macOS instructions on 2026-11-23: html -0.7%, regex -0.9%,
+    // compression -0.6%, json -0.9%, protobuf -0.7%, the rest noise.
+    // Fuzz: 4,000 rustlantis seeds with it on (about half usable; stock
+    // fails the rest), no failure; std corpus with its candidates replays
+    // clean. `PLIRON_SCOPED_NOALIAS=0` off.
+    "PLIRON_SCOPED_NOALIAS",
     // 2026-11-23: loadfwd keeps `a[i]` across a store to `a[i + 1]`
     // (addresses as `base + scale * idx + k`, disjoint constant offsets).
     // brotli's literal-cost prefix sums: rust-compression -0.5..-0.7%
