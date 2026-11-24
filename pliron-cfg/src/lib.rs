@@ -59,6 +59,15 @@ pub const DEFAULT_ON: &[&str] = &[
     // Held-out instructions within +-0.3%, ms/cycles lean down; std
     // corpus 11 fns, net -136 weighted insts. `PLIRON_CLOSELATCH=0` off.
     "PLIRON_CLOSELATCH",
+    // 2026-11-24: sroa splits an aggregate pinned only by drop glue —
+    // html's 144-byte StackItem temps, whole-copied into arg temps then
+    // dropped on bail paths through drop_glue invokes. The drop operand
+    // is non-retaining by semantics (the call consumes the object), so
+    // its pin is writeback-only: no reloads, no invoke pad trampoline —
+    // which sidesteps the unfound SYNC_INVOKE miscompile rather than
+    // relying on it. asmvs html: 1.07x -> 1.042x cycles vs LLVM.
+    // `PLIRON_SROA_PINFULL=0` off.
+    "PLIRON_SROA_PINFULL",
     // 2026-11-23: loadfwd keeps `a[i]` across a store to `a[i + 1]`
     // (addresses as `base + scale * idx + k`, disjoint constant offsets).
     // brotli's literal-cost prefix sums: rust-compression -0.5..-0.7%

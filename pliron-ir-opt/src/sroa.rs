@@ -286,8 +286,9 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
     if !direct && idx == 0 {
         return false;
     }
-    // `PLIRON_SROA_PINFULL=1`: a `drop_in_place`/drop-glue call consumes
-    // the object: keeping the pointer past it is UB, so the operand is
+    // `PLIRON_SROA_PINFULL` (default on, `=0` off): a
+    // `drop_in_place`/drop-glue call consumes the object: keeping the
+    // pointer past it is UB, so the operand is
     // non-retaining even where IPO capture can't prove it (nested drops
     // pass derived pointers to callees the solver conservatively marks
     // captured) — and even on an invoke's unwind edge, which has no
@@ -371,11 +372,11 @@ fn bodiless_pin(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
         .is_some_and(|f| !crate::has_body(ctx, f.op))
 }
 
-/// `PLIRON_SROA_PINFULL=1`: operand `idx` of `op` is this alloca's base
-/// passed to a call that is neither diverging, copyable nor
-/// extent-pinned — `drop_glue` is the shape, handed a whole local
-/// aggregate on a bail path after the aggregate was moved on the
-/// function's main path. When the callee provably can't retain the
+/// `PLIRON_SROA_PINFULL` (default on, `=0` off): operand `idx` of `op`
+/// is this alloca's base passed to a call that is neither diverging,
+/// copyable nor extent-pinned — `drop_glue` is the shape, handed a
+/// whole local aggregate on a bail path after the aggregate was moved
+/// on the function's main path. When the callee provably can't retain the
 /// pointer (or is bodiless, so a cross-CGU fact may still make it
 /// syncable) the operand is a `Pin` over the whole alloca: `split`
 /// syncs the slices into `pin_a` around the call and everything else
@@ -1419,7 +1420,7 @@ fn split(
         let out_min: u64 = crate::env_get("PLIRON_SROA_FRAGCOPY_OUT").and_then(|v| v.parse().ok()).unwrap_or(0);
         let pinfull = crate::env_is("PLIRON_SROA_PINFULL", "1");
         // `Some(written)` per piece when only direct accesses and one
-        // copy out touch the aggregate. `PLIRON_SROA_PINFULL=1` also
+        // copy out touch the aggregate. `PLIRON_SROA_PINFULL` also
         // admits a pin whose call operand is syncable (a `drop_glue`
         // bail-path call is the shape) and more than one copy out —
         // each is independently rewritten into stores on its own
