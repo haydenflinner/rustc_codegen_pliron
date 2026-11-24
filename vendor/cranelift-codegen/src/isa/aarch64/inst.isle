@@ -5545,6 +5545,42 @@
 (decl pure cmn_on () bool)
 (extern constructor cmn_on cmn_on)
 
+;; PLIRON (`PLIRON_CMN_NARROW=1`, opt-in; rules 12, 13: above 10/11, which
+;; take only equality and unsigned relations): an 8/16-bit signed compare
+;; against a constant compares the sign-extended operand with the
+;; sign-extended constant as an immediate: `cmp w, #k` for `k >= 0`, `cmn
+;; w, #-k` for `k < 0`. Rule 0 put the constant in a register and compared
+;; with the extended-register form: UTF-8's `is_char_boundary`, `(b as i8)
+;; >= -0x40`, behind every `&s[a..b]`, was `mov w0, #0xc0; sxtb w1, w1;
+;; cmp w1, w0, sxtb` (LLVM: `ldrsb; cmn #0x41`). Only the low 32 bits of
+;; the compare matter for these condition codes, and both operands are
+;; exact 32-bit sign extensions.
+(decl pure cmn_narrow_on () bool)
+(extern constructor cmn_narrow_on cmn_narrow_on)
+(rule 12 (emit_icmp cc rn @ (value_type (fits_in_16 ty)) (iconst _ n))
+  (if (signed_cond_code cc))
+  (if-let true (cmn_narrow_on))
+  (if-let (imm12_from_u64 imm) (i64_cast_unsigned (i64_sextend_imm64 ty n)))
+  (CondResult.Cond
+    (cmp_imm (OperandSize.Size32) (put_in_reg_sext32_sink rn) imm)
+    (cond_code cc)))
+(rule 13 (emit_icmp cc rn @ (value_type (fits_in_16 ty)) y @ (iconst _ (u64_from_imm64 n)))
+  (if (signed_cond_code cc))
+  (if-let true (cmn_narrow_on))
+  (if-let true (u64_ne n 0))
+  (if-let imm (imm12_from_negated_value y))
+  (CondResult.Cond
+    (cmn_imm (OperandSize.Size32) (put_in_reg_sext32_sink rn) imm)
+    (cond_code cc)))
+;; The operand sign-extended to 32 bits; a single-use narrow load becomes
+;; the extending load itself (`ldrsb`), as `sextend` of a load does.
+(decl put_in_reg_sext32_sink (Value) Reg)
+(rule 0 (put_in_reg_sext32_sink x) (put_in_reg_ext32_maybe x (ArgumentExtension.Sext)))
+(rule 1 (put_in_reg_sext32_sink x @ (load in_ty (little_or_native_endian flags) address offset))
+  (if-let inst (is_sinkable_inst x))
+  (let ((_ Unit (sink_inst inst)))
+    (aarch64_sload in_ty (amode in_ty address offset) flags)))
+
 ;; For direct equality comparisons to zero transform the other operand into a
 ;; nonzero comparison and then invert the whole conditional to test for zero.
 (rule 7 (emit_icmp (IntCC.Equal) a (u64_from_iconst 0)) (cond_result_invert (is_nonzero a)))

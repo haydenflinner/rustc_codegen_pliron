@@ -2418,3 +2418,19 @@ instructions; small leaves stay frameless (`=1` cost rust-json and
 pulldown-cmark there). `harness/placement.py --no-exact`, 4-8 copies:
 blake3 instructions -1.04%, cycles -2.0% (real); html, json, pulldown,
 regex, compression, protobuf, blind-sig within placement.
+
+## `PLIRON_CMN_NARROW` (aarch64, 2026-11-23)
+
+`src/isa/aarch64/inst.isle` (`emit_icmp` rules 12/13,
+`put_in_reg_sext32_sink`), `src/isa/aarch64/lower/isle.rs`
+(`cmn_narrow_on`): an 8/16-bit signed `icmp` against a constant compares
+the sign-extended operand with the sign-extended constant as an immediate
+(`cmp w, #k`, or `cmn w, #-k` for negative `k`); a single-use narrow load
+operand becomes the extending load (`ldrsb`/`ldrsh`). UTF-8's
+`is_char_boundary` (`(b as i8) >= -0x40`, behind every `&s[a..b]`) was
+`ldrb; mov w0, #0xc0; sxtb; cmp w1, w0, sxtb` and is `ldrsb; cmn #0x40`,
+as LLVM's. Extended-register compares: pulldown-cmark 117 -> 0, regex 74
+-> 0, html 71 -> 11, json 21 -> 11. Test
+`pliron-clif-opt/tests/aarch64_cmn_narrow.rs` runs every `i8` value (and
+an `i16` sweep) against eleven constants and four conditions, from memory
+and from a register with junk above the narrow value.

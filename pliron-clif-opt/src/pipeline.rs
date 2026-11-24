@@ -5039,8 +5039,11 @@ fn s_armhoist(p: &mut Pipe, an: &mut Analysis) -> usize {
 }
 
 fn s_vrp2(p: &mut Pipe, an: &mut Analysis) -> usize {
-    // Wasm only, a measurement boundary (native was not timed).
-    if !p.target.is_wasm() {
+    // Wasm only, a measurement boundary (native was not timed);
+    // `PLIRON_VRP2_NATIVE=1` (opt-in) runs it on native too.
+    static NATIVE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::env_is("PLIRON_VRP2_NATIVE", "1"));
+    if !p.target.is_wasm() && !*NATIVE {
         return 0;
     }
     let k = crate::vrp::run_with(&mut p.clctx.func, an, p.vfacts);
