@@ -451,9 +451,20 @@ fn dep_promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
         // one of 132k vector growths went through one more call
         // (`<RawVecInner>::finish_grow`, the `Result` returned through
         // memory): +1.7M..+2.1M instructions in `raw_vec` / prost paths.
+        // The keep is released when the dep's sole user is itself
+        // copyable: keeping the dep Internal then rejects every copy of
+        // the user, so all cross-CGU callers pay `bl user` where an
+        // inlined body + `bl dep` is cheaper — OnceCell's
+        // `get_or_try_init` (size 14) fast path in every caller vs
+        // `bl try_init` on a miss. `grow_amortized` qualifies through
+        // `leaf_copyable` (its calls are all `#[cold]`), so
+        // `finish_grow` is released and the doubling math inlines into
+        // `grow_one` sites again: rust-protobuf +0.6% instr but -2%
+        // cycles vs the plain keep (2026-11-24 ab).
         let last: usize = crate::env_get("PLIRON_XCGU_LASTCALL").and_then(|s| s.parse().ok()).unwrap_or(20);
         if last > 0 && !out.is_empty() {
             let mut users: FxHashMap<&str, u32> = FxHashMap::default();
+            let mut user_inst: FxHashMap<&str, Instance<'tcx>> = FxHashMap::default();
             for p in parts {
                 for &item in p.items().keys() {
                     let MonoItem::Fn(c) = item else { continue };
@@ -466,6 +477,7 @@ fn dep_promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
                         let s = tcx.symbol_name(d).name;
                         if out.contains(s) && seen_here.insert(s) {
                             *users.entry(s).or_default() += 1;
+                            user_inst.entry(s).or_insert(c);
                         }
                     }
                 }
@@ -476,6 +488,13 @@ fn dep_promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
                     let MonoItem::Fn(d) = item else { continue };
                     let s = tcx.symbol_name(d).name;
                     if out.contains(s) && users.get(s).copied().unwrap_or(0) == 1 && tcx.size_estimate(d) > last {
+                        if user_inst.get(s).is_some_and(|&c| copyable(tcx, c, limit)) {
+                            if pliron_cfg::tracing_on() {
+                                tracing::info!(target: "pliron::stats", "xcgu lastcall-rel {} (size {})",
+                                    with_no_trimmed_paths!(d.to_string()), tcx.size_estimate(d));
+                            }
+                            continue;
+                        }
                         if pliron_cfg::tracing_on() {
                             tracing::info!(target: "pliron::stats", "xcgu lastcall {} (size {})",
                                 with_no_trimmed_paths!(d.to_string()), tcx.size_estimate(d));
