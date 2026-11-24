@@ -246,6 +246,25 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
     r
 }
 
+/// A direct call to `core::ptr`'s drop glue (`drop_glue`/`drop_in_place`,
+/// v0 and Itanium mangled components — the `4core3ptr` anchor keeps a
+/// same-named user function from matching). The call consumes the object:
+/// its pinned operand needs the writeback (the glue reads the fields)
+/// but no reload on either edge — the caller cannot read the object after
+/// it, unwind included.
+fn consuming_drop(ctx: &Context, op: Ptr<Operation>) -> bool {
+    let Some(c) = Operation::get_op::<CallOp>(op, ctx) else {
+        return false;
+    };
+    let Some(id) = c.get_attr_llvm_call_callee(ctx) else {
+        return false;
+    };
+    let n = AsRef::<str>::as_ref(id.as_ref());
+    n.contains("4core3ptr9drop_glue")
+        || n.contains("4core3ptr14drop_in_place")
+        || n.contains("4core3ptr13drop_in_place")
+}
+
 /// Operand `idx` of call `op` cannot be retained by the callee past the
 /// call's end: rustc's `nocapture` bit on the arg (`nocap`) or our own
 /// `nocapture` inference. `noalias` alone does NOT suffice: `f(&'a mut
@@ -266,6 +285,17 @@ fn nonretaining(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> bo
     // Operand 0 of an indirect call is the callee, not an argument.
     if !direct && idx == 0 {
         return false;
+    }
+    // `PLIRON_SROA_PINFULL=1`: a `drop_in_place`/drop-glue call consumes
+    // the object: keeping the pointer past it is UB, so the operand is
+    // non-retaining even where IPO capture can't prove it (nested drops
+    // pass derived pointers to callees the solver conservatively marks
+    // captured) — and even on an invoke's unwind edge, which has no
+    // legal read of the object. Its pin is synced by writeback only:
+    // `split` emits no reloads for it, so the `get_next`/invoke
+    // structural gates below don't apply.
+    if crate::env_is("PLIRON_SROA_PINFULL", "1") && consuming_drop(ctx, op) {
+        return true;
     }
     // A call with no following op has no normal edge to reload on; an
     // invoke whose pad takes arguments can't take a reload trampoline —
@@ -339,6 +369,48 @@ fn bodiless_pin(ctx: &Context, st: &State, op: Ptr<Operation>) -> bool {
     st.funcs
         .get(sym)
         .is_some_and(|f| !crate::has_body(ctx, f.op))
+}
+
+/// `PLIRON_SROA_PINFULL=1`: operand `idx` of `op` is this alloca's base
+/// passed to a call that is neither diverging, copyable nor
+/// extent-pinned — `drop_glue` is the shape, handed a whole local
+/// aggregate on a bail path after the aggregate was moved on the
+/// function's main path. When the callee provably can't retain the
+/// pointer (or is bodiless, so a cross-CGU fact may still make it
+/// syncable) the operand is a `Pin` over the whole alloca: `split`
+/// syncs the slices into `pin_a` around the call and everything else
+/// scalarizes, instead of `accesses` refusing the alloca outright.
+fn pin_full(
+    ctx: &Context,
+    st: &State,
+    op: Ptr<Operation>,
+    idx: usize,
+    base: i64,
+    size: u64,
+    flow: bool,
+) -> Option<Access> {
+    if flow || base != 0 || !crate::env_is("PLIRON_SROA_PINFULL", "1") {
+        return None;
+    }
+    let c = Operation::get_op::<CallOp>(op, ctx)?;
+    // Operand 0 of an indirect call is the callee, not an argument.
+    if c.get_attr_llvm_call_callee(ctx).is_none() && idx == 0 {
+        return None;
+    }
+    // A consuming drop is writeback-only (no reload, no pad trampoline),
+    // so an invoke operand is fine.
+    if st.invokes.contains(op) && !consuming_drop(ctx, op) {
+        return None;
+    }
+    if !nonretaining(ctx, st, op, idx) && !bodiless_pin(ctx, st, op) {
+        return None;
+    }
+    Some(Access {
+        op,
+        off: 0,
+        kind: Kind::Pin { idx, n: size },
+        flow: false,
+    })
 }
 
 fn intrinsic<'a>(st: &'a State, op: Ptr<Operation>) -> Option<&'a str> {
@@ -843,6 +915,8 @@ fn accesses_inner(
                     kind: Kind::Pin { idx, n },
                     flow,
                 });
+            } else if let Some(x) = pin_full(ctx, st, op, idx, base, size, flow) {
+                out.push(x);
             } else {
                 return None;
             }
@@ -1343,8 +1417,13 @@ fn split(
         // (regex's `CompileClass::c_utf8_seq`, 32 bytes, 7 pieces, 4
         // accesses: +96k executed instructions).
         let out_min: u64 = crate::env_get("PLIRON_SROA_FRAGCOPY_OUT").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let pinfull = crate::env_is("PLIRON_SROA_PINFULL", "1");
         // `Some(written)` per piece when only direct accesses and one
-        // copy out touch the aggregate.
+        // copy out touch the aggregate. `PLIRON_SROA_PINFULL=1` also
+        // admits a pin whose call operand is syncable (a `drop_glue`
+        // bail-path call is the shape) and more than one copy out —
+        // each is independently rewritten into stores on its own
+        // destination.
         let built_in_place = || -> Option<Vec<bool>> {
             let mut outs = 0;
             let mut written = vec![false; sl.len()];
@@ -1363,13 +1442,30 @@ fn split(
                         }
                     }
                     Kind::Copy { dst: false, .. } => outs += 1,
+                    // A copy in writes its covered pieces — the pass-
+                    // through shape (copy in, fields read, copy out).
+                    Kind::Copy { dst: true, n, .. } if pinfull => {
+                        for (i, sx) in sl.iter().enumerate() {
+                            if x.off < sx.off + sx.size && sx.off < x.off + n {
+                                written[i] = true;
+                            }
+                        }
+                    }
+                    Kind::Pin { .. }
+                        if pinfull && pin_rngs.contains_key(&x.op) => {}
                     _ => return None,
                 }
             }
-            (outs == 1).then_some(written)
+            (if pinfull { outs >= 1 } else { outs == 1 }).then_some(written)
         };
         if whole_copy && frag_copy_stays_whole(size, &pieces, direct, per, word) {
-            let w = if out_min > 0 && size >= out_min { built_in_place() } else { None };
+            let w = if (out_min > 0 && size >= out_min)
+                || (pinfull
+                    && acc.iter().any(|x| matches!(x.kind, Kind::Pin { .. }))) {
+                built_in_place()
+            } else {
+                None
+            };
             // Padding is the exception: unwritten pieces of less than a
             // word in all (`PropertiesI`'s last byte).
             let take = w.as_ref().is_some_and(|w| {
@@ -1796,6 +1892,13 @@ fn split(
                 StoreOp::new(ctx, lv, p)
                     .get_operation()
                     .insert_before(ctx, *cop);
+            }
+            // A consuming drop needs no reload: the object is dead on both
+            // the normal and the unwind edge, so the SSA slices' stale
+            // values have no readers (and an invoke keeps its `call; br`
+            // shape without a pad trampoline).
+            if consuming_drop(ctx, *cop) {
+                continue;
             }
             let next = cop.get_next(ctx);
             if let Some(next) = next {
