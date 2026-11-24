@@ -1515,6 +1515,7 @@ pub(crate) fn iropt_tail(
     // `PLIRON_MEMCPYOPT_SRCFWD=1` again: adopt + nocap3 may have shown a
     // param's cross-CGU callees keep nothing.
     if adopt_ord.is_some() && pass_enabled("PLIRON_MEMCPYOPT") {
+        dumpfn(ctx, st, "srcfwd2");
         pt!(prof, cgu, "srcfwd2", memcpyopt::run_srcfwd(ctx, st));
     }
     // `PLIRON_SROA_TAILSPLIT=1`: re-split allocas that deferred on a

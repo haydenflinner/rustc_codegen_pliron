@@ -3278,10 +3278,52 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
             if !hit.is_empty() {
                 let hit: Vec<_> = hit.into_iter().collect();
                 let rs: FxHashSet<Ptr<Operation>> = readers.iter().copied().collect();
-                let Some(late) = reached_after(ctx, st, &hit, &rs) else {
-                    sfno!(name, "walk budget");
+                // `PLIRON_SRCFWD_RANGES=1`: a write conflicts only with a read
+                // after it whose bytes overlap (temp coordinates; unknown
+                // overlaps everything). Drop glue on a field writes only that
+                // field (`drop_in_place::<T>` touches the `T` at its pointer:
+                // rustc's pointee size, `arg_extent`), so an unwind chain
+                // dropping a moved value's fields one by one is no conflict.
+                let precise = srcfwd_ranges() && hit.len() <= 32;
+                let late = if precise {
+                    let wr = |w: Ptr<Operation>| -> Option<(i64, i64)> {
+                        if drops.contains(&w) {
+                            return temp_access(ctx, st, t, w);
+                        }
+                        let ts = users.get(&w)?;
+                        let (a, b) = ts.iter().filter(|x| x.write).fold((u64::MAX, 0u64), |(a, b), x| (a.min(x.lo), b.max(x.hi)));
+                        (a < b).then(|| (a as i64 - off as i64, b as i64 - off as i64))
+                    };
+                    let mut bad: FxHashSet<Ptr<Operation>> = FxHashSet::default();
+                    for &w in &hit {
+                        let w_r = wr(w);
+                        let Some(after) = reached_after(ctx, st, &[w], &rs) else {
+                            sfno!(name, "walk budget");
+                        };
+                        for r in after {
+                            let r_r = temp_access(ctx, st, t, r);
+                            let disjoint = matches!((w_r, r_r), (Some((a, b)), Some((c, d))) if b <= c || d <= a);
+                            if !disjoint {
+                                bad.insert(r);
+                            }
+                        }
+                    }
+                    bad
+                } else {
+                    let Some(late) = reached_after(ctx, st, &hit, &rs) else {
+                        sfno!(name, "walk budget");
+                    };
+                    late
                 };
                 if !late.is_empty() {
+                    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::memcpyopt", tracing::Level::TRACE) {
+                        for &w in hit.iter().take(6) {
+                            tracing::trace!(target: "pliron::memcpyopt", "srcfwd conflict write: {}", pliron::operation::OpDbg { op: w, ctx }.to_string().chars().take(200).collect::<String>());
+                        }
+                        for &r in late.iter().take(6) {
+                            tracing::trace!(target: "pliron::memcpyopt", "srcfwd conflict read:  {}", pliron::operation::OpDbg { op: r, ctx }.to_string().chars().take(200).collect::<String>());
+                        }
+                    }
                     let what: Vec<String> = hit
                         .iter()
                         .take(4)
@@ -3310,6 +3352,55 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
     st.promoted.remove(t);
     Operation::erase(t_op, ctx);
     true
+}
+
+fn srcfwd_ranges() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_SRCFWD_RANGES", "1"));
+    *ON
+}
+
+/// `p`'s byte offset in temp `t`, through constant GEPs.
+fn temp_off(ctx: &Context, st: &State, t: Value, mut p: Value) -> Option<i64> {
+    let mut off = 0i64;
+    for _ in 0..16 {
+        if p == t {
+            return Some(off);
+        }
+        let d = p.defining_op()?;
+        Operation::get_op::<GetElementPtrOp>(d, ctx)?;
+        off = off.checked_add(gep_offset(ctx, st, d)?)?;
+        p = d.deref(ctx).get_operand(ctx, 0);
+    }
+    None
+}
+
+/// The bytes of temp `t` that `op` reads or (drop glue) writes: a load, a
+/// mem* copy out of it, or a drop of a value in it (`arg_extent`, rustc's
+/// pointee size for `drop_in_place::<T>`). `None` when unknown.
+fn temp_access(ctx: &Context, st: &State, t: Value, op: Ptr<Operation>) -> Option<(i64, i64)> {
+    let d = op.deref(ctx);
+    if Operation::is_op::<LoadOp>(op, ctx) {
+        let o = temp_off(ctx, st, t, d.get_operand(ctx, 0))?;
+        let n = crate::types::size_align(ctx, d.get_result(ctx, 0).get_type(ctx)).0 as i64;
+        return Some((o, o + n));
+    }
+    if let Some(nm) = st.intrinsics.get(op).map(|s| s.as_str())
+        && matches!(nm, "llvm.memcpy" | "llvm.memmove")
+    {
+        let o = temp_off(ctx, st, t, d.get_operand(ctx, 1))?;
+        let n = const_int(ctx, st, d.get_operand(ctx, 2)).and_then(|x| i64::try_from(x).ok())?;
+        return Some((o, o + n));
+    }
+    if Operation::is_op::<CallOp>(op, ctx) {
+        let info = st.calls.get(op)?;
+        for (k, a) in d.operands(ctx).enumerate() {
+            if let Some(o) = temp_off(ctx, st, t, a) {
+                let n = info.arg_extent.as_ref()?.get(k)?.0 as i64;
+                return (n > 0).then_some((o, o + n));
+            }
+        }
+    }
+    None
 }
 
 fn srcfwd_ro() -> bool {
