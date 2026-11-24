@@ -474,6 +474,7 @@ static RETNN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env
 static DISJOINT_ADD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_DISJOINT_ADD", "1"));
 static EXACT_DIV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_EXACT_DIV", "1"));
 static COLD_SWITCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_COLD_SWITCH", "1"));
+static TRUNC_FLAGS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_TRUNC_FLAGS", "1"));
 
 fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
@@ -5923,6 +5924,22 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// Integer `div`/`rem` elementwise, with an i128 fast path: constant
     /// unsigned divisors become limb magic-multiply sequences instead of
     /// `__udivti3`/`__umodti3` libcalls (~15 insts vs ~100+ cycles).
+    /// The `x` of `zext (trunc nuw x)` (`sext (trunc nsw x)` when `signed`)
+    /// when the extension goes back to `x`'s own type.
+    fn trunc_roundtrip(&self, op: Ptr<Operation>, opnds: &[Value], signed: bool) -> Option<Value> {
+        let ctx = self.ctx;
+        let t = opnds[0].defining_op()?;
+        if !Operation::is_op::<TruncOp>(t, ctx) {
+            return None;
+        }
+        let key = if signed { "pliron_trunc_nsw" } else { "pliron_trunc_nuw" };
+        if !pliron_ir_opt::facts::flag(ctx, t, key) {
+            return None;
+        }
+        let x = t.deref(ctx).get_operand(ctx, 0);
+        (x.get_type(ctx) == self.res_ty(op)).then_some(x)
+    }
+
     /// `PLIRON_EXACT_DIV=1`: rustc's `exact` division (no remainder:
     /// `ptr.offset_from`, a slice iterator's `len()`) by a constant
     /// `d = 2^k * m`, `m` odd, is a shift by `k` (arithmetic for `sdiv`)
@@ -6875,6 +6892,11 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let a = self.get(opnds[0]);
             let r = a.iter().map(|x| self.fneg(*x)).collect();
             self.set(op, r);
+        } else if (is!(ZExtOp) || is!(SExtOp)) && *TRUNC_FLAGS && let Some(x) = self.trunc_roundtrip(op, opnds, is!(SExtOp)) {
+            // `PLIRON_TRUNC_FLAGS=1`: `zext (trunc nuw x)` / `sext (trunc nsw
+            // x)` back to `x`'s type is `x` (rustc's `unchecked_{u,s}trunc`).
+            let v = self.get(x);
+            self.set(op, v);
         } else if is!(TruncOp) || is!(ZExtOp) || is!(SExtOp) || is!(PtrToIntOp) || is!(IntToPtrOp) {
             let src_w = self.int_width(opnds[0].get_type(ctx));
             let dst_w = self.int_width(self.res_ty(op));

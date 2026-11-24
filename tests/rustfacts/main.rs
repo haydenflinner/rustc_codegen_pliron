@@ -9,6 +9,12 @@
 #[inline(never)] fn d12(a: *const S12, b: *const S12) -> isize { unsafe { b.offset_from(a) } }
 #[inline(never)] fn d8(a: *const u64, b: *const u64) -> isize { unsafe { b.offset_from(a) } }
 #[inline(never)] fn len24(v: &[S24]) -> usize { v.iter().len() }
+/// Narrowing round trips run under `PLIRON_TRUNC_FLAGS`. rustc emits
+/// `unchecked_utrunc` only for unchecked shift amounts and bool switch
+/// discriminants, so these lower to a compare and select and do not reach
+/// the round-trip rule; they check the knob changes nothing else.
+#[inline(never)] fn rt(a: u64) -> u64 { let h: u32 = unsafe { a.try_into().unwrap_unchecked() }; h as u64 }
+#[inline(never)] fn rts(a: i64) -> i64 { let h: i16 = unsafe { a.try_into().unwrap_unchecked() }; h as i64 }
 #[inline(never)] fn len12(v: &[S12]) -> usize { v.iter().skip(1).len() }
 fn main() {
     let n: usize = std::env::args().count() * 37;
@@ -21,5 +27,7 @@ fn main() {
         acc = acc.wrapping_mul(31).wrapping_add(d12(&v12[j], &v12[i]) as i64);
         acc = acc.wrapping_mul(31).wrapping_add(d8(&v8[i], &v8[j]) as i64);
     }}
-    println!("{} {} {} {}", acc, len24(&v24[3..]), len12(&v12[5..]), v24[0].a + v24[0].b + v24[0].c + v12[0].a as u64 + v12[0].b as u64 + v12[0].c as u64);
+    let mut t: u64 = 0;
+    for i in 0..n as u64 { t = t.wrapping_mul(7).wrapping_add(rt(i * 1_000_003 % 4_000_000_000)).wrapping_add(rts(i as i64 * 97 % 30_000 - 15_000) as u64); }
+    println!("{} {} {} {} {}", t, acc, len24(&v24[3..]), len12(&v12[5..]), v24[0].a + v24[0].b + v24[0].c + v12[0].a as u64 + v12[0].b as u64 + v12[0].c as u64);
 }

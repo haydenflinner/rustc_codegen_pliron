@@ -1009,7 +1009,7 @@ t_rustfacts() {
   # `d24` must divide without a multiply-high (`smulh`).
   rustc --edition 2021 -O tests/rustfacts/main.rs -o $out/rustfacts-stock$exe || return 1
   local v i=0
-  for v in "PLIRON_EXACT_DIV=0" "PLIRON_EXACT_DIV=1 PLIRON_DISJOINT_ADD=1 PLIRON_COLD_SWITCH=1"; do
+  for v in "PLIRON_EXACT_DIV=0" "PLIRON_EXACT_DIV=1 PLIRON_DISJOINT_ADD=1 PLIRON_COLD_SWITCH=1 PLIRON_TRUNC_FLAGS=1"; do
     i=$((i + 1))
     env $v rustc $BE --edition 2021 -O tests/rustfacts/main.rs -o $out/rustfacts$i$exe || return 1
     [[ -n "$exe" ]] && continue
