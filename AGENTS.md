@@ -751,6 +751,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   noise (html +0.2..+0.7%, placement suspected).
   `PLIRON_VFACTS_RANGE=0` / `_NW=0` drop one kind
   (`docs/history/2026-11-23-nocapsum.md`).
+- `PLIRON_LINDIS` (default on since 2026-11-23, `=0` off) — loadfwd
+  reads an address as `base + scale * idx + k` (`loadfwd::lin_form`): two
+  with one base, index and scale differ by exactly their `k`s, so a store
+  to `a[i + 1]` keeps `a[i]`. brotli's literal-cost prefix sums reloaded
+  `a[i]` after every store in the unrolled body: rust-compression
+  -0.5..-0.7% macOS instructions, the other seven byte-identical. Test
+  `loadfwd_lindis`.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

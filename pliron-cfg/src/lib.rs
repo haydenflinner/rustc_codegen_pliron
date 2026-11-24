@@ -37,6 +37,13 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-23: loadfwd keeps `a[i]` across a store to `a[i + 1]`
+    // (addresses as `base + scale * idx + k`, disjoint constant offsets).
+    // brotli's literal-cost prefix sums: rust-compression -0.5..-0.7%
+    // macOS instructions, cycles -2.5..-6%; the other seven held-out
+    // binaries byte-identical; std corpus 4 functions smaller. Test
+    // loadfwd_lindis. `PLIRON_LINDIS=0` off.
+    "PLIRON_LINDIS",
     // 2026-11-23: rustc's `exact` division by a constant as a shift plus a
     // multiply by the odd part's inverse (LLVM's lowering; `offset_from`,
     // slice `len()`). macOS instructions: regex -1.0% (pikevm::exec -128
