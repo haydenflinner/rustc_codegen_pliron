@@ -1931,6 +1931,20 @@ path into the copy) by comparing mismatch lists before and after.
 
 Ranked by expected card gain per effort. Each item links its evidence.
 
+0. **Open: rust-compression +0.4% under `PLIRON_EXACT_DIV`** (default on
+   since 2026-11-23, `6419721c`). macOS retired instructions +0.4% and
+   cycles +1.1% against an A/A pair differing by 0.1%, but the code change
+   is two instructions in miniz's `init_tree` (register allocation) plus
+   one function moving 32 bytes: too little for ~230k executed
+   instructions, so executed alignment `nop`s (placement) are suspected.
+   To settle it: callgrind exact counts per function and instruction
+   class (`bench/heldout/irdiff.py rust-compression --env
+   PLIRON_EXACT_DIV=0` against the default, or `harness/placement.py
+   heldout rust-compression --cand ex:PLIRON_EXACT_DIV=0`), which needs
+   OrbStack running. If the non-`nop` delta is real, find the function
+   and fix it, or narrow the lowering; do not keep a trade
+   (`history/2026-11-23-nocapsum.md`, "rustc's facts, kept").
+
 1. **Runtime parity on held-out programs** (`bench/heldout/run.py`,
    1.08x on 2026-11-09): the phased plan, with the LLVM and GCC
    frameworks we lack (SCEV/LFTR, value ranges, regalloc
