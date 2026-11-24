@@ -520,12 +520,18 @@ pub fn root_pair(
 /// `ms_of`'s bounded `root_min`.
 #[derive(Default)]
 struct NrMemo {
+    /// [`lin_form`] per address value.
+    lin: std::cell::RefCell<FxHashMap<Value, Option<Lin>>>,
     pair: std::cell::RefCell<FxHashMap<Value, ((Root, i64), (Root, i64))>>,
     n0: std::cell::RefCell<FxHashMap<Value, (Root, i64)>>,
     rm: std::cell::RefCell<FxHashMap<Value, (Root, i64)>>,
 }
 
 impl NrMemo {
+    fn lin(&self, func: &Function, v: Value) -> Option<Lin> {
+        *self.lin.borrow_mut().entry(v).or_insert_with(|| lin_form(func, v))
+    }
+
     fn pair(
         &self,
         func: &Function,
@@ -568,6 +574,125 @@ impl NrMemo {
             .entry(v)
             .or_insert_with(|| root_min(func, ps, na, Some(bnd), v))
     }
+}
+
+/// `PLIRON_LINDIS`: an address as `base + scale * idx + k`, exactly
+/// (modulo 2^64). Two addresses with the same `base`, `idx` and `scale`
+/// differ by exactly the difference of their `k`s, so their accesses are
+/// disjoint when those byte ranges are. Unrolled copies of `a[i]`,
+/// `a[i + 1]`: `base + ((i + 1) << 2)` against `base + (i << 2)`, which
+/// `root` sees as two unrelated pointers (brotli's literal-cost prefix sum
+/// reloaded `a[i]` after every store to `a[i + 1]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Lin {
+    pub base: Value,
+    pub idx: Value,
+    pub scale: i64,
+    pub k: i64,
+}
+
+static LINDIS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_LINDIS", "1"));
+
+/// [`Lin`] of address `v`: `iadd(base, s)` where `s` is `ishl(t, c)`,
+/// `imul(t, c)` (constant `c`) or, with scale 1, `t` itself, and `t`
+/// peels `iadd(x, const)` chains down to `idx`. Pointer-width integers
+/// only: a narrower index would wrap before it is scaled.
+pub fn lin_form(func: &Function, v: Value) -> Option<Lin> {
+    let ty = func.dfg.value_type(v);
+    let iconst = |x: Value| match func.dfg.insts[func.dfg.value_def(x).inst()?] {
+        InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => Some(imm.bits()),
+        _ => None,
+    };
+    let def = |x: Value| -> Option<(Opcode, [Value; 2])> {
+        match func.dfg.insts[func.dfg.value_def(x).inst()?] {
+            InstructionData::Binary { opcode, args } => Some((
+                opcode,
+                [func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1])],
+            )),
+            _ => None,
+        }
+    };
+    // `t` as `idx + k` (constant `k`), through at most 8 adds.
+    let peel = |mut t: Value| -> (Value, i64) {
+        let mut k = 0i64;
+        for _ in 0..8 {
+            match def(t) {
+                Some((Opcode::Iadd, [a, b])) if func.dfg.value_type(t) == ty => {
+                    if let Some(c) = iconst(b) {
+                        k = k.wrapping_add(c);
+                        t = a;
+                    } else if let Some(c) = iconst(a) {
+                        k = k.wrapping_add(c);
+                        t = b;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        (t, k)
+    };
+    // A scaled index: `(idx, scale, k)`.
+    let scaled = |s: Value| -> Option<(Value, i64, i64)> {
+        if func.dfg.value_type(s) != ty {
+            return None;
+        }
+        let (op, [a, b]) = def(s)?;
+        let scale = match op {
+            Opcode::Ishl => {
+                let c = iconst(b)?;
+                if !(0..=6).contains(&c) {
+                    return None;
+                }
+                1i64 << c
+            }
+            Opcode::Imul => {
+                let c = iconst(b)?;
+                if !(1..=4096).contains(&c) {
+                    return None;
+                }
+                c
+            }
+            _ => return None,
+        };
+        let (idx, k) = peel(a);
+        Some((idx, scale, k.wrapping_mul(scale)))
+    };
+    let (op, [a, b]) = def(v)?;
+    if op != Opcode::Iadd || func.dfg.value_type(a) != ty || func.dfg.value_type(b) != ty {
+        return None;
+    }
+    if let Some((idx, scale, k)) = scaled(b) {
+        return Some(Lin { base: a, idx, scale, k });
+    }
+    if let Some((idx, scale, k)) = scaled(a) {
+        return Some(Lin { base: b, idx, scale, k });
+    }
+    // Scale 1: `x + (y + k)`; the pair is unordered, so name it by value
+    // number.
+    let (pa, ka) = peel(a);
+    let (pb, kb) = peel(b);
+    if ka == 0 && kb == 0 {
+        return None;
+    }
+    let (base, idx) = if pa.as_u32() <= pb.as_u32() { (pa, pb) } else { (pb, pa) };
+    Some(Lin { base, idx, scale: 1, k: ka.wrapping_add(kb) })
+}
+
+/// `[x + kx, + nx)` and `[y + ky, + ny)` with `lin(x)`, `lin(y)` of one
+/// `base`/`idx`/`scale` do not overlap (modulo 2^64; sizes are small).
+fn lin_disjoint(lx: Lin, kx: i64, nx: i64, ly: Lin, ky: i64, ny: i64) -> bool {
+    if (lx.base, lx.idx, lx.scale) != (ly.base, ly.idx, ly.scale) {
+        return false;
+    }
+    let a = i128::from(lx.k) + i128::from(kx);
+    let b = i128::from(ly.k) + i128::from(ky);
+    // Exact difference modulo 2^64, taken as the nearer of the two ways.
+    let d = (b - a).rem_euclid(1i128 << 64);
+    let (nx, ny) = (i128::from(nx), i128::from(ny));
+    // `b` is `a + d` and also `a + d - 2^64`.
+    d >= nx && (1i128 << 64) - d >= ny
 }
 
 /// Kill the locations a store of `ty` at `(r, o)` may overwrite. `ms`,
@@ -1869,6 +1994,26 @@ fn transfer(
                     }
                     None => Vec::new(),
                 };
+                // `PLIRON_LINDIS`: locs whose address is the store's
+                // `base + scale * idx` at a disjoint constant offset.
+                let lin_keep: Vec<(Loc, Value)> = match r {
+                    Root::V(rv) if *LINDIS => match nm.lin(func, rv) {
+                        Some(sl) => {
+                            let n = i64::from(ty.bytes());
+                            av.iter()
+                                .filter(|&(&(r2, o2, t2), _)| match r2 {
+                                    Root::V(y) if y != rv => nm.lin(func, y).is_some_and(|l| {
+                                        lin_disjoint(sl, o, n, l, o2, i64::from(t2.bytes()))
+                                    }),
+                                    _ => false,
+                                })
+                                .map(|(&l, &v)| (l, v))
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
                 kill(av, r, o, ty, ms, iso, ncc, invs, cur, invreg, rpar);
                 // `na` includes `ofrozen` stops but `iso`/`ncc` classify
                 // under `na0` — the same memory can carry two root names.
@@ -1929,6 +2074,9 @@ fn transfer(
                     }
                 }
                 for (l, v) in same_obj {
+                    av.insert(l, v);
+                }
+                for (l, v) in lin_keep {
                     av.insert(l, v);
                 }
                 if av.len() < MAX_ENTRIES {
