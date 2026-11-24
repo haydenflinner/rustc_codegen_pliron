@@ -37,6 +37,14 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-23: rustc's `exact` division by a constant as a shift plus a
+    // multiply by the odd part's inverse (LLVM's lowering; `offset_from`,
+    // slice `len()`). macOS instructions: regex -1.0% (pikevm::exec -128
+    // bytes), html -0.3%, protobuf -0.1%, compression +0.4% (accepted: its
+    // code changes by +2 instructions in miniz's init_tree; placement
+    // suspected, no callgrind to split it). Stanza rustfacts.
+    // `PLIRON_EXACT_DIV=0` off.
+    "PLIRON_EXACT_DIV",
     // 2026-11-23: mintrip reads a header param's step through latch block
     // params (`clin`). blind-sig's `SmallVec::extend(repeat(x).take(n))`
     // gets its umin pre-loop and LLVM's `stp q0, q0` fill: -0.95% macOS
