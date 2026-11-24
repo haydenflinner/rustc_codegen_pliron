@@ -5545,7 +5545,7 @@
 (decl pure cmn_on () bool)
 (extern constructor cmn_on cmn_on)
 
-;; PLIRON (`PLIRON_CMN_NARROW=1`, opt-in; rules 12, 13: above 10/11, which
+;; PLIRON (`PLIRON_CMN_NARROW`, default on, `=0` off; rules 12, 13: above 10/11, which
 ;; take only equality and unsigned relations): an 8/16-bit signed compare
 ;; against a constant compares the sign-extended operand with the
 ;; sign-extended constant as an immediate: `cmp w, #k` for `k >= 0`, `cmn

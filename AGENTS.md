@@ -758,6 +758,14 @@ time, memory, code size, stack frames) in ~20 min and writes
   `a[i]` after every store in the unrolled body: rust-compression
   -0.5..-0.7% macOS instructions, the other seven byte-identical. Test
   `loadfwd_lindis`.
+- `PLIRON_CMN_NARROW` (vendored aarch64, default on since 2026-11-23,
+  `=0` off) — an 8/16-bit signed `icmp` against a constant is `cmp w, #k`
+  / `cmn w, #-k` on the sign-extended operand, and a single-use narrow
+  load operand becomes `ldrsb`/`ldrsh`: `is_char_boundary` behind every
+  `&s[a..b]` is `ldrsb; cmn #0x40` as LLVM's (was `ldrb; mov #0xc0; sxtb;
+  cmp w, w, sxtb`). Test `aarch64_cmn_narrow` (every `i8` value, run).
+  `PLIRON_VRP2_NATIVE=1` (opt-in): the late range pass `vrp2` on native
+  too (an escape loop's `i < n` then `i == n` folds).
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

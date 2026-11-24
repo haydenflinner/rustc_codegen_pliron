@@ -2419,7 +2419,7 @@ pulldown-cmark there). `harness/placement.py --no-exact`, 4-8 copies:
 blake3 instructions -1.04%, cycles -2.0% (real); html, json, pulldown,
 regex, compression, protobuf, blind-sig within placement.
 
-## `PLIRON_CMN_NARROW` (aarch64, 2026-11-23)
+## `PLIRON_CMN_NARROW` (aarch64, default on since 2026-11-23, `=0` off)
 
 `src/isa/aarch64/inst.isle` (`emit_icmp` rules 12/13,
 `put_in_reg_sext32_sink`), `src/isa/aarch64/lower/isle.rs`

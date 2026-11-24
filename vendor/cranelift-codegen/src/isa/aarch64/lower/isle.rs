@@ -1755,11 +1755,12 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         *ON.get_or_init(|| std::env::var("PLIRON_CMN").as_deref() != Ok("0"))
     }
 
-    /// PLIRON (`PLIRON_CMN_NARROW=1`, opt-in): `cmp`/`cmn` immediates for
-    /// 8/16-bit signed compares (`emit_icmp` rules 12 and 13).
+    /// PLIRON (`PLIRON_CMN_NARROW`, default on since 2026-11-23, `=0`
+    /// off): `cmp`/`cmn` immediates for 8/16-bit signed compares
+    /// (`emit_icmp` rules 12 and 13).
     fn cmn_narrow_on(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_CMN_NARROW").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_CMN_NARROW").as_deref() != Ok("0"))
     }
 
     /// PLIRON (`PLIRON_CCMP`, default on): `band`/`bor` of two integer
