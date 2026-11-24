@@ -74,3 +74,38 @@ the debug panic was a canary for a release miscompile path. Test:
   through shape works; `v30085`/`v30078` are the arg-temp half.
 * callgrind / OrbStack still unavailable, so per-instruction splits
   on the held-out programs remain estimate-based.
+
+## xcgu `lastcall-rel` — release keeps whose sole user is copyable (1a7a7f82)
+
+The `lastcall` keep held `OnceCell::try_init` Internal (sole user,
+size 51 > 20) in every lol_html CGU partition, which rejected the
+copyable `get_or_try_init` (size 14) — all 16 hot-path sites emitted
+`bl get_or_try_init` where LLVM inlines the `cbz`-on-empty fast path
+and calls `.llvm.try_init` only on a miss. Root cause of the earlier
+puzzle: `get_or_try_init` is `GloballyShared` in *both* builds
+(`cross_crate_inlinable` wants `calls == 0`; it calls `try_init`) —
+LLVM's win is its per-CGU `LocalCopy` machinery, ours is xcgu.
+
+Release rule: if the kept dep's *sole user* is itself `copyable`,
+promoting the dep unlocks copies of the user — inlined body + `bl dep`
+beats `bl user` at every cross-CGU caller. New `xcgu lastcall-rel`
+stats line distinguishes releases from plain `lastcall` keeps.
+
+- rust-html-rewriter: all 16 sites converted, `bl try_init` on miss —
+  7.017ms vs llvm 6.925 (instr 109.9M vs 102.78M).
+- rust-protobuf (clean two-side ab, `P=1` sides): the feared
+  `finish_grow` release fired — `grow_amortized` is `leaf_copyable`
+  (all calls `#[cold]`), so its doubling math re-inlined into
+  `grow_one` sites: +0.6% instr, **-2% cycles, -1.5% ms**. The earlier
+  +2.2%/+3.5% "regression" was a stale `ab-pliron` side dir (same
+  release-dylib gotcha as before — `--backend` is one global path, so
+  pre/post needs two differently-named sides).
+- Gate: 131 jobs passed.
+
+## Still open (updated)
+
+* html residual: ~+7% instr / +2% cycles — `Vec` field reloads
+  (`raw_vec:635/655` cap/len past conditional `grow`), CSS
+  `Component::clone`/`Token::clone` deep-copy work (~20% of samples on
+  both sides — equal work, ours costs more per op), small `0→N`
+  closures LLVM fully inlines.
