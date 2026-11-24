@@ -2446,7 +2446,7 @@ compares on it need no `uxtb`/`uxth`. pulldown-cmark's byte dispatch in
 `match`) lost its per-byte `uxtb`; 30 `umov.b; uxtb` pairs in pulldown.
 Test `pliron-clif-opt/tests/aarch64_extclean.rs` (every byte value, run).
 
-## `PLIRON_CLOSELATCH=1` (aarch64, opt-in, 2026-11-24)
+## `PLIRON_CLOSELATCH` (aarch64, default on since 2026-11-24, `=0` off)
 
 `src/machinst/placement.rs` (chain walk's successor key): a successor
 that jumps to the chain's head is the loop's latch — on an edge-weight

@@ -52,6 +52,13 @@ pub const DEFAULT_ON: &[&str] = &[
     // within +-0.3% on a quiet machine (docs/history/2026-11-23-night.md).
     // Test aarch64_extclean. `PLIRON_EXTCLEAN=0` off.
     "PLIRON_EXTCLEAN",
+    // 2026-11-24: on an edge-weight tie the chain walk prefers a
+    // successor that jumps to the chain's head (the loop's latch) over
+    // an if-arm — pulldown-cmark's byte loop goes from two taken
+    // branches per byte to LLVM's one. Vendored aarch64 placement.
+    // Held-out instructions within +-0.3%, ms/cycles lean down; std
+    // corpus 11 fns, net -136 weighted insts. `PLIRON_CLOSELATCH=0` off.
+    "PLIRON_CLOSELATCH",
     // 2026-11-23: loadfwd keeps `a[i]` across a store to `a[i + 1]`
     // (addresses as `base + scale * idx + k`, disjoint constant offsets).
     // brotli's literal-cost prefix sums: rust-compression -0.5..-0.7%

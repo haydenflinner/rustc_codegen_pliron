@@ -773,6 +773,10 @@ time, memory, code size, stack frames) in ~20 min and writes
   `scalar_iterate_special_bytes`). Statically: compression -146, regex
   -62, html -57 extends; executed instructions within +-0.3%. Test
   `aarch64_extclean` (every byte value, run).
+- `PLIRON_CLOSELATCH` (vendored placement, default on since 2026-11-24,
+  `=0` off) — on an edge-weight tie the chain walk prefers a successor
+  that jumps to the chain's head (the loop's latch) over an if-arm:
+  pulldown's byte loop pays one taken branch per byte, not two.
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to
