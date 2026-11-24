@@ -2434,3 +2434,14 @@ as LLVM's. Extended-register compares: pulldown-cmark 117 -> 0, regex 74
 `pliron-clif-opt/tests/aarch64_cmn_narrow.rs` runs every `i8` value (and
 an `i16` sweep) against eleven constants and four conditions, from memory
 and from a register with junk above the narrow value.
+
+## `PLIRON_EXTCLEAN=1` (aarch64, opt-in, 2026-11-23)
+
+`src/isa/aarch64/lower/isle.rs` (`wide_uext_clean`: `uload8`/`uload16`/
+`uload32`), `src/isa/aarch64/inst.isle` (`val_already_extended`: narrow
+integer `extractlane`): `ldrb`/`ldrh`/`ldr w` and `umov` zero the
+register above the narrow width, so `ireduce` of such a value and narrow
+compares on it need no `uxtb`/`uxth`. pulldown-cmark's byte dispatch in
+`scalar_iterate_special_bytes` (`ireduce.i8 (uload8.i64 p)` feeding the
+`match`) lost its per-byte `uxtb`; 30 `umov.b; uxtb` pairs in pulldown.
+Test `pliron-clif-opt/tests/aarch64_extclean.rs` (every byte value, run).

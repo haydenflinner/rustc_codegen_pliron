@@ -470,8 +470,25 @@ pub(crate) fn wide_uext_clean(
             let [_, a, b] = *args;
             wide_uext_clean(dfg, a, bits, budget) && wide_uext_clean(dfg, b, bits, budget)
         }
+        // PLIRON (`PLIRON_EXTCLEAN=1`, opt-in): `ldrb`/`ldrh`/`ldr w`
+        // zero the register above the loaded width. pulldown-cmark's
+        // byte dispatch (`ireduce.i8 (uload8.i64 p)`) took a `uxtb` per
+        // special byte in `scalar_iterate_special_bytes`.
+        InstructionData::Load { opcode, .. } if wideclean_load() => match opcode {
+            Opcode::Uload8 => bits >= 8,
+            Opcode::Uload16 => bits >= 16,
+            Opcode::Uload32 => bits >= 32,
+            _ => false,
+        },
         _ => false,
     }
+}
+
+/// PLIRON (`PLIRON_EXTCLEAN=1`, opt-in): zero-extending loads and narrow
+/// lane extracts (`umov`) count as zero-extended producers.
+pub(crate) fn wideclean_load() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_EXTCLEAN").as_deref() == Ok("1"))
 }
 
 fn iconst_bits(dfg: &crate::ir::DataFlowGraph, v: Value) -> Option<u64> {
@@ -1747,6 +1764,11 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             return false;
         };
         narrowext_part(64) && wide_uext_clean(self.lower_ctx.dfg(), val, bits, &mut budget)
+    }
+
+    /// PLIRON (`PLIRON_EXTCLEAN=1`): see `wideclean_load`.
+    fn extclean_on(&mut self) -> bool {
+        wideclean_load()
     }
 
     /// PLIRON (`PLIRON_CMN`, default on): `cmp x, -c` -> `cmn x, c`.
