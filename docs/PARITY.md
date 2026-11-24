@@ -1111,7 +1111,19 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    like `impls::call_mut` survive to the post-constload devirt window):
    html (`ab.py`, 15 rounds) 1.063x instr / 1.009x cycles, all `bl`
    call_mut/shim sites inlined; protobuf +0.1% instr (still ~4% faster
-   cycles than LLVM), blind-sig unchanged. Earlier figures below.)
+   cycles than LLVM), blind-sig unchanged. `c6f97c84` adds aarch64
+   `LoadAddr` rematerialization (spilled `stack_addr` reloads re-emit
+   `add rd, sp, #off`) and `PLIRON_MEMFAST_MED=1` (opt-in (32,64] copy
+   arm; flat on the corpus — kept for band-heavy workloads): html
+   109.08M instr. asmvs after the shim fix: residual is `ptr:570`'s
+   copy-cascade footprint vs `bl memcpy` (+47), `vec:2955`/`raw_vec`
+   field loads spread over ~150 inlined copies (+67), `slot-*` surviving
+   allocas (+114), and `spill-*` (+37). The per-site shapes match LLVM
+   (`str` vs `ldr+add+str` at vec:2955; same reload after the outlined
+   `reserve_one_unchecked`); the delta is copy count and register
+   coverage, not a missing pass — `ncc` call-kill, `edge_pre` load-PRE,
+   `PLIRON_SHRINKWRAP` and the remat stack are all on. Earlier figures
+   below.)
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
