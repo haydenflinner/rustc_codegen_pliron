@@ -8610,6 +8610,42 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.ins().store(f, v1, de, 0);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(slow);
+        // `PLIRON_MEMFAST_MED=1` (opt-in): `(2k, 4k]` is four overlapping
+        // k-byte moves instead of the libc call. Flat on the held-out
+        // corpus (copies there are <= 2k or large) — kept for workloads
+        // whose copies cluster in the band.
+        if crate::env_is("PLIRON_MEMFAST_MED", "1") {
+            let (mid, call) = (self.b.create_block(), self.b.create_block());
+            let m4 = self.b.ins().iadd_imm_s(n, -2 * k);
+            let c4 = self
+                .b
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, m4, 2 * k);
+            self.b.ins().brif(c4, mid, &[], call, &[]);
+            self.b.switch_to_block(mid);
+            // All loads before all stores: a valid memmove, same rule as
+            // the `fast` arm.
+            let f = if self.st.notrap {
+                MemFlagsData::new().with_notrap()
+            } else {
+                MemFlagsData::new()
+            };
+            let (se4, de4) = (self.b.ins().iadd(src, m4), self.b.ins().iadd(dst, m4));
+            let (v0, v1) = (
+                self.b.ins().load(t, f, src, 0),
+                self.b.ins().load(t, f, src, k as i32),
+            );
+            let (v2, v3) = (
+                self.b.ins().load(t, f, se4, 0),
+                self.b.ins().load(t, f, se4, k as i32),
+            );
+            self.b.ins().store(f, v0, dst, 0);
+            self.b.ins().store(f, v1, dst, k as i32);
+            self.b.ins().store(f, v2, de4, 0);
+            self.b.ins().store(f, v3, de4, k as i32);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(call);
+        }
         let cfg = self.tcfg;
         if memcpy {
             self.b.call_memcpy(cfg, dst, src, n);

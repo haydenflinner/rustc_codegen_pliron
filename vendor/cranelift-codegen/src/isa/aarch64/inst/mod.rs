@@ -1339,6 +1339,20 @@ impl MachInst for Inst {
             Inst::AluRRImmLogic { alu_op: ALUOp::Orr, size, rn, imml, .. } if *rn == zero_reg() => {
                 Some(Inst::AluRRImmLogic { alu_op: ALUOp::Orr, size: *size, rd: dst, rn: *rn, imml: *imml })
             }
+            // A fixed stack-slot/arg address (`add xd, sp|fp, #off` after
+            // `mem_finalize`): LLVM remats frame-index forms the same
+            // way; the reg/label modes read a register and can't remat.
+            Inst::LoadAddr { mem, .. }
+                if matches!(
+                    mem,
+                    AMode::SPOffset { .. }
+                        | AMode::FPOffset { .. }
+                        | AMode::SlotOffset { .. }
+                        | AMode::IncomingArg { .. }
+                ) =>
+            {
+                Some(Inst::LoadAddr { rd: dst, mem: mem.clone() })
+            }
             _ => None,
         }
     }
@@ -1356,6 +1370,14 @@ impl MachInst for Inst {
                 rn,
                 ..
             } if *rn == zero_reg() => true,
+            Inst::LoadAddr {
+                mem:
+                    AMode::SPOffset { .. }
+                    | AMode::FPOffset { .. }
+                    | AMode::SlotOffset { .. }
+                    | AMode::IncomingArg { .. },
+                ..
+            } => true,
             _ => false,
         }
     }
