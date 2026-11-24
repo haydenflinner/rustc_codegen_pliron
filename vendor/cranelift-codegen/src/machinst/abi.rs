@@ -1407,6 +1407,29 @@ impl<M: ABIMachineSpec> Callee<M> {
                 )
             })
         });
+        // PLIRON: `PLIRON_X30=3` (aarch64): also a leaf of at least
+        // `PLIRON_X30_MIN` (default 256) instructions counts here: such a
+        // body spills and sets up a frame record anyway (blake3's
+        // `compress_in_place`), while small leaves stay frameless (`=1`
+        // cost rust-json and pulldown-cmark there).
+        let has_calls = has_calls || {
+            static BIG: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+            BIG.get_or_init(|| {
+                (std::env::var("PLIRON_X30").as_deref() == Ok("3")).then(|| {
+                    std::env::var("PLIRON_X30_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+                })
+            })
+            .is_some_and(|min| {
+                let mut n = 0usize;
+                for b in f.layout.blocks() {
+                    n += f.layout.block_insts(b).count();
+                    if n >= min {
+                        return true;
+                    }
+                }
+                false
+            })
+        };
 
         {
             static FN_DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

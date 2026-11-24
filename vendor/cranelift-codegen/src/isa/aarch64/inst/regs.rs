@@ -156,6 +156,9 @@ pub fn x30_mode() -> u8 {
     *MODE.get_or_init(|| match std::env::var("PLIRON_X30").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
+        // Mode 2 plus large leaves (`machinst/abi.rs` folds them into
+        // `has_calls`).
+        Ok("3") => 2,
         _ => 0,
     })
 }

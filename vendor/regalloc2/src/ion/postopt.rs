@@ -138,6 +138,8 @@ pub fn run<F: Function>(func: &F, ctx: &mut Ctx) {
     if bits == 0 || ctx.output.edits.is_empty() || func.multi_spillslot_named_by_last_slot() {
         return;
     }
+    // Fixed stack slots posing as registers (`MachineEnv::fixed_stack_slots`).
+    let stack_preg: alloc::vec::Vec<bool> = ctx.pregs.iter().map(|p| p.is_stack).collect();
     let out = &mut ctx.output;
     let nb = func.num_blocks();
     let np = PReg::NUM_INDEX;
@@ -313,6 +315,14 @@ pub fn run<F: Function>(func: &F, ctx: &mut Ctx) {
 
     if bits & 8 != 0 && out.num_spillslots > 0 {
         dead_stores(func, out, &first, &mut stats);
+    }
+
+    if crate::reloadcopy_on() {
+        let n = reload_into_copy(func, out, &stack_preg);
+        if crate::postopt_stats() && n > 0 {
+            #[cfg(feature = "std")]
+            std::eprintln!("ra2post: reloadcopy {n}");
+        }
     }
 
     if crate::postopt_stats() {
@@ -525,4 +535,166 @@ fn region_census<F: Function>(func: &F, out: &crate::Output, first: &[usize]) {
             }
         }
     }
+}
+
+/// `PLIRON_RA2_RELOADCOPY=1`: an edit that fills `r` just before a register
+/// copy `mov d, r`, where nothing reads `r` afterwards, fills `d` instead,
+/// and the copy reads `d`: `mov d, d`, which emission drops. A spilled
+/// call argument was reloaded into a scratch register and copied into the
+/// argument register (`ldr x11, [sp, #k]; mov x1, x11`, 776 sites in
+/// rust-compression against LLVM's 142).
+///
+/// Conditions: neither of the copy's operands is pinned to a register (a
+/// fixed one may be a stack slot posing as a register); the edit is the last one at the copy's `Before` point that writes
+/// `r`, and no later edit at that point reads or writes `r` or `d`; `r` is
+/// written (a def, a clobber or an edit) before anything reads it, later in
+/// the same block. The copy's definition of `d` and every other location
+/// are unchanged, so the checker's view of each value stays the same.
+fn reload_into_copy<F: Function>(func: &F, out: &mut crate::Output, stack_preg: &[bool]) -> usize {
+    let nb = func.num_blocks();
+    // Per-block edit starts (the earlier bits deleted edits).
+    let mut first = vec![0usize; nb + 1];
+    {
+        let mut e = 0;
+        for b in 0..nb {
+            first[b] = e;
+            let end = func.block_insns(Block::new(b)).last().index() + 1;
+            while e < out.edits.len() && out.edits[e].0.inst().index() < end {
+                e += 1;
+            }
+        }
+        first[nb] = e;
+    }
+    let mut n = 0;
+    for b in 0..nb {
+        let insts = func.block_insns(Block::new(b));
+        let (lo, hi) = (first[b], first[b + 1]);
+        let mut e0 = lo;
+        for inst in insts.iter() {
+            // Edits at `Before(inst)`: `e0..e1`.
+            while e0 < hi && out.edits[e0].0 < ProgPoint::new(inst, InstPosition::Before) {
+                e0 += 1;
+            }
+            let mut e1 = e0;
+            while e1 < hi && out.edits[e1].0 == ProgPoint::new(inst, InstPosition::Before) {
+                e1 += 1;
+            }
+            if e1 == e0 || func.pliron_move(inst).is_none() {
+                continue;
+            }
+            let ops = func.inst_operands(inst);
+            let base = out.inst_alloc_offsets[inst.index()] as usize;
+            let (mut ui, mut di) = (None, None);
+            for (i, op) in ops.iter().enumerate() {
+                match op.kind() {
+                    OperandKind::Use => ui = Some(i),
+                    OperandKind::Def => di = Some(i),
+                }
+            }
+            let (Some(ui), Some(di)) = (ui, di) else { continue };
+            // Neither side pinned: a fixed destination may be a stack slot
+            // posing as a register (`fixed_stack_slots`), and a fixed
+            // source must stay where it is.
+            let free = |c: crate::OperandConstraint| matches!(c, crate::OperandConstraint::Reg | crate::OperandConstraint::Any);
+            if ops.len() != 2 || !free(ops[ui].constraint()) || !free(ops[di].constraint()) {
+                continue;
+            }
+            let (Some(r), Some(d)) = (out.allocs[base + ui].as_reg(), out.allocs[base + di].as_reg()) else {
+                continue;
+            };
+            let is_stack = |p: PReg| stack_preg.get(p.index()).copied().unwrap_or(true);
+            if r == d || r.class() != d.class() || is_stack(r) || is_stack(d) {
+                continue;
+            }
+            // The last edit at this point writing `r`; nothing after it
+            // here may touch `r` or `d`.
+            let Some(e) = (e0..e1).rev().find(|&e| {
+                let Edit::Move { to, .. } = out.edits[e].1;
+                to.as_reg() == Some(r)
+            }) else {
+                continue;
+            };
+            let touches = |a: Allocation| a.as_reg() == Some(r) || a.as_reg() == Some(d);
+            if (e + 1..e1).any(|k| {
+                let Edit::Move { from, to } = out.edits[k].1;
+                touches(from) || touches(to)
+            }) {
+                continue;
+            }
+            let Edit::Move { from, .. } = out.edits[e].1;
+            if from.as_reg() == Some(d) {
+                continue;
+            }
+            if !reg_dead_after(func, out, inst, insts.last(), e1, hi, r) {
+                continue;
+            }
+            out.edits[e].1 = Edit::Move { from, to: Allocation::reg(d) };
+            out.allocs[base + ui] = Allocation::reg(d);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `r` is written before it is read after `inst`, within `inst`'s block
+/// (ending at `block_end`; `e` is the first edit after `inst`'s `Before`
+/// point, `hi` the block's edit end). Leaving the block undecided counts
+/// as read.
+fn reg_dead_after<F: Function>(
+    func: &F,
+    out: &crate::Output,
+    inst: crate::Inst,
+    block_end: crate::Inst,
+    mut e: usize,
+    hi: usize,
+    r: PReg,
+) -> bool {
+    // Edit effects at one point: a read of `r` decides "live", a write
+    // "dead"; edits run in order.
+    let edits_at = |e: &mut usize, pt: ProgPoint| -> Option<bool> {
+        while *e < hi && out.edits[*e].0 == pt {
+            let Edit::Move { from, to } = out.edits[*e].1;
+            *e += 1;
+            if from.as_reg() == Some(r) {
+                return Some(false);
+            }
+            if to.as_reg() == Some(r) {
+                return Some(true);
+            }
+        }
+        None
+    };
+    // The copy's own `After` edits first.
+    if let Some(d) = edits_at(&mut e, ProgPoint::new(inst, InstPosition::After)) {
+        return d;
+    }
+    let mut i = inst.index() + 1;
+    while i <= block_end.index() {
+        let ii = crate::Inst::new(i);
+        // Skip edits strictly before this point (none should remain).
+        while e < hi && out.edits[e].0 < ProgPoint::new(ii, InstPosition::Before) {
+            e += 1;
+        }
+        if let Some(d) = edits_at(&mut e, ProgPoint::new(ii, InstPosition::Before)) {
+            return d;
+        }
+        let ops = func.inst_operands(ii);
+        let base = out.inst_alloc_offsets[ii.index()] as usize;
+        if ops.iter().enumerate().any(|(k, op)| op.kind() == OperandKind::Use && out.allocs[base + k].as_reg() == Some(r)) {
+            return false;
+        }
+        if ops.iter().enumerate().any(|(k, op)| op.kind() == OperandKind::Def && out.allocs[base + k].as_reg() == Some(r))
+            || func.inst_clobbers(ii).contains(r)
+        {
+            return true;
+        }
+        if func.is_ret(ii) {
+            return false;
+        }
+        if let Some(d) = edits_at(&mut e, ProgPoint::new(ii, InstPosition::After)) {
+            return d;
+        }
+        i += 1;
+    }
+    false
 }

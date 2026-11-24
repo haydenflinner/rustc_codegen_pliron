@@ -623,3 +623,18 @@ minimal bundles, and whether the hot latch reloaded the bound depended on
 which register a temporary took. At 4 the loop keeps the bound and the
 automaton pointer in registers (loop-weighted stack accesses 181 -> 133).
 rafuzz: 400k seeds at 4 and 8, no failure.
+
+## `PLIRON_RA2_RELOADCOPY=1` (opt-in, 2026-11-23)
+
+`src/ion/postopt.rs` (`reload_into_copy`), `src/lib.rs`
+(`reloadcopy_on`): after the other post-allocation cleanups, an edit that
+fills `r` just before a register copy `mov d, r` (`Function::pliron_move`)
+fills `d` instead, and the copy reads `d`, when nothing reads `r` before it
+is written again in the block, no later edit at that point touches `r` or
+`d`, neither copy operand is pinned and neither register is a fixed stack
+slot (`PRegData::is_stack`; the first version broke two rafuzz seeds,
+82467 and 93016, on such a slot). Cranelift drops the resulting `mov d, d`.
+A spilled call argument was reloaded into a scratch register and copied
+into the argument register (`ldr x11, [sp, #k]; mov x1, x11`):
+rust-compression 776 such pairs -> 156 (LLVM 142); std corpus -801
+instructions, -2.2% frequency-weighted copies; checker clean.

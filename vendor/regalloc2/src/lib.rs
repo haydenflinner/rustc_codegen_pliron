@@ -494,6 +494,18 @@ pub(crate) fn nopinmerge_on() -> bool {
     true
 }
 
+/// PLIRON (`PLIRON_RA2_RELOADCOPY=1`, opt-in): `ion/postopt.rs`'s
+/// reload-into-copy rewrite (`reload_into_copy`).
+pub(crate) fn reloadcopy_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_RELOADCOPY").is_ok_and(|v| v == "1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
 /// PLIRON (`PLIRON_RA2_POSTOPT=<bits>`, default 15 since 2026-11-17,
 /// `=0` off): post-allocation spill-traffic cleanup, see
 /// `ion/postopt.rs`. 1 = redundant reloads, 2 = reloads served from
