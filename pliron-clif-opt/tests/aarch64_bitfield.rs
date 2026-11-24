@@ -291,3 +291,55 @@ fn zero_compare_stays_nonzero_path() {
         "`cmp x, 0` must not become `cmn x, #0`:\n{a}"
     );
 }
+
+/// `(v0 << 100) & 0xff` on i64 — a shift constant past the type width.
+/// `bf_ubfiz_immr` must decline without computing `rs - k` (fuzz seed
+/// 20430 ICE'd on `then_some`'s eager evaluation).
+const BIGSHIFT: &str = "function %f(i64) -> i64 {
+block0(v0: i64):
+    v10 = iconst.i64 100
+    v1 = ishl v0, v10
+    v11 = iconst.i64 0xff
+    v2 = band v1, v11
+    return v2
+}";
+
+/// `(v0 << 200) & ((1<<40)-1)` — same for the `(x&m)<<k` rule order.
+const BIGSHIFT_L: &str = "function %f(i64) -> i64 {
+block0(v0: i64):
+    v10 = iconst.i64 0xffffffffff
+    v1 = band v0, v10
+    v11 = iconst.i64 200
+    v2 = ishl v1, v11
+    return v2
+}";
+
+fn asm_level(clif: &str, level: &str) -> String {
+    let mut b = settings::builder();
+    b.set("opt_level", level).unwrap();
+    b.set("is_pic", "true").unwrap();
+    let isa = cranelift_codegen::isa::lookup_by_name("aarch64-apple-darwin")
+        .unwrap()
+        .finish(settings::Flags::new(b))
+        .unwrap();
+    let f: Function = cranelift_reader::parse_functions(clif).unwrap().remove(0);
+    let mut ctx = Context::for_function(f);
+    ctx.set_disasm(true);
+    ctx.compile(&*isa, &mut ControlPlane::default()).unwrap();
+    ctx.compiled_code().unwrap().vcode.clone().unwrap()
+}
+
+#[test]
+fn oversized_shift_const_lowers() {
+    // preopt masks shift constants; at `opt_level=none` the raw `iconst`
+    // (e.g. `ishl x, 200` emitted by an earlier pass) reaches the ISLE
+    // rules unmasked — that is the path the fuzz seed took.
+    for clif in [BIGSHIFT, BIGSHIFT_L] {
+        let a = asm_level(clif, "none");
+        assert!(
+            !a.lines().any(|l| l.trim_start().starts_with("ubfiz ")
+                || l.trim_start().starts_with("ubfm ")),
+            "shift past width must not fuse to `ubfiz`:\n{a}"
+        );
+    }
+}

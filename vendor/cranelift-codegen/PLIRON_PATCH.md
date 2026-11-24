@@ -1454,6 +1454,13 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     wider flipped the UBFM to `ubfx x, #64-k, ...` outright. Usually
     hidden because `ushr (band x, m), k` absorbs such a `band` first;
     `dem64`'s `ireduce.i32` passthrough exposed it.
+    Fix (fuzz seed 20430): `bf_ubfiz_immr` computed `rs - k` inside
+    `then_some` — eager, so an `ishl` constant past the type width
+    (`x << 100` reaching ISLE unmasked at `opt_level=none`, where
+    preopt's masking fold doesn't run) panicked on underflow. Lazy
+    `then` now; `bf_ubfiz_imms`/`bf_ubfx_imms` `k + w` uses
+    `checked_add` — a wrapped sum would otherwise pass `<= bits` and
+    emit a wrong immediate in release.
 
 107. aarch64 `cmn` for negative compare immediates (`PLIRON_CMN`,
     default on, `=0` off): `emit_icmp` on a 32/64-bit `icmp x, -c`

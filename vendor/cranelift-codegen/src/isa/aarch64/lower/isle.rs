@@ -1907,7 +1907,8 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     fn bf_ubfx_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
         let bits = ty.bits();
         let w = bf_low_w(bits, m)?;
-        (k + w as u64 <= bits as u64).then_some((k + w as u64 - 1) as u8)
+        let s = k.checked_add(w as u64)?;
+        (s <= bits as u64).then_some((s - 1) as u8)
     }
 
     /// `(x<<k)&m` → `ubfiz`: `m = ((1<<w)-1)<<k`; imms = k+w-1.
@@ -1925,13 +1926,16 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     fn bf_ubfiz_immr(&mut self, ty: Type, k: u64) -> Option<u8> {
         let bits = ty.bits();
         let rs: u64 = if bits <= 32 { 32 } else { 64 };
-        (k >= 1 && k < bits as u64).then_some((rs - k) as u8)
+        // `then`, not `then_some`: a constant shift past the type width
+        // (`x << 100`) must not compute `rs - k` at all (fuzz seed 20430).
+        (k >= 1 && k < bits as u64).then(|| (rs - k) as u8)
     }
 
     /// `(x&m)<<k` → `ubfiz`: imms = w-1.
     fn bf_ubfiz_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
         let w = bf_low_w(ty.bits(), m)?;
-        (k + w as u64 <= ty.bits() as u64).then_some((w - 1) as u8)
+        let s = k.checked_add(w as u64)?;
+        (s <= ty.bits() as u64).then_some((w - 1) as u8)
     }
 
     /// `(x<<k)&m` as `ubfiz` mask form: imms = w-1.
