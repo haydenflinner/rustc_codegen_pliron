@@ -1093,6 +1093,8 @@ pub(crate) fn iropt_head(
     facts: FactsMode,
 ) {
     pliron_ir_opt::opt_skip_init(ctx, st);
+    // `PLIRON_TRACE=pliron::facts`: rustc's facts as the front end kept them.
+    pliron_ir_opt::facts::report(ctx, st);
     // Copies nothing calls yet are emit-only fodder — mark them before
     // the IPO scans so `bodied`/`opt_body` leave them alone entirely.
     if st.earlydead {

@@ -470,6 +470,10 @@ impl CtxSlot<'_> {
 /// `PLIRON_RETNN=1`: rustc's `nonnull` return attributes become facts on
 /// call results (opt-in until measured; see `FuncInfo::ret_nonnull`).
 static RETNN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_RETNN", "1"));
+/// rustc's facts (`pliron_ir_opt::facts`), each consumer opt-in.
+static DISJOINT_ADD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_DISJOINT_ADD", "1"));
+static EXACT_DIV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_EXACT_DIV", "1"));
+static COLD_SWITCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_COLD_SWITCH", "1"));
 
 fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
@@ -5919,6 +5923,51 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// Integer `div`/`rem` elementwise, with an i128 fast path: constant
     /// unsigned divisors become limb magic-multiply sequences instead of
     /// `__udivti3`/`__umodti3` libcalls (~15 insts vs ~100+ cycles).
+    /// `PLIRON_EXACT_DIV=1`: rustc's `exact` division (no remainder:
+    /// `ptr.offset_from`, a slice iterator's `len()`) by a constant
+    /// `d = 2^k * m`, `m` odd, is a shift by `k` (arithmetic for `sdiv`)
+    /// and, for `m > 1`, a multiply by `m`'s inverse mod 2^w: with no
+    /// remainder both steps are exact. Scalars up to 64 bits, `d > 0`.
+    fn exact_div(&mut self, op: Ptr<Operation>, opnds: &[Value], unsigned: bool) -> bool {
+        let ctx = self.ctx;
+        if !*EXACT_DIV || !pliron_ir_opt::facts::flag(ctx, op, "pliron_exact") {
+            return false;
+        }
+        let Some(d) = self.const_int(opnds[1]) else { return false };
+        let a = self.get(opnds[0]);
+        if a.len() != 1 {
+            return false;
+        }
+        let x = a[0];
+        let ty = self.b.func.dfg.value_type(x);
+        if !ty.is_int() || ty.bits() > 64 {
+            return false;
+        }
+        let w = ty.bits();
+        let mask: u64 = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let d = (d as u64) & mask;
+        // signed: a positive divisor only (the sign bit of `d` clear)
+        if d == 0 || (!unsigned && d >> (w - 1) & 1 == 1) {
+            return false;
+        }
+        let k = d.trailing_zeros() as i64;
+        let m = d >> k;
+        let mut v = x;
+        if k > 0 {
+            v = if unsigned { self.b.ins().ushr_imm(v, k) } else { self.b.ins().sshr_imm(v, k) };
+        }
+        if m > 1 {
+            // Newton's iteration for the inverse of an odd `m` mod 2^64
+            let mut inv = m;
+            for _ in 0..6 {
+                inv = inv.wrapping_mul(2u64.wrapping_sub(m.wrapping_mul(inv)));
+            }
+            v = self.b.ins().imul_imm(v, (inv & mask) as i64);
+        }
+        self.set1(op, v);
+        true
+    }
+
     fn int_divrem(
         &mut self,
         op: Ptr<Operation>,
@@ -6515,6 +6564,19 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 .iter()
                 .map(|c| (c.value.value().to_u128(), self.blocks[&c.dest]))
                 .collect();
+            // `PLIRON_COLD_SWITCH=1`: rustc's cold arms (`switch_with_weights`)
+            // as cold blocks, when the switch is their only way in.
+            if *COLD_SWITCH && let Some((idx, cold_default)) = pliron_ir_opt::facts::cold_cases(ctx, op) {
+                let mut cold: Vec<Ptr<pliron::basic_block::BasicBlock>> = idx.iter().filter_map(|&i| cases.get(i).map(|c| c.dest)).collect();
+                if cold_default {
+                    cold.push(sw.default_dest(ctx));
+                }
+                for pb in cold {
+                    if pb.preds(ctx).len() == 1 {
+                        self.b.set_cold_block(self.blocks[&pb]);
+                    }
+                }
+            }
             let dead_default = sw
                 .default_dest(ctx)
                 .deref(ctx)
@@ -6751,7 +6813,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
         } else if is!(AndOp) {
             binop!(band)
         } else if is!(OrOp) {
-            binop!(bor)
+            // `PLIRON_DISJOINT_ADD=1`: rustc's `or disjoint` (no bit set in
+            // both) is an add, which Cranelift folds into address modes.
+            if *DISJOINT_ADD && pliron_ir_opt::facts::flag(ctx, op, "pliron_disjoint") {
+                binop!(iadd)
+            } else {
+                binop!(bor)
+            }
         } else if is!(XorOp) {
             binop!(bxor)
         } else if is!(ShlOp) {
@@ -6767,9 +6835,13 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 binop!(sshr)
             }
         } else if is!(UDivOp) {
-            self.int_divrem(op, opnds, "__udivti3", true, false)
+            if !self.exact_div(op, opnds, true) {
+                self.int_divrem(op, opnds, "__udivti3", true, false)
+            }
         } else if is!(SDivOp) {
-            self.int_divrem(op, opnds, "__divti3", false, false)
+            if !self.exact_div(op, opnds, false) {
+                self.int_divrem(op, opnds, "__divti3", false, false)
+            }
         } else if is!(URemOp) {
             self.int_divrem(op, opnds, "__umodti3", true, true)
         } else if is!(SRemOp) {

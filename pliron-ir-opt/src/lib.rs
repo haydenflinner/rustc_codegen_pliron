@@ -27,6 +27,7 @@ pub mod irstat;
 pub mod lutcorr;
 pub mod memcpyopt;
 pub mod nnret;
+pub mod facts;
 pub mod nocapture;
 pub mod nounwind;
 pub mod nowrite;

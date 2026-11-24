@@ -11,7 +11,7 @@
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 halfclob regionsplit bigtmp fragcopyout
-#   partinline solecopy srcfwd
+#   partinline solecopy srcfwd rustfacts
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -1000,6 +1000,28 @@ t_partinline() {
   done
 }
 
+t_rustfacts() {
+  # rustc's facts the builder used to drop (`unchecked_*` nsw/nuw, `trunc`
+  # flags, `or disjoint`, `exact` division, load `range`s, alignment, cold
+  # switch arms) and their opt-in lowering consumers. `exact` division by a
+  # constant is a shift plus a multiply by the odd part's inverse mod 2^w:
+  # output pinned by stock rustc with the consumers off and on; on aarch64
+  # `d24` must divide without a multiply-high (`smulh`).
+  rustc --edition 2021 -O tests/rustfacts/main.rs -o $out/rustfacts-stock$exe || return 1
+  local v i=0
+  for v in "PLIRON_EXACT_DIV=0" "PLIRON_EXACT_DIV=1 PLIRON_DISJOINT_ADD=1 PLIRON_COLD_SWITCH=1"; do
+    i=$((i + 1))
+    env $v rustc $BE --edition 2021 -O tests/rustfacts/main.rs -o $out/rustfacts$i$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/rustfacts-stock$exe a b) <($out/rustfacts$i$exe a b) || { echo "rustfacts: output differs ($v)" >&2; return 1; }
+  done
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
+  local dis
+  dis=$("$llvmod" -d --no-show-raw-insn $out/rustfacts2$exe)
+  awk '$0 ~ "^[0-9a-f]+ <_*[^ ]*3d24>:$" {p=1; next} /^$/ {p=0} p' <<< "$dis" | grep -q smulh && { echo "rustfacts: d24 still divides with smulh" >&2; return 1; }
+  return 0
+}
+
 t_srcfwd() {
   # PLIRON_MEMCPYOPT_SRCFWD: a temporary that only a copy of an unaliased
   # by-value parameter writes reads the parameter. The parameter written
@@ -1718,6 +1740,7 @@ want halfclob && t_halfclob
 want partinline && t_partinline
 want solecopy && t_solecopy
 want srcfwd && t_srcfwd
+want rustfacts && t_rustfacts
 want regionsplit && t_regionsplit
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi

@@ -191,11 +191,57 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         a: Value,
         b: Value,
     ) -> Value {
-        let flags = pliron_llvm::attributes::IntegerOverflowFlagsAttr {
-            nsw: false,
-            nuw: false,
-        };
+        self.binf_nw::<T>(a, b, false, false)
+    }
+
+    /// `binf` with rustc's no-wrap promise (`unchecked_*`): the op's
+    /// `nsw`/`nuw` overflow flags.
+    fn binf_nw<T: pliron_llvm::op_interfaces::IntBinArithOpWithOverflowFlag>(
+        &mut self,
+        a: Value,
+        b: Value,
+        nsw: bool,
+        nuw: bool,
+    ) -> Value {
+        let flags = pliron_llvm::attributes::IntegerOverflowFlagsAttr { nsw, nuw };
         self.mk(|c| T::new_with_overflow_flag(c, a, b, flags))
+    }
+
+    /// Records a fact rustc gave on the op defining `v` as a `pliron.*`
+    /// attribute (op attributes travel with the op when a pass clones it).
+    /// Facts the LLVM dialect has no field for: `trunc nuw/nsw`, `or
+    /// disjoint`, `exact` division, load `range`s, cold switch cases, loop
+    /// hints (`pliron_ir_opt::facts` reads them).
+    fn note_op<A: pliron::attribute::Attribute>(&mut self, op: Ptr<Operation>, key: &str, attr: A) {
+        let c = self.cx.pctx.borrow();
+        let k = pliron::identifier::Identifier::try_new(key.to_string()).unwrap();
+        op.deref_mut(&c).attributes.set(&c, k, attr);
+    }
+
+    fn note(&mut self, v: Value, key: &str) {
+        if let Some(op) = v.defining_op() {
+            self.note_op(op, key, pliron::builtin::attributes::BoolAttr::new(true));
+        }
+    }
+
+    /// rustc's alignment for a load or store (the op's `llvm_alignment`).
+    fn set_align(&mut self, op: Option<Ptr<Operation>>, align: Align) {
+        use pliron_llvm::op_interfaces::AlignableOpInterface;
+        let Some(op) = op else { return };
+        let c = self.cx.pctx.borrow();
+        let n = align.bytes() as u32;
+        if let Some(l) = Operation::get_op::<LoadOp>(op, &c) {
+            l.set_alignment(&c, n);
+        } else if let Some(st) = Operation::get_op::<StoreOp>(op, &c) {
+            st.set_alignment(&c, n);
+        }
+    }
+
+    /// The last op of the current block (a terminator just emitted).
+    fn last_op(&self) -> Option<Ptr<Operation>> {
+        use pliron::linked_list::ContainsLinkedList;
+        let c = self.cx.pctx.borrow();
+        self.block.deref(&c).get_tail()
     }
 
     fn cast<T: CastOpInterface>(&mut self, v: Value, ty: TypeHandle) -> Value {
@@ -451,6 +497,43 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     // r[impl front.ir.switch]
+    /// `switch` with rustc's cold arms (`#[cold]` callees, `unlikely`):
+    /// recorded on the emitted `SwitchOp` as `pliron_cold_cases`, the cold
+    /// case indices plus `else` when the default is cold. A compare chain
+    /// (`PLIRON_SWITCH=0`) carries none.
+    fn switch_with_weights(
+        &mut self,
+        v: Value,
+        else_llbb: Ptr<BasicBlock>,
+        else_is_cold: bool,
+        cases: impl ExactSizeIterator<Item = (u128, Ptr<BasicBlock>, bool)>,
+    ) {
+        let cases: Vec<_> = cases.collect();
+        let mut cold: Vec<String> = cases.iter().enumerate().filter(|(_, c)| c.2).map(|(i, _)| i.to_string()).collect();
+        if else_is_cold {
+            cold.push("else".into());
+        }
+        let at = self.block;
+        self.switch(v, else_llbb, cases.into_iter().map(|(val, bb, _)| (val, bb)));
+        if !cold.is_empty() && self.block == at
+            && let Some(op) = self.last_op()
+            && Operation::is_op::<SwitchOp>(op, &self.cx.pctx.borrow())
+        {
+            self.note_op(op, "pliron_cold_cases", StringAttr::new(cold.join(",")));
+        }
+    }
+
+    /// `br` with loop hints (`UnrollAttr`), kept on the branch as
+    /// `pliron_loop_hints`.
+    fn br_with_attrs(&mut self, dest: Ptr<BasicBlock>, loop_hint_attrs: &[rustc_attr_ir::UnrollAttr]) {
+        self.br(dest);
+        if !loop_hint_attrs.is_empty()
+            && let Some(op) = self.last_op()
+        {
+            self.note_op(op, "pliron_loop_hints", StringAttr::new(format!("{loop_hint_attrs:?}")));
+        }
+    }
+
     fn switch(
         &mut self,
         v: Value,
@@ -582,6 +665,52 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn mul(&mut self, a: Value, b: Value) -> Value {
         self.binf::<MulOp>(a, b)
     }
+    // rustc's no-wrap promises: `nuw` (unsigned), `nsw` (signed), both (`su`).
+    fn unchecked_uadd(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<AddOp>(a, b, false, true)
+    }
+    fn unchecked_sadd(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<AddOp>(a, b, true, false)
+    }
+    fn unchecked_suadd(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<AddOp>(a, b, true, true)
+    }
+    fn unchecked_usub(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<SubOp>(a, b, false, true)
+    }
+    fn unchecked_ssub(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<SubOp>(a, b, true, false)
+    }
+    fn unchecked_susub(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<SubOp>(a, b, true, true)
+    }
+    fn unchecked_umul(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<MulOp>(a, b, false, true)
+    }
+    fn unchecked_smul(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<MulOp>(a, b, true, false)
+    }
+    fn unchecked_sumul(&mut self, a: Value, b: Value) -> Value {
+        self.binf_nw::<MulOp>(a, b, true, true)
+    }
+    /// `or disjoint`: no bit is set in both operands, so it is an add.
+    fn or_disjoint(&mut self, a: Value, b: Value) -> Value {
+        let v = self.or(a, b);
+        self.note(v, "pliron_disjoint");
+        v
+    }
+    /// `trunc nuw`: zero-extending the result gives back the operand.
+    fn unchecked_utrunc(&mut self, v: Value, t: TypeHandle) -> Value {
+        let r = self.trunc(v, t);
+        self.note(r, "pliron_trunc_nuw");
+        r
+    }
+    /// `trunc nsw`: sign-extending the result gives back the operand.
+    fn unchecked_strunc(&mut self, v: Value, t: TypeHandle) -> Value {
+        let r = self.trunc(v, t);
+        self.note(r, "pliron_trunc_nsw");
+        r
+    }
     fn fmul(&mut self, a: Value, b: Value) -> Value {
         self.bin::<FMulOp>(a, b)
     }
@@ -594,14 +723,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn udiv(&mut self, a: Value, b: Value) -> Value {
         self.bin::<UDivOp>(a, b)
     }
+    /// `exact`: the division leaves no remainder.
     fn exactudiv(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<UDivOp>(a, b)
+        let v = self.bin::<UDivOp>(a, b);
+        self.note(v, "pliron_exact");
+        v
     }
     fn sdiv(&mut self, a: Value, b: Value) -> Value {
         self.bin::<SDivOp>(a, b)
     }
     fn exactsdiv(&mut self, a: Value, b: Value) -> Value {
-        self.bin::<SDivOp>(a, b)
+        let v = self.bin::<SDivOp>(a, b);
+        self.note(v, "pliron_exact");
+        v
     }
     fn fdiv(&mut self, a: Value, b: Value) -> Value {
         self.bin::<FDivOp>(a, b)
@@ -738,8 +872,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.alloca(layout.size, layout.align.abi)
     }
 
-    fn load(&mut self, ty: TypeHandle, ptr: Value, _align: Align) -> Value {
-        self.mk(|c| LoadOp::new(c, ptr, ty))
+    fn load(&mut self, ty: TypeHandle, ptr: Value, align: Align) -> Value {
+        let v = self.mk(|c| LoadOp::new(c, ptr, ty));
+        self.set_align(v.defining_op(), align);
+        v
     }
     fn volatile_load(&mut self, ty: TypeHandle, ptr: Value, _align: Align) -> Value {
         let v = self.mk(|c| LoadOp::new(c, ptr, ty));
@@ -839,6 +975,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         {
             self.st.borrow_mut().bool01.insert(op);
         }
+        // Every range, as `pliron_range = "start:end"` (wrapping, inclusive:
+        // enum tags, `char`, `NonZero`, niches).
+        if let Some(op) = load.defining_op() {
+            let r = format!("{}:{}", range.start, range.end);
+            self.note_op(op, "pliron_range", StringAttr::new(r));
+        }
     }
     fn nonnull_metadata(&mut self, load: Value) {
         if let Some(op) = load.defining_op() {
@@ -846,8 +988,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
-    fn store(&mut self, val: Value, ptr: Value, _align: Align) -> Value {
-        self.mk_op(|c| StoreOp::new(c, val, ptr));
+    fn store(&mut self, val: Value, ptr: Value, align: Align) -> Value {
+        let op = self.mk_op(|c| StoreOp::new(c, val, ptr));
+        self.set_align(Some(op), align);
         val
     }
     fn store_with_flags(&mut self, val: Value, ptr: Value, align: Align, flags: MemFlags) -> Value {
