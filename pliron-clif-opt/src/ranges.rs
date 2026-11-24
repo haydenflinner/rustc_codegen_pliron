@@ -16,8 +16,10 @@
 //! Soundness: every rule is exact in the value's width; arithmetic that
 //! could wrap returns the full range. Every walk has a budget
 //! (`MAX_DEPTH`, `MAX_WORK`); exhausting it returns the full range, never
-//! a wrong one. CLIF carries no `nsw`/`nuw`, so nothing is assumed about
-//! wrapping beyond what the intervals prove.
+//! a wrong one. CLIF carries no `nsw`/`nuw`; rustc's flags and load
+//! ranges arrive as side facts ([`Ranges::with_facts`], `crate::vfacts`,
+//! recorded under `PLIRON_VFACTS=1`): a value that breaks one is
+//! undefined behavior, so its range is met with the fact.
 
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -146,6 +148,50 @@ pub struct Ranges {
     /// `at()` results per (value, block); unrolled runs re-ask the
     /// same question down the same dominator chain.
     at_memo: FxHashMap<(Value, Block), Range>,
+    /// rustc's load ranges and no-wrap flags ([`Ranges::with_facts`]).
+    facts: crate::vfacts::VFacts,
+}
+
+/// `a op b`'s interval when rustc's `nw` bits (`vfacts::NSW`/`NUW`) say
+/// the operation does not wrap: the exact interval of the mathematical
+/// result, clamped to what the type holds (a result outside it is
+/// undefined behavior).
+fn nw_range(bits: u32, op: Opcode, a: &Range, b: &Range, nw: u8) -> Vec<Range> {
+    let mut out = Vec::new();
+    let m = umask(bits) as u128;
+    if nw & crate::vfacts::NUW != 0 {
+        let (al, ah, bl, bh) = (a.ulo as u128, a.uhi as u128, b.ulo as u128, b.uhi as u128);
+        let iv = match op {
+            Opcode::Iadd => Some((al + bl, ah + bh)),
+            Opcode::Isub => Some((al.saturating_sub(bh), ah.checked_sub(bl).unwrap_or(0))).filter(|_| ah >= bl),
+            Opcode::Imul => Some((al * bl, ah * bh)),
+            _ => None,
+        };
+        if let Some((lo, hi)) = iv
+            && lo <= m
+        {
+            out.push(Range::unsigned(bits, lo as u64, hi.min(m) as u64));
+        }
+    }
+    if nw & crate::vfacts::NSW != 0 {
+        let (al, ah, bl, bh) = (a.slo as i128, a.shi as i128, b.slo as i128, b.shi as i128);
+        let iv = match op {
+            Opcode::Iadd => Some((al + bl, ah + bh)),
+            Opcode::Isub => Some((al - bh, ah - bl)),
+            Opcode::Imul => {
+                let c = [al * bl, al * bh, ah * bl, ah * bh];
+                Some((*c.iter().min().unwrap(), *c.iter().max().unwrap()))
+            }
+            _ => None,
+        };
+        if let Some((lo, hi)) = iv {
+            let (lo, hi) = (lo.max(smin(bits) as i128), hi.min(smax(bits) as i128));
+            if lo <= hi {
+                out.push(Range::signed(bits, lo as i64, hi as i64));
+            }
+        }
+    }
+    out
 }
 
 fn width(ty: Type) -> Option<u32> {
@@ -349,6 +395,7 @@ impl Ranges {
             edge_facts_multi,
             param_src,
             at_memo: FxHashMap::default(),
+            facts: Default::default(),
         }
     }
 
@@ -370,9 +417,60 @@ impl Ranges {
             return full;
         }
         self.work += 1;
-        let r = self.compute_inner(func, v, bits, depth).unwrap_or(full);
+        let mut r = self.compute_inner(func, v, bits, depth).unwrap_or(full);
+        if !self.facts.is_empty() {
+            if let Some(f) = self.fact_range(func, v, bits, depth) {
+                // Empty: the value breaks its fact here (undefined
+                // behavior or unreachable); keep the plain answer.
+                r = r.meet(&f).unwrap_or(r);
+            }
+        }
         self.visiting.remove(&v);
         r
+    }
+
+    /// Use rustc's facts on this function's values (`crate::vfacts`).
+    pub fn with_facts(mut self, facts: &crate::vfacts::VFacts) -> Ranges {
+        self.facts = facts.clone();
+        self
+    }
+
+    /// What `v`'s facts alone say: its load range, or its add/sub/mul's
+    /// interval without wrapping when rustc said it does not wrap.
+    fn fact_range(&mut self, func: &Function, v: Value, bits: u32, depth: u32) -> Option<Range> {
+        let mut out: Option<Range> = None;
+        let mut put = |r: Range| {
+            out = Some(match out {
+                Some(o) => o.meet(&r).unwrap_or(o),
+                None => r,
+            })
+        };
+        if let Some(&(fb, start, end)) = self.facts.range.get(&v)
+            && fb == bits
+        {
+            let m = umask(bits);
+            let (start, end) = (start & m, end & m);
+            if start <= end {
+                put(Range::unsigned(bits, start, end));
+            } else if sext(start, bits) <= sext(end, bits) {
+                // Wraps through zero: a signed interval around it.
+                put(Range::signed(bits, sext(start, bits), sext(end, bits)));
+            }
+        }
+        if let Some(nw) = self.facts.nw_of(func, v)
+            && let ValueDef::Result(inst, 0) = func.dfg.value_def(v)
+            && let InstructionData::Binary { opcode, args: [x, y] } = func.dfg.insts[inst]
+            && matches!(opcode, Opcode::Iadd | Opcode::Isub | Opcode::Imul)
+        {
+            let a = self.sub(func, x, depth);
+            let b = self.sub(func, y, depth);
+            if a.bits == bits && b.bits == bits {
+                for r in nw_range(bits, opcode, &a, &b, nw) {
+                    put(r);
+                }
+            }
+        }
+        out
     }
 
     fn sub(&mut self, func: &Function, v: Value, depth: u32) -> Range {

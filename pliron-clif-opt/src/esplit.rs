@@ -274,9 +274,14 @@ struct Plan {
 }
 
 pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
+    run_with(func, an, &Default::default())
+}
+
+/// [`run`] with rustc's value facts (`crate::vfacts`).
+pub fn run_with(func: &mut Function, an: &mut Analysis, facts: &crate::vfacts::VFacts) -> usize {
     let uses = an.uses(func);
     let crate::pipeline::CfgDtLa { cfg, dt, .. } = an.cfg_dt_la(func);
-    let rs = RefCell::new(Ranges::new(func, cfg));
+    let rs = RefCell::new(Ranges::new(func, cfg).with_facts(facts));
     let mut plans: Vec<(Block, Plan)> = Vec::new();
     let mut env: FxHashMap<Value, u64> = FxHashMap::default();
     let mut over: FxHashMap<Value, (u64, u64)> = FxHashMap::default();

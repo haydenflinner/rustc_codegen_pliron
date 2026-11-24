@@ -225,6 +225,8 @@ pub struct Pipe<'a> {
     pub fname: &'a str,
     pub func_id: FuncId,
     pub nonnull: &'a mut FxHashSet<Value>,
+    /// rustc's load ranges and no-wrap flags (`vfacts`).
+    pub vfacts: &'a crate::vfacts::VFacts,
     pub derived: &'a mut VMap<Value>,
     pub frozen: &'a mut FxHashMap<Value, u64>,
     pub noalias: &'a mut FxHashSet<Value>,
@@ -1318,6 +1320,7 @@ fn corpus_dump(p: &mut Pipe) {
         stub_extent: Default::default(),
         undef: None,
         lifetime_starts: None,
+        vfacts: Some(p.vfacts),
     };
     // Extra replay facts `diffcheck-facts` can't express: the per-callee
     // nocapture arg positions (a `(Inst, arg)` set on `Pipe`) re-keyed by
@@ -1711,6 +1714,7 @@ fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
         stub_extent: crate::diffcheck::stub_extents(&p.clctx.func, |i, k| p.nocap.get(&(i, k)).copied()),
         undef: None,
         lifetime_starts: None,
+        vfacts: Some(p.vfacts),
     }
 }
 
@@ -4035,7 +4039,7 @@ fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_esplit(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = crate::esplit::run(&mut p.clctx.func, an);
+    let k = crate::esplit::run_with(&mut p.clctx.func, an, p.vfacts);
     if k > 0 {
         an.invalidate(&p.clctx.func);
         if p.dump {
@@ -5039,7 +5043,7 @@ fn s_vrp2(p: &mut Pipe, an: &mut Analysis) -> usize {
     if !p.target.is_wasm() {
         return 0;
     }
-    let k = crate::vrp::run(&mut p.clctx.func, an);
+    let k = crate::vrp::run_with(&mut p.clctx.func, an, p.vfacts);
     if k > 0 {
         an.invalidate(&p.clctx.func);
         p.dump("vrp2");
@@ -5052,7 +5056,7 @@ fn s_vrp0(p: &mut Pipe, an: &mut Analysis) -> usize {
     if !p.target.is_wasm() || !unreach::has_assume_edge(&p.clctx.func) {
         return 0;
     }
-    let k = crate::vrp::run(&mut p.clctx.func, an);
+    let k = crate::vrp::run_with(&mut p.clctx.func, an, p.vfacts);
     if k > 0 {
         an.invalidate(&p.clctx.func);
         p.dump("vrp0");
@@ -5060,8 +5064,17 @@ fn s_vrp0(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_vrpf(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::vrp::run_facts_only(&mut p.clctx.func, an, p.vfacts);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("vrpf");
+    }
+    k
+}
+
 fn s_vrp(p: &mut Pipe, an: &mut Analysis) -> usize {
-    let k = crate::vrp::run(&mut p.clctx.func, an);
+    let k = crate::vrp::run_with(&mut p.clctx.func, an, p.vfacts);
     if k > 0 {
         p.dump("vrp");
     }
@@ -5182,6 +5195,12 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             .needs(shape::BLOCKS2),
         step("unreach0", "", Gate::All(&[Gate::Flag(FlagId::Unreach), Gate::OptIn("PLIRON_UNREACH_EARLY")]), s_unreach0)
             .needs(shape::BLOCKS2),
+        // rustc's load ranges and no-wrap flags (`PLIRON_VFACTS=1`,
+        // `crate::vfacts`) name values of the function as lowered:
+        // `loadfwd` rebuilds a narrow load and its extension as one new
+        // value and the egraph rewrites `x + 1 == 0` as `x == -1`, so the
+        // ranges read them here, before anything rebuilds those values.
+        step("vrpf", "vrp", Gate::OptIn("PLIRON_VFACTS"), s_vrpf),
         // Straight-line `jump` pairs merge first, so jumpthread sees a
         // param block and the `brif` it feeds as one (see `mergejump`).
         step("mergejump", "mergejump", Gate::OptIn("PLIRON_MERGEJUMP"), s_mergejump).needs(shape::MULTI),
@@ -6319,6 +6338,7 @@ mod tests {
         func_id: FuncId::from_u32(0),
         uen_syms: &uen_syms,
         nonnull: &mut nonnull,
+        vfacts: &Default::default(),
         derived: &mut derived,
         frozen: &mut frozen,
         noalias: &mut noalias,

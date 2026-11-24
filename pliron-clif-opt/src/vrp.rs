@@ -22,6 +22,7 @@ use cranelift_codegen::ir::{Block, Function, Inst, InstBuilder, InstructionData,
 use crate::pipeline::{Analysis, CfgDtLa};
 use crate::ranges::{Range, Ranges, bits_of, decide};
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Fix {
     /// Replace result `v` by `w`.
     Alias(Value, Value),
@@ -34,10 +35,52 @@ enum Fix {
 }
 
 pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
-    let mut fixes: Vec<Fix> = Vec::new();
-    {
+    run_with(func, an, &Default::default())
+}
+
+/// [`run`] with rustc's value facts (`crate::vfacts`).
+pub fn run_with(func: &mut Function, an: &mut Analysis, facts: &crate::vfacts::VFacts) -> usize {
+    let fixes = {
         let CfgDtLa { cfg, dt, .. } = an.cfg_dt_la(func);
-        let mut rs = Ranges::new(func, cfg);
+        collect(func, cfg, dt, facts)
+    };
+    apply(func, an, fixes)
+}
+
+/// [`run_with`] only in a function where `facts` decide something the
+/// plain ranges do not (step `vrpf`, ahead of the pipeline: the facts name
+/// values as lowered). Elsewhere nothing: folding that early what the
+/// pipeline folds later anyway moves the later steps' choices (blind-sig's
+/// `montgomery`, +11% instructions). Where it runs it makes every fold,
+/// the plain ones too: a fact that decides `i < 3` takes away the branch
+/// that decided the bounds test `i < 8` below it.
+pub fn run_facts_only(func: &mut Function, an: &mut Analysis, facts: &crate::vfacts::VFacts) -> usize {
+    if facts.is_empty() {
+        return 0;
+    }
+    let fixes = {
+        let CfgDtLa { cfg, dt, .. } = an.cfg_dt_la(func);
+        let with = collect(func, cfg, dt, facts);
+        if with.is_empty() {
+            return 0;
+        }
+        let without: rustc_hash::FxHashSet<Fix> = collect(func, cfg, dt, &Default::default()).into_iter().collect();
+        if with.iter().all(|f| without.contains(f)) {
+            return 0;
+        }
+        with
+    };
+    apply(func, an, fixes)
+}
+
+fn collect(
+    func: &Function,
+    cfg: &cranelift_codegen::flowgraph::ControlFlowGraph,
+    dt: &cranelift_codegen::dominator_tree::DominatorTree,
+    facts: &crate::vfacts::VFacts,
+) -> Vec<Fix> {
+    let mut fixes: Vec<Fix> = Vec::new();
+    let mut rs = Ranges::new(func, cfg).with_facts(facts);
         for b in func.layout.blocks() {
             if !dt.is_reachable(b) {
                 continue;
@@ -156,7 +199,10 @@ pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
                 }
             }
         }
-    }
+    fixes
+}
+
+fn apply(func: &mut Function, an: &mut Analysis, fixes: Vec<Fix>) -> usize {
     if fixes.is_empty() {
         return 0;
     }

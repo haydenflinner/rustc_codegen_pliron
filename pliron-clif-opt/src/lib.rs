@@ -117,6 +117,7 @@ pub mod unroll;
 pub(crate) mod uses;
 pub mod vecsel;
 pub mod veclegalize;
+pub mod vfacts;
 pub mod vmap;
 pub mod webroot;
 pub mod zipiv;

@@ -96,6 +96,92 @@ pub struct Facts<'a> {
     /// Not used for one build's steps: a stale marker there is what
     /// slotmerge must not trust, and the check must keep reporting it.
     pub lifetime_starts: Option<&'a [(Vec<StackSlot>, Option<Inst>, Block, bool)]>,
+    /// rustc's load ranges and no-wrap flags (`crate::vfacts`): in a run
+    /// of the original a value that breaks one is undefined behavior, so
+    /// the run stops.
+    pub vfacts: Option<&'a crate::vfacts::VFacts>,
+}
+
+/// For a load `i` whose result `r` broke its `vfacts` range: when it read
+/// seeded memory the run has not written, the bytes there that put it in
+/// range (the range's start plus the loaded value modulo its length, so
+/// trials still vary).
+fn range_repair(s: &mut Sandbox, f: &Function, i: Inst, r: Value) -> Option<(u64, Vec<u8>)> {
+    let &(bits, start, end) = s.vfacts.range.get(&r)?;
+    let ir::InstructionData::Load { arg, offset, .. } = f.dfg.insts[i] else { return None };
+    let n = u64::from(f.dfg.value_type(r).bytes());
+    if n == 0 || n > 8 || u64::from(bits) > n * 8 {
+        return None;
+    }
+    let a = f.dfg.resolve_aliases(arg);
+    let p = as_ptr(s.current_frame_mut().entries_mut().get(a.index())?.as_ref()?)?;
+    let addr = p.checked_add_signed(i64::from(i32::from(offset)))?;
+    let (base, reg) = s.find(addr, n)?;
+    let o = (addr - base) as usize;
+    let span = o..o + n as usize;
+    if reg.data[span.clone()] != reg.init[span.clone()] {
+        return None;
+    }
+    let mut cur = [0u8; 8];
+    cur[..n as usize].copy_from_slice(&reg.data[span]);
+    let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let len = end.wrapping_sub(start) & m;
+    let x = u64::from_le_bytes(cur);
+    let v = start.wrapping_add(if len == m { x } else { x % (len + 1) }) & m;
+    Some((addr, v.to_le_bytes()[..n as usize].to_vec()))
+}
+
+/// Whether result `r` of `i`, computed as `val`, breaks one of rustc's
+/// facts on it: a load outside its range, or an add/sub/mul that wraps
+/// against its `nsw`/`nuw`. `arg` reads an operand's current value.
+fn vfact_broken(
+    vf: &crate::vfacts::VFacts,
+    f: &Function,
+    i: Inst,
+    r: Value,
+    val: Option<&DataValue>,
+    mut arg: impl FnMut(Value) -> Option<DataValue>,
+) -> Option<String> {
+    let int = |d: &DataValue| -> Option<u64> {
+        Some(match *d {
+            DataValue::I8(x) => x as u8 as u64,
+            DataValue::I16(x) => x as u16 as u64,
+            DataValue::I32(x) => x as u32 as u64,
+            DataValue::I64(x) => x as u64,
+            _ => return None,
+        })
+    };
+    if vf.range.contains_key(&r)
+        && let Some(x) = val.and_then(int)
+        && !vf.in_range(r, x)
+    {
+        return Some(format!("load {r} yielded {x:#x} outside rustc's range"));
+    }
+    let nw = vf.nw_of(f, r)?;
+    let ir::InstructionData::Binary { opcode, args: [a, b] } = f.dfg.insts[i] else { return None };
+    let bits = f.dfg.value_type(r).bits();
+    if bits > 64 {
+        return None;
+    }
+    let (a, b) = (f.dfg.resolve_aliases(a), f.dfg.resolve_aliases(b));
+    let (x, y) = (int(&arg(a)?)?, int(&arg(b)?)?);
+    let m: u128 = if bits >= 64 { u64::MAX as u128 } else { (1u128 << bits) - 1 };
+    let sx = |v: u64| -> i128 { (((v as u128) << (128 - bits)) as i128) >> (128 - bits) };
+    let (ux, uy) = (x as u128 & m, y as u128 & m);
+    let (smin, smax) = (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1);
+    let (u, sg) = match opcode {
+        ir::Opcode::Iadd => (Some(ux + uy), sx(x) + sx(y)),
+        ir::Opcode::Isub => (ux.checked_sub(uy), sx(x) - sx(y)),
+        ir::Opcode::Imul => (Some(ux * uy), sx(x) * sx(y)),
+        _ => return None,
+    };
+    if nw & crate::vfacts::NUW != 0 && !u.is_some_and(|u| u <= m) {
+        return Some(format!("{opcode} nuw {r} wrapped"));
+    }
+    if nw & crate::vfacts::NSW != 0 && !(smin..=smax).contains(&sg) {
+        return Some(format!("{opcode} nsw {r} wrapped"));
+    }
+    None
 }
 
 /// [`Facts::stub_extent`] for `func`: per direct callee and argument, the
@@ -435,7 +521,17 @@ pub fn check_cross(
                 .clone()
                 .unwrap_or_else(|| before.name.to_string()),
         };
-        let (b, btrace) = run(before, &world, &nowrite_names, &self_name, cfg.fuel, true, xb, None);
+        let (mut b, mut btrace) = run(before, &world, &nowrite_names, &self_name, cfg.fuel, true, xb, None);
+        // A seeded byte that breaks a load's `vfacts` range: seed an
+        // in-range one there and run again (both functions read it).
+        let mut repairs = 0;
+        while let Some((addr, bytes)) = btrace.repair.take()
+            && repairs < MAX_REPAIRS
+            && world.seed_bytes(addr, &bytes)
+        {
+            repairs += 1;
+            (b, btrace) = run(before, &world, &nowrite_names, &self_name, cfg.fuel, true, xb, None);
+        }
         let blog = &btrace.log;
         if cross.is_some() && let Some(m) = prefix_mismatch(&b, &btrace, trial, &world, &|w| {
             // The run that pins the arguments down, as below.
@@ -517,6 +613,10 @@ impl Default for ArgRec {
 struct Trace {
     /// What its stubs did, one entry per call.
     log: Vec<CallRec>,
+    /// A load of seeded memory the run had not written broke its
+    /// `vfacts` range: the bytes that put it in range, for the trial to
+    /// seed and run again.
+    repair: Option<(u64, Vec<u8>)>,
     /// The calls made, when the run did not return (a returned run has
     /// them in its `Outcome`).
     calls: Vec<(String, Vec<DataValue>)>,
@@ -976,6 +1076,8 @@ struct World {
     /// `Facts::derived`: inbounds offset → base. An offset that comes out
     /// 0 from a non-zero base is undefined behavior, so the run stops.
     derived: FxHashMap<Value, Value>,
+    /// `Facts::vfacts`.
+    vfacts: crate::vfacts::VFacts,
     /// `Facts::memcmp` callees as call names spell them.
     memcmp: FxHashSet<String>,
     /// `Facts::undef`.
@@ -1109,6 +1211,23 @@ fn place_symbol(
 }
 
 impl World {
+    /// Overwrite seeded bytes at `addr` (data and seed alike, so the run
+    /// that writes nothing there reports no write). False when they are
+    /// not all inside one seeded region.
+    fn seed_bytes(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        let Some((&base, reg)) = self.regions.range_mut(..=addr).next_back() else { return false };
+        let o = (addr - base) as usize;
+        let Some(end) = o.checked_add(bytes.len()).filter(|&e| e <= reg.data.len() && e <= reg.init.len()) else {
+            return false;
+        };
+        if reg.data[o..end] == *bytes {
+            return false;
+        }
+        reg.data[o..end].copy_from_slice(bytes);
+        reg.init[o..end].copy_from_slice(bytes);
+        true
+    }
+
     /// Place `names` (sorted) with their `images`, and write the
     /// addresses the images' relocations name.
     fn add_symbols(&mut self, names: &[String], images: &FxHashMap<String, &DataImage>) {
@@ -1242,6 +1361,7 @@ impl World {
                 .derived
                 .map(|d| d.iter().map(|(v, &b)| (v, b)).collect())
                 .unwrap_or_default(),
+            vfacts: facts.vfacts.cloned().unwrap_or_default(),
             memcmp: facts
                 .memcmp
                 .iter()
@@ -1568,6 +1688,8 @@ struct Sandbox<'a> {
     nonnull: &'a FxHashSet<Value>,
     /// Empty unless this run checks the facts (the original).
     derived: &'a FxHashMap<Value, Value>,
+    /// Empty unless this run checks the facts (the original).
+    vfacts: &'a crate::vfacts::VFacts,
     memcmp: &'a FxHashSet<String>,
     extent: &'a FxHashMap<(String, u32), u64>,
     /// `Facts::undef`, when this run is the original under the other
@@ -1596,6 +1718,8 @@ struct Sandbox<'a> {
     replay: Option<&'a [CallRec]>,
     /// What this run's stubs did, one entry per `calls` entry.
     log: Vec<CallRec>,
+    /// [`Trace::repair`].
+    repair: Option<(u64, Vec<u8>)>,
 }
 
 impl<'a> Sandbox<'a> {
@@ -1958,6 +2082,7 @@ fn run_inner(
 ) -> (Outcome, Trace) {
     let no_facts = FxHashSet::default();
     let no_derived = FxHashMap::default();
+    let no_vfacts = crate::vfacts::VFacts::default();
     let (no_lt_inst, no_lt_block) = (FxHashMap::default(), FxHashMap::default());
     // Stack frame: the pair's layout (`slot_layout`), the same for
     // every run of the trial, behind the rerun's pad. A slot the layout
@@ -1989,6 +2114,7 @@ fn run_inner(
         } else {
             &no_derived
         },
+        vfacts: if check_nonnull { &world.vfacts } else { &no_vfacts },
         memcmp: &world.memcmp,
         extent: &world.extent,
         undef: if check_nonnull && world.stack_fill != 0 { &world.undef } else { &no_facts },
@@ -2006,6 +2132,7 @@ fn run_inner(
         xsyms,
         replay,
         log: Vec::new(),
+        repair: None,
     };
     // Data symbols: same name, same address and contents in every run.
     // (A cross-build pair's are placed already: `World::add_symbols`.)
@@ -2031,8 +2158,11 @@ fn run_inner(
         }),
         Err(Stop::Unsupported(r)) => Outcome::Inconclusive(r),
     };
-    (o, Trace { log: s.log, calls: s.calls })
+    (o, Trace { log: s.log, calls: s.calls, repair: s.repair })
 }
+
+/// Seeded bytes a trial may rewrite to satisfy `vfacts` load ranges.
+const MAX_REPAIRS: usize = 16;
 
 /// Deepest self-recursion interpreted before giving up.
 const MAX_DEPTH: usize = 48;
@@ -2198,6 +2328,16 @@ fn exec_body(s: &mut Sandbox, entry: ir::Block, left: &mut u64) -> Result<Vec<Da
                     return Err(Stop::Trap(format!(
                         "inbounds offset {r} of non-null {base} yielded 0"
                     )));
+                }
+                let vf = s.vfacts;
+                if !vf.is_empty()
+                    && let Some(&r) = f.dfg.inst_results(i).first()
+                    && let Some(why) = vfact_broken(vf, f, i, r, vals.first(), |a| {
+                        s.current_frame_mut().entries_mut().get(a.index()).cloned().flatten()
+                    })
+                {
+                    s.repair = range_repair(s, f, i, r);
+                    return Err(Stop::Trap(why));
                 }
                 s.current_frame_mut()
                     .set_all(f.dfg.inst_results(i), vals.to_vec());
@@ -2802,6 +2942,8 @@ pub struct OwnedFacts {
     /// [`Facts::stub_extent`], filled by [`Self::bind_self`] from `nocap`.
     pub stub_extent: FxHashMap<(String, u32), u64>,
     pub derived: VMap<Value>,
+    /// [`Facts::vfacts`] (`vrange=` / `vnw=` in the header).
+    pub vfacts: crate::vfacts::VFacts,
     /// `(FuncRef, arg-index, extent)` triples a `; diffcheck-nocap:`
     /// header records; applied to every direct callsite of that callee
     /// on replay (`u64::MAX` = unknown = whole slot).
@@ -3003,6 +3145,7 @@ impl OwnedFacts {
             stub_extent: self.stub_extent.clone(),
             undef: Some(&self.undef),
             lifetime_starts: None,
+            vfacts: Some(&self.vfacts),
         }
     }
 
@@ -3157,6 +3300,20 @@ impl OwnedFacts {
                             out.derived.insert(v, b);
                         }
                     }
+                    "vrange" if parts.len() == 4 => {
+                        if let (Some(v), Ok(b), Ok(lo), Ok(hi)) =
+                            (val(parts[0]), parts[1].parse(), parts[2].parse(), parts[3].parse())
+                        {
+                            out.vfacts.range.insert(v, (b, lo, hi));
+                        }
+                    }
+                    "vnw" if parts.len() == 5 => {
+                        if let (Some(v), Ok(bits), Ok(op), Some(a), Some(b)) =
+                            (val(parts[0]), parts[1].parse(), parts[2].parse(), val(parts[3]), val(parts[4]))
+                        {
+                            out.vfacts.nw.insert(v, crate::vfacts::Nw { bits, op, args: [a, b] });
+                        }
+                    }
                     "nowrite" if parts.len() == 2 => {
                         if let Some(r) = fref(parts[0]) {
                             out.nowrite.insert(r, parts[1] == "1");
@@ -3268,6 +3425,15 @@ pub fn facts_header(f: &Function, facts: &Facts) -> String {
         s,
         " nonnull={nonnull} noalias={noalias} scopedna={scopedna} deref={deref} frozen={frozen} nowrite={nowrite} derived={derived}"
     );
+    // Written only when present, so headers of builds without
+    // `PLIRON_VFACTS` stay as they were.
+    if let Some(vf) = facts.vfacts.filter(|vf| !vf.is_empty()) {
+        let vrange = sorted(vf.range.iter().map(|(v, (b, lo, hi))| format!("{v}:{b}:{lo}:{hi}")).collect());
+        let vnw = sorted(
+            vf.nw.iter().map(|(v, n)| format!("{v}:{}:{}:{}:{}", n.bits, n.op, n.args[0], n.args[1])).collect(),
+        );
+        let _ = write!(s, " vrange={vrange} vnw={vnw}");
+    }
     if let Some(n) = &facts.self_name {
         let _ = write!(s, " self={n}");
     }

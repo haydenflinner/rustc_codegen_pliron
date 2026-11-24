@@ -739,6 +739,18 @@ time, memory, code size, stack frames) in ~20 min and writes
   noise), but over the cap only in a function with a foldable param:
   `montgomery` has none, and the folds there cascaded (+12.7% blind-sig).
   Filetest `wide128_phi`.
+- `PLIRON_VFACTS=1` (opt-in, 2026-11-23) — lowering keeps rustc's load
+  ranges and `nsw`/`nuw` on add/sub/mul as side facts
+  (`pliron_clif_opt::vfacts`); `ranges::Ranges` meets intervals with them
+  (`vrp`, `esplit`), and step `vrpf` runs `vrp` first in the pipeline in
+  functions where a fact decides a fold. A flag holds only while its
+  value keeps the opcode and operands it was recorded for (a pass may
+  rebuild `isub x, 1` as `iadd x, -1`). The differential checker stops a
+  run of the original that breaks a fact and reseeds an out-of-range
+  load. Code -0.2..-3.5 KB on six held-out programs, instructions within
+  noise (html +0.2..+0.7%, placement suspected).
+  `PLIRON_VFACTS_RANGE=0` / `_NW=0` drop one kind
+  (`docs/history/2026-11-23-nocapsum.md`).
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

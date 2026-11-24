@@ -475,6 +475,14 @@ static DISJOINT_ADD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cra
 static EXACT_DIV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_EXACT_DIV", "1"));
 static COLD_SWITCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_COLD_SWITCH", "1"));
 static TRUNC_FLAGS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_TRUNC_FLAGS", "1"));
+/// Record rustc's load ranges and no-wrap flags for `ranges::Ranges`
+/// (`pliron_clif_opt::vfacts`).
+static VFACTS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_VFACTS", "1"));
+/// Under `PLIRON_VFACTS`: `PLIRON_VFACTS_RANGE=0` / `PLIRON_VFACTS_NW=0`
+/// leave out the load ranges / the no-wrap flags (bisecting).
+static VFACTS_RANGE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| *VFACTS && !crate::env_is("PLIRON_VFACTS_RANGE", "0"));
+static VFACTS_NW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| *VFACTS && !crate::env_is("PLIRON_VFACTS_NW", "0"));
 
 fn lowerfree() -> bool {
     crate::env_is("PLIRON_LOWERFREE", "1")
@@ -646,6 +654,7 @@ struct FnJob {
     align: u64,
     func: ir::Function,
     nonnull: FxHashSet<ir::Value>,
+    vfacts: pliron_clif_opt::vfacts::VFacts,
     derived: pliron_clif_opt::vmap::VMap<ir::Value>,
     frozen: FxHashMap<ir::Value, u64>,
     noalias: FxHashSet<ir::Value>,
@@ -712,6 +721,7 @@ impl FnJob {
     fn shed_facts(&mut self) {
         self.dbg_slots = Default::default();
         self.nonnull = Default::default();
+        self.vfacts = Default::default();
         self.derived = Default::default();
         self.frozen = Default::default();
         self.noalias = Default::default();
@@ -742,6 +752,7 @@ impl FnJob {
             align: 0,
             func,
             nonnull: FxHashSet::default(),
+            vfacts: Default::default(),
             derived: pliron_clif_opt::vmap::VMap::default(),
             frozen: FxHashMap::default(),
             noalias: FxHashSet::default(),
@@ -1092,6 +1103,7 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
                 func_id: j.id,
                 uen_syms: &j.uen_syms,
                 nonnull: &mut j.nonnull,
+                vfacts: &j.vfacts,
                 derived: &mut j.derived,
                 frozen: &mut j.frozen,
                 noalias: &mut j.noalias,
@@ -2273,6 +2285,7 @@ pub fn lower_module<'a>(
             clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
             let undef: Vec<ir::Value>;
             let nonnull: FxHashSet<cranelift_codegen::ir::Value>;
+            let vfacts: pliron_clif_opt::vfacts::VFacts;
             let derived: pliron_clif_opt::vmap::VMap<cranelift_codegen::ir::Value>;
             let frozen: FxHashMap<cranelift_codegen::ir::Value, u64>;
             let noalias: FxHashSet<cranelift_codegen::ir::Value>;
@@ -2321,6 +2334,7 @@ pub fn lower_module<'a>(
                     vars: std::mem::take(&mut scratch.vars),
                     stubs: rustc_hash::FxHashSet::default(),
                     nonnull: FxHashSet::default(),
+                    vfacts: Default::default(),
                     bool01: std::mem::take(&mut scratch.bool01),
                     derived: pliron_clif_opt::vmap::VMap::default(),
                     frozen: FxHashMap::default(),
@@ -2417,6 +2431,7 @@ pub fn lower_module<'a>(
                 t_fin += tl3.elapsed();
                 asm_stubs.extend(fl.stubs.iter().copied());
                 nonnull = std::mem::take(&mut fl.nonnull);
+                vfacts = std::mem::take(&mut fl.vfacts);
                 derived = std::mem::take(&mut fl.derived);
                 frozen = std::mem::take(&mut fl.frozen);
                 noalias = std::mem::take(&mut fl.noalias);
@@ -2474,6 +2489,7 @@ pub fn lower_module<'a>(
                     align: st.fn_align.get(n.as_str()).copied().unwrap_or(0),
                     func: std::mem::replace(&mut clctx.func, ir::Function::new()),
                     nonnull,
+                    vfacts,
                     derived,
                     frozen,
                     noalias,
@@ -3414,6 +3430,7 @@ pub fn lower_clif_wasm(
         clctx.func.signature = make_sig(ctx, f.ty, &f.exts, cc_of(n));
         let (
             nonnull,
+            vfacts,
             derived,
             frozen,
             noalias,
@@ -3457,6 +3474,7 @@ pub fn lower_clif_wasm(
                 vars: std::mem::take(&mut scratch.vars),
                 stubs: rustc_hash::FxHashSet::default(),
                 nonnull: FxHashSet::default(),
+                vfacts: Default::default(),
                 bool01: std::mem::take(&mut scratch.bool01),
                 derived: pliron_clif_opt::vmap::VMap::default(),
                 frozen: FxHashMap::default(),
@@ -3520,6 +3538,7 @@ pub fn lower_clif_wasm(
             );
             (
                 fl.nonnull,
+                fl.vfacts,
                 fl.derived,
                 fl.frozen,
                 fl.noalias,
@@ -3552,6 +3571,7 @@ pub fn lower_clif_wasm(
                 align: st.fn_align.get(n.as_str()).copied().unwrap_or(0),
                 func: std::mem::replace(&mut clctx.func, ir::Function::new()),
                 nonnull,
+                vfacts,
                 derived,
                 frozen,
                 noalias,
@@ -4024,6 +4044,8 @@ struct FnLower<'a, 'b> {
     stubs: rustc_hash::FxHashSet<&'static str>,
     /// Results of `!nonnull` memory loads.
     nonnull: FxHashSet<cranelift_codegen::ir::Value>,
+    /// rustc's load ranges and no-wrap flags (`pliron_clif_opt::vfacts`).
+    vfacts: pliron_clif_opt::vfacts::VFacts,
     /// Results of `bool` loads known to be 0 or 1.
     bool01: FxHashSet<cranelift_codegen::ir::Value>,
     /// Inbounds GEP result → base (null only if the base is).
@@ -5924,6 +5946,41 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// Integer `div`/`rem` elementwise, with an i128 fast path: constant
     /// unsigned divisors become limb magic-multiply sequences instead of
     /// `__udivti3`/`__umodti3` libcalls (~15 insts vs ~100+ cycles).
+    /// rustc's `nsw`/`nuw` on a scalar add, sub or mul, as a fact on its
+    /// CLIF result (`pliron_clif_opt::vfacts`).
+    fn record_nw(&mut self, op: Ptr<Operation>) {
+        use pliron_clif_opt::vfacts::{NSW, NUW};
+        if !*VFACTS_NW {
+            return;
+        }
+        let ctx = self.ctx;
+        let Some(fl) = op.deref(ctx).attributes.get::<pliron_llvm::attributes::IntegerOverflowFlagsAttr>(
+            ctx,
+            &pliron_llvm::op_interfaces::ATTR_KEY_INTEGER_OVERFLOW_FLAGS,
+        ) else {
+            return;
+        };
+        let bits = if fl.nsw { NSW } else { 0 } | if fl.nuw { NUW } else { 0 };
+        if bits == 0 {
+            return;
+        }
+        let vs = self.get(op.deref(ctx).get_result(ctx, 0));
+        // Only a result of the instruction just built: a value reused as
+        // the result (a fold) carries its own definition's facts.
+        if vs.len() == 1
+            && self.b.func.dfg.value_type(vs[0]).is_int()
+            && let cranelift_codegen::ir::ValueDef::Result(i, 0) = self.b.func.dfg.value_def(vs[0])
+            && matches!(
+                self.b.func.dfg.insts[i].opcode(),
+                cranelift_codegen::ir::Opcode::Iadd | cranelift_codegen::ir::Opcode::Isub | cranelift_codegen::ir::Opcode::Imul
+            )
+            && !self.vfacts.nw.contains_key(&vs[0])
+            && let cranelift_codegen::ir::InstructionData::Binary { opcode, args } = self.b.func.dfg.insts[i]
+        {
+            self.vfacts.nw.insert(vs[0], pliron_clif_opt::vfacts::Nw { bits, op: opcode, args });
+        }
+    }
+
     /// The `x` of `zext (trunc nuw x)` (`sext (trunc nsw x)` when `signed`)
     /// when the extension goes back to `x`'s own type.
     fn trunc_roundtrip(&self, op: Ptr<Operation>, opnds: &[Value], signed: bool) -> Option<Value> {
@@ -6822,11 +6879,14 @@ impl<'a, 'b> FnLower<'a, 'b> {
             let r = self.b.ins().fcmp(cc, a, b);
             self.set1(op, r);
         } else if is!(AddOp) {
-            binop!(iadd)
+            binop!(iadd);
+            self.record_nw(op);
         } else if is!(SubOp) {
-            binop!(isub)
+            binop!(isub);
+            self.record_nw(op);
         } else if is!(MulOp) {
-            binop!(imul)
+            binop!(imul);
+            self.record_nw(op);
         } else if is!(AndOp) {
             binop!(band)
         } else if is!(OrOp) {
@@ -7216,6 +7276,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             if r.len() == 1 && self.st.bool01.contains(op) {
                 self.bool01.insert(r[0]);
+            }
+            // rustc's `range` on the load (`pliron_clif_opt::vfacts`)
+            if r.len() == 1
+                && *VFACTS_RANGE
+                && let Some((st_, en)) = pliron_ir_opt::facts::load_range(ctx, op)
+            {
+                let ty = self.b.func.dfg.value_type(r[0]);
+                if ty.is_int() && ty.bits() <= 64 {
+                    self.vfacts.range.insert(r[0], (ty.bits(), st_ as u64, en as u64));
+                }
             }
             if let Some(&reg) = self.st.frozen_loads.get(op) {
                 for &v in &r {

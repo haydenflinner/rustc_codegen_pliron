@@ -1003,13 +1003,14 @@ t_partinline() {
 t_rustfacts() {
   # rustc's facts the builder used to drop (`unchecked_*` nsw/nuw, `trunc`
   # flags, `or disjoint`, `exact` division, load `range`s, alignment, cold
-  # switch arms) and their opt-in lowering consumers. `exact` division by a
+  # switch arms) and their opt-in lowering consumers, and `PLIRON_VFACTS`
+  # (load ranges and nsw/nuw read by the CLIF range analysis). `exact` division by a
   # constant is a shift plus a multiply by the odd part's inverse mod 2^w:
   # output pinned by stock rustc with the consumers off and on; on aarch64
   # `d24` must divide without a multiply-high (`smulh`).
   rustc --edition 2021 -O tests/rustfacts/main.rs -o $out/rustfacts-stock$exe || return 1
   local v i=0
-  for v in "PLIRON_EXACT_DIV=0" "PLIRON_EXACT_DIV=1 PLIRON_DISJOINT_ADD=1 PLIRON_COLD_SWITCH=1 PLIRON_TRUNC_FLAGS=1"; do
+  for v in "PLIRON_EXACT_DIV=0" "PLIRON_EXACT_DIV=1 PLIRON_DISJOINT_ADD=1 PLIRON_COLD_SWITCH=1 PLIRON_TRUNC_FLAGS=1 PLIRON_VFACTS=1"; do
     i=$((i + 1))
     env $v rustc $BE --edition 2021 -O tests/rustfacts/main.rs -o $out/rustfacts$i$exe || return 1
     [[ -n "$exe" ]] && continue
@@ -1019,6 +1020,9 @@ t_rustfacts() {
   local dis
   dis=$("$llvmod" -d --no-show-raw-insn $out/rustfacts2$exe)
   awk '$0 ~ "^[0-9a-f]+ <_*[^ ]*3d24>:$" {p=1; next} /^$/ {p=0} p' <<< "$dis" | grep -q smulh && { echo "rustfacts: d24 still divides with smulh" >&2; return 1; }
+  # PLIRON_VFACTS: the tag's range drops `cmp #3`, `nuw` the zero test.
+  awk '$0 ~ "^[0-9a-f]+ <_*[^ ]*6e3_idx>:$" {p=1; next} /^$/ {p=0} p' <<< "$dis" | grep -qE "cmp.*#0x3$" && { echo "rustfacts: e3_idx still tests the tag against 3" >&2; return 1; }
+  awk '$0 ~ "^[0-9a-f]+ <_*[^ ]*6add_nz>:$" {p=1; next} /^$/ {p=0} p' <<< "$dis" | grep -qE "csel|cmp|cbz|cbnz" && { echo "rustfacts: add_nz still tests y == 0" >&2; return 1; }
   return 0
 }
 

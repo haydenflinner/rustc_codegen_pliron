@@ -486,6 +486,7 @@ fn with_pipe_lts<R>(
         func_id,
         uen_syms: &uen_syms,
         nonnull: &mut nonnull,
+        vfacts: &facts.vfacts,
         derived: &mut derived,
         frozen: &mut frozen,
         noalias: &mut noalias,
