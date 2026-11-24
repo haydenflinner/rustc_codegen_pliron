@@ -137,6 +137,38 @@ block3(v17: i32):
     );
 }
 
+/// An `ishl` with an out-of-range constant amount is a legal shift
+/// (CLIF masks the amount) whose scale `1 << c` does not exist. `scaled`
+/// must not compute it eagerly under `then_some` — a debug build
+/// panicked compiling lol_html.
+#[test]
+fn skips_overshift_ishl() {
+    let src = "
+function %f(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v3 = iconst.i64 0
+    jump block1(v3, v1)
+
+block1(v4: i64, v5: i64):
+    v10 = iconst.i64 1
+    v11 = iadd v4, v10
+    v12 = icmp ult v11, v0
+    brif v12, block2, block3(v5)
+
+block2:
+    v20 = iconst.i64 64
+    v21 = ishl v11, v20
+    jump block1(v11, v21)
+
+block3(v17: i64):
+    return v17
+}
+";
+    let mut after = parse(src);
+    let k = pliron_clif_opt::ivretro::run(&mut after, &mut Analysis::default());
+    assert_eq!(k, 0, "rewrote an overshifted edge:\n{}", after.display());
+}
+
 /// `arg_iv` not of the form `iv + s` (a second use of `iv` itself is
 /// fine — `s = 0` forwards `p`) — but a non-step arg leaves no hook.
 #[test]

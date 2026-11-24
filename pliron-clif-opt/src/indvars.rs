@@ -719,6 +719,11 @@ fn elim_shadowed(
     let sh = i64::from(e.trailing_zeros());
     let pow2 = e.unsigned_abs().is_power_of_two();
     let ty = func.dfg.value_type(np);
+    // Every bound below is masked into a `u64` — wider IVs are out of
+    // scope (`(1 << bits)` at `tmask` does not exist).
+    if ty.bits() > 64 {
+        return 0;
+    }
     // `e >= 2^w` collapses every `*e` product to 0 mod 2^w.
     if pow2 && sh >= i64::from(ty.bits()) {
         return 0;

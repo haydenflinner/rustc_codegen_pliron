@@ -80,7 +80,7 @@ fn scaled(func: &Function, v: Value) -> Option<(Value, i64)> {
         } => iconst(func, args[1]).and_then(|c| {
             (0..63)
                 .contains(&c)
-                .then_some((func.dfg.resolve_aliases(args[0]), 1i64 << c))
+                .then(|| (func.dfg.resolve_aliases(args[0]), 1i64 << c))
         }),
         _ => None,
     }
