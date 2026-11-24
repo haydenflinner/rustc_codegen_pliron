@@ -624,7 +624,7 @@ which register a temporary took. At 4 the loop keeps the bound and the
 automaton pointer in registers (loop-weighted stack accesses 181 -> 133).
 rafuzz: 400k seeds at 4 and 8, no failure.
 
-## `PLIRON_RA2_RELOADCOPY=1` (opt-in, 2026-11-23)
+## `PLIRON_RA2_RELOADCOPY` (default on since 2026-11-23, `=0` off)
 
 `src/ion/postopt.rs` (`reload_into_copy`), `src/lib.rs`
 (`reloadcopy_on`): after the other post-allocation cleanups, an edit that

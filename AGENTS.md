@@ -1412,6 +1412,16 @@ time, memory, code size, stack frames) in ~20 min and writes
   hashbrown's `reserve_rehash`, so `ctx` may be captured.
   `PLIRON_TRACE=pliron::memcpyopt=debug` prints `srcfwd:` lines. Stanza
   `srcfwd`.
+- `PLIRON_RA2_RELOADCOPY` (vendored regalloc2, default on since
+  2026-11-23, `=0` off) — after allocation, a reload (or any edit) filling
+  `r` just before a copy `mov d, r`, with `r` dead after it in the block,
+  fills `d` instead and the copy becomes `mov d, d`, which emission drops
+  (`ldr x11, [sp, #k]; mov x1, x11` for a spilled call argument:
+  rust-compression 776 pairs -> 156, LLVM 142). std corpus -0.19%
+  instructions; held-out instructions within placement, compression
+  cycles -3%. Checker clean on 400k rafuzz seeds and the std corpus.
+  `PLIRON_X30=3` (opt-in): `=2` plus leaves of at least `PLIRON_X30_MIN`
+  (256) instructions (blake3 -0.8%; measured on a loaded machine).
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,
