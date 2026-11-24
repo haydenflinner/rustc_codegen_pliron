@@ -1058,6 +1058,27 @@ pub fn home_copies(ctx: &mut Context, st: &mut State) -> usize {
     // same-named hidden-external home def either way, so erasing is never
     // a link risk under `home_linkable` — and it stops an unreferenced
     // local body being emitted for nothing.
+    //
+    // Except a copy a global's init data names (a vtable slot, a fn
+    // table): `constload` later folds a `load` of that global to a `Sym`
+    // operand and `devirt` aims a brand-new call at it — a caller that
+    // can't exist yet but needs the body to still be here. `addressof`
+    // uses in code already resolve through `indirect_callee` today, so
+    // only data-held `Sym` consts can produce such late callers.
+    let mut data: FxHashSet<Value> = st.globals.values().filter_map(|g| g.init).collect();
+    for c in st.consts.values() {
+        if let ConstVal::Agg(vs) = c {
+            data.extend(vs.iter().copied());
+        }
+    }
+    let data_taken: FxHashSet<&String> = st
+        .consts
+        .iter()
+        .filter_map(|(v, c)| match c {
+            ConstVal::Sym { sym, .. } if data.contains(&v) => Some(sym),
+            _ => None,
+        })
+        .collect();
     let back: Vec<(String, Ptr<Operation>)> = st
         .xcgu_home
         .iter()
@@ -1065,7 +1086,8 @@ pub fn home_copies(ctx: &mut Context, st: &mut State) -> usize {
             let f = st.funcs.get(n.as_str())?;
             (f.linkage == Linkage::Local
                 && has_body(ctx, f.op)
-                && !st.dead_fns.contains(n.as_str()))
+                && !st.dead_fns.contains(n.as_str())
+                && !data_taken.contains(n))
             .then(|| (n.clone(), f.op))
         })
         .collect();

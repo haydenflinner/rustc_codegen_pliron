@@ -846,6 +846,16 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                     copyable(tcx, c, limit),
                     tcx.size_estimate(c));
             }
+            if let Some(w) = crate::env_get("PLIRON_STATS_XCGU_CALLER").as_deref()
+                && with_no_trimmed_paths!(inst.to_string()).contains(w)
+            {
+                tracing::info!(target: "pliron::stats",
+                    "xcgu dep {} in {} -> {} (ours={})",
+                    with_no_trimmed_paths!(inst.to_string()),
+                    cgu.name(),
+                    with_no_trimmed_paths!(u.node.to_string()),
+                    ours.contains_key(&u.node));
+            }
             if direct.insert(u.node)
                 && let MonoItem::Fn(c) = u.node
                 && !ours.contains_key(&u.node)
