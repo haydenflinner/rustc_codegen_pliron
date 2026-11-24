@@ -96,6 +96,13 @@ pub const DEFAULT_ON: &[&str] = &[
     // (`docs/history/2026-11-19-sibcall.md`). Stanza sibcall.
     // `PLIRON_SIBCALL=0` off.
     "PLIRON_SIBCALL",
+    // 2026-11-24: `call_indirect; return` as `return_call_indirect` on the
+    // platform CCs too (the vendored emitter pins the target to `x17`
+    // there — `x1` stays the `tail`-CC pin). lol_html's `call_mut` vtable
+    // shim and `next(state)` transitions go frameless. A/B: html
+    // instructions -0.8%, cycles -0.9%; the other seven within noise
+    // (no conversion sites). `PLIRON_SIBCALL_IND=0` off.
+    "PLIRON_SIBCALL_IND",
     // 2026-11-20: latchspec keeps a latch whose header parameter is still
     // live into the folded branch's other successor (the fold would cost
     // moves plus the split edge's jump on the back edge). Exact counts

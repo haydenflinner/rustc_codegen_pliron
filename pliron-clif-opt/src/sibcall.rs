@@ -34,10 +34,10 @@
 //!   frame).
 //!
 //! An indirect call is a candidate on the `tail` convention (whose
-//! `return_call_indirect` pins its target register to `x1`) and, under
-//! `PLIRON_SIBCALL_IND` (opt-in), on the platform conventions, where the
-//! vendored emitter pins the target to `x17` — never an argument
-//! register, and untouched by the tail-call restore sequence.
+//! `return_call_indirect` pins its target register to `x1`) and, since
+//! 2026-11-24 (`PLIRON_SIBCALL_IND=0` off), on the platform conventions,
+//! where the vendored emitter pins the target to `x17` — never an
+//! argument register, and untouched by the tail-call restore sequence.
 //!
 //! A `try_call` is not a candidate (the landing pad needs the frame), and
 //! neither is a call followed by anything but the `return`.
@@ -118,7 +118,7 @@ pub fn run(func: &mut Function, nocap: &FxHashMap<(Inst, u32), u64>) -> usize {
             // The aarch64 `return_call_indirect` pins its target to `x1`
             // under the `tail` convention (whose arguments skip `x0`/`x1`)
             // and to `x17` — never an argument register — on the platform
-            // conventions (`PLIRON_SIBCALL_IND`).
+            // conventions (`PLIRON_SIBCALL_IND`, default on).
             InstructionData::CallIndirect { opcode: Opcode::CallIndirect, sig_ref, .. }
                 if cc == CallConv::Tail
                     || pliron_cfg::env_is("PLIRON_SIBCALL_IND", "1") =>
