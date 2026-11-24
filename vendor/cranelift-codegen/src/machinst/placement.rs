@@ -641,6 +641,10 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
     // out-of-line spot. Recursive hot loops otherwise pay a taken
     // front-end redirect per non-leaf call (~1.4x on fib).
     let loopft = std::env::var("PLIRON_LOOPFT").as_deref() != Ok("0");
+    // PLIRON (`PLIRON_CLOSELATCH=1`, opt-in): prefer a successor that
+    // jumps back into this chain (the loop latch) over an if-arm whose
+    // join it is not. See `closes` below.
+    let closelatch = std::env::var("PLIRON_CLOSELATCH").as_deref() == Ok("1");
     let reach_loop: Vec<bool> = {
         let mut reach = vec![false; n];
         if loopft {
@@ -727,7 +731,7 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
         }
         loop {
             let tail = *chains[cur].last().unwrap();
-            let mut best: Option<(usize, (f64, bool, bool))> = None;
+            let mut best: Option<(usize, (f64, bool, bool, bool))> = None;
             for (k, &s) in succs[tail].iter().enumerate() {
                 let s = res[s];
                 if cold[s] || empty[s] || !in_region(s) {
@@ -765,7 +769,19 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
                 // Ties go to a successor none of whose other predecessors
                 // is unplaced (the arm of an if, not its join).
                 let unplaced_other = preds[s].iter().any(|&p| p != tail && !placed_here[p] && !cold[p] && in_region(p) && chain_of[p] != c);
-                let key = (w, reach_loop[s], !unplaced_other);
+                // PLIRON (`PLIRON_CLOSELATCH=1`, opt-in): a successor that
+                // jumps to a block already in this chain is the loop's
+                // latch — placing it next makes the header's edge to it
+                // the free fallthrough and keeps the body compact. Its
+                // unplaced in-loop preds (the cold arm's merge) then pay
+                // the taken branch, not the hot arm's. pulldown-cmark's
+                // `scalar_iterate_special_bytes`: `brif is_special,
+                // dispatch, latch` picked the dispatch arm on
+                // `!unplaced_other` and ordinary bytes paid `cbz` +
+                // `b.lo`, two taken branches per byte.
+                let closes = closelatch
+                    && succs[s].iter().any(|&t| res[t] == chains[cur][0]);
+                let key = (w, reach_loop[s], closes, !unplaced_other);
                 if best.map_or(true, |(_, bk)| key > bk) {
                     best = Some((s, key));
                 }

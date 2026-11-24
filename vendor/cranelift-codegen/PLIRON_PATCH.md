@@ -2445,3 +2445,17 @@ compares on it need no `uxtb`/`uxth`. pulldown-cmark's byte dispatch in
 `scalar_iterate_special_bytes` (`ireduce.i8 (uload8.i64 p)` feeding the
 `match`) lost its per-byte `uxtb`; 30 `umov.b; uxtb` pairs in pulldown.
 Test `pliron-clif-opt/tests/aarch64_extclean.rs` (every byte value, run).
+
+## `PLIRON_CLOSELATCH=1` (aarch64, opt-in, 2026-11-24)
+
+`src/machinst/placement.rs` (chain walk's successor key): a successor
+that jumps to the chain's head is the loop's latch — on an edge-weight
+tie it now beats an if-arm for the fallthrough slot (new `closes` key
+between `reach_loop` and `!unplaced_other`). pulldown-cmark's
+`scalar_iterate_special_bytes` head `brif is_special, dispatch, latch`
+picked the dispatch arm and ordinary bytes paid `cbz` + `b.lo` (two
+taken branches per byte); now `cbnz dispatch; add; cmp; b.lo`, one —
+LLVM's shape. std corpus: 11 of 4,979 fns change, weighted insts -136
+net (memchr's two_way searchers +96 each are the loss: an unrolled
+compare chain moves out of line). Held-out: instructions within +-0.3%
+everywhere; ms/cycles lean down (pulldown min -2.5%).
