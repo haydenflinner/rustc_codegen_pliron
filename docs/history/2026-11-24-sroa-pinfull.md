@@ -109,3 +109,49 @@ stats line distinguishes releases from plain `lastcall` keeps.
   `Component::clone`/`Token::clone` deep-copy work (~20% of samples on
   both sides — equal work, ours costs more per op), small `0→N`
   closures LLVM fully inlines.
+
+## `xcgu-home`: keep data-taken copies (98f36846)
+
+The `0->N` closure/shim cluster's root cause. `home_copies`
+(`PLIRON_XCGU_HOME=mono`) converted *every* xcgu_home member to an
+Import right after the main inline round — including copies only
+referenced by a `Sym` const inside a global initializer (vtable
+slots, fn tables). But `constload` (tail, ~100 passes later) folds
+`load(vtable+slot)` into a `Sym` operand and `inline::devirt` rewrites
+`llvm.call v` into `llvm.call @sym` — a caller that cannot exist until
+*after* the conversion. `impls::call_mut` (the `&mut dyn FnMut(&[u8])`
+dispatch shim) was the case on rust-html-rewriter: its copy was an
+Import by the time devirt materialized ~16 callers into `into_bytes`
+& co, so every site emitted `bl call_mut` (call + frame + `ldr vtable;
+blr`) where LLVM inlines the 2-insn body.
+
+`address_taken` already scans global inits (`escaped`) so
+`free_dead`/`dead_fns`/`mark_dead_unopt` all kept the copy — the bug
+was `home_copies` ignoring `taken` deliberately ("address uses bind
+to the same-named home def"). Fix: compute `data_taken` (Sym consts
+reachable from `st.globals` inits / Agg consts — exactly the set a
+load fold can materialize) and skip conversion for it. Code-held
+`addressof` uses already resolve through `indirect_callee` today, so
+only data-held Syms can produce late callers.
+
+- rust-html-rewriter: `bl call_mut` 16 -> 0 binary-wide; instr
+  109.53 -> 109.16M, cycles 25.84 -> 24.78M vs llvm 102.71M / 24.57M
+  (**cycles ~1.009x**, instr +6.3%). `token_produced0`, Lexer closure,
+  `Map::next`, `drop_glue`, `SpecFromIter` `bl` sites all gone.
+- rust-protobuf +0.1% instr (still ~4% faster cycles than llvm);
+  blind-sig unchanged. Gate: 131 jobs.
+- `PLIRON_MEMFAST_SMALL=0|hot` on html: both *raise* instr ~+0.8%
+  and ms ~+2% — the inline size cascade already beats `bl memcpy` +
+  libc dispatch for the sizes seen; `ptr:570`'s +49-sample delta is
+  memcpy-quality, not a knob.
+
+## Still open (updated 2)
+
+* html residual ~+6.3% instr / ~+1% cycles: `ptr/mod.rs:570+844`
+  variable-size `copy` (libc `_platform_memmove` beats the cascade
+  per-byte on large chunks — the [k,2k]-overlapping-move scheme only
+  covers <=32 B, then we pay cascade *and* the call), `raw_vec:635`
+  extra inlined `Vec` ops per site (we emit `ldp` fine — just more
+  copies), bounds-check cmp skew (`slice/index:184`), register-
+  pressure stack-loads (`dispatcher:144`), ~3x const materialization.
+  No single trick left — it's diffuse shape work now.
