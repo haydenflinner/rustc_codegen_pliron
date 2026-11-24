@@ -3312,6 +3312,11 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
     true
 }
 
+fn srcfwd_ro() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_SRCFWD_RO", "1"));
+    *ON
+}
+
 thread_local! {
     /// What made the last `src_touches` walk call its param captured (for the `srcfwd` trace).
     static CAPTURE_WHY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -3391,6 +3396,14 @@ fn src_touches(
                 let drop = info
                     .and_then(|i| i.callee.as_deref())
                     .is_some_and(|s| s.contains("4core3ptr9drop_glue") || s.contains("13drop_in_place"));
+                // An indirect call whose callee is a constant function address
+                // (a vtable slot `constload2` folded after the last `devirt`)
+                // reads that function's facts.
+                // (or a join of them: `bailout`'s recovery functions)
+                let const_callees = (!direct)
+                    .then(|| op.deref(ctx).get_operand(ctx, 0))
+                    .and_then(|cv| crate::helpers::const_callees(ctx, st, cv));
+                let const_callee = const_callees.as_ref().map(|cs| cs.join(","));
                 let nocap = (direct || i != 0)
                     && (drop
                         || info.and_then(|i| i.nocap.as_ref()).is_some_and(|n| n.get(ai) == Some(&true))
@@ -3398,11 +3411,34 @@ fn src_touches(
                             .get_attr_llvm_call_callee(ctx)
                             .and_then(|id| st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref())))
                             .and_then(|sym| st.nocapture.get(sym))
-                            .is_some_and(|s| s.contains(&(ai as u32))));
+                            .is_some_and(|s| s.contains(&(ai as u32)))
+                        || const_callees.as_ref().is_some_and(|cs| {
+                            cs.iter().all(|sym| st.nocapture.get(sym).is_some_and(|s| s.contains(&(ai as u32))))
+                        }));
                 let ext = info.and_then(|i| i.arg_extent.as_ref()).and_then(|e| e.get(ai)).map(|e| e.0).filter(|&n| n > 0);
+                // `PLIRON_SRCFWD_RO=1`: a frozen `&T` (rustc's `readonly` +
+                // `noalias` on the operand) is a read for the call's
+                // duration, and a copy kept past it can never be used to
+                // write (a write through a shared borrow is UB). lol_html's
+                // compiled selector matchers get `&ctx.stack_item.local_name`
+                // through a `dyn Fn` no analysis can resolve.
+                let frozen = (direct || i != 0)
+                    && srcfwd_ro()
+                    && info.and_then(|i| i.arg_ro.as_ref()).is_some_and(|r| r.get(ai) == Some(&true))
+                    && info.and_then(|i| i.arg_noalias.as_ref()).is_some_and(|r| r.get(ai) == Some(&true));
+                if frozen {
+                    out.entry(op).or_default().push(touch(true, false, base, ext));
+                    continue;
+                }
                 if !nocap {
                     captured = true;
-                    if why.is_none() { why = Some(format!("call {}{}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()).map(|c| format!(" {}", &c[..c.len().min(100)])).unwrap_or_default())); }
+                    if why.is_none() { why = Some(format!("call {}{} arg {ai}{}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()).map(|c| format!(" {}", &c[..c.len().min(100)])).unwrap_or_default(), const_callee.as_deref().map(|c| format!(" const callee {}", &c[..c.len().min(100)])).unwrap_or_else(|| if direct { String::new() } else {
+                        let cv = op.deref(ctx).get_operand(ctx, 0);
+                        match cv.defining_op() {
+                            Some(d) => format!(" callee from {} {} in {}", Operation::get_opid(d, ctx), pliron::operation::OpDbg { op: d, ctx }.to_string().chars().take(100).collect::<String>(), pliron::operation::OpDbg { op, ctx }.to_string().chars().take(220).collect::<String>()),
+                            None => format!(" callee is a block arg; const {:?}", st.consts.get(cv)),
+                        }
+                    }))); }
                 }
                 out.entry(op).or_default().push(touch(true, true, base, ext));
             } else {

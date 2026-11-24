@@ -877,6 +877,22 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
         v
     }
+    /// `ptr.add(i)` and kin: rustc promises the indices are non-negative and
+    /// the offset does not wrap unsigned. Kept as the op's `NUW` no-wrap flag
+    /// (an op attribute, so it travels with the op when it is cloned): a
+    /// GEP with a variable index then still has a lower bound on its offset
+    /// (`nocapture`'s slot flows). `inbounds` stays in `State::inbounds`.
+    fn inbounds_nuw_gep(&mut self, ty: TypeHandle, ptr: Value, indices: &[Value]) -> Value {
+        let v = self.inbounds_gep(ty, ptr, indices);
+        if let Some(op) = v.defining_op() {
+            let mut c = self.cx.pctx.borrow_mut();
+            if let Some(g) = Operation::get_op::<GetElementPtrOp>(op, &c) {
+                let flags = g.no_wrap_flags(&c) | pliron_llvm::attributes::GepNoWrapFlags::NUW;
+                g.set_attr_llvm_gep_no_wrap_flags(&mut c, flags.into());
+            }
+        }
+        v
+    }
 
     fn trunc(&mut self, v: Value, t: TypeHandle) -> Value {
         self.cast::<TruncOp>(v, t)

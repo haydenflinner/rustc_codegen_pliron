@@ -1342,10 +1342,22 @@ pub(crate) fn iropt_head(
         );
         // Inlining + SROA make vtable pointers constant: call those slots
         // directly, inline them and clean up again (`PLIRON_DEVIRT=0` disables).
+        // `PLIRON_DEVIRT_ROUNDS=<n>` (default 1): repeat the round while the
+        // previous one found sites. A vtable can turn constant only after a
+        // round's `phisimp2` + `constload2`: hashbrown's `&mut dyn FnMut`
+        // probe callback inside an inlined `find`, whose environment then
+        // stays in a stack slot that holds the looked-up key's address.
+        let rounds = pliron_cfg::env_get("PLIRON_DEVIRT_ROUNDS").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).max(1);
+        for round in 0..rounds {
         if pass_enabled("PLIRON_DEVIRT") {
             // Profile guards on a pointer that is a constant by now.
-            pt!(prof, cgu, "icp-fold", pliron_ir_opt::devirt::fold_static(ctx, st));
+            if round == 0 {
+                pt!(prof, cgu, "icp-fold", pliron_ir_opt::devirt::fold_static(ctx, st));
+            }
             let (sites, owners) = pt!(prof, cgu, "devirt", inline::devirt(ctx, st));
+            if sites.is_empty() && round > 0 {
+                break;
+            }
             pt!(prof, cgu, "domcheck:dv", domcheck::run(ctx, st, "devirt"));
             grew |= !sites.is_empty();
             if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
@@ -1385,7 +1397,11 @@ pub(crate) fn iropt_head(
                 if pass_enabled("PLIRON_DEVIRT_CL") {
                     pt!(prof, cgu, "constload2", constload::run(ctx, st));
                 }
+                dumpfn(ctx, st, if round == 0 { "devirt1" } else { "devirt2" });
+            } else {
+                break;
             }
+        }
         }
     }
     // `PLIRON_REMARKS`: which promoted indirect-call targets were inlined.

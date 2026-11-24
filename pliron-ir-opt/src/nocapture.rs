@@ -114,16 +114,40 @@ ascent::ascent! {
     captured(f, i) <-- arg(f, c, k, v), keeps(c, k), der(v, m), for i in bits(*m);
 }
 
+/// Depths `CapNode` tracks per param: 0 (the param), 1 (pointers loaded out
+/// of its memory), 2 (pointers loaded through those). Node `3i + d`.
+pub const DEPTHS: u32 = 3;
+
+/// For a value at depth `d` of a param stored at depth `j` of a slot that a
+/// call gets: (param depth, callee depth) pairs whose capture links, and the
+/// slot's own path (callee depth `m < j`: what the value points at is
+/// reachable through it).
+fn slot_links(d: u32, j: u32) -> Vec<(u32, u32)> {
+    let mut v: Vec<(u32, u32)> = (0..DEPTHS - d).filter(|x| j + x < DEPTHS).map(|x| (d + x, j + x)).collect();
+    v.extend((0..j).map(|m| (d, m)));
+    v
+}
+
+/// The first param depth such a store reaches past the callee's last
+/// tracked depth: captured, as far as `CapNode` can tell.
+fn slot_over(d: u32, j: u32) -> Vec<u32> {
+    (0..DEPTHS - d).find(|x| j + x >= DEPTHS).map(|x| d + x).into_iter().collect()
+}
+
 ascent::ascent! {
     /// Capture over nodes (`PLIRON_NOCAP_DEEP`, and the summaries of
-    /// `PLIRON_NOCAPSUM`): node `2i` is param `i` itself, node `2i+1` the
-    /// pointers loaded straight out of the memory it points at (depth 1).
-    /// A pointer stored into a stack slot whose address only goes to
-    /// loads and call arguments (`slotarg`) is at depth 1 of that slot, so
-    /// it is captured only if a callee getting the slot captures its
-    /// depth-1 pointers. hashbrown's scope guards and closure environments
-    /// hold a table pointer that way; LLVM's `captures(none)` has no
-    /// depth-1 form and calls every such store a capture.
+    /// `PLIRON_NOCAPSUM`): node `3i + d` is what lies at depth `d` of param
+    /// `i` (0: the param; 1: pointers loaded straight out of its memory; 2:
+    /// pointers loaded through those). If a node is captured, every deeper
+    /// one is: what a kept pointer reaches is reachable.
+    ///
+    /// A pointer stored into a stack slot that only loads and call arguments
+    /// see (`slot_calls`) sits at depth `j` of what the call gets (1, or 2
+    /// when the slot's own address is stored into another such slot: a
+    /// closure environment holding another closure's, hashbrown's `find`
+    /// probe holding `&mut equivalent_key(k)`), and is captured only if the
+    /// callee captures that depth. LLVM's `captures(none)` has no depth and
+    /// calls every such store a capture.
     ///
     /// `local(_)`: a callee with no body and no adopted facts (`opaque`)
     /// captures every node. `summary(_)`: it becomes an edge,
@@ -137,8 +161,8 @@ ascent::ascent! {
     /// `f` copies memory out of `v` (memcpy/memmove source).
     relation memsrc(u32, Value);
     relation arg(u32, u32, u32, Value);
-    /// `f` stores `v` into a slot passed as argument `k` of a call to `c`.
-    relation slotarg(u32, Value, u32, u32);
+    /// `f` stores `v` at depth `j` of what argument `k` of a call to `c` is.
+    relation slotarg(u32, Value, u32, u32, u32);
     relation nparams(u32, u32);
     relation opaque(u32);
     relation capin(u32, u32);
@@ -151,35 +175,41 @@ ascent::ascent! {
     lattice dd(Value, Mask);
     dd(r, m) <-- ld(a, r), der(a, m);
     dd(d, m) <-- flow(s, d), dd(s, m);
+    lattice dd2(Value, Mask);
+    dd2(r, m) <-- ld(a, r), dd(a, m);
+    dd2(d, m) <-- flow(s, d), dd2(s, m);
 
     /// Node `x` of `f` is captured if node `z` of `c` is.
     relation pass(u32, u32, u32, u32);
-    pass(f, 2 * i, c, 2 * k) <-- arg(f, c, k, v), der(v, m), for i in bits(*m);
-    pass(f, 2 * i + 1, c, 2 * k + 1) <-- arg(f, c, k, v), der(v, m), for i in bits(*m);
-    pass(f, 2 * i + 1, c, 2 * k) <-- arg(f, c, k, v), dd(v, m), for i in bits(*m);
-    // a stored pointer sits at depth 1 of the slot; if the slot's address
-    // escapes, so does what it holds
-    pass(f, 2 * i, c, 2 * k + 1) <-- slotarg(f, v, c, k), der(v, m), for i in bits(*m);
-    pass(f, 2 * i, c, 2 * k) <-- slotarg(f, v, c, k), der(v, m), for i in bits(*m);
-    pass(f, 2 * i + 1, c, 2 * k + 1) <-- slotarg(f, v, c, k), dd(v, m), for i in bits(*m);
-    pass(f, 2 * i + 1, c, 2 * k) <-- slotarg(f, v, c, k), dd(v, m), for i in bits(*m);
+    pass(f, 3 * i + e, c, 3 * k + e) <-- arg(f, c, k, v), der(v, m), for i in bits(*m), for e in 0..3u32;
+    pass(f, 3 * i + 1 + e, c, 3 * k + e) <-- arg(f, c, k, v), dd(v, m), for i in bits(*m), for e in 0..2u32;
+    pass(f, 3 * i + 2, c, 3 * k) <-- arg(f, c, k, v), dd2(v, m), for i in bits(*m);
+    pass(f, 3 * i + fd, c, 3 * k + cd) <-- slotarg(f, v, c, k, j), der(v, m), for i in bits(*m), for (fd, cd) in slot_links(0, *j);
+    pass(f, 3 * i + fd, c, 3 * k + cd) <-- slotarg(f, v, c, k, j), dd(v, m), for i in bits(*m), for (fd, cd) in slot_links(1, *j);
+    pass(f, 3 * i + fd, c, 3 * k + cd) <-- slotarg(f, v, c, k, j), dd2(v, m), for i in bits(*m), for (fd, cd) in slot_links(2, *j);
 
     relation cap(u32, u32);
     cap(c, x) <-- capin(c, x);
-    cap(f, 2 * i) <-- retain(f, v), der(v, m), for i in bits(*m);
-    cap(f, 2 * i + 1) <-- retain(f, v), dd(v, m), for i in bits(*m);
-    cap(f, 2 * i + 1) <-- memsrc(f, v), der(v, m), for i in bits(*m);
-    cap(f, x) <-- pass(f, x, c, z), nparams(c, n), if *z >= 2 * *n;
+    cap(f, 3 * i) <-- retain(f, v), der(v, m), for i in bits(*m);
+    cap(f, 3 * i + 1) <-- retain(f, v), dd(v, m), for i in bits(*m);
+    cap(f, 3 * i + 2) <-- retain(f, v), dd2(v, m), for i in bits(*m);
+    cap(f, 3 * i + 1) <-- memsrc(f, v), der(v, m), for i in bits(*m);
+    cap(f, 3 * i + 2) <-- memsrc(f, v), dd(v, m), for i in bits(*m);
+    cap(f, 3 * i + fd) <-- slotarg(f, v, _, _, j), der(v, m), for i in bits(*m), for fd in slot_over(0, *j);
+    cap(f, 3 * i + fd) <-- slotarg(f, v, _, _, j), dd(v, m), for i in bits(*m), for fd in slot_over(1, *j);
+    cap(f, x + 1) <-- cap(f, x), if *x % 3 < 2;
+    cap(f, x) <-- pass(f, x, c, z), nparams(c, n), if *z >= 3 * *n;
     cap(f, x) <-- pass(f, x, c, z), cap(c, z);
     cap(f, x) <-- pass(f, x, c, _), opaque(c), local(_);
 
     relation dep(u32, u32, u32, u32);
     dep(f, x, c, z) <-- pass(f, x, c, z), opaque(c), summary(_);
-    dep(f, x, c2, y) <-- pass(f, x, c, z), nparams(c, n), if *z < 2 * *n, dep(c, z, c2, y);
+    dep(f, x, c2, y) <-- pass(f, x, c, z), nparams(c, n), if *z < 3 * *n, dep(c, z, c2, y);
+    dep(f, x + 1, c, z) <-- dep(f, x, c, z), if *x % 3 < 2;
 }
 
-/// One node's capture summary (`PLIRON_NOCAPSUM`; node `2i` is param `i`,
-/// `2i+1` the pointers loaded from it, see `CapNode`).
+/// One node's capture summary (`PLIRON_NOCAPSUM`; node `3i + d` is depth
+/// `d` of param `i`, see `CapNode`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CapSum {
     /// Captured by the function itself (or through a callee with a body).
@@ -274,22 +304,72 @@ pub fn solve_capsum(
     out
 }
 
-/// `p`'s byte offset from the stack slot it points into, through constant
-/// GEPs; `None` when a GEP is variable or the chain does not reach a slot.
-fn slot_off(ctx: &Context, st: &State, mut p: Value) -> Option<i64> {
-    let mut off = 0i64;
+/// `p`'s byte offset from the stack slot it points into: `(lo, exact)`, the
+/// offset is `lo` (`exact`) or at least `lo`. Constant GEPs add exactly; a
+/// GEP with a variable index adds at least its constant part when it is
+/// `nuw` (rustc's `ptr.add`: indices non-negative, no unsigned wrap), and
+/// makes the offset unknown (`None`) otherwise. `mem::swap`'s word loop in
+/// hashbrown's `prepare_resize` indexes its scope guard's value that way.
+fn slot_off(ctx: &Context, st: &State, mut p: Value) -> Option<(i64, bool)> {
+    let (mut off, mut exact) = (0i64, true);
     for _ in 0..16 {
         if st.allocas.contains(p) {
-            return Some(off);
+            return Some((off, exact));
         }
         let d = p.defining_op()?;
         if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
             return None;
         }
-        off = off.checked_add(crate::sroa::gep_offset(ctx, st, d)?)?;
+        let (o, e) = match crate::sroa::gep_offset(ctx, st, d) {
+            Some(o) => (o, true),
+            None => (nuw_gep_floor(ctx, st, d)?, false),
+        };
+        off = off.checked_add(o)?;
+        exact &= e;
         p = d.deref(ctx).get_operand(ctx, 0);
     }
     None
+}
+
+/// The least byte offset a `nuw` GEP with variable indices can add: its
+/// constant indices' contributions, each variable index taken as 0. `None`
+/// without `nuw`, or for a variable struct index.
+fn nuw_gep_floor(ctx: &Context, st: &State, op: pliron::context::Ptr<Operation>) -> Option<i64> {
+    use pliron_llvm::attributes::GepNoWrapFlags;
+    use pliron_llvm::ops::GepIndex;
+    let gep = Operation::get_op::<GetElementPtrOp>(op, ctx)?;
+    if !gep.no_wrap_flags(ctx).contains(GepNoWrapFlags::NUW) {
+        return None;
+    }
+    let mut cur = gep.src_elem_type(ctx);
+    let mut off: i64 = 0;
+    for (k, idx) in gep.indices(ctx).iter().enumerate() {
+        let c: Option<i64> = match idx {
+            GepIndex::Constant(c) => Some(*c as i64),
+            GepIndex::Value(v) => crate::sroa::const_int(ctx, st, *v).map(|c| c as i64),
+        };
+        if k == 0 {
+            if let Some(c) = c {
+                off = off.checked_add(c.checked_mul(crate::types::size_align(ctx, cur).0 as i64)?)?;
+            }
+            continue;
+        }
+        match classify(ctx, cur) {
+            TyK::Struct(fs, packed) => {
+                let c = c? as usize;
+                off = off.checked_add(*crate::types::struct_offsets(ctx, &fs, packed).0.get(c)? as i64)?;
+                cur = *fs.get(c)?;
+            }
+            TyK::Array(e, _) | TyK::Vector(e, _) => {
+                if let Some(c) = c {
+                    off = off.checked_add(c.checked_mul(crate::types::size_align(ctx, e).0 as i64)?)?;
+                }
+                cur = e;
+            }
+            _ => return None,
+        }
+    }
+    Some(off)
 }
 
 /// `CapNode`'s store -> load flows for a store of `sv` through `dp` into a
@@ -319,12 +399,12 @@ fn slot_flows(
         return;
     }
     let sz = |v: Value| crate::types::size_align(ctx, v.get_type(ctx)).0 as i64;
-    let so = slot_off(ctx, st, dp).map(|o| (o, o + sz(sv)));
+    // byte ranges, `i64::MAX` an open upper end
+    let range = |o: Option<(i64, bool)>, n: i64| o.map(|(lo, exact)| (lo, if exact { lo + n } else { i64::MAX }));
+    let so = range(slot_off(ctx, st, dp), sz(sv));
     for &r in loads {
         let lo = *lmemo.entry(r).or_insert_with(|| {
-            r.defining_op()
-                .and_then(|l| slot_off(ctx, st, l.deref(ctx).get_operand(ctx, 0)))
-                .map(|o| (o, o + sz(r)))
+            range(r.defining_op().and_then(|l| slot_off(ctx, st, l.deref(ctx).get_operand(ctx, 0))), sz(r))
         });
         let disjoint = matches!((so, lo), (Some((a, b)), Some((c, d))) if b <= c || d <= a);
         if !disjoint {
@@ -341,66 +421,89 @@ fn slot_flows(
 /// indirect with resolved callees): its loads and every (callee, argument)
 /// it is passed as. `None` for anything else (the address stored as a
 /// value, copied out of, passed to an unresolved indirect call).
-fn slot_calls(ctx: &Context, st: &State, dp: Value, ids: &mut Syms) -> Option<(Vec<Value>, Vec<(u32, u32)>)> {
+fn slot_calls(ctx: &Context, st: &State, dp: Value, ids: &mut Syms) -> Option<(Vec<Value>, Vec<(u32, u32, u32)>)> {
+    let r = slot_calls_why(ctx, st, dp, ids, 1);
+    if let Err(why) = &r
+        && pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::nocapture", tracing::Level::TRACE)
+    {
+        tracing::trace!(target: "pliron::nocapture", "slot_calls {dp:?}: {why}");
+    }
+    r.ok()
+}
+
+/// `j`: the depth a pointer stored into this slot has in what the calls
+/// get (1 for the slot itself; 2 for a slot whose address is stored into
+/// another one, which may then have no loads: a reload would hand the
+/// caller this slot's address and so its contents).
+fn slot_calls_why(ctx: &Context, st: &State, dp: Value, ids: &mut Syms, j: u32) -> Result<(Vec<Value>, Vec<(u32, u32, u32)>), String> {
     let mut root = dp;
     for _ in 0..8 {
         if st.allocas.contains(root) {
             break;
         }
-        let d = root.defining_op()?;
+        let d = root.defining_op().ok_or("root is a block arg")?;
         if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
-            return None;
+            return Err(format!("root through {}", Operation::get_opid(d, ctx)));
         }
         root = d.deref(ctx).get_operand(ctx, 0);
     }
     if !st.allocas.contains(root) {
-        return None;
+        return Err("not a slot".into());
     }
     let (mut loads, mut calls) = (Vec::new(), Vec::new());
     let mut work = vec![root];
     let mut budget = 512usize;
     while let Some(v) = work.pop() {
         for u in v.uses_iter(ctx) {
-            budget = budget.checked_sub(1)?;
+            budget = budget.checked_sub(1).ok_or("budget")?;
             let o = u.user_op();
             let i = u.find_index(ctx);
             if st.volatile.contains(o) {
-                return None;
+                return Err("volatile".into());
             }
             if Operation::is_op::<GetElementPtrOp>(o, ctx) && i == 0 {
                 work.push(o.deref(ctx).get_result(ctx, 0));
             } else if Operation::is_op::<LoadOp>(o, ctx) {
                 loads.push(o.deref(ctx).get_result(ctx, 0));
             } else if Operation::is_op::<StoreOp>(o, ctx) && i == 1 {
+            } else if Operation::is_op::<StoreOp>(o, ctx) && i == 0 && j + 1 < DEPTHS {
+                // this slot's address goes into another slot: one level deeper
+                let outer = o.deref(ctx).get_operand(ctx, 1);
+                let (ls, cs) = slot_calls_why(ctx, st, outer, ids, j + 1).map_err(|e| format!("outer slot: {e}"))?;
+                if !ls.is_empty() {
+                    return Err("outer slot is loaded".into());
+                }
+                calls.extend(cs);
             } else if Operation::is_op::<ICmpOp>(o, ctx) {
             } else if let Some(n) = st.intrinsics.get(o).map(|s| s.as_str()) {
                 let ok = n.starts_with("llvm.lifetime.")
                     || (matches!(n, "llvm.memcpy" | "llvm.memmove" | "llvm.memset") && i == 0);
                 if !ok {
-                    return None;
+                    return Err(format!("intrinsic {n} operand {i}"));
                 }
             } else if let Some(c) = Operation::get_op::<CallOp>(o, ctx) {
                 let direct = c.get_attr_llvm_call_callee(ctx).is_some();
                 if !direct && i == 0 {
-                    return None;
+                    return Err("slot is the callee".into());
                 }
                 let k = (i - usize::from(!direct)) as u32;
                 match direct_callee(ctx, st, o) {
                     Some(c) if alloc_shim(c) => {}
-                    Some(c) => calls.push((ids.id(c), k)),
+                    Some(c) => calls.push((ids.id(c), k, j)),
                     None => {
-                        let CallOpCallable::Indirect(cv) = c.callee(ctx) else { return None };
-                        for c in indirect_callees(ctx, st, cv)? {
-                            calls.push((ids.id(&c), k));
+                        let CallOpCallable::Indirect(cv) = c.callee(ctx) else { return Err("callee".into()) };
+                        for c in indirect_callees(ctx, st, cv).ok_or("unresolved indirect call")? {
+                            calls.push((ids.id(&c), k, j));
                         }
                     }
                 }
             } else {
-                return None;
+                return Err(format!("use by {} operand {i}", Operation::get_opid(o, ctx)));
             }
         }
     }
-    Some((loads, calls))
+    Ok((loads, calls))
 }
 
 /// `c` is the callee of an indirect call. If it is a load from a
@@ -419,6 +522,13 @@ fn indirect_callees(ctx: &Context, st: &State, c: Value) -> Option<Vec<String>> 
             }
             return None;
         };
+    }
+    // A constant function address: a vtable slot `constload2` folded after
+    // the one `devirt` round (hashbrown's `&mut dyn FnMut` probe callback
+    // reaches a constant only once `phisimp2` has run).
+    // ... or a join of such constants (`crate::helpers::const_callees`).
+    if let Some(cs) = crate::helpers::const_callees(ctx, st, c) {
+        return Some(cs);
     }
     let Some(op) = c.defining_op() else {
         return None;
@@ -569,7 +679,7 @@ pub fn run_with(ctx: &Context, st: &mut State, deep: bool, capsum_on: bool) {
     let mut old_only_retain: Vec<(u32, Value)> = Vec::new();
     let mut ld: Vec<(Value, Value)> = Vec::new();
     let mut memsrc: Vec<(u32, Value)> = Vec::new();
-    let mut slotarg: Vec<(u32, Value, u32, u32)> = Vec::new();
+    let mut slotarg: Vec<(u32, Value, u32, u32, u32)> = Vec::new();
     // Store -> load flows through frame slots: the default `Capture` keeps
     // its slot-wide form (every load of a slot gets every stored value);
     // `CapNode` gets them by byte range (`slot_flows`). Neither goes into
@@ -752,7 +862,7 @@ pub fn run_with(ctx: &Context, st: &mut State, deep: bool, capsum_on: bool) {
                             Some((ls, calls)) => {
                                 old_only_retain.push((f, sv));
                                 slot_flows(ctx, st, sv, dp, &ls, &mut via_slot_node, &mut load_ranges, &mut node_flow);
-                                slotarg.extend(calls.into_iter().map(|(c, k)| (f, sv, c, k)));
+                                slotarg.extend(calls.into_iter().map(|(c, k, j)| (f, sv, c, k, j)));
                             }
                             None => retain(sv),
                         },
@@ -859,19 +969,21 @@ pub fn run_with(ctx: &Context, st: &mut State, deep: bool, capsum_on: bool) {
         let known: FxHashSet<u32> = q.nparams.iter().map(|&(c, _)| c).collect();
         let mut opaque: FxHashSet<u32> = FxHashSet::default();
         opaque.extend(q.arg.iter().map(|&(_, c, _, _)| c).filter(|c| !known.contains(c)));
-        opaque.extend(q.slotarg.iter().map(|&(_, _, c, _)| c).filter(|c| !known.contains(c)));
+        opaque.extend(q.slotarg.iter().map(|&(_, _, c, _, _)| c).filter(|c| !known.contains(c)));
         q.opaque = opaque.into_iter().map(|c| (c,)).collect();
-        // adopted callees: shallow from `nocapture`, depth 1 from `deepnocap`
-        // (none known: every depth-1 node captures)
+        // adopted callees: depth 0 from `nocapture`, deeper from `freenodes`
+        // (none known: depth 1 captures, and with it depth 2)
         for (sym, set) in &imported {
             let c = ids.id(sym);
-            let dset = st.deepnocap.get(sym);
+            let free = st.freenodes.get(sym);
             for k in 0..MAX_PARAMS {
                 if !set.contains(&k) {
-                    q.capin.push((c, 2 * k));
+                    q.capin.push((c, DEPTHS * k));
                 }
-                if !dset.is_some_and(|d| d.contains(&k)) {
-                    q.capin.push((c, 2 * k + 1));
+                for d in 1..DEPTHS {
+                    if !free.is_some_and(|fr| fr.contains(&(DEPTHS * k + d))) {
+                        q.capin.push((c, DEPTHS * k + d));
+                    }
                 }
             }
         }
@@ -894,13 +1006,13 @@ pub fn run_with(ctx: &Context, st: &mut State, deep: bool, capsum_on: bool) {
             let mode = if summary { "sum" } else { "loc" };
             for &(f, x) in &q.cap {
                 let fname = &names[f as usize];
-                if !fname.contains(want) || x >= 4 {
+                if !fname.contains(want) || x >= 2 * DEPTHS {
                     continue;
                 }
-                let (i, depth) = (x / 2, x % 2);
+                let (i, depth) = (x / DEPTHS, x % DEPTHS);
                 let mut why: Vec<String> = Vec::new();
                 for &(g, v) in &q.retain {
-                    let m = if depth == 0 { der.get(&v) } else { ddm.get(&v) };
+                    let m = match depth { 0 => der.get(&v), 1 => ddm.get(&v), _ => None };
                     if g == f && m.is_some_and(|m| m.0 & (1 << i) != 0) {
                         let at = dbgrets.iter().find(|(_, w, _)| *w == v).map(|(_, _, o)| o.as_str()).unwrap_or("?");
                         // two levels of incoming flow, the ones carrying bit i
@@ -942,7 +1054,7 @@ pub fn run_with(ctx: &Context, st: &mut State, deep: bool, capsum_on: bool) {
         for s in &bodied {
             let f = ids.id(s);
             let n = nparams.get(&f).copied().unwrap_or(0);
-            let v = (0..2 * n)
+            let v = (0..DEPTHS * n)
                 .map(|x| {
                     if cap.contains(&(f, x)) {
                         CapSum::Captured
@@ -996,16 +1108,16 @@ pub fn run_with(ctx: &Context, st: &mut State, deep: bool, capsum_on: bool) {
         for s in &bodied {
             let f = ids.id(s);
             let n = nparams.get(&f).copied().unwrap_or(0);
-            nc.insert(s.clone(), (0..n).filter(|&i| !cap.contains(&(f, 2 * i))).collect());
-            dn.push((s.clone(), (0..n).filter(|&i| !cap.contains(&(f, 2 * i + 1))).collect()));
+            nc.insert(s.clone(), (0..n).filter(|&i| !cap.contains(&(f, DEPTHS * i))).collect());
+            dn.push((s.clone(), (0..DEPTHS * n).filter(|&x| !cap.contains(&(f, x))).collect()));
         }
-        // bodiless decls keep their adopted depth-1 sets
+        // bodiless decls keep their adopted node sets
         let mut keep: Vec<(String, FxHashSet<u32>)> = imported
             .iter()
-            .filter_map(|(sym, _)| st.deepnocap.get(sym).map(|d| (sym.clone(), d.clone())))
+            .filter_map(|(sym, _)| st.freenodes.get(sym).map(|d| (sym.clone(), d.clone())))
             .collect();
         keep.extend(dn);
-        st.deepnocap = keep.into_iter().collect();
+        st.freenodes = keep.into_iter().collect();
     } else {
         let cap: FxHashSet<(u32, u32)> = p.captured.iter().copied().collect();
         for s in &bodied {
@@ -1166,6 +1278,40 @@ mod tests {
         }"#;
         assert!(analyze_f_with(input, 1, true).contains(&0), "deep");
         assert!(!analyze_f_with(input, 1, false).contains(&0), "default");
+    }
+
+    /// `p` two levels down: stored into slot `a`, whose address goes into
+    /// slot `b`, which `@probe` gets and reads through both (hashbrown's
+    /// `find` probe closure holding `&mut equivalent_key(k)`). Depth 2 of
+    /// `b` is not retained, so `p` is not. A version whose callee keeps the
+    /// depth-2 pointer captures.
+    #[test]
+    fn deep_nested_slots() {
+        let input = |keep: bool| format!(r#"
+        builtin.module @m {{
+        ^b():
+          llvm.func @probe: llvm.func <builtin.integer i64(llvm.ptr (0), llvm.ptr (0)) variadic = false> [] {{
+          ^e(q: llvm.ptr (0), out: llvm.ptr (0)):
+            a = llvm.load q : llvm.ptr (0);
+            k = llvm.load a : llvm.ptr (0);
+            {}
+            x = llvm.load k : builtin.integer i64;
+            llvm.return x
+          }};
+          llvm.func @f: llvm.func <builtin.integer i64(llvm.ptr (0), llvm.ptr (0)) variadic = false> [] {{
+          ^e(p: llvm.ptr (0), out: llvm.ptr (0)):
+            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+            sa = llvm.alloca [llvm.ptr (0) x one] : llvm.ptr (0);
+            sb = llvm.alloca [llvm.ptr (0) x one] : llvm.ptr (0);
+            llvm.store *sa <- p;
+            llvm.store *sb <- sa;
+            v = llvm.call @probe (sb, out) : llvm.func <builtin.integer i64(llvm.ptr (0), llvm.ptr (0)) variadic = false>;
+            llvm.return v
+          }}
+        }}"#, if keep {{ "llvm.store *out <- k;" }} else {{ "" }});
+        assert!(analyze_f_with(&input(false), 2, true).contains(&0), "reader");
+        assert!(!analyze_f_with(&input(true), 2, true).contains(&0), "keeper");
+        assert!(!analyze_f_with(&input(false), 2, false).contains(&0), "default");
     }
 
     /// The callee keeps what it loads out of the slot (stores it through

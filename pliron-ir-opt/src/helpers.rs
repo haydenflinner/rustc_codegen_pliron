@@ -309,3 +309,50 @@ impl<K: pliron::cols::ColKey + std::hash::Hash> SparseSet<K> {
         self.0.iter().map(|(k, _)| k)
     }
 }
+
+/// The functions an indirect callee `v` can be: constant function addresses,
+/// directly or through block params whose every incoming value is one (a
+/// `bailout(ctx, b, Self::recover_after_*)` inlined at three sites joins
+/// three recovery functions). `None` when anything else reaches it: a
+/// load, a function param, a landing pad's payload, more than 64 values.
+pub fn const_callees(ctx: &pliron::context::Context, st: &crate::state::State, v: pliron::value::Value) -> Option<Vec<String>> {
+    use pliron::builtin::op_interfaces::BranchOpInterface;
+    use pliron::op::op_cast;
+    use pliron::operation::Operation;
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: rustc_hash::FxHashSet<pliron::value::Value> = Default::default();
+    let mut work = vec![v];
+    let mut budget = 64usize;
+    while let Some(v) = work.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        budget = budget.checked_sub(1)?;
+        if let Some(crate::state::ConstVal::Sym { sym, off: 0 }) = st.consts.get(v) {
+            if !st.funcs.contains_key(sym) {
+                return None;
+            }
+            if !out.contains(sym) {
+                out.push(sym.clone());
+            }
+            continue;
+        }
+        let b = v.defining_block()?;
+        let k = v.try_find_index(ctx).ok()?;
+        let preds = b.preds(ctx);
+        if preds.is_empty() {
+            return None;
+        }
+        for p in preds {
+            let t = p.deref(ctx).iter(ctx).last()?;
+            let op = Operation::get_op_dyn(t, ctx);
+            let br = op_cast::<dyn BranchOpInterface>(&*op)?;
+            for (si, s) in t.deref(ctx).successors(ctx).enumerate() {
+                if s == b {
+                    work.push(*br.successor_operands(ctx, si).get(k)?);
+                }
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
