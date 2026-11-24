@@ -97,6 +97,10 @@ pub struct ReturnCallInfo<T> {
     /// otherwise. The callee returns to this function's caller, so its
     /// writes belong to this function's own set.
     pub pliron_clobbers: Option<regalloc2::PRegSet>,
+    /// PLIRON: the call's calling convention (`PLIRON_SIBCALL_IND`) —
+    /// `collect_operands` picks the indirect target's pinned register
+    /// from it.
+    pub call_conv: CallConv,
 }
 
 fn count_zero_half_words(mut value: u64, num_half_words: u8) -> usize {
@@ -912,7 +916,17 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             // This shouldn't be a fixed register constraint, but it's not clear how to pick a
             // register that won't be clobbered by the callee-save restore code emitted with a
             // return_call_indirect.
-            collector.reg_fixed_use(&mut info.dest, xreg(1));
+            // PLIRON (`PLIRON_SIBCALL_IND`): `x1` is only free under the
+            // `tail` convention — it is an argument register on the
+            // platform conventions. `x17` (`tmp2`) is never an argument
+            // register and the restore sequence above does not write it
+            // (`gen_sp_reg_adjust` uses `x16`/`spilltmp` only).
+            let preg = if info.call_conv == CallConv::Tail {
+                xreg(1)
+            } else {
+                xreg(17)
+            };
+            collector.reg_fixed_use(&mut info.dest, preg);
             for CallArgPair { vreg, preg } in &mut info.uses {
                 collector.reg_fixed_use(vreg, *preg);
             }

@@ -2466,3 +2466,20 @@ LLVM's shape. std corpus: 11 of 4,979 fns change, weighted insts -136
 net (memchr's two_way searchers +96 each are the loss: an unrolled
 compare chain moves out of line). Held-out: instructions within +-0.3%
 everywhere; ms/cycles lean down (pulldown min -2.5%).
+
+## `PLIRON_SIBCALL_IND` (aarch64, opt-in)
+
+`src/isa/aarch64/inst/mod.rs` (`ReturnCallInfo::call_conv` field,
+`ReturnCallInd` operand collection), `src/isa/aarch64/lower/isle.rs`
+(`gen_return_call_info` / `gen_return_call_ind_info` fill it from the
+sig): upstream pins the indirect tail-call target to `x1`, which is only
+free under the `tail` convention — it is an argument register on
+`SystemV`/`AppleAarch64`. The pin is `x17` (`tmp2`) on the platform
+conventions: never an argument register, never callee-saved, and
+untouched by `emit_return_call_common_sequence` (`gen_sp_reg_adjust`
+uses `x16`/`spilltmp` only). With `PLIRON_SIBCALL_IND=1` the sibcall
+pass emits `return_call_indirect` on the platform CCs — lol_html's
+`FnMut::call_mut` vtable shim (`ldp; ldr; br x17`, as LLVM's `br x3`
+shape) and state-machine `next(state)` transitions through function
+pointers. rust-html-rewriter A/B (release dylib): instructions -0.8%,
+cycles -0.9%.

@@ -753,6 +753,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             sign_return_address_all: self.backend.isa_flags.sign_return_address_all(),
             new_stack_arg_size,
             pliron_clobbers,
+            call_conv: self.lower_ctx.sigs()[sig].call_conv(),
         })
     }
 
@@ -777,6 +778,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             sign_return_address_all: self.backend.isa_flags.sign_return_address_all(),
             new_stack_arg_size,
             pliron_clobbers: None,
+            call_conv: self.lower_ctx.sigs()[sig].call_conv(),
         })
     }
 
