@@ -766,6 +766,13 @@ time, memory, code size, stack frames) in ~20 min and writes
   cmp w, w, sxtb`). Test `aarch64_cmn_narrow` (every `i8` value, run).
   `PLIRON_VRP2_NATIVE=1` (opt-in): the late range pass `vrp2` on native
   too (an escape loop's `i < n` then `i == n` folds).
+- `PLIRON_EXTCLEAN` (vendored aarch64, default on since 2026-11-24,
+  `=0` off) — `uload8`/`uload16`/`uload32` and narrow `umov` lane
+  extracts count as zero-extended producers, so `ireduce` of them needs
+  no `uxtb`/`uxth` (pulldown's per-byte `uxtb` in
+  `scalar_iterate_special_bytes`). Statically: compression -146, regex
+  -62, html -57 extends; executed instructions within +-0.3%. Test
+  `aarch64_extclean` (every byte value, run).
 - `PLIRON_STEP_FNS=<step>=<lo>..<hi>` — run one CLIF step only in the
   functions whose `fn_hash` is in `[lo, hi)` (everything else as usual),
   `PLIRON_STEP_FNS_LOG=<file>` names them. Halve the range per probe to

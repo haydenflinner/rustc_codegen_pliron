@@ -45,6 +45,13 @@ pub const DEFAULT_ON: &[&str] = &[
     // fails the rest), no failure; std corpus with its candidates replays
     // clean. `PLIRON_SCOPED_NOALIAS=0` off.
     "PLIRON_SCOPED_NOALIAS",
+    // 2026-11-24: aarch64 `ldrb`/`ldrh`/`ldr w` (`uload*`) and narrow
+    // `umov` lane extracts count as zero-extended, so an `ireduce` of
+    // them needs no `uxtb`/`uxth`. Statically: compression -146, html
+    // -57, regex -62 `uxtb`/`uxth`; held-out executed instructions all
+    // within +-0.3% on a quiet machine (docs/history/2026-11-23-night.md).
+    // Test aarch64_extclean. `PLIRON_EXTCLEAN=0` off.
+    "PLIRON_EXTCLEAN",
     // 2026-11-23: loadfwd keeps `a[i]` across a store to `a[i + 1]`
     // (addresses as `base + scale * idx + k`, disjoint constant offsets).
     // brotli's literal-cost prefix sums: rust-compression -0.5..-0.7%

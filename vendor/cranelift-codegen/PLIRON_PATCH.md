@@ -2435,7 +2435,7 @@ as LLVM's. Extended-register compares: pulldown-cmark 117 -> 0, regex 74
 an `i16` sweep) against eleven constants and four conditions, from memory
 and from a register with junk above the narrow value.
 
-## `PLIRON_EXTCLEAN=1` (aarch64, opt-in, 2026-11-23)
+## `PLIRON_EXTCLEAN` (aarch64, default on since 2026-11-24, `=0` off; opt-in 2026-11-23)
 
 `src/isa/aarch64/lower/isle.rs` (`wide_uext_clean`: `uload8`/`uload16`/
 `uload32`), `src/isa/aarch64/inst.isle` (`val_already_extended`: narrow

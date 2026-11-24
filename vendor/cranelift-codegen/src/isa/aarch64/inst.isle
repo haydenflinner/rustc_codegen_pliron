@@ -3986,7 +3986,7 @@
 (rule 1 (val_already_extended (ArgumentExtension.Uext)
         (load (fits_in_16 _) _ _ _)) true)
 
-;; PLIRON (`PLIRON_EXTCLEAN=1`, opt-in): a narrow integer `extractlane`
+;; PLIRON (`PLIRON_EXTCLEAN=0` off): a narrow integer `extractlane`
 ;; is `umov w, v.b[i]` / `v.h[i]`, which zero-extends into the register
 ;; (pulldown-cmark: 30 `umov.b; uxtb` pairs).
 (decl pure extclean_on () bool)
