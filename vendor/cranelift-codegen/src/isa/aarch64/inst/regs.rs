@@ -150,16 +150,17 @@ pub fn x30_allocatable() -> bool {
     x30_mode() != 0
 }
 
-/// `PLIRON_X30`: 0 (unset) off, 1 everywhere, 2 where a frame record exists anyway.
+/// `PLIRON_X30`: 0 off, 1 everywhere, 2 where a frame record exists anyway,
+/// 3 (default) that plus leaves of at least `PLIRON_X30_MIN` instructions.
 pub fn x30_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("PLIRON_X30").as_deref() {
+        Ok("0") => 0,
         Ok("1") => 1,
         Ok("2") => 2,
-        // Mode 2 plus large leaves (`machinst/abi.rs` folds them into
-        // `has_calls`).
-        Ok("3") => 2,
-        _ => 0,
+        // Mode 3 (the default since 2026-11-23): mode 2 plus large leaves
+        // (`machinst/abi.rs` folds them into `has_calls`).
+        _ => 2,
     })
 }
 

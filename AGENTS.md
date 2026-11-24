@@ -1420,8 +1420,9 @@ time, memory, code size, stack frames) in ~20 min and writes
   rust-compression 776 pairs -> 156, LLVM 142). std corpus -0.19%
   instructions; held-out instructions within placement, compression
   cycles -3%. Checker clean on 400k rafuzz seeds and the std corpus.
-  `PLIRON_X30=3` (opt-in): `=2` plus leaves of at least `PLIRON_X30_MIN`
-  (256) instructions (blake3 -0.8%; measured on a loaded machine).
+  `PLIRON_X30=3` (default since 2026-11-23; `=0` off): `=2` plus leaves of
+  at least `PLIRON_X30_MIN` (256) instructions. blake3 -1.04% instructions,
+  -2.0% cycles over placement copies; the other seven within placement.
 - `PLIRON_RA_STATS=1` — one `ra2stats:` line per function (splits /
   minimal / use_cluster / region / evicts).
 - `PLIRON_X18=1` (opt-in) — the platform register x18 is allocatable,
@@ -1493,7 +1494,8 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_INLINE_GLUET=<n>` (opt-in) — drop-glue call-site threshold at
   least n (after the `DROPLIM` cap). At 90: html-rewriter -0.84%,
   pulldown -0.31%, protobuf -0.34%, but compression +1.25%, regex +0.35%.
-- `PLIRON_X30=1|2` (opt-in, aarch64) — the link register is allocatable.
+- `PLIRON_X30=1|2|3` (aarch64; `=3` the default since 2026-11-23, `=0` off)
+  — the link register is allocatable.
   `=1` everywhere (a frameless leaf grows a frame record). `=2` only in
   a function that already makes a regular call, or when frame pointers
   are kept. With X17, `=1` is blake3 `compress_in_place` −669k but

@@ -2407,7 +2407,7 @@ to 8, then tested for wrapping). Measured with `PLIRON_WIDE128_VARSHIFT`
 (which lets the egraph see hashbrown's rehash closures at all): html
 -0.119%, protobuf -0.013%, blind-sig +0.024% (allocator noise).
 
-## `PLIRON_X30=3` (opt-in, 2026-11-23)
+## `PLIRON_X30=3` (default since 2026-11-23; `=0` off, `=1`/`=2` the older modes)
 
 `src/machinst/abi.rs` (`has_calls`), `src/isa/aarch64/inst/regs.rs`
 (`x30_mode`): mode 2 (the link register is allocatable where a frame
@@ -2415,4 +2415,6 @@ record exists anyway) plus leaves of at least `PLIRON_X30_MIN` (default
 256) instructions, which spill and set up a frame record anyway. blake3's
 `compress_in_place` (a leaf with a frame record) gets `x30`: -0.8% macOS
 instructions; small leaves stay frameless (`=1` cost rust-json and
-pulldown-cmark there). Measured on a loaded machine: not yet a default.
+pulldown-cmark there). `harness/placement.py --no-exact`, 4-8 copies:
+blake3 instructions -1.04%, cycles -2.0% (real); html, json, pulldown,
+regex, compression, protobuf, blind-sig within placement.

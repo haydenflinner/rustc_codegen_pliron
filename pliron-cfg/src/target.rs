@@ -200,7 +200,8 @@ impl Target {
     /// Allocatable integer registers under the register knobs the
     /// vendored aarch64 backend reads: `PLIRON_X17` (default on), `PLIRON_X18`
     /// (opt-in, and only where [`Target::platform_reg_free`]), `PLIRON_X30`
-    /// (`=1|2`; counted for `=2` too, an upper bound for leaves). Elsewhere
+    /// (`=1|2`; counted for `=2` too, an upper bound for leaves; the default
+    /// `=3`, which adds large leaves, is not counted, as measured). Elsewhere
     /// the same as [`Target::int_regs`].
     pub fn int_regs_alloc(&self) -> Option<(u32, u32)> {
         let (mut n, csr) = self.int_regs()?;

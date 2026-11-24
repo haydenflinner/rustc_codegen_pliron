@@ -1407,7 +1407,7 @@ impl<M: ABIMachineSpec> Callee<M> {
                 )
             })
         });
-        // PLIRON: `PLIRON_X30=3` (aarch64): also a leaf of at least
+        // PLIRON: `PLIRON_X30=3` (aarch64, the default): also a leaf of at least
         // `PLIRON_X30_MIN` (default 256) instructions counts here: such a
         // body spills and sets up a frame record anyway (blake3's
         // `compress_in_place`), while small leaves stay frameless (`=1`
@@ -1415,7 +1415,7 @@ impl<M: ABIMachineSpec> Callee<M> {
         let has_calls = has_calls || {
             static BIG: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
             BIG.get_or_init(|| {
-                (std::env::var("PLIRON_X30").as_deref() == Ok("3")).then(|| {
+                matches!(std::env::var("PLIRON_X30").as_deref(), Ok("3") | Err(_)).then(|| {
                     std::env::var("PLIRON_X30_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
                 })
             })
