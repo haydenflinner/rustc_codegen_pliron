@@ -1495,8 +1495,13 @@ impl MachInst for Inst {
 //=============================================================================
 // Pretty-printing of instructions.
 
-fn mem_finalize_for_show(mem: &AMode, access_ty: Type, state: &EmitState) -> (String, String) {
-    let (mem_insts, mem) = mem_finalize(None, mem, access_ty, state);
+fn mem_finalize_for_show(
+    mem: &AMode,
+    access_ty: Type,
+    state: &EmitState,
+    avoid: &[Reg],
+) -> (String, String) {
+    let (mem_insts, mem, mem_post) = mem_finalize(None, mem, access_ty, state, avoid);
     let mut mem_str = mem_insts
         .into_iter()
         .map(|inst| inst.print_with_state(&mut EmitState::default()))
@@ -1506,7 +1511,15 @@ fn mem_finalize_for_show(mem: &AMode, access_ty: Type, state: &EmitState) -> (St
         mem_str += " ; ";
     }
 
-    let mem = mem.pretty_print(access_ty.bytes() as u8);
+    let mut mem = mem.pretty_print(access_ty.bytes() as u8);
+    if !mem_post.is_empty() {
+        mem += " ; ";
+        mem += &mem_post
+            .into_iter()
+            .map(|inst| inst.print_with_state(&mut EmitState::default()))
+            .collect::<Vec<_>>()
+            .join(" ; ");
+    }
     (mem_str, mem)
 }
 
@@ -1712,10 +1725,11 @@ impl Inst {
                     _ => unreachable!(),
                 };
 
-                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let rd_reg = rd.to_reg();
+                let rd = pretty_print_ireg(rd_reg, size);
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[rd_reg]);
 
                 format!("{mem_str}{op} {rd}, {mem}")
             }
@@ -1739,10 +1753,10 @@ impl Inst {
                     _ => unreachable!(),
                 };
 
-                let rd = pretty_print_ireg(rd, size);
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[rd]);
+                let rd = pretty_print_ireg(rd, size);
 
                 format!("{mem_str}{op} {rd}, {mem}")
             }
@@ -2208,21 +2222,21 @@ impl Inst {
                 let rd = pretty_print_vreg_scalar(rd.to_reg(), ScalarSize::Size16);
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[]);
                 format!("{mem_str}ldr {rd}, {mem}")
             }
             &Inst::FpuLoad32 { rd, ref mem, .. } => {
                 let rd = pretty_print_vreg_scalar(rd.to_reg(), ScalarSize::Size32);
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[]);
                 format!("{mem_str}ldr {rd}, {mem}")
             }
             &Inst::FpuLoad64 { rd, ref mem, .. } => {
                 let rd = pretty_print_vreg_scalar(rd.to_reg(), ScalarSize::Size64);
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[]);
                 format!("{mem_str}ldr {rd}, {mem}")
             }
             &Inst::FpuLoad128 { rd, ref mem, .. } => {
@@ -2230,28 +2244,28 @@ impl Inst {
                 let rd = "q".to_string() + &rd[1..];
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[]);
                 format!("{mem_str}ldr {rd}, {mem}")
             }
             &Inst::FpuStore16 { rd, ref mem, .. } => {
                 let rd = pretty_print_vreg_scalar(rd, ScalarSize::Size16);
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[]);
                 format!("{mem_str}str {rd}, {mem}")
             }
             &Inst::FpuStore32 { rd, ref mem, .. } => {
                 let rd = pretty_print_vreg_scalar(rd, ScalarSize::Size32);
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[]);
                 format!("{mem_str}str {rd}, {mem}")
             }
             &Inst::FpuStore64 { rd, ref mem, .. } => {
                 let rd = pretty_print_vreg_scalar(rd, ScalarSize::Size64);
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[]);
                 format!("{mem_str}str {rd}, {mem}")
             }
             &Inst::FpuStore128 { rd, ref mem, .. } => {
@@ -2259,7 +2273,7 @@ impl Inst {
                 let rd = "q".to_string() + &rd[1..];
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state);
+                let (mem_str, mem) = mem_finalize_for_show(&mem, access_ty, state, &[]);
                 format!("{mem_str}str {rd}, {mem}")
             }
             &Inst::FpuLoadP64 {
@@ -3324,7 +3338,8 @@ impl Inst {
                 // expansion stage (i.e., legalization, but without the slow edit-in-place
                 // of the existing legalization framework).
                 let mem = mem.clone();
-                let (mem_insts, mem) = mem_finalize(None, &mem, I8, state);
+                let (mem_insts, mem, mem_post) =
+                    mem_finalize(None, &mem, I8, state, &[rd.to_reg()]);
                 let mut ret = String::new();
                 for inst in mem_insts.into_iter() {
                     ret.push_str(&inst.print_with_state(&mut EmitState::default()));
@@ -3368,7 +3383,25 @@ impl Inst {
                     };
                     ret.push_str(&add.print_with_state(&mut EmitState::default()));
                 } else {
-                    let tmp = writable_spilltmp_reg();
+                    // Mirror the `emit` side: `tmp2` when x17 is not
+                    // allocatable, `rd` when it is and is not the base,
+                    // a borrowed scratch otherwise (`PLIRON_X16`).
+                    let (tmp, save) = if !x17_allocatable() {
+                        (writable_tmp2_reg(), false)
+                    } else if rd.to_reg() != reg {
+                        (rd, false)
+                    } else if !x16_allocatable() {
+                        (writable_spilltmp_reg(), false)
+                    } else {
+                        let (tmp, save) = emit_scratch_reg(&[rd.to_reg()]);
+                        if save {
+                            ret.push_str(
+                                &emit_scratch_save(tmp)
+                                    .print_with_state(&mut EmitState::default()),
+                            );
+                        }
+                        (Writable::from_reg(tmp), save)
+                    };
                     for inst in Inst::load_constant(tmp, abs_offset).into_iter() {
                         ret.push_str(&inst.print_with_state(&mut EmitState::default()));
                     }
@@ -3380,6 +3413,15 @@ impl Inst {
                         rm: tmp.to_reg(),
                     };
                     ret.push_str(&add.print_with_state(&mut EmitState::default()));
+                    if save {
+                        ret.push_str(
+                            &emit_scratch_restore(tmp.to_reg())
+                                .print_with_state(&mut EmitState::default()),
+                        );
+                    }
+                }
+                for inst in mem_post.into_iter() {
+                    ret.push_str(&inst.print_with_state(&mut EmitState::default()));
                 }
                 ret
             }
@@ -3559,14 +3601,18 @@ impl MachInstLabelUse for LabelUse {
     fn veneer_size(self) -> CodeOffset {
         match self {
             LabelUse::Branch14 | LabelUse::Branch19 => 4,
-            LabelUse::Branch26 if regs::x17_allocatable() => 28,
+            LabelUse::Branch26 if regs::x17_allocatable() || regs::x16_allocatable() => 28,
             LabelUse::Branch26 => 20,
             _ => unreachable!(),
         }
     }
 
     fn worst_case_veneer_size() -> CodeOffset {
-        if regs::x17_allocatable() { 28 } else { 20 }
+        if regs::x17_allocatable() || regs::x16_allocatable() {
+            28
+        } else {
+            20
+        }
     }
 
     /// Generate a veneer into the buffer, given that this veneer is at `veneer_offset`, and return
@@ -3597,6 +3643,15 @@ impl MachInstLabelUse for LabelUse {
             // available for us to use.
             // With `PLIRON_X17`, x17 may hold a live value across an
             // intra-function jump, so the veneer saves it below sp around its use.
+            // With `PLIRON_X16` also set, x16 may be live likewise, but
+            // the branch-target register is necessarily left holding the
+            // target at the destination: an indirect-branch veneer cannot
+            // preserve every register (this is why the ABI reserves IP
+            // regs). The residual window is a live x16 across an
+            // intra-function `b` whose target is more than ±128MB away —
+            // a single function body that large cannot be produced by
+            // this compiler, and `bl` call sites (the other Branch26
+            // user) have dead scratch registers anyway.
             LabelUse::Branch26 if regs::x17_allocatable() => {
                 let tmp1 = regs::spilltmp_reg();
                 let tmp1_w = regs::writable_spilltmp_reg();
@@ -3614,6 +3669,32 @@ impl MachInstLabelUse for LabelUse {
                 let restore = 0xf84107f1u32;
                 // br x16
                 let br = emit::enc_br(tmp1);
+                for (i, w) in [save, ldr, adr, add, restore, br].into_iter().enumerate() {
+                    buffer[i * 4..i * 4 + 4].clone_from_slice(&u32::to_le_bytes(w));
+                }
+                (veneer_offset + 24, LabelUse::PCRel32)
+            }
+            // `PLIRON_X16` only: x16 may hold a live value across an
+            // intra-function jump (x17 is not allocatable), so the veneer
+            // saves x16 below sp and keeps the target in x17. Mirror of
+            // the `PLIRON_X17` variant with the roles swapped.
+            LabelUse::Branch26 if regs::x16_allocatable() => {
+                let tmp1 = regs::spilltmp_reg();
+                let tmp1_w = regs::writable_spilltmp_reg();
+                let tmp2 = regs::tmp2_reg();
+                let tmp2_w = regs::writable_tmp2_reg();
+                // str x16, [sp, #-16]!
+                let save = 0xf81f0ff0u32;
+                // ldrsw x17, 20
+                let ldr = emit::enc_ldst_imm19(0b1001_1000, 20 / 4, tmp2);
+                // adr x16, 16
+                let adr = emit::enc_adr(16, tmp1_w);
+                // add x17, x17, x16
+                let add = emit::enc_arith_rrr(0b10001011_000, 0, tmp2_w, tmp2, tmp1);
+                // ldr x16, [sp], #16
+                let restore = 0xf84107f0u32;
+                // br x17
+                let br = emit::enc_br(tmp2);
                 for (i, w) in [save, ldr, adr, add, restore, br].into_iter().enumerate() {
                     buffer[i * 4..i * 4 + 4].clone_from_slice(&u32::to_le_bytes(w));
                 }

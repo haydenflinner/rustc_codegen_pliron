@@ -668,20 +668,36 @@ impl ABIMachineSpec for AArch64MachineDeps {
             };
             ret.push(adj_inst);
         } else {
-            let tmp = writable_spilltmp_reg();
-            // `gen_sp_reg_adjust` is called after regalloc2, so it's acceptable to reuse `tmp` for
-            // intermediates in `load_constant`.
-            let const_inst = Inst::load_constant(tmp, amount);
-            let adj_inst = Inst::AluRRRExtend {
-                alu_op,
-                size: OperandSize::Size64,
-                rd: writable_stack_reg(),
-                rn: stack_reg(),
-                rm: tmp.to_reg(),
-                extendop: ExtendOp::UXTX,
-            };
-            ret.extend(const_inst);
-            ret.push(adj_inst);
+            // PLIRON (`PLIRON_X16`): chain `imm12` `add`/`sub` forms — no
+            // scratch register at all, so this is safe at any point after
+            // regalloc: under `PLIRON_X16` x16 (`spilltmp`) may hold a
+            // live allocated value, e.g. at the shrink-wrap save point
+            // mid-function or beside a call's return-value sequence. Each
+            // `Imm12` chunk covers up to 0xfff000 plus a trailing plain
+            // 12-bit remainder, so all frame sizes in practice take 1-2
+            // instructions — the `load_constant` + extended `add` it
+            // replaces costs the same or more.
+            let mut left = amount;
+            while left > 0 {
+                let hi = left & !0xfff;
+                let chunk = if hi > 0xfff000 {
+                    0xfff000
+                } else if hi != 0 {
+                    hi
+                } else {
+                    left
+                };
+                let imm12 = Imm12::maybe_from_u64(chunk)
+                    .expect("chunk is a plain or shifted-12 12-bit value");
+                ret.push(Inst::AluRRImm12 {
+                    alu_op,
+                    size: OperandSize::Size64,
+                    rd: writable_stack_reg(),
+                    rn: stack_reg(),
+                    imm12,
+                });
+                left -= chunk;
+            }
         }
         ret
     }
@@ -1388,16 +1404,23 @@ impl ABIMachineSpec for AArch64MachineDeps {
             _ => false,
         };
         let x18 = x18_allocatable();
-        if x17_allocatable() || lr || x18 {
-            // pinned | lr | x18 → 8 slots
-            static ENVS: [std::sync::OnceLock<MachineEnv>; 8] =
-                [const { std::sync::OnceLock::new() }; 8];
+        let x16 = x16_allocatable();
+        if x17_allocatable() || lr || x18 || x16 {
+            // pinned | x16 | lr | x18 → 16 slots
+            static ENVS: [std::sync::OnceLock<MachineEnv>; 16] =
+                [const { std::sync::OnceLock::new() }; 16];
             let pinned = flags.enable_pinned_reg();
-            let key = usize::from(pinned) * 4 + usize::from(lr) * 2 + usize::from(x18);
+            let key = usize::from(pinned) * 8
+                + usize::from(x16) * 4
+                + usize::from(lr) * 2
+                + usize::from(x18);
             return ENVS[key].get_or_init(|| {
                 let mut env = create_reg_env(pinned);
                 if x17_allocatable() {
                     env.preferred_regs_by_class[0].add(xreg_preg(17));
+                }
+                if x16 {
+                    env.preferred_regs_by_class[0].add(xreg_preg(16));
                 }
                 if x18 {
                     env.preferred_regs_by_class[0].add(xreg_preg(18));

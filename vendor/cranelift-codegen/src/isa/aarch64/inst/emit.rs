@@ -7,16 +7,81 @@ use crate::isa::aarch64;
 use crate::isa::aarch64::inst::*;
 use crate::trace;
 
+/// PLIRON (`PLIRON_X16`): the emit-time scratch register for address
+/// computation, and whether it must be preserved. Without the knob this
+/// is `x16` (`spilltmp_reg`), which regalloc never hands out. With it,
+/// x16 may hold a live value (x17 likewise — allocated, or pinned as a
+/// `return_call_indirect` destination), so the borrowed register is
+/// saved to the transient 16-byte slot below `sp` for the duration of
+/// the computation — the same convention as branch veneers, where a
+/// pre/post-indexed pair makes the slot real allocated stack between
+/// the save and the restore. `avoid` holds the registers the sequence
+/// still reads after borrowing or that the post-access restore would
+/// destroy (the mode's base register, the access's value/destination);
+/// the first free candidate is borrowed. `x29` (`fp`) is the last
+/// resort: it never appears in `avoid` when both IP registers do, and
+/// the save/restore makes any non-`sp` register safe to borrow.
+pub fn emit_scratch_reg(avoid: &[Reg]) -> (Reg, bool) {
+    if !x16_allocatable() {
+        return (spilltmp_reg(), false);
+    }
+    for cand in [spilltmp_reg(), tmp2_reg(), fp_reg()] {
+        if !avoid.contains(&cand) {
+            return (cand, true);
+        }
+    }
+    unreachable!("emit scratch: x16, x17 and fp all in the avoid set")
+}
+
+/// `emit_scratch_reg` with the addressing mode's base register added to
+/// the caller's avoid set.
+fn emit_scratch_reg_avoid(basereg: Reg, avoid: &[Reg]) -> (Reg, bool) {
+    let mut avoids: SmallVec<[Reg; 3]> = SmallVec::with_capacity(avoid.len() + 1);
+    avoids.push(basereg);
+    avoids.extend_from_slice(avoid);
+    emit_scratch_reg(&avoids)
+}
+
+/// `str tmp, [sp, #-16]!`: borrow an IP register as the emit scratch.
+pub(crate) fn emit_scratch_save(tmp: Reg) -> Inst {
+    Inst::Store64 {
+        rd: tmp,
+        mem: AMode::SPPreIndexed {
+            simm9: SImm9::maybe_from_i64(-16).unwrap(),
+        },
+        flags: MemFlagsData::trusted(),
+    }
+}
+
+/// `ldr tmp, [sp], #16`: hand the borrowed scratch back.
+pub(crate) fn emit_scratch_restore(tmp: Reg) -> Inst {
+    Inst::ULoad64 {
+        rd: Writable::from_reg(tmp),
+        mem: AMode::SPPostIndexed {
+            simm9: SImm9::maybe_from_i64(16).unwrap(),
+        },
+        flags: MemFlagsData::trusted(),
+    }
+}
+
 /// Memory addressing mode finalization: convert "special" modes (e.g.,
 /// generic arbitrary stack offset) into real addressing modes, possibly by
 /// emitting some helper instructions that come immediately before the use
 /// of this amode.
+///
+/// PLIRON: returns `(pre_insts, amode, post_insts)`. Under `PLIRON_X16`
+/// the address scratch may be an allocated (live) register, borrowed via
+/// `emit_scratch_reg`; the restore must come *after* the instruction
+/// that uses the computed address, so it travels separately as
+/// `post_insts` (empty unless borrowed).
 pub fn mem_finalize(
     sink: Option<&mut MachBuffer<Inst>>,
     mem: &AMode,
     access_ty: Type,
     state: &EmitState,
-) -> (SmallVec<[Inst; 4]>, AMode) {
+    avoid: &[Reg],
+) -> (SmallVec<[Inst; 4]>, AMode, SmallVec<[Inst; 2]>) {
+    let no_post: SmallVec<[Inst; 2]> = smallvec![];
     match mem {
         &AMode::RegOffset { off, .. }
         | &AMode::SPOffset { off }
@@ -57,14 +122,18 @@ pub fn mem_finalize(
 
             if let Some(simm9) = SImm9::maybe_from_i64(off) {
                 let mem = AMode::Unscaled { rn: basereg, simm9 };
-                (smallvec![], mem)
+                (smallvec![], mem, no_post)
             } else if let Some(uimm12) = UImm12Scaled::maybe_from_i64(off, access_ty) {
                 let mem = AMode::UnsignedOffset {
                     rn: basereg,
                     uimm12,
                 };
-                (smallvec![], mem)
-            } else if let Some(imm12) = u64::try_from(off).ok().and_then(Imm12::maybe_from_u64) {
+                (smallvec![], mem, no_post)
+            } else if u64::try_from(off)
+                .ok()
+                .and_then(Imm12::maybe_from_u64)
+                .is_some()
+            {
                 // PLIRON: an offset an `add` immediate holds (a 16-byte
                 // vector slot at an offset that is not a multiple of 16,
                 // past the unscaled range): `add tmp, base, #off` and a
@@ -72,16 +141,34 @@ pub fn mem_finalize(
                 // sxtx]`. Same count, one register read less on the
                 // access, and a form every tool decodes (valgrind does
                 // not know the extended-register `ldr q`).
-                let tmp = writable_spilltmp_reg();
+                let (tmp, save) = emit_scratch_reg_avoid(basereg, avoid);
+                let tmp = Writable::from_reg(tmp);
+                // While borrowed, `sp` sits 16 lower: an `sp`-relative
+                // base needs the offset bumped by the slot's size.
+                let off = if save && basereg == stack_reg() {
+                    off + 16
+                } else {
+                    off
+                };
+                let imm12 = Imm12::maybe_from_u64(off as u64)
+                    .expect("the bump is small and aligned");
+                let mut pre: SmallVec<[Inst; 4]> = smallvec![];
+                let mut post: SmallVec<[Inst; 2]> = smallvec![];
+                if save {
+                    pre.push(emit_scratch_save(tmp.to_reg()));
+                    post.push(emit_scratch_restore(tmp.to_reg()));
+                }
+                pre.push(Inst::AluRRImm12 {
+                    alu_op: ALUOp::Add,
+                    size: OperandSize::Size64,
+                    rd: tmp,
+                    rn: basereg,
+                    imm12,
+                });
                 (
-                    smallvec![Inst::AluRRImm12 {
-                        alu_op: ALUOp::Add,
-                        size: OperandSize::Size64,
-                        rd: tmp,
-                        rn: basereg,
-                        imm12,
-                    }],
+                    pre,
                     AMode::UnsignedOffset { rn: tmp.to_reg(), uimm12: UImm12Scaled::zero(access_ty) },
+                    post,
                 )
             } else {
                 // PLIRON: `[base, tmp]` (the LSL form, no shift) instead
@@ -90,13 +177,22 @@ pub fn mem_finalize(
                 // valgrind decodes only this one for `ldr q` (regex's
                 // `ExecBuilder::build` has a 14KB frame: `ldr q0, [sp,
                 // x16, sxtx]` stopped callgrind with SIGILL).
-                let tmp = writable_spilltmp_reg();
+                let (tmp, save) = emit_scratch_reg_avoid(basereg, avoid);
+                let off = if save && basereg == stack_reg() {
+                    off + 16
+                } else {
+                    off
+                };
+                let mut pre = Inst::load_constant(Writable::from_reg(tmp), off as u64);
+                let mut post: SmallVec<[Inst; 2]> = smallvec![];
+                if save {
+                    pre.insert(0, emit_scratch_save(tmp));
+                    post.push(emit_scratch_restore(tmp));
+                }
                 (
-                    Inst::load_constant(tmp, off as u64),
-                    AMode::RegReg {
-                        rn: basereg,
-                        rm: tmp.to_reg(),
-                    },
+                    pre,
+                    AMode::RegReg { rn: basereg, rm: tmp },
+                    post,
                 )
             }
         }
@@ -104,14 +200,14 @@ pub fn mem_finalize(
         AMode::Const { addr } => {
             let sink = match sink {
                 Some(sink) => sink,
-                None => return (smallvec![], mem.clone()),
+                None => return (smallvec![], mem.clone(), no_post),
             };
             let label = sink.get_label_for_constant(*addr);
             let label = MemLabel::Mach(label);
-            (smallvec![], AMode::Label { label })
+            (smallvec![], AMode::Label { label }, no_post)
         }
 
-        _ => (smallvec![], mem.clone()),
+        _ => (smallvec![], mem.clone(), no_post),
     }
 }
 
@@ -1003,7 +1099,8 @@ impl MachInstEmit for Inst {
             | &Inst::FpuLoad128 { rd, ref mem, flags } => {
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_insts, mem) = mem_finalize(Some(sink), &mem, access_ty, state);
+                let (mem_insts, mem, mem_post) =
+                    mem_finalize(Some(sink), &mem, access_ty, state, &[rd.to_reg()]);
 
                 for inst in mem_insts.into_iter() {
                     inst.emit(sink, emit_info, state);
@@ -1136,6 +1233,11 @@ impl MachInstEmit for Inst {
                         panic!("Should not see {mem:?} here!")
                     }
                 }
+
+                // PLIRON: restore the borrowed scratch (`PLIRON_X16`).
+                for inst in mem_post.into_iter() {
+                    inst.emit(sink, emit_info, state);
+                }
             }
 
             &Inst::Store8 { rd, ref mem, flags }
@@ -1148,7 +1250,10 @@ impl MachInstEmit for Inst {
             | &Inst::FpuStore128 { rd, ref mem, flags } => {
                 let mem = mem.clone();
                 let access_ty = self.mem_type().unwrap();
-                let (mem_insts, mem) = mem_finalize(Some(sink), &mem, access_ty, state);
+                // `rd` is the stored value: the scratch must not clobber
+                // it (`PLIRON_X16`).
+                let (mem_insts, mem, mem_post) =
+                    mem_finalize(Some(sink), &mem, access_ty, state, &[rd]);
 
                 for inst in mem_insts.into_iter() {
                     inst.emit(sink, emit_info, state);
@@ -1234,6 +1339,11 @@ impl MachInstEmit for Inst {
                     | &AMode::RegOffset { .. } => {
                         panic!("Should not see {mem:?} here!")
                     }
+                }
+
+                // PLIRON: restore the borrowed scratch (`PLIRON_X16`).
+                for inst in mem_post.into_iter() {
+                    inst.emit(sink, emit_info, state);
                 }
             }
 
@@ -3631,7 +3741,10 @@ impl MachInstEmit for Inst {
             }
             &Inst::LoadAddr { rd, ref mem } => {
                 let mem = mem.clone();
-                let (mem_insts, mem) = mem_finalize(Some(sink), &mem, I8, state);
+                // `rd` must not be the borrowed scratch (`PLIRON_X16`):
+                // the post-access restore would overwrite the result.
+                let (mem_insts, mem, mem_post) =
+                    mem_finalize(Some(sink), &mem, I8, state, &[rd.to_reg()]);
                 for inst in mem_insts.into_iter() {
                     inst.emit(sink, emit_info, state);
                 }
@@ -3698,17 +3811,27 @@ impl MachInstEmit for Inst {
                     // should otherwise be correct.
                     //
                     // With `PLIRON_X17`, x17 is allocatable, so use `rd` (written here
-                    // anyway) unless it is also the base, in which case the base is an
-                    // allocated register and `spilltmp` is free.
-                    let tmp = if !x17_allocatable() {
+                    // anyway) unless it is also the base. With `PLIRON_X16` too,
+                    // `spilltmp` is also allocatable, so the base-is-destination case
+                    // borrows a register via `emit_scratch_reg` instead.
+                    let (tmp, save) = if !x17_allocatable() {
                         debug_assert!(rd.to_reg() != tmp2_reg());
                         debug_assert!(reg != tmp2_reg());
-                        writable_tmp2_reg()
+                        (writable_tmp2_reg(), false)
                     } else if rd.to_reg() != reg {
-                        rd
-                    } else {
+                        (rd, false)
+                    } else if !x16_allocatable() {
                         debug_assert!(reg != spilltmp_reg());
-                        writable_spilltmp_reg()
+                        (writable_spilltmp_reg(), false)
+                    } else {
+                        // Both IP registers are allocatable and the
+                        // destination is the base register: borrow a
+                        // scratch for the constant materialization.
+                        let (tmp, save) = emit_scratch_reg(&[rd.to_reg()]);
+                        if save {
+                            emit_scratch_save(tmp).emit(sink, emit_info, state);
+                        }
+                        (Writable::from_reg(tmp), save)
                     };
                     for insn in Inst::load_constant(tmp, abs_offset).into_iter() {
                         insn.emit(sink, emit_info, state);
@@ -3721,6 +3844,15 @@ impl MachInstEmit for Inst {
                         rm: tmp.to_reg(),
                     };
                     add.emit(sink, emit_info, state);
+                    if save {
+                        emit_scratch_restore(tmp.to_reg()).emit(sink, emit_info, state);
+                    }
+                }
+
+                // PLIRON: restore the scratch `mem_finalize` borrowed
+                // (`PLIRON_X16`).
+                for inst in mem_post.into_iter() {
+                    inst.emit(sink, emit_info, state);
                 }
             }
             &Inst::Paci { key } => {

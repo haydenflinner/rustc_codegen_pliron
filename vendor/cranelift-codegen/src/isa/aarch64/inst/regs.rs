@@ -187,6 +187,23 @@ pub fn x18_allocatable() -> bool {
         && std::env::var("PLIRON_X18").as_deref() != Ok("0")
 }
 
+/// `PLIRON_X16` (opt-in): x16 is allocatable, as LLVM does (the
+/// interprocedural scratch registers are only linker-veneer scratch).
+/// x16 is `spilltmp_reg` — the emit-time scratch for far stack accesses
+/// and pseudo-op expansion — so under the knob the sites that used to
+/// rely on it being permanently free borrow it (or x17) and restore it
+/// instead: `emit_scratch_reg` in `inst/emit.rs` brackets the address
+/// computation with a save/restore in the 16 bytes below `sp` (the
+/// AAPCS veneer convention, same as the `PLIRON_X17` veneer path).
+/// Branch veneers save whichever IP registers are allocatable, and
+/// `gen_sp_reg_adjust` chains imm12 forms so it needs no scratch.
+/// Prologue uses (stack-limit check, probestack, frame setup) run where
+/// no allocated value can be live in x16 yet and need nothing.
+pub fn x16_allocatable() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_X16").as_deref() == Ok("1"))
+}
+
 /// Get a reference to the second temp register. We need this in some edge cases
 /// where we need both the spilltmp and another temporary.
 ///

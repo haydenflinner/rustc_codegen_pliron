@@ -2483,3 +2483,23 @@ pass emits `return_call_indirect` on the platform CCs — lol_html's
 shape) and state-machine `next(state)` transitions through function
 pointers. rust-html-rewriter A/B (release dylib): instructions -0.8%,
 cycles -0.9%.
+
+## `PLIRON_X16` (aarch64, opt-in): x16 allocatable
+
+`src/isa/aarch64/inst/regs.rs` (`x16_allocatable`), `abi.rs`
+(`get_machine_env_calls` env key grows to 16 slots; `gen_sp_reg_adjust`
+chains `imm12` add/sub forms — no scratch register, so it stays safe at
+the shrink-wrap save point mid-function), `inst/emit.rs`
+(`emit_scratch_reg` + `mem_finalize`'s new `avoid`/`post_insts`: the
+far-stack-offset address scratch is borrowed with a
+`str tmp, [sp, #-16]!` / `ldr tmp, [sp], #16` bracket — veneer
+convention — avoiding the mode's base and the access's value/dest
+register; x29 is the last-resort borrow), `inst/mod.rs` (LoadAddr print
+mirror; `Branch26` veneer gains an x16-only variant that saves x16 and
+branches through x17). Prologue users (stack-limit check, probestack,
+frame setup) run where no allocated value is live in x16 and need
+nothing. Both IP registers allocatable at once leaves one documented
+residual: an indirect-branch veneer cannot preserve the register that
+carries the target (inherent — the ABI reserves IP regs for this), so a
+live x16 across an intra-function `b` more than ±128MB away would still
+be clobbered; `bl` sites have dead scratch regs regardless.

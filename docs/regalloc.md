@@ -536,6 +536,7 @@ source, not `pliron-cfg`'s `DEFAULT_ON`.
 | `PLIRON_RELOADPRE` (`_ROUNDS`), `PLIRON_RELOADCSE`, `PLIRON_SPILLCSE` | Cranelift `vcode.rs` | reload PRE into predecessors; per-block and cross-block reload CSE | on |
 | `PLIRON_EDITPAIR` | Cranelift `vcode.rs` | fuse adjacent spill/reload edits into pairs | on |
 | `PLIRON_SHRINKWRAP` | Cranelift `vcode.rs`, `context.rs` | callee saves at the nearest closed dominator (the source reads `!= "0"`: on, though AGENTS.md still calls it opt-in) | on |
+| `PLIRON_X16` | Cranelift aarch64 `regs.rs`, `emit.rs` | x16 allocatable (LLVM uses both IP regs); emit-time address scratch borrows IP regs with a below-`sp` save/restore | opt-in |
 | `PLIRON_X17` | Cranelift aarch64 `regs.rs` | x17 allocatable (LLVM uses both IP regs) | on since 2026-11-18 (`=0` off) |
 | `PLIRON_X30` | Cranelift aarch64 `regs.rs` | link register allocatable (`=1` everywhere, `=2` framed only) | opt-in |
 | `PLIRON_RA_CHECK=1` | backend, clif-check | regalloc2's checker on every function | debug |

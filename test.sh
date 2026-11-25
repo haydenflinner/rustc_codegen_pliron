@@ -1107,6 +1107,48 @@ t_x18() {
   ' || { echo "x18: value live in x18 across a bl under PLIRON_X18=1 (call clobber missing)" >&2; return 1; }
 }
 
+t_x16() {
+  # PLIRON_X16=1 (opt-in, aarch64, all targets): x16 joins the allocatable
+  # set like LLVM. The object under the knob must name x16 in pressure
+  # code; without it x16 may still appear as the emitter scratch, but this
+  # function has no far stack offsets so it must not.
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
+  local n
+  rustc $BE --edition 2021 -O --crate-type=lib --emit=obj tests/x16/press.rs -o $out/x16-off.o || return 1
+  n=$("$llvmod" -d --no-show-raw-insn $out/x16-off.o | grep -cE '[ ,[](x16|w16)([ ,]|$)' || true)
+  (( n == 0 )) || { echo "x16: $n uses of x16 without the knob" >&2; return 1; }
+  PLIRON_X16=1 rustc $BE --edition 2021 -O --crate-type=lib --emit=obj tests/x16/press.rs -o $out/x16-on.o || return 1
+  n=$("$llvmod" -d --no-show-raw-insn $out/x16-on.o | grep -cE '[ ,[](x16|w16)([ ,]|$)' || true)
+  (( n > 0 )) || { echo "x16: no use of x16 under PLIRON_X16=1 (test lost its pressure)" >&2; return 1; }
+  # x16 stays call-clobbered under the knob: no value may live in x16
+  # across a `bl` (same check as t_x18).
+  PLIRON_X16=1 rustc $BE --edition 2021 -O --crate-type=lib --emit=obj tests/x16/presscall.rs -o $out/x16-call.o || return 1
+  "$llvmod" -d --no-show-raw-insn $out/x16-call.o | awk '
+    {
+      line = $0
+      sub(/^[^:]*:/, "", line); gsub(/^[ \t]+/, "", line)
+      split(line, f, /[ \t]+/); m = f[1]
+      ops = line; sub(/^[^ \t]+[ \t]*/, "", ops)
+      split(ops, o, ","); d1 = o[1]; d2 = o[2]
+      gsub(/^[ \t]+|[ \t]+$/, "", d1); gsub(/^[ \t]+|[ \t]+$/, "", d2)
+    }
+    m ~ /^blr?$/ { if (vol) pend = 1; next }
+    {
+      tmp = ops; cnt = 0
+      while (sub(/(^|[ ,\[])(w16|x16)([ ,\]]|$)/, " ", tmp)) cnt++
+      if (!cnt) next
+      isdef = 0
+      if (m ~ /^ld/) isdef = (d1 ~ /^[wx]16$/ || d2 ~ /^[wx]16$/)
+      else if (m !~ /^(st|cmp|cmn|tst|ccmp|ccmn|cb|tb|prfm|b\.|b$|ret)/) {
+        isdef = (cnt == 1 && d1 ~ /^[wx]16$/)
+      }
+      if (!isdef && pend) bad = 1
+      if (isdef) { vol = 1; pend = 0 }
+    }
+    END { exit bad }
+  ' || { echo "x16: value live in x16 across a bl under PLIRON_X16=1 (call clobber missing)" >&2; return 1; }
+}
+
 t_halfclob() {
   # PLIRON_A64_HALFCLOB=1 (opt-in, aarch64): v8-v15 keep their low 64 bits
   # across calls, so a call across which no value wider than 64 bits is
@@ -1773,6 +1815,7 @@ want fragcopyout && t_fragcopyout
 want shrinkwrap && t_shrinkwrap
 want sibcall && t_sibcall
 want x18 && t_x18
+want x16 && t_x16
 want halfclob && t_halfclob
 want partinline && t_partinline
 want solecopy && t_solecopy
