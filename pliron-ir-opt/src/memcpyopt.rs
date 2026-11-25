@@ -3000,6 +3000,73 @@ mod tests {
         );
         assert!(!sib_forward(&body, true));
     }
+
+    /// `PLIRON_SRCFWD_ALLOCA`: `tmp` filled by `memcpy(tmp, src, 8)` —
+    /// the srcfwd temp/source direction, not `try_forward`'s. `body`
+    /// goes inside `^loop` (HEAD's `dst` alloca is renamed `src`); runs
+    /// `srcfwd_one` on `tmp` with the knob forced `on`.
+    const SFMC: &str = "            m = llvm.call_intrinsic @\"llvm.memcpy\" (tmp, src, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n";
+    fn srcfwd_alloca_try(input: &str, on: bool) -> bool {
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, _m) = fixture(input, st, ctx);
+        let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head().unwrap();
+        // First alloca is `tmp` (entry order), the temp to forward.
+        let tmp = blocks(ctx, f)
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<AllocaOp>(o, ctx))
+            .map(|o| o.deref(ctx).get_result(ctx, 0))
+            .unwrap();
+        TEST_ALLOCA.with(|c| c.set(Some(on)));
+        let ok = srcfwd_one(ctx, st, entry, f, tmp, &mut None, &mut None, None, "");
+        TEST_ALLOCA.with(|c| c.set(None));
+        ok
+    }
+
+    /// `src`'s store sits before the fill-copy inside the loop: it is a
+    /// write of the source reachable after the copy (the next
+    /// iteration's), but every path from it to the read crosses a fill —
+    /// the copy barrier clears it and `tmp`'s reads rebase onto `src`.
+    /// Off by default: refused without `PLIRON_SRCFWD_ALLOCA`.
+    #[test]
+    fn srcfwd_alloca_loop_fill_forwarded() {
+        let input = format!(
+            "{HEAD}            llvm.store *src <- v;\n{SFMC}            r = llvm.load tmp : builtin.integer i64;\n{TAIL}"
+        )
+        .replace("dst = llvm.alloca", "src = llvm.alloca");
+        assert!(srcfwd_alloca_try(&input, true));
+        assert!(!srcfwd_alloca_try(&input, false));
+    }
+
+    /// The same shape with the source written *between* the copy and the
+    /// read on the same iteration: no fill stands between them, the
+    /// forwarded read would see the new bytes where the temp kept the
+    /// old. Must refuse.
+    #[test]
+    fn srcfwd_alloca_write_between_refused() {
+        let input = format!(
+            "{HEAD}{SFMC}            llvm.store *src <- v;\n            r = llvm.load tmp : builtin.integer i64;\n{TAIL}"
+        )
+        .replace("dst = llvm.alloca", "src = llvm.alloca");
+        assert!(!srcfwd_alloca_try(&input, true));
+    }
+
+    /// `src` allocated inside the loop with `tmp` read in `entry`: the
+    /// rebased read would use `src` on a path where it is not defined.
+    /// Must refuse.
+    #[test]
+    fn srcfwd_alloca_non_dominating_refused() {
+        // Drop `dst` from entry; `src`'s alloca sits inside `^loop`
+        // instead, and `tmp` is read in `entry` — `src` cannot dominate
+        // that use.
+        let input = HEAD.replace("            dst = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);\n", "            r = llvm.load tmp : builtin.integer i64;\n");
+        assert_ne!(input, HEAD);
+        let input = format!(
+            "{input}            src = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);\n            llvm.store *src <- v;\n{SFMC}{TAIL}"
+        );
+        assert!(!srcfwd_alloca_try(&input, true));
+    }
 }
 
 /// `PLIRON_MEMCPYOPT_SRCFWD=1`: a temporary that only a copy of an
@@ -3041,6 +3108,8 @@ pub fn run_srcfwd(ctx: &mut Context, st: &mut State) {
             continue;
         };
         let bname = crate::bisect_name(st, f);
+        let mut inc_slot: Option<IncMap> = None;
+        let mut dom_slot: Option<Dom> = None;
         // Rounds: a temp copied from a rewritten temp is a candidate next.
         for _ in 0..4 {
             let mut cands: Vec<Value> = Vec::new();
@@ -3052,7 +3121,7 @@ pub fn run_srcfwd(ctx: &mut Context, st: &mut State) {
                     }
                     let t = op.deref(ctx).get_operand(ctx, 0);
                     if t.defining_op().is_some_and(|a| Operation::is_op::<AllocaOp>(a, ctx))
-                        && param_base(ctx, st, entry, op.deref(ctx).get_operand(ctx, 1)).is_some()
+                        && src_base(ctx, st, entry, inc_of(ctx, f, &mut inc_slot), op.deref(ctx).get_operand(ctx, 1)).is_some()
                         && seen.insert(t)
                     {
                         cands.push(t);
@@ -3061,7 +3130,7 @@ pub fn run_srcfwd(ctx: &mut Context, st: &mut State) {
             }
             let mut did = 0;
             for t in cands {
-                if srcfwd_one(ctx, st, entry, t, name.as_deref(), &bname) {
+                if srcfwd_one(ctx, st, entry, f, t, &mut inc_slot, &mut dom_slot, name.as_deref(), &bname) {
                     did += 1;
                 }
             }
@@ -3101,6 +3170,48 @@ fn param_base(ctx: &Context, st: &State, entry: Ptr<BasicBlock>, v: Value) -> Op
     None
 }
 
+/// `PLIRON_SRCFWD_ALLOCA=1`: a temp's fill-copy may also read out of a
+/// local alloca — `memcpy(t, slot+k, n)` forwards `t`'s bounded reads
+/// (`load`s, copy sources, drop glue) onto `slot+k`. rustc's MIR
+/// temp→temp chains (`next()`'s out slot copied to the `match` scrutinee
+/// copied to a closure argument, each a full memcpy) fold to reads of the
+/// first slot. The source alloca's def must dominate the temp's so the
+/// rebased pointers stay defined on every use, and the reachability
+/// conflict check treats `copies` as barriers — a refill of the source on
+/// a later loop iteration hides behind that iteration's copy, only a
+/// write that reaches a read without crossing a fill is a conflict.
+fn srcfwd_alloca() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_SRCFWD_ALLOCA", "0"));
+    TEST_ALLOCA.with(|c| c.get()).unwrap_or(*ON)
+}
+
+thread_local! {
+    /// `Some(on)` overrides the environment, `None` reads it (tests).
+    static TEST_ALLOCA: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `v` as `(base, byte offset, is_alloca)`: constant GEPs (and, for the
+/// alloca case, block parameters) down to an entry `noalias` param — the
+/// original `srcfwd_one` source — or, under `PLIRON_SRCFWD_ALLOCA`, a
+/// local alloca.
+fn src_base(
+    ctx: &Context,
+    st: &State,
+    entry: Ptr<BasicBlock>,
+    inc: Option<&IncMap>,
+    v: Value,
+) -> Option<(Value, u64, bool)> {
+    if let Some((p, off)) = param_base(ctx, st, entry, v) {
+        return Some((p, off, false));
+    }
+    if srcfwd_alloca() {
+        if let Some((a, off)) = alloca_base(ctx, st, inc, v) {
+            return Some((a, off, true));
+        }
+    }
+    None
+}
+
 macro_rules! sfno {
     ($name:expr, $($t:tt)*) => {{
         if pliron_cfg::tracing_on() {
@@ -3111,12 +3222,17 @@ macro_rules! sfno {
 }
 
 /// Ops of `targets` that run after one of `starts` on some path (invoke
-/// unwind edges included); `None` when the walk runs out of budget.
+/// unwind edges included); `None` when the walk runs out of budget. An op
+/// in `barriers` ends the walk along its path: nothing past it counts —
+/// `srcfwd_one` passes the temp's fill-copies so a source write separated
+/// from a read by a re-fill (the next iteration's copy, say) is not a
+/// conflict.
 fn reached_after(
     ctx: &Context,
     st: &State,
     starts: &[Ptr<Operation>],
     targets: &FxHashSet<Ptr<Operation>>,
+    barriers: Option<&FxHashSet<Ptr<Operation>>>,
 ) -> Option<FxHashSet<Ptr<Operation>>> {
     const MAX_OPS: usize = 1 << 16;
     let mut out = FxHashSet::default();
@@ -3139,6 +3255,7 @@ fn reached_after(
             None => b.deref(ctx).get_head(),
         };
         let mut last = None;
+        let mut stopped = false;
         while let Some(op) = cur {
             seen += 1;
             if seen > MAX_OPS {
@@ -3148,21 +3265,38 @@ fn reached_after(
             if targets.contains(&op) {
                 out.insert(op);
             }
+            if barriers.is_some_and(|bs| bs.contains(&op)) {
+                stopped = true;
+                break;
+            }
             if let Some(&(pad, _)) = st.invokes.get(op) {
                 work.push((pad, None));
             }
             cur = op.get_next(ctx);
         }
-        if let Some(t) = last {
-            for s in t.deref(ctx).successors(ctx) {
-                work.push((s, None));
+        if !stopped {
+            if let Some(t) = last {
+                for s in t.deref(ctx).successors(ctx) {
+                    work.push((s, None));
+                }
             }
         }
     }
     Some(out)
 }
 
-fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Value, name: Option<&str>, bname: &str) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn srcfwd_one(
+    ctx: &mut Context,
+    st: &mut State,
+    entry: Ptr<BasicBlock>,
+    f: Ptr<Operation>,
+    t: Value,
+    inc_slot: &mut Option<IncMap>,
+    dom_slot: &mut Option<Dom>,
+    name: Option<&str>,
+    bname: &str,
+) -> bool {
     let Some(t_op) = t.defining_op() else { return false };
     let Some(&(n, _)) = st.allocas.get(t) else { return false };
     if n == 0 {
@@ -3173,8 +3307,9 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
     let mut readers: Vec<Ptr<Operation>> = Vec::new();
     let mut markers: Vec<Ptr<Operation>> = Vec::new();
     let mut drops: Vec<Ptr<Operation>> = Vec::new();
-    let mut src: Option<(Value, u64)> = None;
+    let mut src: Option<(Value, u64, bool)> = None;
     let mut work = vec![t];
+    let mut cone: Vec<Ptr<Operation>> = Vec::new();
     let mut budget = 4096usize;
     while let Some(p) = work.pop() {
         for u in p.uses_iter(ctx) {
@@ -3183,6 +3318,7 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
                 sfno!(name, "budget");
             }
             let op = u.user_op();
+            cone.push(op);
             let i = u.find_index(ctx);
             if Operation::is_op::<GetElementPtrOp>(op, ctx) {
                 if i != 0 {
@@ -3203,7 +3339,7 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
                         if len != Some(n) {
                             sfno!(name, "partial copy into the temp");
                         }
-                        let Some(b) = param_base(ctx, st, entry, op.deref(ctx).get_operand(ctx, 1)) else {
+                        let Some(b) = src_base(ctx, st, entry, inc_of(ctx, f, inc_slot), op.deref(ctx).get_operand(ctx, 1)) else {
                             sfno!(name, "copy from something else");
                         };
                         if src.is_some_and(|s| s != b) {
@@ -3230,16 +3366,43 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
             }
         }
     }
-    let Some((s, off)) = src else { return false };
+    let Some((s, off, isa)) = src else { return false };
     readers.extend_from_slice(&drops);
-    let Some(&(deref, writable)) = st.noalias.get(s) else { return false };
+    // Where the rebased pointer's `gep(s, off)` is built: at the temp's
+    // alloca for a parameter (its def dominates everything), right after
+    // the source alloca's own def otherwise — `a_op` dominating `t_op`
+    // would be enough but is needlessly narrow (same-block order), so
+    // the check below is per cone op instead.
+    let mut at = t_op;
+    let (deref, writable) = if isa {
+        // Alloca source (`PLIRON_SRCFWD_ALLOCA`): the slot's own size is
+        // the dereferenceable bound and it is always writable. `s`'s def
+        // must dominate every op that used a `t`-rooted pointer — the
+        // reads rebase onto `s + off`, so `s` has to be defined wherever
+        // they were — and the source can't be the temp itself (a copy
+        // out of `t` into `t`).
+        if s == t {
+            sfno!(name, "copy out of the temp itself");
+        }
+        let Some(&(sz, _)) = st.allocas.get(s) else { return false };
+        let Some(a_op) = s.defining_op() else { return false };
+        if !cone.iter().all(|&o| op_dominates(ctx, st, dom_slot, f, a_op, o)) {
+            sfno!(name, "source alloca does not dominate a temp use");
+        }
+        let Some(next) = a_op.get_next(ctx) else { return false };
+        at = next;
+        (sz, true)
+    } else {
+        let Some(&(deref, writable)) = st.noalias.get(s) else { return false };
+        (deref, writable)
+    };
     if !drops.is_empty() && !writable {
         sfno!(name, "drop of a temp copied from read-only memory");
     }
     if off.checked_add(n).is_none_or(|e| e > deref) {
         sfno!(name, "source range past dereferenceable {deref}");
     }
-    let frozen = drops.is_empty() && st.frozen.get(s).is_some_and(|&d| d >= off + n);
+    let frozen = !isa && drops.is_empty() && st.frozen.get(s).is_some_and(|&d| d >= off + n);
     if !frozen {
         let (lo, hi) = (off, off + n);
         let Some((users, captured)) = src_touches(ctx, st, s, deref) else {
@@ -3272,12 +3435,21 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
             }
         }
         if !writes.is_empty() {
-            let Some(hit) = reached_after(ctx, st, &copies, &writes) else {
+            let Some(hit) = reached_after(ctx, st, &copies, &writes, None) else {
                 sfno!(name, "walk budget");
             };
             if !hit.is_empty() {
                 let hit: Vec<_> = hit.into_iter().collect();
                 let rs: FxHashSet<Ptr<Operation>> = readers.iter().copied().collect();
+                // A fill-copy is a barrier for the write→read walk under
+                // `PLIRON_SRCFWD_ALLOCA`: a write of the source that only
+                // reaches a read through another fill (a refill on a later
+                // loop iteration) can't change what the read sees — that
+                // read's temp was last written by a copy that already saw
+                // the write. Off by default: the barriers also widen the
+                // param-source transform, so it goes under the same knob.
+                let cset = srcfwd_alloca()
+                    .then(|| copies.iter().copied().collect::<FxHashSet<Ptr<Operation>>>());
                 // `PLIRON_SRCFWD_RANGES=1`: a write conflicts only with a read
                 // after it whose bytes overlap (temp coordinates; unknown
                 // overlaps everything). Drop glue on a field writes only that
@@ -3297,7 +3469,7 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
                     let mut bad: FxHashSet<Ptr<Operation>> = FxHashSet::default();
                     for &w in &hit {
                         let w_r = wr(w);
-                        let Some(after) = reached_after(ctx, st, &[w], &rs) else {
+                        let Some(after) = reached_after(ctx, st, &[w], &rs, cset.as_ref()) else {
                             sfno!(name, "walk budget");
                         };
                         for r in after {
@@ -3310,7 +3482,7 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
                     }
                     bad
                 } else {
-                    let Some(late) = reached_after(ctx, st, &hit, &rs) else {
+                    let Some(late) = reached_after(ctx, st, &hit, &rs, cset.as_ref()) else {
                         sfno!(name, "walk budget");
                     };
                     late
@@ -3346,7 +3518,7 @@ fn srcfwd_one(ctx: &mut Context, st: &mut State, entry: Ptr<BasicBlock>, t: Valu
         st.intrinsics.remove(op);
         Operation::erase(op, ctx);
     }
-    let base = crate::sroa::ptr_plus(ctx, st, s, off, t_op);
+    let base = crate::sroa::ptr_plus(ctx, st, s, off, at);
     t.replace_all_uses_with(ctx, &base);
     st.allocas.remove(t);
     st.promoted.remove(t);
