@@ -559,6 +559,22 @@ entry (capped at 512). `clif-check codegen` prints the totals and puts
 the weighted vector in each function's `mv`. Under `PLIRON_RA_EXPLAIN`
 merge attempts print `bpmerge` / `merge overlap` lines.
 
+The `bp-overlap` failures are further sub-classified
+(`src/ion/merge.rs`, after the failed `merge_bundles` call): a
+two-pointer scan over the two bundles' ranges tells whether the input
+conflicts only with the param's own ranges or with third-party vregs
+already merged into the to-bundle, and where the input is defined —
+`bp-ovl-3rd` (third-party only; `bp-ovl-mix` both), `bp-ovl-eb`
+(defined in a multi-successor predecessor of an edge stub),
+`bp-ovl-in` (defined in the edge block itself), `bp-ovl-br` /
+`bp-ovl-ss` (defined in the branching / single predecessor of a stub),
+plain `bp-overlap` (defined upstream of those). std corpus
+(2026-11-23, weighted reg-reg): `bp-ovl-3rd` 44.9k, `bp-overlap`
+17.2k, `bp-ovl-mix` 15.6k, `bp-ovl-eb` 13.0k — the third-party
+conflicts are merge-order artifacts a later merge cannot see, not
+fixable by `MERGEDEPTH` order (measured: 4/5 flat, 6 trades reg-reg
+for stack movs net worse).
+
 html corpus (2026-11-17), reg-reg count / weighted: split 12.6k / 14k,
 split-fixed 16.3k / 25k, xblock 17.5k / 20.5k, bp-merged 7.4k / 15.6k,
 bp-overlap 4.2k / 49.6k (42.5k of it one function,

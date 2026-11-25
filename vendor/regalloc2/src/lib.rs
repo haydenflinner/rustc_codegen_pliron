@@ -559,18 +559,23 @@ pub(crate) fn movestats_on() -> bool {
 
 /// Move kinds of `PLIRON_RA2_MOVESTATS`; index `k` counts reg-reg moves,
 /// `16 + k` moves with a stack side.
-pub const MV_NAMES: [&str; 11] = [
+pub const MV_NAMES: [&str; 16] = [
     "split",       // same vreg, two ranges in one block (not a fixed use)
     "split-fixed", // same vreg, the new range starts at a fixed-register use
     "xblock",      // same vreg, different allocations across a block edge
     "bp-merged",   // blockparam move, param and input merged before splitting
-    "bp-overlap",  // blockparam move, merge refused: live ranges overlap
+    "bp-overlap",  // blockparam move, merge refused: live ranges overlap (def upstream)
     "bp-req",      // blockparam move, merge refused: requirements / pin
     "bp-other",    // blockparam move, merge refused: complexity, class, pinned
     "multifixed",  // one vreg in two fixed registers at one instruction
     "reuse",       // reused-input copy
     "?",           // scratch / unknown
-    "bp-ovl-br",   // as bp-overlap, the input defined in a block with 2+ successors
+    "bp-ovl-br",   // as bp-overlap, the input defined in the branching pred
+    "bp-ovl-3rd",  // overlap only with a third-party range in the param bundle
+    "bp-ovl-mix",  // overlap with both the param's own and third-party ranges
+    "bp-ovl-eb",   // input defined in the multi-succ pred of an edge stub
+    "bp-ovl-in",   // input defined inside the jump-pred/stub itself
+    "bp-ovl-ss",   // input defined in a single-succ pred of a stub
 ];
 
 /// The `PLIRON_RA2_MOVESTATS` totals: per kind, count and weighted*1000.

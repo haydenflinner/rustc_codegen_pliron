@@ -6,6 +6,7 @@
 //! backend dylib.
 
 pub mod armhoist;
+pub mod argtail;
 pub mod target;
 pub mod armmerge;
 pub mod scev;

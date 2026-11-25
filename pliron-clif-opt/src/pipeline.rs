@@ -5133,6 +5133,14 @@ fn s_eqedge(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+fn s_argtail(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::argtail::run(&mut p.clctx.func, an);
+    if k > 0 && p.dump {
+        p.dump("argtail");
+    }
+    k
+}
+
 fn s_brhint(p: &mut Pipe, an: &mut Analysis) -> usize {
     crate::brhint::run(&mut p.clctx.func, an)
 }
@@ -6293,6 +6301,13 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // Late: edge-arg substitution needs the final branch shapes
         // (unrolled exit arms compare a counter and pass its constant).
         step("eqedge", "eqedge", Gate::OptIn("PLIRON_EQEDGE"), s_eqedge).needs(shape::CONDBR),
+        // A back-edge arg computed inside its loop overlaps the header
+        // parameter's live range; evaluating it at the edge tail makes
+        // the ranges abut so the blockparam merge goes through — LLVM's
+        // `add x0, x0, #1; b` back edge instead of `add; mov; b`. Last
+        // mutating step: a later GVN would fold the per-edge copies back
+        // into the shared def they came from.
+        step("argtail", "argtail", Gate::OptIn("PLIRON_ARGTAIL"), s_argtail).needs(shape::LOOPS),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

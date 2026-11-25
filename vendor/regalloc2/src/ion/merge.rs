@@ -130,11 +130,15 @@ impl<'a, F: Function> Env<'a, F> {
                 {
                     let (rf, rt) = (ranges_from[idx_from], ranges_to[idx_to]);
                     explain!(
-                        "  merge overlap: v{} {:?} vs v{} {:?}",
+                        "  merge overlap: v{} {:?} (b{}..b{}) vs v{} {:?} (b{}..b{})",
                         self.ranges[rf.index].vreg.index(),
                         rf.range,
+                        self.ctx.cfginfo.insn_block[rf.range.from.inst().index()].index(),
+                        self.ctx.cfginfo.insn_block[rf.range.to.inst().index()].index(),
                         self.ranges[rt.index].vreg.index(),
-                        rt.range
+                        rt.range,
+                        self.ctx.cfginfo.insn_block[rt.range.from.inst().index()].index(),
+                        self.ctx.cfginfo.insn_block[rt.range.to.inst().index()].index(),
                     );
                 }
                 self.ctx.last_merge_fail = 4;
@@ -523,6 +527,9 @@ impl<'a, F: Function> Env<'a, F> {
                 );
                 let mut k = self.ctx.last_merge_fail;
                 if k == 4 {
+                    // PLIRON census: which to-bundle vreg's range the
+                    // input's ranges overlap, and where the input is
+                    // defined relative to the edge.
                     let fb = self.blockparam_outs[i].from_block;
                     let def_block = self.vregs[from_vreg]
                         .ranges
@@ -532,10 +539,54 @@ impl<'a, F: Function> Env<'a, F> {
                         &[p] if self.func.block_succs(fb).len() == 1 => Some(p),
                         _ => None,
                     };
-                    let src = if def_block == Some(fb) { Some(fb) } else { edge_pred.filter(|&p| Some(p) == def_block) };
-                    if src.is_some_and(|b| self.func.block_succs(b).len() >= 2) {
-                        k = 10;
+                    let mut self_ov = false;
+                    let mut third_ov = false;
+                    {
+                        let ranges_from = &self.bundles[from_bundle].ranges[..];
+                        let ranges_to = &self.bundles[to_bundle].ranges[..];
+                        let mut fi = 0;
+                        let mut ti = 0;
+                        let mut steps = 0;
+                        while fi < ranges_from.len() && ti < ranges_to.len() && steps < 400 {
+                            steps += 1;
+                            if ranges_from[fi].range.from >= ranges_to[ti].range.to {
+                                ti += 1;
+                            } else if ranges_to[ti].range.from >= ranges_from[fi].range.to {
+                                fi += 1;
+                            } else {
+                                if self.ranges[ranges_to[ti].index].vreg == to_vreg {
+                                    self_ov = true;
+                                } else {
+                                    third_ov = true;
+                                }
+                                if self_ov && third_ov {
+                                    break;
+                                }
+                                if ranges_from[fi].range.to <= ranges_to[ti].range.to {
+                                    fi += 1;
+                                } else {
+                                    ti += 1;
+                                }
+                            }
+                        }
                     }
+                    let in_fb = def_block == Some(fb);
+                    let in_pred = edge_pred.is_some() && def_block == edge_pred;
+                    k = if third_ov && !self_ov {
+                        11 // conflict only with another vreg already in the bundle
+                    } else if third_ov {
+                        12 // conflict with the param's own ranges and another's
+                    } else if in_fb && self.func.block_succs(fb).len() >= 2 {
+                        10 // input defined in the branching pred, on a direct edge
+                    } else if in_fb {
+                        14 // input defined in the jump-pred/stub itself
+                    } else if in_pred && self.func.block_succs(edge_pred.unwrap()).len() >= 2 {
+                        13 // input defined in the multi-succ pred of a stub: sinkable
+                    } else if in_pred {
+                        15 // input defined in a single-succ pred of a stub
+                    } else {
+                        4 // input defined further upstream
+                    };
                 }
                 self.ctx.bp_merge_kind.insert(key, k);
             }
