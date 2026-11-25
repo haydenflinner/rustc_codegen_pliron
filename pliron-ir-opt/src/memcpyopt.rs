@@ -3162,6 +3162,177 @@ mod tests {
         );
         assert!(!srcfwd_bpsrc_try(&input, true));
     }
+
+    // ---- `PLIRON_SRCFWD_WSTORE`: `store`s *into* the temp rebase onto
+    // the source, write-side. `WEXIT` is a `^loop`-exit edge whose block
+    // carries the store; `WRET` closes it and the function.
+
+    const WEXIT: &str = "        llvm.cond_br if flag ^loop() else ^exit()\n          ^exit():\n";
+    const WRET: &str = "            llvm.return\n        }\n    }\n";
+
+    /// The `srcfwd_alloca` shape (`src` a local alloca) with the ALLOCA
+    /// and WSTORE knobs forced.
+    fn srcfwd_wstore_try(input: &str, on: bool) -> bool {
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, _m) = fixture(input, st, ctx);
+        let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head().unwrap();
+        let tmp = blocks(ctx, f)
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<AllocaOp>(o, ctx))
+            .map(|o| o.deref(ctx).get_result(ctx, 0))
+            .unwrap();
+        TEST_ALLOCA.with(|c| c.set(Some(true)));
+        TEST_WSTORE.with(|c| c.set(Some(on)));
+        let ok = srcfwd_one(ctx, st, entry, f, tmp, &mut None, &mut None, None, "");
+        TEST_WSTORE.with(|c| c.set(None));
+        TEST_ALLOCA.with(|c| c.set(None));
+        ok
+    }
+
+    /// `tmp` filled in `^loop`; the store into `tmp` is in the exit
+    /// block, so no fill can run after it and nothing reads `src` again —
+    /// rebased it writes `src` directly. Off by default.
+    #[test]
+    fn srcfwd_wstore_after_loop_forwarded() {
+        let input = format!(
+            "{HEAD}{SFMC}{WEXIT}            llvm.store *tmp <- v;\n            r = llvm.load tmp : builtin.integer i64;\n{WRET}"
+        )
+        .replace("dst = llvm.alloca", "src = llvm.alloca");
+        assert!(srcfwd_wstore_try(&input, true));
+        assert!(!srcfwd_wstore_try(&input, false));
+    }
+
+    /// `src` read after the store: the rebased store landed its bytes on
+    /// `src` early — the read would see them where the program kept them
+    /// in the private temp. Must refuse.
+    #[test]
+    fn srcfwd_wstore_src_read_after_refused() {
+        let input = format!(
+            "{HEAD}{SFMC}{WEXIT}            llvm.store *tmp <- v;\n            r = llvm.load src : builtin.integer i64;\n{WRET}"
+        )
+        .replace("dst = llvm.alloca", "src = llvm.alloca");
+        assert!(!srcfwd_wstore_try(&input, true));
+    }
+
+    /// ... but a write covering the stored range between the store and
+    /// the read is what the read saw either way: forwarded.
+    #[test]
+    fn srcfwd_wstore_covering_write_forwarded() {
+        let input = format!(
+            "{HEAD}{SFMC}{WEXIT}            llvm.store *tmp <- v;\n            llvm.store *src <- v;\n            r = llvm.load src : builtin.integer i64;\n{WRET}"
+        )
+        .replace("dst = llvm.alloca", "src = llvm.alloca");
+        assert!(srcfwd_wstore_try(&input, true));
+    }
+
+    /// The store into `tmp` sits inside the loop before the wrap edge:
+    /// the next iteration's fill would restore `src`'s bytes — the
+    /// erased copy cannot, so the rebased reads would keep the stored
+    /// value. Must refuse.
+    #[test]
+    fn srcfwd_wstore_refill_refused() {
+        let input = format!("{HEAD}{SFMC}            llvm.store *tmp <- v;\n{TAIL}")
+            .replace("dst = llvm.alloca", "src = llvm.alloca");
+        assert!(!srcfwd_wstore_try(&input, true));
+    }
+
+    /// `src` written in the loop before the exit-edge store into `tmp`:
+    /// the write reaches the store without crossing a fill — the rebased
+    /// store would clobber it early. Must refuse.
+    #[test]
+    fn srcfwd_wstore_src_write_between_refused() {
+        let input = format!(
+            "{HEAD}{SFMC}            llvm.store *src <- v;\n{WEXIT}            llvm.store *tmp <- v;\n            r = llvm.load tmp : builtin.integer i64;\n{WRET}"
+        )
+        .replace("dst = llvm.alloca", "src = llvm.alloca");
+        assert!(!srcfwd_wstore_try(&input, true));
+    }
+
+    /// `tmp` as the *value* of a store: the pointer escapes — out of the
+    /// transform's reach whatever the knob.
+    #[test]
+    fn srcfwd_wstore_stored_value_refused() {
+        let input = format!(
+            "{HEAD}{SFMC}{WEXIT}            llvm.store *src <- tmp;\n            r = llvm.load tmp : builtin.integer i64;\n{WRET}"
+        )
+        .replace("dst = llvm.alloca", "src = llvm.alloca");
+        assert!(!srcfwd_wstore_try(&input, true));
+    }
+
+    /// `tmp` filled from a `noalias` entry param — caller-visible
+    /// memory: a store into the temp would write it where the program
+    /// touched only its private copy. Refuse even on a writable param.
+    #[test]
+    fn srcfwd_wstore_param_source_refused() {
+        let input = format!(
+            "{NA_HEAD}            llvm.br ^loop()\n          ^loop():\n            m = llvm.call_intrinsic @\"llvm.memcpy\" (tmp, p, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n{WEXIT}            llvm.store *tmp <- v;\n            r = llvm.load tmp : builtin.integer i64;\n{WRET}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, _m) = fixture(&input, st, ctx);
+        let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head().unwrap();
+        let p = entry.deref(ctx).get_argument(ctx, 0);
+        st.noalias.insert(p, (8, true));
+        let tmp = blocks(ctx, f)
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<AllocaOp>(o, ctx))
+            .map(|o| o.deref(ctx).get_result(ctx, 0))
+            .unwrap();
+        TEST_WSTORE.with(|c| c.set(Some(true)));
+        let ok = srcfwd_one(ctx, st, entry, f, tmp, &mut None, &mut None, None, "");
+        TEST_WSTORE.with(|c| c.set(None));
+        assert!(!ok);
+    }
+
+    /// `BPM` fill with the WSTORE knob on too — `srcfwd_bpsrc_try` plus
+    /// the store branch.
+    fn srcfwd_wbparam_try(input: &str, on: bool) -> bool {
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, _m) = fixture(input, st, ctx);
+        let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head().unwrap();
+        let tmp = blocks(ctx, f)
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<AllocaOp>(o, ctx))
+            .map(|o| o.deref(ctx).get_result(ctx, 0))
+            .unwrap();
+        TEST_BPSRC.with(|c| c.set(Some(true)));
+        TEST_WSTORE.with(|c| c.set(Some(on)));
+        let ok = srcfwd_one(ctx, st, entry, f, tmp, &mut None, &mut None, None, "");
+        TEST_WSTORE.with(|c| c.set(None));
+        TEST_BPSRC.with(|c| c.set(None));
+        ok
+    }
+
+    const WBPT: &str = "        llvm.cond_br if flag ^loop(dst) else ^exit()\n          ^exit():\n";
+
+    /// The param-carried fill (`sv` names `dst`/`dst2` by route) with the
+    /// store in the exit block: `sv` dominates it, the fill guards it,
+    /// and no window is read after. Forwarded — the store lands on
+    /// whichever window `sv` names that traversal.
+    #[test]
+    fn srcfwd_wbparam_store_forwarded() {
+        let input = format!(
+            "{BPH}{BPM}{WBPT}            llvm.store *tmp <- v;\n            r = llvm.load tmp : builtin.integer i64;\n{WRET}"
+        );
+        assert!(srcfwd_wbparam_try(&input, true));
+        assert!(!srcfwd_wbparam_try(&input, false));
+    }
+
+    /// The same shape with `dst` — one of `sv`'s windows — read after
+    /// the store: the rebase would show the stored bytes where the
+    /// program kept the window's own. Must refuse.
+    #[test]
+    fn srcfwd_wbparam_window_read_after_refused() {
+        let input = format!(
+            "{BPH}{BPM}{WBPT}            llvm.store *tmp <- v;\n            r = llvm.load dst : builtin.integer i64;\n{WRET}"
+        );
+        assert!(!srcfwd_wbparam_try(&input, true));
+    }
 }
 
 /// `PLIRON_MEMCPYOPT_SRCFWD=1`: a temporary that only a copy of an
@@ -3178,7 +3349,10 @@ mod tests {
 /// glue counted as a write): only the function's own ops can change its
 /// bytes. `t` is an alloca of exactly `n` bytes whose every use, through
 /// GEPs, is a load, the source of a `memcpy`/`memmove`, a lifetime marker,
-/// or the destination of such a copy from the same `(s, off)`. Sound when
+/// or the destination of such a copy from the same `(s, off)` — plus,
+/// under `PLIRON_SRCFWD_WSTORE` (opt-in), a `store` *into* `t`, whose write
+/// the rebase lands on `s` directly (`srcfwd_wstore` spells out the
+/// write-side checks). Sound when
 /// no op that may write `s`'s `[off, off + n)` lies on a path from a copy
 /// to a read of `t` (one forward walk from the copies, one from the writes
 /// they reach); a read no copy reaches read uninitialized bytes, and the
@@ -3322,6 +3496,27 @@ fn srcfwd_bpsrc() -> bool {
 thread_local! {
     /// `Some(on)` overrides the environment, `None` reads it (tests).
     static TEST_BPSRC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `PLIRON_SRCFWD_WSTORE=1` (opt-in): a temp's uses may also include
+/// `store`s *into* the temp — the store's address operand is a
+/// temp-rooted pointer (`store`'s operands are `[value, ptr]`). The
+/// rebase lands the write on the source window directly, so the temp's
+/// private copy of those bytes never exists: sound only when no fill
+/// can run after the store (the erased copy's "restore the source
+/// bytes" would be lost) and no read of the source's stored range can
+/// observe the new bytes early — `srcfwd_one`'s write-side checks. A
+/// param source is caller-visible memory, so a store into its temp is
+/// refused outright; a store use where the temp is the *value* operand
+/// (`store dst <- t`) is the pointer escaping and stays a refusal.
+fn srcfwd_wstore() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_SRCFWD_WSTORE", "1"));
+    TEST_WSTORE.with(|c| c.get()).unwrap_or(*ON)
+}
+
+thread_local! {
+    /// `Some(on)` overrides the environment, `None` reads it (tests).
+    static TEST_WSTORE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `v` as the set of constant `(alloca, byte-offset)` windows it may
@@ -3553,6 +3748,9 @@ fn srcfwd_one(
     let mut readers: Vec<Ptr<Operation>> = Vec::new();
     let mut markers: Vec<Ptr<Operation>> = Vec::new();
     let mut drops: Vec<Ptr<Operation>> = Vec::new();
+    // `PLIRON_SRCFWD_WSTORE`: stores into the temp — (op, byte offset in
+    // the temp, stored size).
+    let mut wstores: Vec<(Ptr<Operation>, u64, u64)> = Vec::new();
     let mut src: Option<Src> = None;
     let mut work = vec![t];
     let mut cone: Vec<Ptr<Operation>> = Vec::new();
@@ -3619,6 +3817,28 @@ fn srcfwd_one(
                 // dropping a value moved into it): it reads the bytes and,
                 // rebased, may write the param's.
                 drops.push(op);
+            } else if Operation::is_op::<StoreOp>(op, ctx) {
+                // `store`'s operands are `[value, ptr]`: `i == 1` is a
+                // write into the temp's slot — `PLIRON_SRCFWD_WSTORE`
+                // rebases it onto the source (`srcfwd_wstore`). `i == 0`
+                // stores the temp pointer itself: escape.
+                if i != 1 {
+                    sfno!(name, "temp in llvm.store as value");
+                }
+                if st.volatile.contains(op) {
+                    sfno!(name, "temp in llvm.store as address (volatile)");
+                }
+                let Some(k) = temp_off(ctx, st, t, p) else {
+                    sfno!(name, "temp in llvm.store as address (non-const off)");
+                };
+                if !srcfwd_wstore() {
+                    sfno!(name, "temp in llvm.store as address");
+                }
+                let sz = size_align(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx)).0;
+                if k < 0 || (k as u64).checked_add(sz).is_none_or(|e| e > n) {
+                    sfno!(name, "store into the temp past the copied window");
+                }
+                wstores.push((op, k as u64, sz));
             } else {
                 // Census (temporary): for a call-arg use, log the facts a
                 // `PLIRON_SRCFWD_CALLARG` rule would need — arg index, the
@@ -3647,6 +3867,13 @@ fn srcfwd_one(
     }
     let Some(src) = src else { return false };
     readers.extend_from_slice(&drops);
+    if !wstores.is_empty() && matches!(src, Src::Param(..)) {
+        // A store into the temp rebased onto an entry parameter writes
+        // the caller's memory where the program only touched its local
+        // copy — the difference survives the return. (The local sources
+        // get the reachability checks below instead.)
+        sfno!(name, "store into a temp copied from caller-visible memory");
+    }
     // Where the rebased pointer's `gep(s, off)` is built: at the temp's
     // alloca for a parameter (its def dominates everything), right after
     // the source alloca's own def otherwise — `a_op` dominating `t_op`
@@ -3845,7 +4072,15 @@ fn srcfwd_one(
             };
             if !hit.is_empty() {
                 let hit: Vec<_> = hit.into_iter().collect();
-                let rs: FxHashSet<Ptr<Operation>> = readers.iter().copied().collect();
+                // `PLIRON_SRCFWD_WSTORE`: a store into the temp is a
+                // protected use too — a source write that reaches it
+                // without crossing a fill has its bytes clobbered early
+                // (the write-direction mirror of a stale read).
+                let rs: FxHashSet<Ptr<Operation>> = readers
+                    .iter()
+                    .copied()
+                    .chain(wstores.iter().map(|w| w.0))
+                    .collect();
                 // A fill-copy is a barrier for the write→read walk under
                 // `PLIRON_SRCFWD_ALLOCA`: a write of the source that only
                 // reaches a read through another fill (a refill on a later
@@ -3914,6 +4149,69 @@ fn srcfwd_one(
                 }
             }
         }
+        // `PLIRON_SRCFWD_WSTORE` — a store into the temp lands on the
+        // source directly, so the temp's private copy of those bytes
+        // never exists. Two hazards the read side does not have:
+        //   - a fill after the store would restore the source's bytes
+        //     into the temp — the erased copy can't, so the rebased
+        //     reads would see the stored value where the program meant
+        //     the older source bytes;
+        //   - a read of the source past the store sees the new bytes
+        //     where the program's own source value was meant to live —
+        //     unless a write covering the stored range ran between, which
+        //     is what the program read either way.
+        if !wstores.is_empty() {
+            if captured {
+                // The source's address escaped: reads of it through
+                // pointers the walk never saw could observe the stored
+                // bytes, and `users` names none of them.
+                sfno!(name, "store into a temp whose source's address escaped");
+            }
+            if wstores.len() > 32 {
+                sfno!(name, "too many stores into the temp");
+            }
+            let cset: FxHashSet<Ptr<Operation>> = copies.iter().copied().collect();
+            let wops: Vec<Ptr<Operation>> = wstores.iter().map(|w| w.0).collect();
+            match reached_after(ctx, st, &wops, &cset, None) {
+                Some(h) if h.is_empty() => {}
+                Some(_) => sfno!(name, "a fill after a store into the temp drops the stored bytes"),
+                None => sfno!(name, "walk budget"),
+            }
+            let bparam = matches!(src, Src::BParam(..));
+            let s_off = match &src {
+                Src::Param(..) => 0, // refused above
+                Src::Alloca(_, o) => *o,
+                Src::BParam(..) => 0,
+            };
+            for &(w, k, sz) in &wstores {
+                let (wlo, whi) = (s_off + k, s_off + k + sz);
+                let rtargets: FxHashSet<Ptr<Operation>> = users
+                    .iter()
+                    .filter(|(_, ts)| ts.iter().any(|x| x.read && x.lo < whi && wlo < x.hi))
+                    .map(|(&o, _)| o)
+                    .collect();
+                if rtargets.is_empty() {
+                    continue;
+                }
+                // For a param-carried source the store's window is
+                // dynamic: a write of one possible window cannot prove
+                // it covered the one the store hit, so it is no barrier.
+                let wbarriers: FxHashSet<Ptr<Operation>> = if bparam {
+                    FxHashSet::default()
+                } else {
+                    users
+                        .iter()
+                        .filter(|(_, ts)| ts.iter().any(|x| x.write && x.lo <= wlo && whi <= x.hi))
+                        .map(|(&o, _)| o)
+                        .collect()
+                };
+                match reached_after(ctx, st, &[w], &rtargets, Some(&wbarriers)) {
+                    Some(h) if h.is_empty() => {}
+                    Some(h) => sfno!(name, "the source is read past a store into the temp ({} reads)", h.len()),
+                    None => sfno!(name, "walk budget"),
+                }
+            }
+        }
     }
     if !crate::bisect_in("memcpyopt-srcfwd", bname) {
         return false;
@@ -3925,8 +4223,8 @@ fn srcfwd_one(
         Src::BParam(sv, _) => (*sv, 0, "param"),
     };
     if pliron_cfg::tracing_on() {
-        tracing::debug!(target: "pliron::memcpyopt", "srcfwd: {n}-byte temp reads {rwhat} at +{roff}: {} copies, {} reads ({})",
-            copies.len(), readers.len(), name.unwrap_or(""));
+        tracing::debug!(target: "pliron::memcpyopt", "srcfwd: {n}-byte temp reads {rwhat} at +{roff}: {} copies, {} reads, {} stores ({})",
+            copies.len(), readers.len(), wstores.len(), name.unwrap_or(""));
     }
     for op in copies.into_iter().chain(markers) {
         st.intrinsics.remove(op);
@@ -3968,6 +4266,13 @@ fn temp_access(ctx: &Context, st: &State, t: Value, op: Ptr<Operation>) -> Optio
     if Operation::is_op::<LoadOp>(op, ctx) {
         let o = temp_off(ctx, st, t, d.get_operand(ctx, 0))?;
         let n = crate::types::size_align(ctx, d.get_result(ctx, 0).get_type(ctx)).0 as i64;
+        return Some((o, o + n));
+    }
+    // A `PLIRON_SRCFWD_WSTORE` store into the temp: the write side's
+    // temp range (`store`'s operands are `[value, ptr]`).
+    if Operation::is_op::<StoreOp>(op, ctx) {
+        let o = temp_off(ctx, st, t, d.get_operand(ctx, 1))?;
+        let n = crate::types::size_align(ctx, d.get_operand(ctx, 0).get_type(ctx)).0 as i64;
         return Some((o, o + n));
     }
     if let Some(nm) = st.intrinsics.get(op).map(|s| s.as_str())
