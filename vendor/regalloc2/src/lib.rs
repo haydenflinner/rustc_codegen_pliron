@@ -582,7 +582,8 @@ pub const MV_NAMES: [&str; 16] = [
 pub static MOVESTATS: [core::sync::atomic::AtomicU64; 64] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 64];
 
-/// PLIRON (`PLIRON_RA2_EVICT=1`, opt-in): when a blockparam merge is
+/// PLIRON (`PLIRON_RA2_EVICT`, default on since 2026-11-25, `=0` off):
+/// when a blockparam merge is
 /// refused only because the input's ranges overlap *third-party* vregs
 /// already merged into the parameter's bundle (the `bp-ovl-3rd`
 /// census kind — a merge-order artifact), evict those vregs out of the
@@ -596,7 +597,7 @@ pub(crate) fn evict_on() -> bool {
     #[cfg(feature = "std")]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_RA2_EVICT").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_EVICT").as_deref() != Ok("0"))
     }
     #[cfg(not(feature = "std"))]
     false
