@@ -655,7 +655,7 @@ into the argument register (`ldr x11, [sp, #k]; mov x1, x11`):
 rust-compression 776 such pairs -> 156 (LLVM 142); std corpus -801
 instructions, -2.2% frequency-weighted copies; checker clean.
 
-## `PLIRON_RA2_EVICT=1` (2026-11-25, opt-in): evict merge-order squatters from a blockparam bundle
+## `PLIRON_RA2_EVICT` (2026-11-25, default on, `=0` off): evict merge-order squatters from a blockparam bundle
 
 `src/ion/merge.rs` (`bp_merge_evict`), `src/ion/requirement.rs`
 (`compute_requirement_skip`), `src/ion/data_structures.rs`
