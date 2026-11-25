@@ -376,7 +376,17 @@ in the scoreboard and in the linked history files.
   pulldown -0.10%). Open: `X30` (blake3 wants it with X17; pulldown /
   blind-sig disagree on `=1` vs `=2`), `WIDE128` (pulldown flat after the
   use gate, but blind-sig `montgomery` +2.9%), narrower `REMATW`.
-  Fuzzing: `harness/rafuzz.py`.
+  Fuzzing: `harness/rafuzz.py`. Move kinds (2026-11-24): the excess is
+  almost all *edge* moves — block-param/edge-split copies at block
+  boundaries, 4x-300x LLVM's per program (66 vs 19.8k on blake3, 40k vs
+  1.1M on compression). Structural, not a tuning delta: LLVM keeps
+  edge-consistent colors where ra2 inserts one move per differently
+  colored value crossing an edge. Measured and flat/worse:
+  `PLIRON_RA2_COPYHINT=1|2` (+1.1-1.5% instr — hint-following evicts
+  and cascades), `PLIRON_EQEDGE` (const-arg substitution, wash vs
+  REMAT), `RA2_POSTOPT=15` (flat). The remaining lever is LLVM's
+  `tryHintsRecoloring` — recoloring the *occupier* to satisfy a copy
+  preference — a substantial ra2 feature.
 
 - **Held-out programs: 1.08x** (was 1.57x on 2026-10-31). The livelock
   behind blind-sig's 2.1x is fixed
