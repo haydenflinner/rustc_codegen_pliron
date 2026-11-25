@@ -1435,7 +1435,15 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    without it and keeps the cheaper (frequency-weighted, once-per-call part
    not larger). With `PLIRON_BUMPHOIST_INLOOP`: compression -1.17%,
    blind-sig -0.10%, pulldown -0.04%, none worse
-   (`history/2026-11-20-ivsr.md`).
+   (`history/2026-11-20-ivsr.md`). **Known fragility (2026-11-25):** the
+   frequency-weighted comparison is near-degenerate — a ~0.3% cost
+   perturbation elsewhere (e.g. `PLIRON_RA2_EVICT` moving moves off hot
+   edges) flips `ivsr::pick`'s choice on a hot function and surfaces as a
+   regression attributed to the unrelated change (EVICT's compression
+   +0.10%: under `PLIRON_IVSR=0` EVICT wins there too, −24k). When an A/B
+   shows a single-program regression from an unrelated change, re-run with
+   `PLIRON_IVSR=0` before blaming the mechanism; long-term the pick wants
+   a margin/tie-break so near-equal candidates stop oscillating.
    **Done (default on, 2026-11-20): `PLIRON_BRTHREAD`** threads edges
    into a bare `brif` the edge decides: lol_html's `tag_is_one_of!` over
    an enum re-tested the variant per constant. html-rewriter -0.32%,
