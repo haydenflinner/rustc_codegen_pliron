@@ -6308,6 +6308,22 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // mutating step: a later GVN would fold the per-edge copies back
         // into the shared def they came from.
         step("argtail", "argtail", Gate::OptIn("PLIRON_ARGTAIL"), s_argtail).needs(shape::LOOPS),
+        // armmerge's `change_to_alias` and the late edge/thread steps
+        // leave uniform-input params (every in-edge arg resolving to one
+        // root — StdoutLock's write dispatch feeding v750/v778/v142/v143
+        // on all ~45 arms; demangle's joins each fed distinct
+        // `iconst 1`s). No merge pass runs after them: regalloc merges a
+        // uniform arg for free, but a refused merge (bundle overlap)
+        // pays an edge move per arm. One last sameargs round collapses
+        // them (StdoutLock block95: 5 params -> 1; demangle block137:
+        // 3 -> 1). Opt-in under `PLIRON_SAMEARG4=1`.
+        step(
+            "sameargs4",
+            "sameargs",
+            Gate::All(&[Gate::Env("PLIRON_SAMEARG"), Gate::OptIn("PLIRON_SAMEARG4")]),
+            s_sameargs,
+        )
+        .needs_any(shape::BPARAM | shape::ICONST),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

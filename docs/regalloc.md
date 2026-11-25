@@ -496,6 +496,26 @@ arm). Per-kind weighted (non-remat / remat):
   rescue the stranded edge-tail clones as predicted. Still +0.1%
   pulldown, +0.3% blake3 — not gate-clean enough to flip on this box
   (cycle numbers are noise on a loaded machine).
+- armmerge's uniform params + tail sameargs: `armmerge`'s
+  `change_to_alias` and the late edge/thread steps leave uniform-input
+  params (every in-edge arg resolving to one root — StdoutLock block95:
+  4 of 5 uniform across 45 arms; demangle block137: 8 edges each
+  passing a distinct `iconst 1`). Lowering already resolves aliases
+  (`lower.rs`), so ra2 merges the uniform arg for free — but a refused
+  merge pays an edge move per arm, and the spilled-param machinery is
+  real. `PLIRON_SAMEARG4=1` runs sameargs once at the pipeline tail
+  (after argtail, before brhint): corpus-wide 234 fns changed,
+  −4.1k winsts (−17.9k wspill, +18.0k wmovs — collapse trades the
+  param's spill/copy machinery for materialized copies that cost more
+  in hot loops, e.g. gimli skip_attributes +7.3k winsts vs
+  InlinedFunction −12.2k). Held-out instr: html +0.3%, pulldown
+  −0.06%, protobuf +0.1%, blake3 −0.02% — net-neutral, opt-in only.
+- demangle `Demangle::fmt` EVICTWHY decomposition (91 overlap-failed
+  merges): `self` 50 @ 21.3k (arg's bundle overlaps the param's own
+  range — the fork pattern, unevictable at ra2), `param` 23 @ 10.8k
+  (under EVICT=3 they re-classify to `cold` 9.8k: the param's in-edge
+  weight exceeds the merge gain — only 2 evictions fire, −450
+  weighted), `cap` 12 @ 4.7k, `tied` 4 @ 2k, `cold` 2 @ 1k.
 
 ### blake3 `portable::compress_in_place` reloads (2026-11-17)
 
