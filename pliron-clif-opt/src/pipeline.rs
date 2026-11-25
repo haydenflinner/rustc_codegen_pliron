@@ -5125,6 +5125,14 @@ fn s_padslot(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_eqedge(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::eqedge::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("eqedge");
+    }
+    k
+}
+
 fn s_brhint(p: &mut Pipe, an: &mut Analysis) -> usize {
     crate::brhint::run(&mut p.clctx.func, an)
 }
@@ -6282,6 +6290,9 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // After every pass that reshapes edges. Opt-in: `PLIRON_EXNCONST=1`.
         step("exnconst", "exnconst", Gate::OptIn("PLIRON_EXNCONST"), s_exnconst).needs(shape::CALL),
         step("padslot", "padslot", Gate::OptIn("PLIRON_PADSLOT"), s_padslot).needs(shape::CALL),
+        // Late: edge-arg substitution needs the final branch shapes
+        // (unrolled exit arms compare a counter and pass its constant).
+        step("eqedge", "eqedge", Gate::OptIn("PLIRON_EQEDGE"), s_eqedge).needs(shape::CONDBR),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

@@ -13,6 +13,10 @@ use cranelift_codegen::ir::{Function, Opcode};
 use cranelift_codegen::verifier::verify_function;
 use cranelift_codegen::settings::{self, Configurable};
 use pliron_clif_opt::pipeline::Analysis;
+use std::sync::Mutex;
+
+/// `PLIRON_*` knobs are process-global; tests that flip them serialize.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Counted digit loop: `for i in 0..len { acc = acc*10 + (load8(p+i)-'0') }`
 /// with a dominating `len <= 8` (the `can_not_overflow` path for u32/radix10).
@@ -269,10 +273,113 @@ fn fat_digit_loop_src() -> String {
     s
 }
 
+/// The checked twin of the digit loop: `len >= 9` falls back to
+/// `umul_overflow`. LLVM leaves it rolled — a loop that provably runs
+/// more trips than the peel emits has no exit a copy can take, so the
+/// copies are pure size. `PLIRON_PEEL_GT=1` declines the peel.
+fn checked_digit_loop_src() -> &'static str {
+    r#"
+function u0:0(i64, i64) -> i32 fast {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 9
+    v3 = icmp ult v1, v2
+    brif v3, block5, block2
+
+block2:
+    v4 = iconst.i32 0
+    v5 = iconst.i64 0
+    jump block1(v5, v4)
+
+block1(v10: i64, v11: i32):
+    v12 = icmp ult v10, v1
+    brif v12, block3, block4
+
+block3:
+    v13 = iadd v0, v10
+    v14 = uload8.i32 v13
+    v15 = iconst.i32 48
+    v16 = isub v14, v15
+    v17 = iconst.i32 9
+    v18 = icmp ugt v16, v17
+    brif v18, block5, block6
+
+block6:
+    v19 = iconst.i32 10
+    v20, v21 = umul_overflow.i32 v11, v19
+    brif v21, block5, block7
+
+block7:
+    v22 = iadd v20, v16
+    v23 = iconst.i64 1
+    v24 = iadd v10, v23
+    jump block1(v24, v22)
+
+block4:
+    return v11
+
+block5:
+    v30 = iconst.i32 0
+    return v30
+}
+"#
+}
+
+fn muls(f: &Function) -> usize {
+    f.layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .filter(|&i| {
+            matches!(
+                f.dfg.insts[i].opcode(),
+                Opcode::Imul | Opcode::UmulOverflow | Opcode::SmulOverflow
+            )
+        })
+        .count()
+}
+
+#[test]
+fn peel_gt_rolls_a_loop_the_peel_cannot_cover() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let src = checked_digit_loop_src();
+    unsafe {
+        std::env::remove_var("PLIRON_PEEL_GT");
+        std::env::remove_var("PLIRON_PEEL_DIGIT");
+    }
+    let mut off = parse(src);
+    rotate_then_peel(&mut off);
+    let n_off = muls(&off);
+    assert!(
+        n_off > 2,
+        "ordinary peel should copy the checked body, got {n_off} muls\n{}",
+        off.display()
+    );
+
+    unsafe {
+        std::env::set_var("PLIRON_PEEL_GT", "1");
+        std::env::remove_var("PLIRON_PEEL_DIGIT");
+    }
+    let mut on = parse(src);
+    rotate_then_peel(&mut on);
+    unsafe { std::env::remove_var("PLIRON_PEEL_GT") };
+    verify_function(&on, &flags()).unwrap_or_else(|e| panic!("{e}\n{}", on.display()));
+    let n = muls(&on);
+    // 2 = looprot's first-trip copy + the rolled residual body. `1`
+    // would mean rotation itself was declined — it isn't.
+    assert_eq!(
+        n, 2,
+        "PEEL_GT should leave the checked loop rolled (rotation copy + body), got {n}\n{}",
+        on.display()
+    );
+}
+
 #[test]
 fn peel_digit_knob_unrolls_a_fat_bounded_loop() {
+    let _env = ENV_LOCK.lock().unwrap();
     let src = fat_digit_loop_src();
-    unsafe { std::env::remove_var("PLIRON_PEEL_DIGIT") };
+    unsafe {
+        std::env::remove_var("PLIRON_PEEL_GT");
+        std::env::remove_var("PLIRON_PEEL_DIGIT");
+    }
     let mut off = parse(&src);
     rotate_then_peel(&mut off);
     let n_off = imuls(&off);

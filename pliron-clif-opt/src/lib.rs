@@ -50,6 +50,7 @@ pub mod selxor;
 pub mod commute;
 pub mod config;
 pub mod undefphi;
+pub mod eqedge;
 pub mod eqtree;
 pub mod exnconst;
 pub mod guardsink;
