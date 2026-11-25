@@ -153,9 +153,8 @@ pub const DEFAULT_ON: &[&str] = &[
     "PLIRON_WIDE128_PHI",
     // 2026-11-22: equality chains against six or more sparse constants as
     // a balanced search tree. Exact counts: html -0.384%, the rest within
-    // noise. Opt-in only — flipped 2026-11-22 without gate/crates and
-    // ICEs `codegen_intrinsic_call` on a plain build (non-dominating
-    // inst; see 89ab1a86). `PLIRON_EQTREE=1` on pending a fix.
+    // noise. `PLIRON_EQTREE=0` off.
+    "PLIRON_EQTREE",
     // 2026-11-22: selargs looks through `uextend` of a compare and then
     // threads edges whose arguments decide the destination's compare
     // (`Vec::with_capacity(len)` + extend: the reserve test). Exact
