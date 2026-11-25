@@ -15,7 +15,7 @@
 use super::{
     spill_weight_from_hot, Env, LiveBundleIndex, LiveBundleVec, LiveRangeFlag,
     LiveRangeIndex, LiveRangeKey, LiveRangeList, LiveRangeListEntry, PRegIndex, RegTraversalIter,
-    Requirement, SpillWeight, UseList, VRegIndex,
+    Requirement, SpillSetIndex, SpillWeight, UseList, VRegIndex,
 };
 use crate::{
     ion::data_structures::{
@@ -731,6 +731,9 @@ impl<'a, F: Function> Env<'a, F> {
         // PLIRON (`PLIRON_RA2_COLDSPLIT`): a piece of a cold-split piece
         // stays exempt from the rule (the flag is never set otherwise).
         self.ctx.bundles[new_bundle].cold_split = self.ctx.bundles[bundle].cold_split;
+        // PLIRON (`PLIRON_RA2_MINCLUS`): a piece of a use-cluster bundle
+        // never re-clusters.
+        self.ctx.bundles[new_bundle].minclus = self.ctx.bundles[bundle].minclus;
         for entry in &new_lr_list {
             self.ctx.ranges[entry.index].bundle = new_bundle;
         }
@@ -914,9 +917,112 @@ impl<'a, F: Function> Env<'a, F> {
     /// the spill bundle; and then does minimal reservations of
     /// registers just at uses/defs and moves the "spilled" value
     /// into/out of them immediately.
+    /// PLIRON (`PLIRON_RA2_MINCLUS`): create the per-use minimal bundle
+    /// for one use of `vreg` (the shared tail of
+    /// `split_into_minimal_bundles`, also used for cluster leftovers).
+    fn push_minimal_bundle(
+        &mut self,
+        u: Use,
+        vreg: VRegIndex,
+        spillset: SpillSetIndex,
+        new_lrs: &mut SmallVec<[(VRegIndex, LiveRangeIndex); 16]>,
+        new_bundles: &mut SmallVec<[LiveBundleIndex; 16]>,
+    ) {
+        // Create a new LR.
+        let cr = minimal_range_for_use(&u);
+        let lr = self.ctx.ranges.add(cr, self.ctx.scratch_bump.clone());
+        new_lrs.push((vreg, lr));
+        self.ctx.ranges[lr].uses.push(u);
+        self.ctx.ranges[lr].vreg = vreg;
+
+        // Create a new bundle that contains only this LR.
+        let new_bundle = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
+        self.ctx.ranges[lr].bundle = new_bundle;
+        self.ctx.bundles[new_bundle].spillset = spillset;
+        self.ctx.bundles[new_bundle]
+            .ranges
+            .push(LiveRangeListEntry {
+                range: cr,
+                index: lr,
+            });
+        new_bundles.push(new_bundle);
+
+        // If this use was a Def, set the StartsAtDef flag for the new LR.
+        if u.operand.kind() == OperandKind::Def {
+            self.ctx.ranges[lr].set_flag(LiveRangeFlag::StartsAtDef);
+        }
+
+        trace!(
+            "    -> created new LR {:?} range {:?} with new bundle {:?} for this use",
+            lr,
+            cr,
+            new_bundle
+        );
+    }
+
+    /// PLIRON (`PLIRON_RA2_MINCLUS`): flush the pending use cluster of
+    /// `vreg`: two or more register-uses in one block become one bundle
+    /// covering first use to last (a reload at the first use serves the
+    /// whole cluster when a register stays free across it); a lone use
+    /// gets the ordinary per-use minimal bundle. The cluster bundle goes
+    /// through the normal allocation path; when no register is free over
+    /// its span it splits at the first conflict, and because the spillset
+    /// is already past the split cap that lands back here, where its
+    /// `minclus` flag makes the uses plain minimal bundles — the same
+    /// result as if clustering had never run.
+    fn minclus_flush(
+        &mut self,
+        vreg: VRegIndex,
+        spillset: SpillSetIndex,
+        clus: &mut SmallVec<[Use; 8]>,
+        new_lrs: &mut SmallVec<[(VRegIndex, LiveRangeIndex); 16]>,
+        new_bundles: &mut SmallVec<[LiveBundleIndex; 16]>,
+    ) {
+        if clus.len() >= 2 {
+            let cr = CodeRange {
+                from: minimal_range_for_use(&clus[0]).from,
+                to: minimal_range_for_use(clus.last().unwrap()).to,
+            };
+            let lr = self.ctx.ranges.add(cr, self.ctx.scratch_bump.clone());
+            new_lrs.push((vreg, lr));
+            self.ctx.ranges[lr].vreg = vreg;
+            for &u in clus.iter() {
+                self.ctx.ranges[lr].uses.push(u);
+            }
+            let new_bundle = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
+            self.ctx.ranges[lr].bundle = new_bundle;
+            self.ctx.bundles[new_bundle].spillset = spillset;
+            self.ctx.bundles[new_bundle].minclus = true;
+            self.ctx.bundles[new_bundle]
+                .ranges
+                .push(LiveRangeListEntry {
+                    range: cr,
+                    index: lr,
+                });
+            new_bundles.push(new_bundle);
+            self.ctx.output.stats.splits_minclus += 1;
+            explain!(
+                "    minclus {:?} vreg {:?}: {} uses in range {:?}",
+                new_bundle,
+                vreg,
+                clus.len(),
+                cr
+            );
+        } else {
+            for u in clus.drain(..) {
+                self.push_minimal_bundle(u, vreg, spillset, new_lrs, new_bundles);
+            }
+        }
+        clus.clear();
+    }
+
     pub fn split_into_minimal_bundles(&mut self, bundle: LiveBundleIndex, hint: PReg) {
         self.ctx.output.stats.splits_minimal += 1;
         explain!("  minimal-split {}", self.explain_bundle(bundle));
+        // PLIRON (`PLIRON_RA2_MINCLUS`): nearby uses may share a reload
+        // bundle (see `minclus_flush`); a bundle already produced by
+        // clustering goes to plain minimal bundles instead.
+        let minclus = crate::minclus_on() && !self.ctx.bundles[bundle].minclus;
         assert_eq!(self.ctx.scratch_removed_lrs_vregs.len(), 0);
         self.ctx.scratch_removed_lrs.clear();
 
@@ -945,6 +1051,11 @@ impl<'a, F: Function> Env<'a, F> {
             let mut spill_starts_def = false;
 
             let empty_vec = UseList::new_in(self.ctx.bump());
+            // PLIRON (`PLIRON_RA2_MINCLUS`): register-uses that sit close
+            // together in one block gather in `clus` and become one
+            // bundle covering the whole cluster (see `minclus_flush`);
+            // every other use keeps the per-use path.
+            let mut clus: SmallVec<[Use; 8]> = smallvec![];
             for u in core::mem::replace(&mut self.ctx.ranges[entry.index].uses, empty_vec) {
                 trace!("   -> use {:?}", u);
 
@@ -956,6 +1067,7 @@ impl<'a, F: Function> Env<'a, F> {
                 // could create unnecessary conflicts with existing bundles that need to fit in a
                 // register, more strict requirements, so we delay them eagerly.
                 if u.operand.constraint() == OperandConstraint::Any {
+                    self.minclus_flush(vreg, spillset, &mut clus, &mut new_lrs, &mut new_bundles);
                     trace!("    -> migrating this any-constrained use to the spill range");
                     spill_uses.push(u);
 
@@ -975,37 +1087,39 @@ impl<'a, F: Function> Env<'a, F> {
                     spill_range.from = ProgPoint::before(u.pos.inst().next());
                 }
 
-                // Create a new LR.
-                let cr = minimal_range_for_use(&u);
-                let lr = self.ctx.ranges.add(cr, self.ctx.scratch_bump.clone());
-                new_lrs.push((vreg, lr));
-                self.ctx.ranges[lr].uses.push(u);
-                self.ctx.ranges[lr].vreg = vreg;
-
-                // Create a new bundle that contains only this LR.
-                let new_bundle = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
-                self.ctx.ranges[lr].bundle = new_bundle;
-                self.ctx.bundles[new_bundle].spillset = spillset;
-                self.ctx.bundles[new_bundle]
-                    .ranges
-                    .push(LiveRangeListEntry {
-                        range: cr,
-                        index: lr,
-                    });
-                new_bundles.push(new_bundle);
-
-                // If this use was a Def, set the StartsAtDef flag for the new LR.
-                if is_def {
-                    self.ctx.ranges[lr].set_flag(LiveRangeFlag::StartsAtDef);
+                // PLIRON (`PLIRON_RA2_MINCLUS`): a plain register-use may
+                // join the open cluster when it is in the same block and
+                // within `MINCLUS_SPAN` instructions of its first use;
+                // anything else breaks the cluster and keeps the per-use
+                // minimal bundle (a def writes a new value, a fixed or
+                // tied operand needs a particular register anyway).
+                if minclus && !is_def && u.operand.constraint() == OperandConstraint::Reg {
+                    if !clus.is_empty() {
+                        let same_block = self.ctx.cfginfo.insn_block[u.pos.inst().index()]
+                            == self.ctx.cfginfo.insn_block[clus[0].pos.inst().index()];
+                        let within_span = u
+                            .pos
+                            .inst()
+                            .index()
+                            .saturating_sub(clus[0].pos.inst().index())
+                            <= crate::minclus_span();
+                        if !(same_block && within_span) {
+                            self.minclus_flush(
+                                vreg,
+                                spillset,
+                                &mut clus,
+                                &mut new_lrs,
+                                &mut new_bundles,
+                            );
+                        }
+                    }
+                    clus.push(u);
+                    continue;
                 }
-
-                trace!(
-                    "    -> created new LR {:?} range {:?} with new bundle {:?} for this use",
-                    lr,
-                    cr,
-                    new_bundle
-                );
+                self.minclus_flush(vreg, spillset, &mut clus, &mut new_lrs, &mut new_bundles);
+                self.push_minimal_bundle(u, vreg, spillset, &mut new_lrs, &mut new_bundles);
             }
+            self.minclus_flush(vreg, spillset, &mut clus, &mut new_lrs, &mut new_bundles);
 
             if !spill_range.is_empty() {
                 // Make one entry in the spill bundle that covers the whole range.

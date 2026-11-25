@@ -129,6 +129,52 @@ pub(crate) fn usesplit_multiblock() -> bool {
     false
 }
 
+/// PLIRON `PLIRON_RA2_MINCLUS` (opt-in): in the minimal-bundle fallback,
+/// consecutive register-uses of one vreg in one block within
+/// `PLIRON_RA2_MINCLUS_SPAN` instructions form one bundle covering first
+/// to last use, so a single reload serves the cluster when a register
+/// stays free across it (LLVM's wider spill-reload ranges); uses the
+/// fallback cannot cluster keep their per-use minimal bundles.
+/// `=1` gives the cluster its ordinary spill weight. (A minimal-bundle
+/// grade, i.e. always-evict, was measured negative: evicting the bundles
+/// squatting a cluster's span only relocates their reloads.)
+pub(crate) fn minclus_mode() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *M.get_or_init(|| {
+            std::env::var("PLIRON_RA2_MINCLUS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
+pub(crate) fn minclus_on() -> bool {
+    minclus_mode() != 0
+}
+
+/// PLIRON: `PLIRON_RA2_MINCLUS_SPAN` (default 192): maximum instruction
+/// span, first use's instruction to last use's, of one use cluster.
+pub(crate) fn minclus_span() -> usize {
+    #[cfg(feature = "std")]
+    {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("PLIRON_RA2_MINCLUS_SPAN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n >= 2)
+                .unwrap_or(192)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    192
+}
+
 /// PLIRON: `PLIRON_RA_STATS=1` — print one `ra2stats:` line per allocated
 /// function (also on when `explain_on`).
 pub fn ra_stats_on() -> bool {

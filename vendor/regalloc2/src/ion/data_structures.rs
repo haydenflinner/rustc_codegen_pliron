@@ -213,6 +213,11 @@ pub struct LiveBundle {
     /// region-split again only while it has fewer blocks (LLVM's
     /// `RS_Split2` guard). 0: not from a region split.
     pub region_blocks: u32,
+    /// PLIRON (`PLIRON_RA2_MINCLUS`): this bundle is a use cluster cut out
+    /// of the minimal-bundle fallback; if it ever reaches
+    /// `split_into_minimal_bundles` again its uses go to ordinary minimal
+    /// bundles (no re-clustering), which terminates the retry.
+    pub minclus: bool,
 }
 
 pub const BUNDLE_MAX_SPILL_WEIGHT: u32 = (1 << 28) - 1;
@@ -449,6 +454,7 @@ impl LiveBundles {
             limit: None,
             cold_split: false,
             region_blocks: 0,
+            minclus: false,
         })
     }
 }
@@ -1079,6 +1085,10 @@ pub struct Stats {
     pub splits_use_cluster: usize,
     /// PLIRON: region splits that took (`PLIRON_RA2_REGION`).
     pub splits_region: usize,
+    /// PLIRON: use clusters emitted by the minimal-bundle fallback
+    /// (`PLIRON_RA2_MINCLUS`): each replaces >= 2 per-use minimal bundles
+    /// (one reload) when it keeps a register.
+    pub splits_minclus: usize,
 }
 
 // Helper function for generating sorting keys. The order of arguments is from

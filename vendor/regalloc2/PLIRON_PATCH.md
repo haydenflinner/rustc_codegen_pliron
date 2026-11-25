@@ -692,3 +692,43 @@ not an allocation defect: eviction perturbed the compiled-cost numbers
 `ivsr::pick` sees by ~0.3%, which flipped a take decision near its
 margin (827 vs 825) and dropped the pointer-IV rewrite, leaving index
 recomputes in the depth-3 loop. rafuzz: 35k seeds mixed combos, clean.
+
+## `PLIRON_RA2_MINCLUS` (2026-11-26, opt-in `=1`, `PLIRON_RA2_MINCLUS_SPAN` default 192): cluster nearby uses into one minimal-bundle reload range
+
+`src/ion/process.rs` (`split_into_minimal_bundles`, `minclus_flush`,
+`push_minimal_bundle`), `src/ion/data_structures.rs`
+(`LiveBundle::minclus`, `Stats::splits_minclus`, shown as `minclus=`
+in `ra2stats:`), `src/lib.rs` (`minclus_mode`, `minclus_span`).
+
+Motivation: on blake3's `compress_in_place` we spill *less* than LLVM
+but reload ~1.43x more — the minimal-bundle fallback cuts one tiny
+bundle per use (a reload per use) where LLVM keeps a value in a
+register across several nearby uses of the same vreg. With the knob
+on, consecutive plain `Reg`-constrained uses of one vreg in one block
+within `MINCLUS_SPAN` instructions of the cluster's first use form ONE
+bundle spanning first use to last use; a single reload serves the
+cluster when a register stays free across it (LLVM's wider
+spill-reload ranges). Defs, `Any`-constrained and non-`Reg` uses break
+the cluster and keep the per-use minimal bundle. A cluster bundle gets
+its ordinary computed spill weight and stays non-minimal; if no
+register is free over its span it splits at the first conflict and the
+piece lands back in `split_into_minimal_bundles`, where its `minclus`
+flag makes the uses plain minimal bundles — the same result as if
+clustering had never run, so the retry terminates.
+
+Why opt-in and why it cannot help `compress_in_place`: every candidate
+cluster span there is already squatted by long state bundles whose
+weight a cluster can never evict, so all 8 clusters split straight back
+to per-use minimal (the produced binary is identical). A variant that
+gave cluster bundles the minimal-bundle always-evict grade evicted the
+squatters — and measured strictly worse on the function (88 ldr/23 str
+vs 72/16 baseline): the evicted bundles' reloads just land elsewhere.
+Register pressure there is real (~19 long live state vregs vs ~29
+allocatable regs), so the gap is not reachable by this mechanism.
+
+Measured: blake3-scalar exact instructions unchanged (all clusters
+failed as designed); pulldown-cmark 46,398,014 -> 46,378,507 (-19.5k,
+-0.04%); rust-html-rewriter 92,924,616 -> 92,918,460 (-6.2k, -0.007%);
+std corpus (4,979 fns) -745 weighted stack accesses, -448 weighted
+instructions, one addr2line regression (+306 weighted movs — a cluster
+register picked up copies).

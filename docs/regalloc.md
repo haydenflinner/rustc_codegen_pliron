@@ -548,6 +548,17 @@ instructions.
   4 moves (static html overhead -6.1%, std -0.9%). Dynamic results in the
   knob evaluation below. x18 (Linux only; reserved on macOS) is not
   allocatable in Cranelift at all; LLVM uses it on Linux.
+- **Reload-per-use can't be cured here** (2026-11-26): post-x18 the
+  function is ours 7 st / 48 ld / 2 mov vs LLVM 11 st / 35 ld / 18 mov
+  per call; the 48 `ldur`s come from per-use minimal bundles (LLVM keeps
+  one register across several nearby uses). `PLIRON_RA2_MINCLUS=1`
+  clusters such uses into one reload bundle, but every cluster span is
+  squatted by already-allocated long bundles the cluster weight can
+  never evict, so all 8 clusters fall back to per-use minimal — the
+  emitted binary is identical. Giving the cluster the always-evict
+  grade evicts the squatters but measured strictly worse (88 ldr/23 str
+  vs 72/16 baseline): their reloads just move. The residual gap is
+  register count, not the fallback policy.
 
 ### Callee-save traffic (csr), pulldown and html-rewriter (2026-11-17)
 
@@ -599,6 +610,7 @@ source, not `pliron-cfg`'s `DEFAULT_ON`.
 | `PLIRON_RA2_XBLOCK=1` | regalloc2 `moves.rs` | redundant-move state survives a single-predecessor fallthrough | opt-in (evaluated: pulldown +5k) |
 | `PLIRON_RA2_EVICT` (`_RATIO`, `_CAP`) | regalloc2 `merge.rs` | a merge refused only by third-party range overlap evicts the squatting vregs and retries when the edge is RATIO× hotter; bit1 (`=2`) also evicts conflicting block parameters, bit2 (`=4`) falls back to an exact boundary-move cost when the per-vreg edge sum fails | on since 2026-11-25 (pulldown -0.21%, protobuf -0.10%, blind-sig -0.07%, html -0.05%; compression +0.10% is an ivsr cost flip, not the mechanism). Bits 1+2 measured dead (html +0.2..0.6%, census table: `self` 31k and `cap` 28.6k weighted dominate) |
 | `PLIRON_RA2_MERGEDEPTH=1..6` | regalloc2 `merge.rs` | merge-order experiments: 1..3 deepest loop first, 4/5 hottest edge first (4 ties shortest-span), 6 shortest span first | opt-in (evaluated: pulldown +0.6M..1.2M; 4/6 shift census buckets but regress total weighted insts +6..52k — rejected 2026-11-25) |
+| `PLIRON_RA2_MINCLUS` (`_SPAN`, default 192) | regalloc2 `process.rs` | in the minimal-bundle fallback, consecutive `Reg` uses of one vreg in one block within SPAN instructions form one bundle (one reload serves the cluster); the `minclus` flag makes a failed cluster fall back to per-use minimal bundles | opt-in (2026-11-26: pulldown -19.5k, html -6.2k exact, blake3 identical — clusters can't evict the state bundles that squat their spans; an always-evict variant measured strictly worse) |
 | `PLIRON_RA2_REMATW=0..7` (+`_MAXUSES`, `_MINUSSES`, `_CHEAP`) | Cranelift `vcode.rs` + regalloc2 `process.rs` | rematerializable spill weight; default `7` (`uses≥MINUSSES`, default 8); `=0` off; `_CHEAP` default on (immediates only for weight set) | on (7) since 2026-11-18 |
 | `PLIRON_REMAT`, `_STORE` | Cranelift `vcode.rs` | reloads of constants/addresses rematerialize; stores only remat reads die | on |
 | `PLIRON_RELOADPRE` (`_ROUNDS`), `PLIRON_RELOADCSE`, `PLIRON_SPILLCSE` | Cranelift `vcode.rs` | reload PRE into predecessors; per-block and cross-block reload CSE | on |

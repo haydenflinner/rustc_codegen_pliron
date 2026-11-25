@@ -132,12 +132,13 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         if regalloc2::ra_stats_on() || regalloc2::explain_on() {
             let s = &regalloc_ctx.output.stats;
             eprintln!(
-                "ra2stats: {} algo={:?} splits={} minimal={} use_cluster={} region={} evict={} spill_bundles={} edits={}",
+                "ra2stats: {} algo={:?} splits={} minimal={} use_cluster={} minclus={} region={} evict={} spill_bundles={} edits={}",
                 f.name,
                 options.algorithm,
                 s.splits,
                 s.splits_minimal,
                 s.splits_use_cluster,
+                s.splits_minclus,
                 s.splits_region,
                 s.evict_bundle_count,
                 s.spill_bundle_count,

@@ -81,6 +81,8 @@ KNOBS = [
     ("PLIRON_RA2_USESPLIT", "1", ["0"], "ra2", "1"),
     ("PLIRON_RA2_USESPLIT_GAP", "128", ["8", "32", "64"], "ra2", "128"),
     ("PLIRON_RA2_USESPLIT_MULTIBLOCK", "0", ["1"], "ra2", "0"),
+    ("PLIRON_RA2_MINCLUS", "0", ["1"], "ra2", "1"),
+    ("PLIRON_RA2_MINCLUS_SPAN", "192", ["64", "384"], "ra2", "192"),
     # greedy default is all-spill; COLOR=1 single-block non-edge (both clean).
     # PROOFCOLOR=1 needs COLOR; mixes chromatic rematch + temp prefs.
     # mcts = UCT homes on greedy emit (SIMS/TOPM dials; light-rafuzz clean).
