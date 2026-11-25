@@ -545,9 +545,14 @@ instructions.
   is +0.03..0.06% static overhead on std/html.
 - **What moves it**: registers. `PLIRON_X17=1 PLIRON_X30=1` (both
   existing opt-in knobs) take this function to 6 stores, 51 reloads,
-  4 moves (static html overhead -6.1%, std -0.9%). Dynamic results in the
-  knob evaluation below. x18 (Linux only; reserved on macOS) is not
-  allocatable in Cranelift at all; LLVM uses it on Linux.
+  4 moves (static html overhead -6.1%, std -0.9%). `PLIRON_X16=1`
+  alone: 72 -> 65 ldr here, program -257k (-0.53%) exact — the largest
+  single-knob blake3 delta; pulldown -28.6k, html/compression noise.
+  x18 (Linux only; reserved on macOS) is default-on since 685a9a65.
+  X16 stays opt-in: modest wins and a documented far-`b` veneer
+  residual (a veneer can't preserve a reg carrying the branch target);
+  its scratch-borrow imm12-overflow ICE on far sp access is fixed
+  (4b720edc).
 - **Reload-per-use can't be cured here** (2026-11-26): post-x18 the
   function is ours 7 st / 48 ld / 2 mov vs LLVM 11 st / 35 ld / 18 mov
   per call; the 48 `ldur`s come from per-use minimal bundles (LLVM keeps
