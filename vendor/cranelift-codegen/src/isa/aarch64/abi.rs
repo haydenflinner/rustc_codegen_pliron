@@ -1423,6 +1423,17 @@ impl ABIMachineSpec for AArch64MachineDeps {
             // `bl`/`blr` write the link register.
             set.add(xreg_preg(30));
         }
+        // PLIRON: when `x18_allocatable()` (Linux ELF only) it sits in
+        // `preferred_regs_by_class` — a caller-saved scratch like x30 —
+        // so calls clobber it. Without this a `bl` reported x18
+        // preserved while any callee may use it (the 2026-11-18 blake3
+        // stack-overflow repro). PreserveAll and Winch callees cannot
+        // touch it (contract / never allocated there).
+        if x18_allocatable()
+            && !matches!(call_conv, isa::CallConv::PreserveAll | isa::CallConv::Winch)
+        {
+            set.add(xreg_preg(18));
+        }
         set
     }
 

@@ -1072,6 +1072,39 @@ t_x18() {
       *) (( n > 0 )) || { echo "x18: no use of x18 on Linux under PLIRON_X18=1 (test lost its pressure)" >&2; return 1; } ;;
     esac
   done
+  # x18 is caller-saved under the knob: a `bl` must clobber it. 28 values
+  # live across an opaque call in presscall.rs; before the
+  # get_regs_clobbered_by_call fix the allocator left one in x18 across
+  # `bl` (the 2026-11-18 blake3 stack-overflow repro). The check: an x18
+  # defined by an ALU op, then a `bl`, then an x18 read with no
+  # load/store of x18 in between.
+  PLIRON_X18=1 rustc $BE --edition 2021 -O --crate-type=lib --emit=obj --target aarch64-unknown-linux-musl tests/x18/presscall.rs -o $out/x18-call.o || return 1
+  "$llvmod" -d --no-show-raw-insn $out/x18-call.o | awk '
+    {
+      line = $0
+      sub(/^[^:]*:/, "", line); gsub(/^[ \t]+/, "", line)
+      split(line, f, /[ \t]+/); m = f[1]
+      ops = line; sub(/^[^ \t]+[ \t]*/, "", ops)
+      split(ops, o, ","); d1 = o[1]; d2 = o[2]
+      gsub(/^[ \t]+|[ \t]+$/, "", d1); gsub(/^[ \t]+|[ \t]+$/, "", d2)
+    }
+    m ~ /^blr?$/ { if (vol) pend = 1; next }
+    {
+      tmp = ops; cnt = 0
+      while (sub(/(^|[ ,\[])(w18|x18)([ ,\]]|$)/, " ", tmp)) cnt++
+      if (!cnt) next
+      isdef = 0
+      # loads and ALU ops write their destination; x18 in the dest
+      # slot starts a new value. stores/compares/branches read only.
+      if (m ~ /^ld/) isdef = (d1 ~ /^[wx]18$/ || d2 ~ /^[wx]18$/)
+      else if (m !~ /^(st|cmp|cmn|tst|ccmp|ccmn|cb|tb|prfm|b\.|b$|ret)/) {
+        isdef = (cnt == 1 && d1 ~ /^[wx]18$/)
+      }
+      if (!isdef && pend) bad = 1
+      if (isdef) { vol = 1; pend = 0 }
+    }
+    END { exit bad }
+  ' || { echo "x18: value live in x18 across a bl under PLIRON_X18=1 (call clobber missing)" >&2; return 1; }
 }
 
 t_halfclob() {
