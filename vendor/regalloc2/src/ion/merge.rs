@@ -13,11 +13,11 @@
 //! Bundle merging.
 
 use crate::ion::data_structures::{
-    BlockparamOut, CodeRange, Env, LiveBundleIndex, LiveRangeKey, LiveRangeList, SpillSet,
-    SpillSlotIndex, VRegIndex,
+    BlockparamOut, CodeRange, Env, LiveBundleIndex, LiveRangeKey, LiveRangeList,
+    LiveRangeListEntry, SpillSet, SpillSlotIndex, VRegIndex,
 };
 use crate::ion::requirement::Requirement;
-use crate::{Function, Inst, OperandConstraint, OperandKind, PReg, ProgPoint};
+use crate::{Function, FxHashSet, Inst, OperandConstraint, OperandKind, PReg, ProgPoint};
 use alloc::format;
 use core::convert::TryFrom;
 
@@ -323,6 +323,240 @@ impl<'a, F: Function> Env<'a, F> {
         false
     }
 
+    /// PLIRON (`PLIRON_RA2_EVICT`): the block-frequency weight of a
+    /// blockparam edge move — the move lands where
+    /// `moves.rs::choose_move_location` would put it: at the end of
+    /// `from_block` when `to_block` has several predecessors, at the
+    /// head of `to_block` (an edge stub) otherwise.
+    fn bp_edge_weight(&self, from_block: crate::Block, to_block: crate::Block) -> f32 {
+        let to_preds = self.func.block_preds(to_block).len()
+            + usize::from(self.func.entry_block() == to_block);
+        let blk = if to_preds > 1 { from_block } else { to_block };
+        self.ctx
+            .cfginfo
+            .hot_bonus
+            .get(blk.index())
+            .copied()
+            .unwrap_or(1.0)
+            .max(1.0)
+    }
+
+    /// PLIRON (`PLIRON_RA2_EVICT`): recompute a bundle's
+    /// fixed/fixed-def/stack cached flags and `limit` from its current
+    /// ranges' uses — the merge-time equivalents of what
+    /// `merge_vreg_bundles` sets at bundle creation, needed after ranges
+    /// leave a bundle outside `merge_bundles`.
+    fn set_bundle_flags(&mut self, bundle: LiveBundleIndex) {
+        let mut fixed = false;
+        let mut fixed_def = false;
+        let mut stack = false;
+        'scan: for entry in &self.bundles[bundle].ranges {
+            for u in &self.ranges[entry.index].uses {
+                use OperandConstraint::*;
+                match u.operand.constraint() {
+                    FixedReg(_) => {
+                        fixed = true;
+                        if u.operand.kind() == OperandKind::Def {
+                            fixed_def = true;
+                        }
+                    }
+                    Stack => {
+                        stack = true;
+                    }
+                    Any | Reg | Reuse(_) | Limit(_) => {}
+                }
+                if fixed && stack && fixed_def {
+                    break 'scan;
+                }
+            }
+        }
+        self.bundles[bundle].set_cached_flags(fixed, fixed_def, stack);
+        self.bundles[bundle].limit = self.compute_bundle_limit(bundle);
+    }
+
+    /// PLIRON (`PLIRON_RA2_EVICT`): `merge_bundles(from_b, to_b)` just
+    /// failed on a live-range overlap (`last_merge_fail == 4`). When
+    /// every overlapping to-bundle vreg is a *third party* — not the
+    /// param `to_vreg` itself (the `bp-ovl-3rd` census shape), not a
+    /// block parameter (evicting one cascades to all of its own
+    /// in-edges), not reuse-tied (its bundle is what makes the tied
+    /// operands coincide) — and this edge is at least
+    /// `evict_ratio()` times hotter than the arg edges the conflicts'
+    /// moves would land back on, split the conflicting vregs out of
+    /// `to_b` into one fresh bundle with a fresh spillset and retry the
+    /// merge. Returns true when the retry merged.
+    ///
+    /// The conflicting vregs are all mutually non-overlapping (they
+    /// were co-resident in `to_b`), so they keep their shared
+    /// allocation by sharing the new bundle: this undoes only their
+    /// join into `to_b`, not their merges with each other.
+    fn bp_merge_evict(
+        &mut self,
+        arg_i: usize,
+        to_vreg: VRegIndex,
+        from_b: LiveBundleIndex,
+        to_b: LiveBundleIndex,
+        arg_cost: &[f32],
+        reuse_tied: &[bool],
+    ) -> bool {
+        // Collect every to-bundle vreg whose ranges overlap a
+        // from-bundle range: the same scan `merge_bundles` did
+        // (including the fixed-def range-start adjustment), but
+        // gathering all conflicts rather than stopping at the first.
+        let adjust_range_start = |bundle_idx, range: CodeRange| {
+            if self.bundles[bundle_idx].cached_fixed_def() {
+                ProgPoint::before(range.from.inst())
+            } else {
+                range.from
+            }
+        };
+        let cap = crate::evict_cap();
+        let mut conf: crate::Vec<VRegIndex> = crate::Vec::new();
+        {
+            let ranges_from = &self.bundles[from_b].ranges[..];
+            let ranges_to = &self.bundles[to_b].ranges[..];
+            let (mut fi, mut ti, mut steps) = (0usize, 0usize, 0usize);
+            while fi < ranges_from.len() && ti < ranges_to.len() {
+                steps += 1;
+                if steps > 400 {
+                    return false;
+                }
+                let (rf, rt) = (ranges_from[fi], ranges_to[ti]);
+                if adjust_range_start(from_b, rf.range) >= rt.range.to {
+                    ti += 1;
+                } else if adjust_range_start(to_b, rt.range) >= rf.range.to {
+                    fi += 1;
+                } else {
+                    let v = self.ranges[rt.index].vreg;
+                    if !conf.contains(&v) {
+                        if conf.len() >= cap {
+                            return false;
+                        }
+                        conf.push(v);
+                    }
+                    if rf.range.to <= rt.range.to {
+                        fi += 1;
+                    } else {
+                        ti += 1;
+                    }
+                }
+            }
+        }
+        if conf.is_empty() || conf.contains(&to_vreg) {
+            return false;
+        }
+        // Cost of evicting a vreg: it sits in its own bundle again, so
+        // every arg edge that carried it into a merge gets its edge move
+        // back. `arg_cost[v]` is the sum of those edges' block
+        // frequencies. A vreg with no arg edges cannot be in `to_b`
+        // through a blockparam merge at all (param and reuse-tied vregs
+        // are refused above).
+        let mut cost = 0.0f32;
+        for &v in &conf {
+            if self.vregs[v].blockparam.is_valid() || reuse_tied[v.index()] {
+                return false;
+            }
+            let c = arg_cost[v.index()];
+            if !(c > 0.0) {
+                return false;
+            }
+            cost += c;
+        }
+        let incoming = {
+            let o = self.blockparam_outs[arg_i];
+            self.bp_edge_weight(o.from_block, o.to_block)
+        };
+        if !(incoming >= crate::evict_ratio() * cost) {
+            return false;
+        }
+        // The overlap is provably gone once the conflicting vregs leave;
+        // check the merged requirement on the post-eviction bundle too,
+        // so a requirement refusal doesn't leave the evictions wasted.
+        let skip: FxHashSet<VRegIndex> = conf.iter().copied().collect();
+        let ok = match (
+            self.compute_requirement(from_b),
+            self.compute_requirement_skip(to_b, &skip),
+        ) {
+            (Ok(a), Ok(b)) => a.merge(b).is_ok(),
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+
+        // Evict: move the conflicting vregs' ranges out of `to_b` into a
+        // fresh bundle with a fresh spillset.
+        let bump = self.ctx.bump();
+        let nb = self.ctx.bundles.add(bump);
+        let ranges: &crate::ion::data_structures::LiveRanges = &self.ctx.ranges;
+        let mut moved: crate::Vec<LiveRangeListEntry> = crate::Vec::new();
+        self.ctx.bundles[to_b].ranges.retain(|e| {
+            if skip.contains(&ranges[e.index].vreg) {
+                moved.push(*e);
+                false
+            } else {
+                true
+            }
+        });
+        debug_assert!(!moved.is_empty());
+        for e in &moved {
+            self.ctx.ranges[e.index].bundle = nb;
+        }
+        let mut extent = moved[0].range;
+        for e in &moved[1..] {
+            extent = extent.join(e.range);
+        }
+        self.ctx.bundles[nb].ranges.extend_from_slice(&moved);
+        let class = self.spillsets[self.bundles[to_b].spillset].class;
+        let ssidx = self.spillsets.push(SpillSet {
+            slot: SpillSlotIndex::invalid(),
+            required: false,
+            class,
+            hint: PReg::invalid(),
+            spill_bundle: LiveBundleIndex::invalid(),
+            splits: 0,
+            cold_spill: false,
+            region_count: 0,
+            use_cluster_done: false,
+            range: extent,
+        });
+        self.bundles[nb].spillset = ssidx;
+        self.set_bundle_flags(nb);
+        explain!(
+            "  bp-evict: {:?} out of bundle{} into bundle{} (edge block{} -> v{})",
+            conf,
+            to_b.index(),
+            nb.index(),
+            self.blockparam_outs[arg_i].from_block.index(),
+            to_vreg.index()
+        );
+
+        // `to_b`'s cached flags, limit and spillset extent may have been
+        // widened by the evicted vregs; recompute over what remains.
+        self.set_bundle_flags(to_b);
+        let mut ext: Option<CodeRange> = None;
+        for e in &self.bundles[to_b].ranges {
+            ext = Some(match ext {
+                None => e.range,
+                Some(x) => x.join(e.range),
+            });
+        }
+        if let Some(ext) = ext {
+            let ss = self.ctx.bundles[to_b].spillset;
+            self.ctx.spillsets[ss].range = ext;
+        }
+
+        use core::sync::atomic::Ordering::Relaxed;
+        crate::EVICTSTATS[1].fetch_add(conf.len() as u64, Relaxed);
+        if self.merge_bundles(from_b, to_b) {
+            crate::EVICTSTATS[0].fetch_add(1, Relaxed);
+            true
+        } else {
+            crate::EVICTSTATS[2].fetch_add(1, Relaxed);
+            false
+        }
+    }
+
     pub fn merge_vreg_bundles(&mut self) {
         // Create a bundle for every vreg, initially.
         trace!("merge_vreg_bundles: creating vreg bundles");
@@ -407,6 +641,16 @@ impl<'a, F: Function> Env<'a, F> {
             self.bundles[bundle].spillset = ssidx;
         }
 
+        // PLIRON (`PLIRON_RA2_EVICT`): vregs tied by a Reuse operand are
+        // never evicted from a merge (their shared bundle is what makes
+        // the tied operands coincide); mark both the reusing def and the
+        // reused input.
+        let evict = crate::evict_on();
+        let mut reuse_tied: crate::Vec<bool> = crate::Vec::new();
+        if evict {
+            reuse_tied.resize(self.vregs.len(), false);
+        }
+
         for inst in 0..self.func.num_insts() {
             let inst = Inst::new(inst);
 
@@ -416,6 +660,10 @@ impl<'a, F: Function> Env<'a, F> {
                 if let OperandConstraint::Reuse(reuse_idx) = op.constraint() {
                     let src_vreg = op.vreg();
                     let dst_vreg = self.func.inst_operands(inst)[reuse_idx].vreg();
+                    if evict {
+                        reuse_tied[src_vreg.vreg()] = true;
+                        reuse_tied[dst_vreg.vreg()] = true;
+                    }
 
                     trace!(
                         "trying to merge reused-input def: src {} to dst {}",
@@ -473,6 +721,19 @@ impl<'a, F: Function> Env<'a, F> {
                 }
             });
         }
+        // PLIRON (`PLIRON_RA2_EVICT`): each arg vreg's total edge weight —
+        // the moves that reappear on its out-edges when it is evicted
+        // from a merged bundle.
+        let mut arg_cost: crate::Vec<f32> = crate::Vec::new();
+        if evict {
+            arg_cost.resize(self.vregs.len(), 0.0f32);
+            for o in 0..self.blockparam_outs.len() {
+                let out = self.blockparam_outs[o];
+                let h = self.bp_edge_weight(out.from_block, out.to_block);
+                arg_cost[out.from_vreg.index()] += h;
+            }
+        }
+
         for i in order {
             let BlockparamOut {
                 from_vreg, to_vreg, to_block, ..
@@ -520,7 +781,24 @@ impl<'a, F: Function> Env<'a, F> {
                 self.blockparam_outs[i].from_block.index(),
                 to_block.index()
             );
-            if !self.merge_bundles(from_bundle, to_bundle) && stats {
+            if !self.merge_bundles(from_bundle, to_bundle) {
+                // PLIRON (`PLIRON_RA2_EVICT`): on a pure third-party
+                // overlap, evict the conflicting vregs out of the
+                // to-bundle and retry.
+                if evict
+                    && self.ctx.last_merge_fail == 4
+                    && self.bp_merge_evict(
+                        i,
+                        to_vreg,
+                        from_bundle,
+                        to_bundle,
+                        &arg_cost,
+                        &reuse_tied,
+                    )
+                {
+                    continue;
+                }
+                if stats {
                 let key = crate::ion::data_structures::u64_key(
                     self.blockparam_outs[i].from_block.raw_u32(),
                     to_vreg.raw_u32(),
@@ -589,6 +867,7 @@ impl<'a, F: Function> Env<'a, F> {
                     };
                 }
                 self.ctx.bp_merge_kind.insert(key, k);
+                }
             }
         }
 

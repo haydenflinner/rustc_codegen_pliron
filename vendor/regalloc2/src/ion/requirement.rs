@@ -13,7 +13,8 @@
 //! Requirements computation.
 
 use super::{Env, LiveBundleIndex};
-use crate::{Function, Inst, Operand, OperandConstraint, PReg, ProgPoint};
+use crate::ion::data_structures::VRegIndex;
+use crate::{Function, FxHashSet, Inst, Operand, OperandConstraint, PReg, ProgPoint};
 
 pub struct RequirementConflict;
 
@@ -133,11 +134,35 @@ impl<'a, F: Function> Env<'a, F> {
         &self,
         bundle: LiveBundleIndex,
     ) -> Result<Requirement, RequirementConflictAt> {
+        self.compute_requirement_inner(bundle, None)
+    }
+
+    /// PLIRON (`PLIRON_RA2_EVICT`): the bundle's requirement ignoring the
+    /// ranges of vregs in `skip` — what the bundle would require after
+    /// those vregs are evicted out of it.
+    pub(crate) fn compute_requirement_skip(
+        &self,
+        bundle: LiveBundleIndex,
+        skip: &FxHashSet<VRegIndex>,
+    ) -> Result<Requirement, RequirementConflictAt> {
+        self.compute_requirement_inner(bundle, Some(skip))
+    }
+
+    fn compute_requirement_inner(
+        &self,
+        bundle: LiveBundleIndex,
+        skip: Option<&FxHashSet<VRegIndex>>,
+    ) -> Result<Requirement, RequirementConflictAt> {
         let mut req = Requirement::Any;
         let mut last_pos = ProgPoint::before(Inst::new(0));
         trace!("compute_requirement: {:?}", bundle);
         let ranges = &self.bundles[bundle].ranges;
         for entry in ranges {
+            if let Some(skip) = skip {
+                if skip.contains(&self.ranges[entry.index].vreg) {
+                    continue;
+                }
+            }
             trace!(" -> LR {:?}: {:?}", entry.index, entry.range);
             for u in &self.ranges[entry.index].uses {
                 trace!("  -> use {:?}", u);

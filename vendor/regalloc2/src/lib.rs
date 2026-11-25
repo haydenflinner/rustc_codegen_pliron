@@ -582,6 +582,75 @@ pub const MV_NAMES: [&str; 16] = [
 pub static MOVESTATS: [core::sync::atomic::AtomicU64; 64] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 64];
 
+/// PLIRON (`PLIRON_RA2_EVICT=1`, opt-in): when a blockparam merge is
+/// refused only because the input's ranges overlap *third-party* vregs
+/// already merged into the parameter's bundle (the `bp-ovl-3rd`
+/// census kind — a merge-order artifact), evict those vregs out of the
+/// to-bundle into fresh singleton bundles and retry the merge, when
+/// this edge is at least `PLIRON_RA2_EVICT_RATIO` (default 2.0) times
+/// hotter than the sum of the arg edges the evicted vregs' moves land
+/// back on. At most `PLIRON_RA2_EVICT_CAP` (default 4) vregs per merge;
+/// a block parameter or a reuse-tied vreg is never evicted. See
+/// `ion/merge.rs`.
+pub(crate) fn evict_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_EVICT").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// `PLIRON_RA2_EVICT_RATIO` (default 2.0): how much hotter the merge
+/// edge must be than the evicted vregs' arg edges, summed.
+pub(crate) fn evict_ratio() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *R.get_or_init(|| {
+            std::env::var("PLIRON_RA2_EVICT_RATIO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    2.0
+}
+
+/// `PLIRON_RA2_EVICT_CAP` (default 4): most third-party vregs one merge
+/// retry may evict.
+pub(crate) fn evict_cap() -> usize {
+    #[cfg(feature = "std")]
+    {
+        static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *C.get_or_init(|| {
+            std::env::var("PLIRON_RA2_EVICT_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    4
+}
+
+/// `PLIRON_RA2_EVICT` counters: [0] merges that succeeded after
+/// eviction, [1] vregs evicted, [2] retries that still failed.
+pub static EVICTSTATS: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Snapshot of `EVICTSTATS`.
+pub fn evictstats_snapshot() -> [u64; 4] {
+    [
+        EVICTSTATS[0].load(core::sync::atomic::Ordering::Relaxed),
+        EVICTSTATS[1].load(core::sync::atomic::Ordering::Relaxed),
+        EVICTSTATS[2].load(core::sync::atomic::Ordering::Relaxed),
+        EVICTSTATS[3].load(core::sync::atomic::Ordering::Relaxed),
+    ]
+}
+
 #[cfg(feature = "std")]
 std::thread_local! {
     /// This thread's weighted*1000 per kind since the last

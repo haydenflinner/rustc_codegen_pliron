@@ -654,3 +654,41 @@ A spilled call argument was reloaded into a scratch register and copied
 into the argument register (`ldr x11, [sp, #k]; mov x1, x11`):
 rust-compression 776 such pairs -> 156 (LLVM 142); std corpus -801
 instructions, -2.2% frequency-weighted copies; checker clean.
+
+## `PLIRON_RA2_EVICT=1` (2026-11-25, opt-in): evict merge-order squatters from a blockparam bundle
+
+`src/ion/merge.rs` (`bp_merge_evict`), `src/ion/requirement.rs`
+(`compute_requirement_skip`), `src/ion/data_structures.rs`
+(`LiveBundle::set_cached_flags`), `src/lib.rs` (`evict_on`,
+`evict_ratio`, `evict_cap`, `EVICTSTATS`). A blockparam merge can be
+refused only because the input's ranges overlap *other* vregs that
+earlier merges pulled into the param's bundle (the `bp-ovl-3rd`
+census kind — the dominant refusal, ~45k weighted on the std corpus).
+Since those vregs are mutually non-overlapping, they can go back out
+together: move every conflicting vreg's ranges into one fresh bundle
+with a fresh spillset, then retry the merge. This undoes a merge-order
+artifact instead of reordering attempts (MERGEDEPTH measured dead).
+
+An eviction is refused when the conflicts include the param itself, a
+blockparam (param-in merges would cascade), or a reuse-tied vreg, and
+when the incoming edge is not `PLIRON_RA2_EVICT_RATIO` (default 2)
+times hotter than the arg edges whose moves the eviction restores
+(`arg_cost[v]` sums each conflicting vreg's `blockparam_outs` edge
+frequencies; it over-counts by including edges whose merges failed, so
+the test is conservative). `PLIRON_RA2_EVICT_CAP` (default 4) bounds
+the conflict set. The merged `Requirement` is pre-checked with the
+conflicts skipped so a requirement refusal doesn't strand evictions;
+both bundles' cached fixed/def/stack flags and spillset extents are
+recomputed (merge_bundles skips its overlap scan on flagged bundles).
+`EVICTSTATS` = [merges recovered, vregs evicted, retries still failed],
+printed by clif-check under the knob; the `ra2x: bp-evict:` explain
+line names them.
+
+Held-out exact-instruction deltas (non-nop): pulldown-cmark -0.21%,
+rust-protobuf -0.10%, blind-sig -0.07%, rust-html-rewriter -0.05%,
+blake3/regex flat, rust-json +0.003% (noise); rust-compression +0.10%
+in `BrotliCreateHqZopfliBackwardReferences` — a second-order effect,
+not an allocation defect: eviction perturbed the compiled-cost numbers
+`ivsr::pick` sees by ~0.3%, which flipped a take decision near its
+margin (827 vs 825) and dropped the pointer-IV rewrite, leaving index
+recomputes in the depth-3 loop. rafuzz: 35k seeds mixed combos, clean.

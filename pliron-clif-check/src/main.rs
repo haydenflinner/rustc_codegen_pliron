@@ -1195,6 +1195,11 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
             }
         }
     }
+    // `PLIRON_RA2_EVICT`: merges recovered by evicting third-party vregs.
+    if std::env::var("PLIRON_RA2_EVICT").is_ok_and(|v| v != "0") {
+        let e = regalloc2::evictstats_snapshot();
+        println!("ra2 evict: {} merges recovered, {} vregs evicted, {} retries failed", e[0], e[1], e[2]);
+    }
     println!(
         "codegen: {} fns ({bad} failed): insts {} stack {} movs {} | weighted insts {} stack {} spill {} movs {} (dead {} / {}) | ext {} -> {}",
         rows.len(),

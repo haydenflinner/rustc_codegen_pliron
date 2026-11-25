@@ -70,6 +70,9 @@ KNOBS = [
     ("PLIRON_RA2_RELOADCOPY", "1", ["0"], "ra2,clif", "1"),
     ("PLIRON_RA2_XBLOCK", "0", ["1"], "ra2", "1"),
     ("PLIRON_RA2_MERGEDEPTH", "0", ["1", "2", "3"], "ra2", "2"),
+    ("PLIRON_RA2_EVICT", "0", ["1"], "ra2", "1"),
+    ("PLIRON_RA2_EVICT_RATIO", "2", ["1", "4"], "ra2", "2"),
+    ("PLIRON_RA2_EVICT_CAP", "4", ["1", "8"], "ra2", "4"),
     # Cranelift (vendor/cranelift-codegen/src/machinst, isa/aarch64).
     ("PLIRON_RA2_REMATW", "7", ["0", "1", "2", "3", "4", "5", "6"], "clif", "7"),
     ("PLIRON_RA2_REMATW_MAXUSES", "4", ["2", "8", "16"], "clif", "4"),

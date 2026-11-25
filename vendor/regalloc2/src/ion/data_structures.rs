@@ -274,6 +274,18 @@ impl LiveBundle {
         self.spill_weight_and_props |= 1 << 28;
     }
 
+    /// PLIRON (`PLIRON_RA2_EVICT`): rewrite the fixed/fixed-def/stack
+    /// flag bits (leaving the spill weight and `minimal` alone) —
+    /// needed when ranges leave a bundle outside `merge_bundles`
+    /// (a third-party vreg evicted back out of a merge).
+    #[inline(always)]
+    pub fn set_cached_flags(&mut self, fixed: bool, fixed_def: bool, stack: bool) {
+        self.spill_weight_and_props = (self.spill_weight_and_props & !(0b111 << 28))
+            | ((fixed as u32) << 30)
+            | ((fixed_def as u32) << 29)
+            | ((stack as u32) << 28);
+    }
+
     #[inline(always)]
     pub fn cached_spill_weight(&self) -> u32 {
         self.spill_weight_and_props & BUNDLE_MAX_SPILL_WEIGHT
