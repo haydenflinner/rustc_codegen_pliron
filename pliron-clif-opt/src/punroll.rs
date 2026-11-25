@@ -3916,7 +3916,7 @@ fn peel_trip_cap(
     h: Block,
     latch: Block,
     body: &FxHashSet<Block>,
-) -> Option<(u64, Option<u64>)> {
+) -> Option<(u64, Option<u64>, u64)> {
     let t = func.layout.last_inst(latch)?;
     let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t] else { return None };
     let cpos = blocks.iter().position(|bc| bc.block(&func.dfg.value_lists) == h)?;
@@ -3938,11 +3938,59 @@ fn peel_trip_cap(
     }
     let cnt = find_count(func, h, body, cfg, dt, x, y, cond, &hparams, &cont_args)?;
     let iv0 = crate::loopidiom::entry_arg(func, cfg, dt, h, cnt.pidx)?;
+    // Floor on trips: `bound`'s lower range minus the counter's upper
+    // one (`p + d` starts at `iv0 + d`), `step` at a time. Unsigned
+    // counts only — `Ranges` intervals are unsigned-exact. `0` = no
+    // information. Computed even when `cap` overflows (an i64 bound
+    // tops `trip_max` out): the floor is what `PLIRON_PEEL_GT` reads.
+    let min = (!cnt.signed && cnt.step > 0)
+        .then(|| {
+            let mut rs = crate::ranges::Ranges::new(func, cfg);
+            let (blo, _) = rng_at(&mut rs, func, dt, cnt.bound, h);
+            let (_, shi) = rng_at(&mut rs, func, dt, iv0, h);
+            let shi = shi.saturating_add(cnt.d.max(0) as u64);
+            blo.saturating_sub(shi) / cnt.step as u64
+        })
+        .unwrap_or(0);
     let cap = crate::loopidiom::trip_max(func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le)?;
     let exact = crate::loopidiom::trip_max_exact(
         func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le, cnt.eq, cnt.signed,
     );
-    Some((cap, exact))
+    Some((cap, exact, min))
+}
+
+/// `(ulo, uhi)` of `v` at block `h`: `Ranges::at`, decomposed one level
+/// through `iadd`/`isub` — a peel bound arrives as `len - 0` and the
+/// edge facts (`len >= 9` under the `len < 9` split) are about `len`,
+/// not the `isub`.
+fn rng_at(
+    rs: &mut crate::ranges::Ranges,
+    func: &Function,
+    dt: &DominatorTree,
+    v: Value,
+    h: Block,
+) -> (u64, u64) {
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(i) = func.dfg.value_def(v).inst()
+        && let InstructionData::Binary { opcode, args: [a, b] } = func.dfg.insts[i]
+        && matches!(opcode, Opcode::Iadd | Opcode::Isub)
+    {
+        let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
+        let ra = rs.at(func, dt, a, h);
+        let rb = rs.at(func, dt, b, h);
+        return match opcode {
+            Opcode::Iadd => (ra.ulo.saturating_add(rb.ulo), ra.uhi.saturating_add(rb.uhi)),
+            // `a - b` wraps below zero: an underflowing `uhi` is the
+            // type max, not 0 — the floor estimate stays conservative.
+            Opcode::Isub => (
+                ra.ulo.saturating_sub(rb.uhi),
+                ra.uhi.checked_sub(rb.ulo).unwrap_or(u64::MAX),
+            ),
+            _ => unreachable!(),
+        };
+    }
+    let r = rs.at(func, dt, v, h);
+    (r.ulo, r.uhi)
 }
 
 /// Loop peeling: emit K sequential clones of the chain ahead of the
@@ -4037,10 +4085,13 @@ fn run_peel(
         .sum();
     // Copies past the loop's trip bound never run (`for i in 1..4` got
     // eight): peel at most that many, which unrolls it fully.
-    let (trip_cap, trip_exact) = match peel_trip_cap(func, cfg, dt, h, latch, &body) {
-        Some((cap, exact)) => (Some(cap), exact),
-        None => (None, None),
+    let (trip_cap, trip_exact, trip_min) = match peel_trip_cap(func, cfg, dt, h, latch, &body) {
+        Some((cap, exact, min)) => (Some(cap), exact, min),
+        None => (None, None, 0),
     };
+    if debug() {
+        tracing::debug!(target: "pliron::punroll", "peel {name} block{}: trip_cap {trip_cap:?} trip_exact {trip_exact:?} trip_min {trip_min}", h.as_u32());
+    }
     // `* 10` Horner: the ordinary caps (12 insts → k=4, 16 branch sites)
     // leave `from_str`'s digit loop half-unrolled plus a residual the
     // 8-digit word still executes.
@@ -4072,9 +4123,27 @@ fn run_peel(
     if let Some(m) = trip_cap {
         k = k.min(usize::try_from(m).unwrap_or(usize::MAX)).max(1);
     }
+    // `trip_exact` counts one above the provable maximum: copies past
+    // `m - 1` can never run — emit exactly that many (`from_str`'s
+    // `len <= 8` digit loop wants 8 — LLVM's 7-mul shared Horner).
+    if let Some(m) = trip_exact {
+        k = k
+            .min(usize::try_from(m.saturating_sub(1)).unwrap_or(usize::MAX))
+            .max(1);
+    }
     // Copies past the measured average mostly do not run either.
     if let Some(t) = trip {
         k = k.min(usize::try_from(t.saturating_add(1)).unwrap_or(usize::MAX)).max(1);
+    }
+    // `PLIRON_PEEL_GT` (opt-in): a loop that provably out-runs the peel
+    // gives every copy a dead continue test and keeps its residual —
+    // pure code size. LLVM rolls `from_str`'s checked (`len >= 9`)
+    // digit loop for the same reason. Live env read so a unit test can
+    // flip it.
+    if std::env::var_os("PLIRON_PEEL_GT").as_deref() == Some(std::ffi::OsStr::new("1"))
+        && trip_min > k as u64
+    {
+        bail!("min trip above peel width");
     }
     // `trip_max` rounds up by one. When we've peeled at least that bound
     // minus the round-up, the residual continue is dead under the

@@ -590,6 +590,15 @@ fn sub_cancel_k(func: &Function, cfg: &ControlFlowGraph, a: Value, b: Value) -> 
         c = c.checked_add(k)?;
         b = fwd_param(func, cfg, nxt);
     }
+    // `b` down to a constant zero: `a - b` is `a - c`. cparm substitutes
+    // `0` through an `isub` it leaves behind (`len - 0` under a
+    // `len != 0` entry check); a peeled loop's bound is that `isub` and
+    // its start the same value `+ 1`, so the cancel lands here with
+    // `a` the bound and `c` the peeled step — `x - c` with `x`'s own
+    // nonzero edge fact proving `x >= c`.
+    if iconst(func, b) == Some(0) {
+        return Some((a, c));
+    }
     let ai = func.dfg.value_def(a).inst()?;
     let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[ai] else {
         return None;

@@ -99,6 +99,83 @@ fn slice_loop_bounded_by_len_guard() {
     assert_eq!(m, Some(9));
 }
 
+/// A peeled counted loop's bound can be an `isub len, 0` cparm leaves
+/// behind when a branch arg folds to `0` through the subtract: `len - 0`
+/// is `len`, so the guard bound on `len` is the trip span and the entry
+/// `0 != len` check is what proves `len >= c` for the peeled `+ 1`.
+const SRC_SUB0: &str = "
+function %f(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 9
+    v2 = iconst.i32 0
+    v3 = icmp ult v0, v1
+    brif v3, block1, block9
+
+block1:
+    v4 = isub.i32 v0, v2
+    v5 = icmp ne v2, v4
+    brif v5, block2(v2), block9
+
+block2(v6: i32):
+    v10 = iconst.i32 1
+    v7 = iadd.i32 v6, v10
+    v11 = icmp eq v7, v4
+    brif v11, block9, block3(v7)
+
+block3(v12: i32):
+    v13 = iadd.i32 v12, v10
+    v14 = icmp ne v13, v4
+    brif v14, block3(v13), block9
+
+block9:
+    v15 = iconst.i32 0
+    return v15
+}
+";
+
+#[test]
+fn isub_zero_bound_counts_like_its_base() {
+    let f = parse(SRC_SUB0);
+    let cfg = ControlFlowGraph::with_function(&f);
+    let dt = DominatorTree::with_function(&f, &cfg);
+    let h = block(3);
+    let iv0 = pliron_clif_opt::loopidiom::entry_arg(&f, &cfg, &dt, h, 0).expect("entry arg");
+    assert_eq!(iv0, val(&f, "v7"));
+    let bound = val(&f, "v4");
+    // `len <u 9` and `len != 0` on the way in: at most 8 trips (plus the
+    // round-up), and the bound is a fact the peel may delete the loop on.
+    assert_eq!(
+        pliron_clif_opt::loopidiom::trip_max(&f, &cfg, &dt, h, iv0, bound, 1, false),
+        Some(9)
+    );
+    assert_eq!(
+        pliron_clif_opt::loopidiom::trip_max_exact(&f, &cfg, &dt, h, iv0, bound, 1, false, true, false),
+        Some(9)
+    );
+}
+
+#[test]
+fn isub_zero_bound_without_entry_check_is_not_exact() {
+    // Same shape but the `0 != len` entry guard is gone: `len` may be 0,
+    // `iv0 - 1 == bound` is no longer provable, so only the cost bound
+    // stands — the residual must stay.
+    let src = SRC_SUB0.replace("v5 = icmp ne v2, v4", "v5 = iconst.i32 1");
+    let f = parse(&src);
+    let cfg = ControlFlowGraph::with_function(&f);
+    let dt = DominatorTree::with_function(&f, &cfg);
+    let h = block(3);
+    let iv0 = pliron_clif_opt::loopidiom::entry_arg(&f, &cfg, &dt, h, 0).unwrap();
+    let bound = val(&f, "v4");
+    assert_eq!(
+        pliron_clif_opt::loopidiom::trip_max(&f, &cfg, &dt, h, iv0, bound, 1, false),
+        Some(9)
+    );
+    assert_eq!(
+        pliron_clif_opt::loopidiom::trip_max_exact(&f, &cfg, &dt, h, iv0, bound, 1, false, true, false),
+        None
+    );
+}
+
 #[test]
 fn unguarded_length_has_no_small_bound() {
     // Drop the guard on the rotated entry: block12 now branches on `v22`,
