@@ -917,7 +917,7 @@ struct CgRow {
     wdeadmov: u64,
     /// `PLIRON_RA2_MOVESTATS=1`: the allocator's moves by kind, weighted
     /// by block frequency (`regalloc2::MV_NAMES`; `16 + k` stack side).
-    mv: [u64; 32],
+    mv: Vec<u64>,
     /// Standalone narrow extensions: `uxtb`/`uxth`/`sxtb`/`sxth` and
     /// `and w, w, #0xff`/`#0xffff`.
     ext: u64,
@@ -1110,7 +1110,7 @@ fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path, keep_vcode: bool) 
             (row.slots, row.spills) = (slots, spills);
             let depth = |b: &str| depths.get(b).copied().unwrap_or(0);
             score_vcode(&v, &mut row, i64::from(out) + i64::from(slots), &depth);
-            row.mv = regalloc2::movestats_take_local().map(|w| w / 1000);
+            row.mv = regalloc2::movestats_take_local().into_iter().map(|w| w / 1000).collect();
             if keep_vcode {
                 row.vtext = format!("; frame slots={slots} spills={spills} out={out}\n{}", depth_labels(&v, &depth));
             }
@@ -1187,11 +1187,21 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
     // `PLIRON_RA2_MOVESTATS=1`: the allocator's moves by cause.
     if std::env::var("PLIRON_RA2_MOVESTATS").as_deref() == Ok("1") {
         let st = regalloc2::movestats_snapshot();
-        println!("ra2 moves by kind: reg-reg count / weighted | with a stack side count / weighted");
+        println!("ra2 moves by kind: reg-reg count / weighted | with a stack side count / weighted (remat-arg share of each in parens)");
         for (k, name) in regalloc2::MV_NAMES.iter().enumerate() {
-            let (r, m) = (st[k], st[16 + k]);
-            if r[0] + m[0] > 0 {
-                println!("  {name:12} {:>8} {:>12.0} | {:>8} {:>12.0}", r[0], r[1] as f64 / 1000.0, m[0], m[1] as f64 / 1000.0);
+            let (r, m, rr, rm) = (st[k], st[16 + k], st[32 + k], st[48 + k]);
+            if r[0] + m[0] + rr[0] + rm[0] > 0 {
+                println!(
+                    "  {name:12} {:>8} {:>12.0} | {:>8} {:>12.0}   ({:>6} {:>9.0} | {:>6} {:>9.0})",
+                    r[0],
+                    r[1] as f64 / 1000.0,
+                    m[0],
+                    m[1] as f64 / 1000.0,
+                    rr[0],
+                    rr[1] as f64 / 1000.0,
+                    rm[0],
+                    rm[1] as f64 / 1000.0
+                );
             }
         }
     }
@@ -1199,6 +1209,15 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
     if std::env::var("PLIRON_RA2_EVICT").is_ok_and(|v| v != "0") {
         let e = regalloc2::evictstats_snapshot();
         println!("ra2 evict: {} merges recovered, {} vregs evicted, {} retries failed", e[0], e[1], e[2]);
+        if std::env::var("PLIRON_RA2_MOVESTATS").as_deref() == Ok("1") {
+            let w = regalloc2::evictwhy_snapshot();
+            println!("ra2 evict refusals: count / weighted");
+            for (name, c) in regalloc2::EVICTWHY_NAMES.iter().zip(w.iter()) {
+                if c[0] > 0 {
+                    println!("  {name:12} {:>8} {:>12.0}", c[0], c[1] as f64 / 1000.0);
+                }
+            }
+        }
     }
     println!(
         "codegen: {} fns ({bad} failed): insts {} stack {} movs {} | weighted insts {} stack {} spill {} movs {} (dead {} / {}) | ext {} -> {}",

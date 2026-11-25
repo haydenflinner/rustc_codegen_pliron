@@ -449,6 +449,54 @@ program) and in regalloc overhead (st+ld+mov+csr), pliron side:
 
 ## Investigations
 
+### bp-move census after EVICT (2026-11-25)
+
+`PLIRON_RA2_MOVESTATS=1 clif-check codegen target/corpus/std` now also
+prints the `ra2 evict refusals` table (`EVICTWHY`) and a remat-arg share
+per move kind (kind bit `0x20` on a refused merge whose arg
+`is_remat`). Headline: **about a third of the bp-* census weight is
+phantom cost** — a refused merge for a remat-able arg emits a move that
+Cranelift rematerializes into the same instruction the def would have
+cost anyway (`movz w22, #K` on the edge vs. the merged `movz` in the
+arm). Per-kind weighted (non-remat / remat):
+
+| kind | real | remat |
+|---|---|---|
+| xblock | 21,201 | 0 |
+| bp-ovl-3rd | 19,543 | 26,612 |
+| bp-overlap | 16,881 | 251 |
+| bp-ovl-eb | 10,374 | 2,525 |
+| bp-merged | 8,711 | 0 |
+| bp-ovl-mix | 7,651 | 13,753 |
+
+- `StdoutLock::write_all_vectored` (formerly 21.6k, the #2 function):
+  a ~45-arm `icmp` cascade, each arm `brif .., join(state, const_k)`.
+  `v1209` (`iconst 0`) is passed to **both** param slots on one edge and
+  one slot on ~40; its merged range spans every arm block, so all 41
+  distinct const args conflict → 41 `cold` refusals (evicting it would
+  restore ~40×512). 99.7% remat args → the bucket was ~phantom.
+- `rustc_demangle legacy Demangle::fmt` (~1100 blocks, 10–12-wide
+  params) is the real whale: ~26.7k real bp-* (self 21.3k, param 10.8k
+  of refusals tried) + ~10.3k stack-side xblock/split — spilled values
+  crossing edges, not reg-reg moves.
+- `bp-overlap` (16.9k) is ~99% non-remat self-overlap, defs upstream —
+  demangle 5.7k + `small_sort_*` instantiations ~7k + btree `navigate`.
+  At the ra2 level the fork (one reg → two live values past the arg's
+  def) is fundamental: any bundle/range split relocates the same move —
+  measured zero-sum. Wins here are upstream (argtail-style def sinking)
+  or LLVM-style value-structure changes.
+- EVICT measured-dead extensions: bit1 param eviction (`=3`: html
+  +0.6%), bit2 exact cost (`=5`: +0.2%), `=7` +0.2..0.5%; `_CAP=8/16`
+  recovers ~1k (cap refusals mostly re-classify to `self`).
+- `PLIRON_RA2_MERGEDEPTH=4/6` global merge reordering shuffles the
+  buckets (overlap −4..5k, mix −3k) but total weighted insts regress
+  +6..52k — bigger early bundles cost spill pressure. Rejected.
+- ARGTAIL×EVICT (`ab.py`, exact instr): `PLIRON_ARGTAIL=1` is flat on
+  html (+0.005%) under EVICT-on but +0.6% under `EVICT=0` — EVICT does
+  rescue the stranded edge-tail clones as predicted. Still +0.1%
+  pulldown, +0.3% blake3 — not gate-clean enough to flip on this box
+  (cycle numbers are noise on a loaded machine).
+
 ### blake3 `portable::compress_in_place` reloads (2026-11-17)
 
 Executed per call (51,465 calls): ours 11 spill stores, 62 reloads, 4
@@ -529,8 +577,8 @@ source, not `pliron-cfg`'s `DEFAULT_ON`.
 | `PLIRON_RA2_POTTS_PIECES=1` | regalloc2 `potts.rs` | `POTTS` also relabels partial block pieces (live in and dying; defined and leaving or dying) and counts the copies inside them as energy pairs | on since 2026-11-20 (protobuf -0.45%, html -0.43%, regex -0.23%, json -0.22%, pulldown -0.19%, none worse) |
 | `PLIRON_A64_HALFCLOB=1` | Cranelift `vcode.rs` | a plain call with no wide (>64-bit float-class) value live across it does not clobber `v8`-`v15` for regalloc | on since 2026-11-20 (compression -0.12%, rest noise) |
 | `PLIRON_RA2_XBLOCK=1` | regalloc2 `moves.rs` | redundant-move state survives a single-predecessor fallthrough | opt-in (evaluated: pulldown +5k) |
-| `PLIRON_RA2_EVICT` (`_RATIO`, `_CAP`) | regalloc2 `merge.rs` | a merge refused only by third-party range overlap evicts the squatting vregs and retries when the edge is RATIO× hotter | on since 2026-11-25 (pulldown -0.21%, protobuf -0.10%, blind-sig -0.07%, html -0.05%; compression +0.10% is an ivsr cost flip, not the mechanism) |
-| `PLIRON_RA2_MERGEDEPTH=1..3` | regalloc2 `merge.rs` | merge blockparams of the deepest loops first | opt-in (evaluated: pulldown +0.6M..1.2M) |
+| `PLIRON_RA2_EVICT` (`_RATIO`, `_CAP`) | regalloc2 `merge.rs` | a merge refused only by third-party range overlap evicts the squatting vregs and retries when the edge is RATIO× hotter; bit1 (`=2`) also evicts conflicting block parameters, bit2 (`=4`) falls back to an exact boundary-move cost when the per-vreg edge sum fails | on since 2026-11-25 (pulldown -0.21%, protobuf -0.10%, blind-sig -0.07%, html -0.05%; compression +0.10% is an ivsr cost flip, not the mechanism). Bits 1+2 measured dead (html +0.2..0.6%, census table: `self` 31k and `cap` 28.6k weighted dominate) |
+| `PLIRON_RA2_MERGEDEPTH=1..6` | regalloc2 `merge.rs` | merge-order experiments: 1..3 deepest loop first, 4/5 hottest edge first (4 ties shortest-span), 6 shortest span first | opt-in (evaluated: pulldown +0.6M..1.2M; 4/6 shift census buckets but regress total weighted insts +6..52k — rejected 2026-11-25) |
 | `PLIRON_RA2_REMATW=0..7` (+`_MAXUSES`, `_MINUSSES`, `_CHEAP`) | Cranelift `vcode.rs` + regalloc2 `process.rs` | rematerializable spill weight; default `7` (`uses≥MINUSSES`, default 8); `=0` off; `_CHEAP` default on (immediates only for weight set) | on (7) since 2026-11-18 |
 | `PLIRON_REMAT`, `_STORE` | Cranelift `vcode.rs` | reloads of constants/addresses rematerialize; stores only remat reads die | on |
 | `PLIRON_RELOADPRE` (`_ROUNDS`), `PLIRON_RELOADCSE`, `PLIRON_SPILLCSE` | Cranelift `vcode.rs` | reload PRE into predecessors; per-block and cross-block reload CSE | on |

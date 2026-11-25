@@ -579,8 +579,11 @@ pub const MV_NAMES: [&str; 16] = [
 ];
 
 /// The `PLIRON_RA2_MOVESTATS` totals: per kind, count and weighted*1000.
-pub static MOVESTATS: [core::sync::atomic::AtomicU64; 64] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 64];
+/// Slots 0..32 as `k`/`16+k` in `tally_move`; slots 32..63 repeat the
+/// same layout for moves whose merge refusal carried the remat-able-arg
+/// flag (kind bit 0x20).
+pub static MOVESTATS: [core::sync::atomic::AtomicU64; 128] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 128];
 
 /// PLIRON (`PLIRON_RA2_EVICT`, default on since 2026-11-25, `=0` off):
 /// when a blockparam merge is
@@ -594,13 +597,28 @@ pub static MOVESTATS: [core::sync::atomic::AtomicU64; 64] =
 /// a block parameter or a reuse-tied vreg is never evicted. See
 /// `ion/merge.rs`.
 pub(crate) fn evict_on() -> bool {
+    evict_mode() != 0
+}
+
+/// `PLIRON_RA2_EVICT` as a bitfield (default 1): bit 0 the third-party
+/// eviction itself; bit 1 (`=2`) also evicts conflicting *block
+/// parameters* (their in-edges' args stay behind and pay their restored
+/// edge moves; cost via `in_cost`); bit 2 (`=4`) falls back to an exact
+/// boundary-crossing move cost when the conservative per-vreg edge sum
+/// fails the ratio test.
+pub(crate) fn evict_mode() -> u8 {
     #[cfg(feature = "std")]
     {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_RA2_EVICT").as_deref() != Ok("0"))
+        static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *M.get_or_init(|| {
+            std::env::var("PLIRON_RA2_EVICT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+        })
     }
     #[cfg(not(feature = "std"))]
-    false
+    1
 }
 
 /// `PLIRON_RA2_EVICT_RATIO` (default 2.0): how much hotter the merge
@@ -652,24 +670,63 @@ pub fn evictstats_snapshot() -> [u64; 4] {
     ]
 }
 
+/// `PLIRON_RA2_EVICT` refusal census (`EVICTWHY_NAMES`), counted in
+/// `bp_merge_evict` when `PLIRON_RA2_MOVESTATS=1`: why a merge that
+/// failed on overlap was not rescued by eviction. `[2*i]` counts,
+/// `[2*i+1]` sums the incoming edge's block weight (thousandths).
+pub static EVICTWHY: [core::sync::atomic::AtomicU64; 20] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 20];
+
+/// Names for `EVICTWHY` (index i counts at `2*i`, weight at `2*i+1`).
+pub const EVICTWHY_NAMES: [&str; 10] = [
+    "tried",   // overlap-failed merge reaching bp_merge_evict
+    "steps",   // conflict scan exceeded 400 steps
+    "cap",     // more distinct conflicting vregs than EVICT_CAP
+    "self",    // the param itself conflicts (mix/self overlap)
+    "param",   // a conflicting vreg is itself a block parameter
+    "tied",    // a conflicting vreg is reuse-tied
+    "nocost",  // a conflicting vreg has no arg-edge cost
+    "cold",    // edge not EVICT_RATIO x hotter than restored moves
+    "req",     // merged requirement still conflicts post-eviction
+    "evicted", // eviction performed (== EVICTSTATS[0]+[2])
+];
+
+/// Record one `EVICTWHY` outcome: count plus the edge's weight.
+pub(crate) fn evictwhy_add(reason: usize, weight: f32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    EVICTWHY[2 * reason].fetch_add(1, Relaxed);
+    EVICTWHY[2 * reason + 1].fetch_add((weight * 1000.0) as u64, Relaxed);
+}
+
+/// Snapshot of `EVICTWHY`: `[reason][0 count, 1 weighted*1000]`.
+pub fn evictwhy_snapshot() -> [[u64; 2]; 10] {
+    let mut o = [[0u64; 2]; 10];
+    for (i, v) in o.iter_mut().enumerate() {
+        v[0] = EVICTWHY[2 * i].load(core::sync::atomic::Ordering::Relaxed);
+        v[1] = EVICTWHY[2 * i + 1].load(core::sync::atomic::Ordering::Relaxed);
+    }
+    o
+}
+
 #[cfg(feature = "std")]
 std::thread_local! {
     /// This thread's weighted*1000 per kind since the last
     /// `movestats_take_local` (per-function attribution in a driver).
-    pub(crate) static MOVESTATS_TL: core::cell::Cell<[u64; 32]> = const { core::cell::Cell::new([0; 32]) };
+    pub(crate) static MOVESTATS_TL: core::cell::Cell<[u64; 64]> = const { core::cell::Cell::new([0; 64]) };
 }
 
 /// This thread's `PLIRON_RA2_MOVESTATS` weights (thousandths) per kind
 /// since the last call, and reset them.
 #[cfg(feature = "std")]
-pub fn movestats_take_local() -> [u64; 32] {
-    MOVESTATS_TL.with(|c| c.replace([0; 32]))
+pub fn movestats_take_local() -> [u64; 64] {
+    MOVESTATS_TL.with(|c| c.replace([0; 64]))
 }
 
-/// Snapshot of `MOVESTATS`: `[kind][0 count, 1 weighted*1000]`, reg-reg
-/// kinds at `0..10`, kinds with a stack side at `16..26`.
-pub fn movestats_snapshot() -> [[u64; 2]; 32] {
-    let mut out = [[0u64; 2]; 32];
+/// Snapshot of `MOVESTATS`: `[slot][0 count, 1 weighted*1000]`, slot
+/// `k`/`16+k`/`32+k`/`48+k` for kind `k`, reg-reg / stack-side /
+/// reg-reg remat-arg / stack-side remat-arg.
+pub fn movestats_snapshot() -> [[u64; 2]; 64] {
+    let mut out = [[0u64; 2]; 64];
     for (k, o) in out.iter_mut().enumerate() {
         o[0] = MOVESTATS[2 * k].load(core::sync::atomic::Ordering::Relaxed);
         o[1] = MOVESTATS[2 * k + 1].load(core::sync::atomic::Ordering::Relaxed);

@@ -828,7 +828,13 @@ impl<'a, F: Function> Env<'a, F> {
             Some(f) => (f as f64).min(512.0),
             None => 8f64.powi(self.cfginfo.approx_loop_depth[block.index()].min(3) as i32),
         };
-        let k = (kind as usize).min(15) + if is_reg(src) && is_reg(dst) { 0 } else { 16 };
+        // PLIRON census: kind bit 0x20 (set by the bp-merge classifier
+        // when the refused arg is remat-able) shifts the tally into the
+        // +32 slots so remat-able refusal moves are counted separately —
+        // they cost the same materialization merged or not.
+        let k = ((kind as usize) & 31).min(15)
+            + if is_reg(src) && is_reg(dst) { 0 } else { 16 }
+            + if kind & 32 != 0 { 32 } else { 0 };
         crate::MOVESTATS[2 * k].fetch_add(1, Relaxed);
         crate::MOVESTATS[2 * k + 1].fetch_add((w * 1000.0) as u64, Relaxed);
         #[cfg(feature = "std")]

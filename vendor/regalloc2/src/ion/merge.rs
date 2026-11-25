@@ -399,6 +399,37 @@ impl<'a, F: Function> Env<'a, F> {
         arg_cost: &[f32],
         reuse_tied: &[bool],
     ) -> bool {
+        let stats = crate::movestats_on();
+        let incoming = {
+            let o = self.blockparam_outs[arg_i];
+            self.bp_edge_weight(o.from_block, o.to_block)
+        };
+        // The census-comparable weight: the block frequency where the
+        // edge move would land, as `tally_move` weights it.
+        let mw = if stats {
+            let o = self.blockparam_outs[arg_i];
+            let to_preds = self.func.block_preds(o.to_block).len()
+                + usize::from(self.func.entry_block() == o.to_block);
+            let blk = if to_preds > 1 { o.from_block } else { o.to_block };
+            match self.func.block_hotness(blk) {
+                Some(f) => (f as f64).min(512.0),
+                None => {
+                    8f64.powi(self.ctx.cfginfo.approx_loop_depth[blk.index()].min(3) as i32)
+                }
+            }
+        } else {
+            0.0
+        };
+        macro_rules! why {
+            ($r:expr) => {
+                if stats {
+                    crate::evictwhy_add($r, mw as f32);
+                }
+            };
+        }
+        if stats {
+            crate::evictwhy_add(0, mw as f32);
+        }
         // Collect every to-bundle vreg whose ranges overlap a
         // from-bundle range: the same scan `merge_bundles` did
         // (including the fixed-def range-start adjustment), but
@@ -419,6 +450,7 @@ impl<'a, F: Function> Env<'a, F> {
             while fi < ranges_from.len() && ti < ranges_to.len() {
                 steps += 1;
                 if steps > 400 {
+                    why!(1);
                     return false;
                 }
                 let (rf, rt) = (ranges_from[fi], ranges_to[ti]);
@@ -430,6 +462,7 @@ impl<'a, F: Function> Env<'a, F> {
                     let v = self.ranges[rt.index].vreg;
                     if !conf.contains(&v) {
                         if conf.len() >= cap {
+                            why!(2);
                             return false;
                         }
                         conf.push(v);
@@ -442,32 +475,68 @@ impl<'a, F: Function> Env<'a, F> {
                 }
             }
         }
-        if conf.is_empty() || conf.contains(&to_vreg) {
+        if conf.is_empty() {
+            // Overlap was reported but the scan found no conflicting
+            // vreg: the fixed-def start adjustment differed. Count it
+            // with the other scan anomaly.
+            why!(1);
+            return false;
+        }
+        if conf.contains(&to_vreg) {
+            why!(3);
             return false;
         }
         // Cost of evicting a vreg: it sits in its own bundle again, so
-        // every arg edge that carried it into a merge gets its edge move
-        // back. `arg_cost[v]` is the sum of those edges' block
-        // frequencies. A vreg with no arg edges cannot be in `to_b`
-        // through a blockparam merge at all (param and reuse-tied vregs
-        // are refused above).
+        // every merged edge that carried it in gets its edge move back.
+        // `ecost[v]` is the sum of the edge weights that touch `v` as
+        // arg or param — an over-count of the restored moves (it
+        // charges edges that never merged), hence conservative.
+        let evict_params = crate::evict_mode() & 2 != 0;
         let mut cost = 0.0f32;
         for &v in &conf {
-            if self.vregs[v].blockparam.is_valid() || reuse_tied[v.index()] {
+            if self.vregs[v].blockparam.is_valid() && !evict_params {
+                why!(4);
+                return false;
+            }
+            if reuse_tied[v.index()] {
+                why!(5);
                 return false;
             }
             let c = arg_cost[v.index()];
             if !(c > 0.0) {
+                why!(6);
                 return false;
             }
             cost += c;
         }
-        let incoming = {
-            let o = self.blockparam_outs[arg_i];
-            self.bp_edge_weight(o.from_block, o.to_block)
-        };
         if !(incoming >= crate::evict_ratio() * cost) {
-            return false;
+            // PLIRON (EVICT bit 2): the per-vreg sum over-counts — it
+            // charges every edge touching a conflicting vreg, merged or
+            // not. Recompute exactly: only edges that were merged into
+            // `to_b` and are split by this eviction restore a move
+            // (arg in `conf` xor param in `conf`, both bundles `to_b`).
+            if crate::evict_mode() & 4 == 0 {
+                why!(7);
+                return false;
+            }
+            let inset = |v: VRegIndex| conf.contains(&v);
+            let mut xcost = 0.0f32;
+            for o in 0..self.blockparam_outs.len() {
+                let out = self.blockparam_outs[o];
+                let fb = self.ranges[self.vregs[out.from_vreg].ranges[0].index].bundle;
+                if fb != to_b {
+                    continue;
+                }
+                let tb = self.ranges[self.vregs[out.to_vreg].ranges[0].index].bundle;
+                if tb == to_b && inset(out.from_vreg) != inset(out.to_vreg) {
+                    xcost += self.bp_edge_weight(out.from_block, out.to_block);
+                }
+            }
+            cost = xcost;
+            if !(incoming >= crate::evict_ratio() * cost) {
+                why!(7);
+                return false;
+            }
         }
         // The overlap is provably gone once the conflicting vregs leave;
         // check the merged requirement on the post-eviction bundle too,
@@ -481,8 +550,10 @@ impl<'a, F: Function> Env<'a, F> {
             _ => false,
         };
         if !ok {
+            why!(8);
             return false;
         }
+        why!(9);
 
         // Evict: move the conflicting vregs' ranges out of `to_b` into a
         // fresh bundle with a fresh spillset.
@@ -721,9 +792,11 @@ impl<'a, F: Function> Env<'a, F> {
                 }
             });
         }
-        // PLIRON (`PLIRON_RA2_EVICT`): each arg vreg's total edge weight —
-        // the moves that reappear on its out-edges when it is evicted
-        // from a merged bundle.
+        // PLIRON (`PLIRON_RA2_EVICT`): each vreg's total edge weight —
+        // the moves that reappear on the edges touching it when it is
+        // evicted from a merged bundle. An edge charges both ends: an
+        // evicted arg pays its arg edges, an evicted param its in-edges
+        // (mode 2); both in `conf` double-count, which is conservative.
         let mut arg_cost: crate::Vec<f32> = crate::Vec::new();
         if evict {
             arg_cost.resize(self.vregs.len(), 0.0f32);
@@ -731,6 +804,9 @@ impl<'a, F: Function> Env<'a, F> {
                 let out = self.blockparam_outs[o];
                 let h = self.bp_edge_weight(out.from_block, out.to_block);
                 arg_cost[out.from_vreg.index()] += h;
+                if crate::evict_mode() & 2 != 0 {
+                    arg_cost[out.to_vreg.index()] += h;
+                }
             }
         }
 
@@ -865,6 +941,14 @@ impl<'a, F: Function> Env<'a, F> {
                     } else {
                         4 // input defined further upstream
                     };
+                    // PLIRON census: bit 0x20 — the refused arg is
+                    // remat-able (`Function::is_remat`): the emitted edge
+                    // move rematerializes it for the same instruction the
+                    // def would have cost anyway, so its tally weight
+                    // overstates the true cost of the refusal.
+                    if self.func.is_remat(from_vreg.index()) {
+                        k |= 32;
+                    }
                 }
                 self.ctx.bp_merge_kind.insert(key, k);
                 }
