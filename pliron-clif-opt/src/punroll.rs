@@ -3916,7 +3916,7 @@ fn peel_trip_cap(
     h: Block,
     latch: Block,
     body: &FxHashSet<Block>,
-) -> Option<(u64, Option<u64>, u64)> {
+) -> Option<(Option<u64>, Option<u64>, u64)> {
     let t = func.layout.last_inst(latch)?;
     let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[t] else { return None };
     let cpos = blocks.iter().position(|bc| bc.block(&func.dfg.value_lists) == h)?;
@@ -3952,7 +3952,7 @@ fn peel_trip_cap(
             blo.saturating_sub(shi) / cnt.step as u64
         })
         .unwrap_or(0);
-    let cap = crate::loopidiom::trip_max(func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le)?;
+    let cap = crate::loopidiom::trip_max(func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le);
     let exact = crate::loopidiom::trip_max_exact(
         func, cfg, dt, h, iv0, cnt.bound, cnt.step, cnt.le, cnt.eq, cnt.signed,
     );
@@ -4085,10 +4085,8 @@ fn run_peel(
         .sum();
     // Copies past the loop's trip bound never run (`for i in 1..4` got
     // eight): peel at most that many, which unrolls it fully.
-    let (trip_cap, trip_exact, trip_min) = match peel_trip_cap(func, cfg, dt, h, latch, &body) {
-        Some((cap, exact, min)) => (Some(cap), exact, min),
-        None => (None, None, 0),
-    };
+    let (trip_cap, trip_exact, trip_min) =
+        peel_trip_cap(func, cfg, dt, h, latch, &body).unwrap_or((None, None, 0));
     if debug() {
         tracing::debug!(target: "pliron::punroll", "peel {name} block{}: trip_cap {trip_cap:?} trip_exact {trip_exact:?} trip_min {trip_min}", h.as_u32());
     }
