@@ -1475,6 +1475,9 @@ pub fn run(
     // into a bigger frame (serde's escape loop in `serialize_field`, regex's
     // `follow_epsilons` in `next_state`) and saves only the one call.
     let loopy_native = crate::env_is("PLIRON_INLINE_LOOPY_NATIVE", "1");
+    // `PLIRON_INLINE_LOOPYHINT=1` (opt-in): `loopy` also refuses
+    // `#[inline]` callees — see the gate.
+    let loopy_hint = crate::env_is("PLIRON_INLINE_LOOPYHINT", "0");
     let mut has_loop: FxHashMap<String, bool> = FxHashMap::default();
     // The profitability model (`PLIRON_INLINE_MODEL=0` gives the fixed
     // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
@@ -2207,11 +2210,19 @@ pub fn run(
                         && st
                             .invokes.get(op)
                             .is_some_and(|&(_, catch)| catch || !eh_invoke);
+                    // `PLIRON_INLINE_LOOPYHINT=1` (opt-in): the `loopy`
+                    // gate also covers `#[inline]` callees. core's
+                    // `eq_ignore_ascii_case_simple` is `#[inline]` +
+                    // carries a loop: pasting it into `LocalName::eq`
+                    // (and onward into `Stack::pop_up_to`'s scan loop)
+                    // unrolls ~30 live byte values into the loop's frame
+                    // and spills; LLVM keeps it a call. inlinehint raises
+                    // LLVM's threshold too but doesn't force the inline.
                     let loopy = (small || loopy_native)
                         && loopy_min > 0
                         && !hot_site
                         && !free
-                        && !f.inline_hint
+                        && !(f.inline_hint && !loopy_hint)
                         && ci.n > loopy_min
                         && !loops
                             .get_or_insert_with(|| loop_blocks(ctx, st, caller))

@@ -1190,6 +1190,15 @@ fn trivially_promotable(
 /// all `insert_before(alloca)`, so pushing them in creation order keeps
 /// a caller-maintained alloca list in exact body-scan order.
 // r[impl iropt.sroa]
+/// `split` declining `a`: record the gate for the PLIRON_STATS `why`/
+/// `whyfn` lines (no cost when tracing is off).
+fn refuse(st: &mut State, a: Value, r: &'static str) -> bool {
+    if pliron_cfg::tracing_on() {
+        st.sroa_why.insert(a, r);
+    }
+    false
+}
+
 fn split(
     ctx: &mut Context,
     st: &mut State,
@@ -1199,7 +1208,7 @@ fn split(
 ) -> bool {
     let a = alloca.deref(ctx).get_result(ctx, 0);
     let Some(&(size, align)) = st.allocas.get(a) else {
-        return false;
+        return refuse(st, a, "not in st.allocas");
     };
     // `homes`: a local memcpyopt passes to a call by value in place of an
     // argument copy (`PLIRON_BYVALHOME`). Split, every other access would
@@ -1207,35 +1216,44 @@ fn split(
     // (`Kind::Escape`/`Pin` below) — nine loop-carried SSA values for
     // regex-syntax's `concat = self.push_group(concat)?`.
     if st.escape_copies.contains(a) || st.homes.contains(a) {
-        return false;
+        return refuse(
+            st,
+            a,
+            if st.homes.contains(a) {
+                "byval home"
+            } else {
+                "escape copy"
+            },
+        );
     }
     // Deferred on a bodiless-callee pin: only `retry_deferred` (post
     // xfacts-adopt) clears the mark — head rounds skip the re-analysis.
     if st.sroa_defer.contains(a) && !st.sroa_facts {
-        return false;
+        return refuse(st, a, "deferred pin (tailsplit pending)");
     }
     if st.promoted.contains(a) {
         validate(ctx, st, a);
         if st.promoted.contains(a) {
-            return false;
+            return refuse(st, a, "promoted");
         }
     }
     if size == 0 || size > MAX_SIZE {
-        return false;
+        return refuse(st, a, "size 0/>512");
     }
     let Some((acc, geps)) = accesses(ctx, st, a, size, 0) else {
-        return false;
+        return refuse(st, a, "accesses: out of range / self-copy");
     };
     if acc.is_empty() {
-        return false;
+        return refuse(st, a, "no accesses");
     }
     let escapes = acc.iter().any(|x| matches!(x.kind, Kind::Escape { .. }));
     if !escapes && let Some(t) = trivially_promotable(ctx, &acc, &geps, size) {
         st.promoted.insert(a, t);
         return true;
     }
-    let Ok(sl) = slices(ctx, &acc) else {
-        return false;
+    let sl = match slices(ctx, &acc) {
+        Ok(sl) => sl,
+        Err(e) => return refuse(st, a, e),
     };
 
     // A runtime-byte memset scalarizes to an integer splat, which the
@@ -1249,7 +1267,7 @@ fn split(
                 .filter(|s| x.off <= s.off && s.off + s.size <= x.off + n)
             {
                 if !matches!(classify(ctx, s.ty), TyK::Int(_)) || s.size > 16 {
-                    return false;
+                    return refuse(st, a, "memset: runtime byte over non-int/>16B slice");
                 }
             }
         }
@@ -1367,7 +1385,15 @@ fn split(
         }
         let nt = touched.iter().filter(|&&t| t).count();
         if whole_copy && (none_sync || nt * 3 <= sl.len()) {
-            return false;
+            return refuse(
+                st,
+                a,
+                if none_sync {
+                    "pinwhole (unsyncable pins)"
+                } else {
+                    "pinwhole (sret temp moved whole)"
+                },
+            );
         }
     }
     // `PLIRON_SROA_FRAGCOPY=<k>` (default 8, `=0` off): an aggregate that
@@ -1486,7 +1512,15 @@ fn split(
                     if take { "split" } else { "kept" }, pieces.len());
             }
             if !take {
-                return false;
+                return refuse(
+                    st,
+                    a,
+                    if w.is_some() {
+                        "fragcopy (unwritten pieces)"
+                    } else {
+                        "fragcopy"
+                    },
+                );
             }
         }
     }
@@ -1503,7 +1537,7 @@ fn split(
         && sl.iter().enumerate().any(|(i, s)| s.pinned && !syncable[i])
     {
         st.sroa_defer.insert(a);
-        return false;
+        return refuse(st, a, "deferred pin (bodiless callee)");
     }
     // `PLIRON_SROA_DEBUG=<fn substr>`: the access list and slices of each
     // split attempted in matching functions (eprintln, for bisect repros).
@@ -1597,7 +1631,7 @@ fn split(
         .iter()
         .any(|x| matches!(x.kind, Kind::Flow { .. }) && !(x.off >= pin_lo && x.off < pin_hi))
     {
-        return false;
+        return refuse(st, a, "flow outside pin span");
     }
     let pin_a = if pin_lo < pin_hi {
         let arr = ArrayType::get(ctx, i8t, pin_hi - pin_lo).into();
@@ -1930,6 +1964,11 @@ fn split(
     if !a.is_used(ctx) {
         st.allocas.remove(a);
         Operation::erase(alloca, ctx);
+    } else {
+        // Split ran, but a use of `a` itself survives (e.g. a `flow`
+        // access whose operand stays the loaded-back pointer): the alloca
+        // remains a stack slot and the next round retries it.
+        refuse(st, a, "partially split (alloca still used)");
     }
     true
 }
@@ -2345,7 +2384,13 @@ fn why(ctx: &Context, st: &State, a: Value) -> String {
 }
 
 /// `why`, refined with the accesses/slices verdict (PLIRON_STATS_WHY).
+/// The gate `split` last declined at (recorded under `tracing_on`)
+/// names the real refusal when there was one; the recomputed
+/// `accesses`/`slices` answer is the fallback.
 fn why2(ctx: &mut Context, st: &State, a: Value) -> String {
+    if let Some(&r) = st.sroa_why.get(a) {
+        return r.into();
+    }
     let w = why(ctx, st, a);
     if !w.starts_with("layout") {
         return w;

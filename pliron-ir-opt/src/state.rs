@@ -402,6 +402,9 @@ pub struct State {
     /// `nowrite`: lets `split` fall through to the pin path rather than
     /// re-deferring a deferred alloca it still can't prove.
     pub sroa_facts: bool,
+    /// The gate `sroa::split` last declined each still-present alloca at
+    /// (PLIRON_STATS `why`/`whyfn` lines; written only under `tracing_on`).
+    pub sroa_why: ColMap<Value, &'static str>,
     pub calls: ColMap<Ptr<Operation>, CallInfo>,
     pub intrinsics: ColMap<Ptr<Operation>, String>,
     pub rmw: ColMap<Ptr<Operation>, AtomicRmwKindAttr>,
