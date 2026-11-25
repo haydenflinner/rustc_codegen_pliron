@@ -2496,10 +2496,24 @@ far-stack-offset address scratch is borrowed with a
 convention — avoiding the mode's base and the access's value/dest
 register; x29 is the last-resort borrow), `inst/mod.rs` (LoadAddr print
 mirror; `Branch26` veneer gains an x16-only variant that saves x16 and
-branches through x17). Prologue users (stack-limit check, probestack,
-frame setup) run where no allocated value is live in x16 and need
-nothing. Both IP registers allocatable at once leaves one documented
-residual: an indirect-branch veneer cannot preserve the register that
-carries the target (inherent — the ABI reserves IP regs for this), so a
-live x16 across an intra-function `b` more than ±128MB away would still
-be clobbered; `bl` sites have dead scratch regs regardless.
+branches through x17), `machinst/abi.rs` + `machinst/vcode.rs` +
+`machinst/compile.rs` (`machine_env`/`get_machine_env_calls` take the
+lowered instruction count). Prologue users (stack-limit check,
+probestack, frame setup) run where no allocated value is live in x16
+and need nothing.
+
+Both IP registers allocatable at once had one residual: an
+indirect-branch veneer cannot preserve the register that carries the
+target (inherent — `br` has no memory-indirect form and the ABI
+reserves IP regs for this), so a live x16 across an intra-function `b`
+more than ±128MB away would be clobbered. Closed by
+`ip_regs_allocatable` (`aarch64/abi.rs`): when both `PLIRON_X16` and
+`PLIRON_X17` are on, a function whose vcode count could let its buffer
+exceed `b`'s ±128MB reach (`num_insts × 1KiB ≥ 128MB`, several times
+the ~240B/inst worst case including regalloc edits) keeps both IP
+registers reserved — upstream's env exactly — so wherever a veneer can
+actually fire both are dead at the branch edge. Single-knob
+combinations never needed it: the veneer's target carrier is the
+reserved register and its save restores the allocatable one. `bl`
+sites have dead scratch regs regardless; the only remaining hole is
+the `force_veneers` debug hook, which has no in-tree users.

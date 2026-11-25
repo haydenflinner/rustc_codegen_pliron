@@ -1383,7 +1383,11 @@ impl ABIMachineSpec for AArch64MachineDeps {
     }
 
     fn get_machine_env(flags: &settings::Flags, call_conv: isa::CallConv) -> &MachineEnv {
-        Self::get_machine_env_calls(false, true, flags, call_conv)
+        // No function context: `num_insts` 0 never narrows the env for
+        // size (the veneer reserve below). Allocation for real functions
+        // goes through `Callee::machine_env`, which passes the vcode
+        // instruction count.
+        Self::get_machine_env_calls(false, true, 0, flags, call_conv)
     }
 
     /// PLIRON: x17 (`PLIRON_X17`) and the link register (`PLIRON_X30`) join
@@ -1392,9 +1396,16 @@ impl ABIMachineSpec for AArch64MachineDeps {
     /// regular call, or frame pointers are preserved): in a frameless leaf
     /// it would add the frame record (rust-json +46k executed instructions
     /// in one `Deserialize` leaf under `=1`).
+    ///
+    /// With `PLIRON_X16` *and* `PLIRON_X17` both set, a function large
+    /// enough to need an out-of-range `b` veneer keeps both IP registers
+    /// reserved instead (`ip_regs_allocatable`): the veneer must `br`
+    /// through some register, and none is provably dead at a branch edge
+    /// when both are allocatable.
     fn get_machine_env_calls(
         _has_wide: bool,
         has_calls: bool,
+        num_insts: usize,
         flags: &settings::Flags,
         _call_conv: isa::CallConv,
     ) -> &MachineEnv {
@@ -1404,19 +1415,20 @@ impl ABIMachineSpec for AArch64MachineDeps {
             _ => false,
         };
         let x18 = x18_allocatable();
-        let x16 = x16_allocatable();
-        if x17_allocatable() || lr || x18 || x16 {
-            // pinned | x16 | lr | x18 → 16 slots
-            static ENVS: [std::sync::OnceLock<MachineEnv>; 16] =
-                [const { std::sync::OnceLock::new() }; 16];
+        let (x16, x17) = ip_regs_allocatable(x16_allocatable(), x17_allocatable(), num_insts);
+        if x17 || lr || x18 || x16 {
+            // pinned | x16 | x17 | lr | x18 → 32 slots
+            static ENVS: [std::sync::OnceLock<MachineEnv>; 32] =
+                [const { std::sync::OnceLock::new() }; 32];
             let pinned = flags.enable_pinned_reg();
-            let key = usize::from(pinned) * 8
-                + usize::from(x16) * 4
+            let key = usize::from(pinned) * 16
+                + usize::from(x16) * 8
+                + usize::from(x17) * 4
                 + usize::from(lr) * 2
                 + usize::from(x18);
             return ENVS[key].get_or_init(|| {
                 let mut env = create_reg_env(pinned);
-                if x17_allocatable() {
+                if x17 {
                     env.preferred_regs_by_class[0].add(xreg_preg(17));
                 }
                 if x16 {
@@ -1922,6 +1934,39 @@ const WINCH_CLOBBERS: PRegSet = winch_clobbers();
 const ALL_CLOBBERS: PRegSet = all_clobbers();
 const NO_CLOBBERS: PRegSet = PRegSet::empty();
 
+/// PLIRON (`PLIRON_X16`/`PLIRON_X17`): the IP registers that join the
+/// allocatable set for a function whose lowered vcode has `num_insts`
+/// instructions. With both knobs set, an out-of-range intra-function `b`
+/// veneer (`LabelUse::Branch26`, ±128MiB) has no provably-dead register
+/// to carry the far target: `br` has no memory-indirect form, and a
+/// register borrowed for the target cannot be restored after the
+/// branch. So a function large enough to possibly out-range `b` keeps
+/// both IP registers reserved — upstream's env exactly — and every
+/// veneer variant then finds its scratch dead at the branch edge.
+///
+/// `num_insts` bounds the emitted buffer generously: each vcode
+/// instruction emits at most `Inst::worst_case_size` (44 bytes) plus
+/// `worst_case_island_growth` (128 bytes) of veneer/constant/trap
+/// state, plus a bounded number of regalloc-inserted edit moves (each a
+/// spill/reload expansion of a few instructions) and a few bytes of
+/// jump-table data per target; 1KiB per instruction covers all of it
+/// with a wide margin, so below `VENEER_POSSIBLE_INSTS` no buffer can
+/// reach `b`'s range. When only one knob is set the other IP register
+/// is already reserved and the veneer needs nothing.
+fn ip_regs_allocatable(x16: bool, x17: bool, num_insts: usize) -> (bool, bool) {
+    /// Bytes of emitted code each vcode instruction may contribute —
+    /// several times the ~240-byte worst case including regalloc edits.
+    const EMITTED_PER_INST_BOUND: u64 = 1024;
+    /// Instructions at which a buffer may out-range `b`'s ±128MiB
+    /// reach (`LabelUse::Branch26::max_pos_range` is `(1 << 27) - 1`).
+    const VENEER_POSSIBLE_INSTS: u64 = (1 << 27) / EMITTED_PER_INST_BOUND;
+    if x16 && x17 && num_insts as u64 >= VENEER_POSSIBLE_INSTS {
+        (false, false)
+    } else {
+        (x16, x17)
+    }
+}
+
 const fn create_reg_env(enable_pinned_reg: bool) -> MachineEnv {
     const fn preg(r: Reg) -> PReg {
         r.to_real_reg().unwrap().preg()
@@ -2015,4 +2060,29 @@ const fn create_reg_env(enable_pinned_reg: bool) -> MachineEnv {
     }
 
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ip_regs_allocatable;
+
+    /// With both IP knobs set, a function large enough to out-range `b`
+    /// keeps both IP registers reserved so a far-branch veneer always
+    /// finds dead scratch registers (the `PLIRON_X16` residual);
+    /// everything below that count allocates both.
+    #[test]
+    fn ip_regs_allocatable_size_gate() {
+        const LIMIT: usize = ((1 << 27) / 1024) as usize;
+        // Below the limit both join the env unchanged.
+        assert_eq!(ip_regs_allocatable(true, true, 0), (true, true));
+        assert_eq!(ip_regs_allocatable(true, true, LIMIT - 1), (true, true));
+        // At/above it both are reserved, even though both knobs are on.
+        assert_eq!(ip_regs_allocatable(true, true, LIMIT), (false, false));
+        assert_eq!(ip_regs_allocatable(true, true, usize::MAX), (false, false));
+        // A single knob never narrows: the other IP register is already
+        // reserved, so the veneer always has dead scratch.
+        assert_eq!(ip_regs_allocatable(true, false, usize::MAX), (true, false));
+        assert_eq!(ip_regs_allocatable(false, true, usize::MAX), (false, true));
+        assert_eq!(ip_regs_allocatable(false, false, usize::MAX), (false, false));
+    }
 }

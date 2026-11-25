@@ -598,10 +598,14 @@ pub trait ABIMachineSpec {
 
     /// PLIRON: `get_machine_env_for` that also knows whether the function
     /// makes a regular (non-tail) call, so it sets up a frame record anyway
-    /// (aarch64 `PLIRON_X30=2`). Default: ignore it.
+    /// (aarch64 `PLIRON_X30=2`), and how many instructions the lowered
+    /// vcode holds, so a backend can keep a register out of the allocatable
+    /// set only where its emit-time use could go wrong in a huge function
+    /// (aarch64 IP-register branch veneers). Default: ignore them.
     fn get_machine_env_calls(
         has_wide: bool,
         _has_calls: bool,
+        _num_insts: usize,
         flags: &settings::Flags,
         call_conv: isa::CallConv,
     ) -> &MachineEnv {
@@ -1784,10 +1788,21 @@ impl<M: ABIMachineSpec> Callee<M> {
     }
 
     /// Get the ABI-dependent MachineEnv for managing register allocation.
-    pub fn machine_env(&self) -> &MachineEnv {
+    ///
+    /// PLIRON: `num_insts` is the lowered vcode's instruction count (all
+    /// callers have the vcode in scope); backends may narrow the
+    /// allocatable set for very large functions (see
+    /// `get_machine_env_calls`).
+    pub fn machine_env(&self, num_insts: usize) -> &MachineEnv {
         // PLIRON: pass the per-function wide-vector signal so backends can
         // narrow the env (see `get_machine_env_for`).
-        M::get_machine_env_calls(self.has_wide_vector, self.has_calls, &self.flags, self.call_conv)
+        M::get_machine_env_calls(
+            self.has_wide_vector,
+            self.has_calls,
+            num_insts,
+            &self.flags,
+            self.call_conv,
+        )
     }
 
     /// The offsets of all sized stack slots (not spill slots) for debuginfo purposes.

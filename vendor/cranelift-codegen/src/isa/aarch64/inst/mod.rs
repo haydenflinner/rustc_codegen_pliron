@@ -3643,15 +3643,19 @@ impl MachInstLabelUse for LabelUse {
             // available for us to use.
             // With `PLIRON_X17`, x17 may hold a live value across an
             // intra-function jump, so the veneer saves it below sp around its use.
-            // With `PLIRON_X16` also set, x16 may be live likewise, but
-            // the branch-target register is necessarily left holding the
-            // target at the destination: an indirect-branch veneer cannot
-            // preserve every register (this is why the ABI reserves IP
-            // regs). The residual window is a live x16 across an
-            // intra-function `b` whose target is more than ±128MB away —
-            // a single function body that large cannot be produced by
-            // this compiler, and `bl` call sites (the other Branch26
-            // user) have dead scratch registers anyway.
+            // With `PLIRON_X16` also set, x16 may be live likewise, and
+            // the branch-target register is left holding the target at
+            // the destination: an indirect-branch veneer cannot preserve
+            // every register (this is why the ABI reserves IP regs). That
+            // combination is safe anyway: `get_machine_env_calls`
+            // (`ip_regs_allocatable` in `abi.rs`) keeps both IP registers
+            // reserved in any function large enough to out-range `b`, so
+            // wherever this veneer can actually fire neither register
+            // holds an allocated value. `bl` call sites (the other
+            // Branch26 user) have dead scratch registers regardless.
+            // Forced-veneer debug emission (`force_veneers`, no in-tree
+            // users) is the one hole: it would generate this veneer for
+            // an in-range `b` in a small function where x16 is live.
             LabelUse::Branch26 if regs::x17_allocatable() => {
                 let tmp1 = regs::spilltmp_reg();
                 let tmp1_w = regs::writable_spilltmp_reg();

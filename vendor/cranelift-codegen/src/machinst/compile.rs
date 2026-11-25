@@ -115,7 +115,12 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         vcode.compute_remat_vregs();
         vcode.compute_block_freq();
         vcode.pliron_strip_half_clobbers();
-        regalloc2::run_with_ctx(&vcode, vcode.abi.machine_env(), &options, regalloc_ctx)
+        regalloc2::run_with_ctx(
+            &vcode,
+            vcode.abi.machine_env(vcode.num_insts()),
+            &options,
+            regalloc_ctx,
+        )
             .map_err(|err| {
                 log::error!(
                     "Register allocation error for vcode\n\
@@ -284,7 +289,8 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     // Run the regalloc checker, if requested.
     if b.flags().regalloc_checker() {
         let _tt = timing::regalloc_checker();
-        let mut checker = regalloc2::checker::Checker::new(&vcode, &vcode.abi.machine_env());
+        let mut checker =
+            regalloc2::checker::Checker::new(&vcode, &vcode.abi.machine_env(vcode.num_insts()));
         checker.prepare(&regalloc_ctx.output);
         checker
             .run()
@@ -299,7 +305,8 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     if std::env::var_os("PLIRON_RELOADPRE_CHECK").is_some()
         && let Some(out) = vcode.post_alloc(&regalloc_ctx.output)
     {
-        let mut checker = regalloc2::checker::Checker::new(&vcode, &vcode.abi.machine_env());
+        let mut checker =
+            regalloc2::checker::Checker::new(&vcode, &vcode.abi.machine_env(vcode.num_insts()));
         checker.prepare(&out);
         if let Err(err) = checker.run() {
             panic!("reload_pre: checker errors in {}:\n{err:?}", f.name);

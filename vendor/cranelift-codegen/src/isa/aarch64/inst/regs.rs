@@ -198,7 +198,11 @@ pub fn x18_allocatable() -> bool {
 /// Branch veneers save whichever IP registers are allocatable, and
 /// `gen_sp_reg_adjust` chains imm12 forms so it needs no scratch.
 /// Prologue uses (stack-limit check, probestack, frame setup) run where
-/// no allocated value can be live in x16 yet and need nothing.
+/// no allocated value can be live in x16 yet and need nothing. With
+/// `PLIRON_X17` also on, `get_machine_env_calls` reserves both IP
+/// registers in a function large enough to out-range `b` (a veneer must
+/// branch through a register, and none is provably dead there when both
+/// are allocatable); everywhere else veneers cannot fire at all.
 pub fn x16_allocatable() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PLIRON_X16").as_deref() == Ok("1"))

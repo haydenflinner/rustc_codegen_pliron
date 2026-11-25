@@ -582,7 +582,7 @@ impl<I: VCodeInst> VCodeBuilder<I> {
     }
 
     fn collect_operands(&mut self, vregs: &VRegAllocator<I>) {
-        let allocatable = PRegSet::from(self.vcode.abi.machine_env());
+        let allocatable = PRegSet::from(self.vcode.abi.machine_env(self.vcode.num_insts()));
         for (i, insn) in self.vcode.insts.iter_mut().enumerate() {
             // Push operands from the instruction onto the operand list.
             //
@@ -2361,7 +2361,7 @@ impl<I: VCodeInst> VCode<I> {
         // that never appear as operand defs (writeback amodes in the
         // prologue/epilogue), which would leave stale classes.
         let mcp_allocset = if mcp {
-            Some(PRegSet::from(self.abi.machine_env()))
+            Some(PRegSet::from(self.abi.machine_env(self.num_insts())))
         } else {
             None
         };
