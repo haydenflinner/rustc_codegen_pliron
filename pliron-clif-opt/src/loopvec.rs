@@ -5715,65 +5715,102 @@ pub fn run(
             n += 1;
         }
     }
-    // `PLIRON_VEC_MASKSHL=1` (opt-in).
+    // `PLIRON_VEC_MASKSHL` is in `DEFAULT_ON` (the fold is
+    // semantics-equal and linear; `mask*C` covers the `imul` form too).
+    // `=0` off.
     if n > 0 && pliron_cfg::env_is("PLIRON_VEC_MASKSHL", "1") {
         fold_mask_shifts(func);
     }
     n
 }
 
-/// The splat value of a `vconst` whose lanes are all equal, or `None`.
-fn vconst_splat(func: &Function, v: Value) -> Option<u64> {
+/// The per-lane value of a splat integer vector — a `vconst` whose lanes
+/// are all equal or a `splat` of an `iconst` — or `None`.
+fn splat_const(func: &Function, v: Value) -> Option<u64> {
     let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
-    let InstructionData::UnaryConst { opcode: Opcode::Vconst, constant_handle, .. } = func.dfg.insts[i] else {
-        return None;
-    };
-    let lb = func.dfg.value_type(v).lane_type().bytes() as usize;
-    let bytes = func.dfg.constants.get(constant_handle).as_slice();
-    let lane = |k: usize| bytes[k * lb..(k + 1) * lb].iter().rev().fold(0u64, |a, &b| (a << 8) | u64::from(b));
-    let first = lane(0);
-    (1..bytes.len() / lb).all(|k| lane(k) == first).then_some(first)
+    match func.dfg.insts[i] {
+        InstructionData::UnaryConst { opcode: Opcode::Vconst, constant_handle, .. } => {
+            let lb = func.dfg.value_type(v).lane_type().bytes() as usize;
+            let bytes = func.dfg.constants.get(constant_handle).as_slice();
+            let lane = |k: usize| {
+                bytes[k * lb..(k + 1) * lb].iter().rev().fold(0u64, |a, &b| (a << 8) | u64::from(b))
+            };
+            let first = lane(0);
+            (1..bytes.len() / lb).all(|k| lane(k) == first).then_some(first)
+        }
+        InstructionData::Unary { opcode: Opcode::Splat, arg } => {
+            iconst(func, arg).map(|k| k as u64)
+        }
+        _ => None,
+    }
 }
 
 /// `ishl(band(m, splat 1), k)` with `m` a vector compare (lanes all ones or
-/// zero) is `band(m, splat(1 << k))`: one op instead of two per vector.
+/// zero) is `band(m, splat(1 << k))`, and `imul(band(m, splat 1), C)` is
+/// `band(m, splat(C))`: one op instead of two per vector. `imul(m, C)` on a
+/// bare mask is `band(m, splat(-C))` (`-1 * C` wraps to `0 - C`).
 /// `u8::to_ascii_lowercase`'s `is_ascii_uppercase() as u8 * 32` lowered as
 /// `cmhi; and #1; shl #5`, LLVM's as `cmhi; and #0x20`. One scan of the
 /// function after `loopvec` converted something.
 fn fold_mask_shifts(func: &mut Function) {
+    // (inst, mask value, per-lane constant of the folded `band`)
     let mut todo: Vec<(Inst, Value, i64)> = Vec::new();
+    let is_cmp = |func: &Function, v: Value| {
+        func.dfg.value_def(func.dfg.resolve_aliases(v)).inst().is_some_and(|ci| {
+            matches!(func.dfg.insts[ci].opcode(), Opcode::Icmp | Opcode::Fcmp)
+        })
+    };
+    // `(m, unit)` when `v` is `band(m, splat 1)` — the 0/1 form of mask `m`.
+    let band_mask1 = |func: &Function, v: Value| {
+        let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+        let InstructionData::Binary { opcode: Opcode::Band, args: ba } = func.dfg.insts[i] else {
+            return None;
+        };
+        if is_cmp(func, ba[0]) && splat_const(func, ba[1]) == Some(1) {
+            Some(ba[0])
+        } else if is_cmp(func, ba[1]) && splat_const(func, ba[0]) == Some(1) {
+            Some(ba[1])
+        } else {
+            None
+        }
+    };
     for b in func.layout.blocks() {
         for i in func.layout.block_insts(b) {
-            let InstructionData::Binary { opcode: Opcode::Ishl, args } = func.dfg.insts[i] else { continue };
+            let InstructionData::Binary { opcode, args } = func.dfg.insts[i] else { continue };
             let vt = func.dfg.value_type(func.dfg.first_result(i));
             if !vt.is_vector() || !vt.lane_type().is_int() {
                 continue;
             }
-            let Some(k) = iconst(func, args[1]) else { continue };
-            if !(0..i64::from(vt.lane_bits())).contains(&k) {
-                continue;
+            let lb = i64::from(vt.lane_bits());
+            match opcode {
+                Opcode::Ishl => {
+                    let Some(k) = iconst(func, args[1]) else { continue };
+                    if !(0..lb).contains(&k) {
+                        continue;
+                    }
+                    let Some(m) = band_mask1(func, args[0]) else { continue };
+                    todo.push((i, m, 1i64 << k));
+                }
+                Opcode::Imul => {
+                    for (a, b) in [(0, 1), (1, 0)] {
+                        let Some(c) = splat_const(func, args[b]) else { continue };
+                        if let Some(m) = band_mask1(func, args[a]) {
+                            todo.push((i, m, c as i64));
+                            break;
+                        }
+                        if is_cmp(func, args[a]) {
+                            todo.push((i, args[a], (c as i64).wrapping_neg()));
+                            break;
+                        }
+                    }
+                }
+                _ => continue,
             }
-            let Some(bi) = func.dfg.value_def(func.dfg.resolve_aliases(args[0])).inst() else { continue };
-            let InstructionData::Binary { opcode: Opcode::Band, args: ba } = func.dfg.insts[bi] else { continue };
-            let is_cmp = |v: Value| {
-                func.dfg.value_def(func.dfg.resolve_aliases(v)).inst().is_some_and(|ci| {
-                    matches!(func.dfg.insts[ci].opcode(), Opcode::Icmp | Opcode::Fcmp)
-                })
-            };
-            let m = if is_cmp(ba[0]) && vconst_splat(func, ba[1]) == Some(1) {
-                ba[0]
-            } else if is_cmp(ba[1]) && vconst_splat(func, ba[0]) == Some(1) {
-                ba[1]
-            } else {
-                continue;
-            };
-            todo.push((i, m, k));
         }
     }
-    for (i, m, k) in todo {
+    for (i, m, c) in todo {
         let vt = func.dfg.value_type(func.dfg.first_result(i));
         let lb = vt.lane_type().bytes() as usize;
-        let c = 1u64 << k;
         let mut bytes = Vec::with_capacity(vt.bytes() as usize);
         while bytes.len() < vt.bytes() as usize {
             bytes.extend_from_slice(&c.to_le_bytes()[..lb]);
@@ -6241,5 +6278,64 @@ mod tests {
             .flat_map(|b| func.layout.block_insts(b))
             .any(|i| func.dfg.insts[i].opcode() == Opcode::Vswizzle);
         assert!(has_swizzle);
+    }
+
+    /// `fold_mask_shifts` rewrites `ishl(band(m, splat 1), k)`,
+    /// `imul(band(m, splat 1), C)` and `imul(m, C)` — m an all-ones-lane
+    /// compare — as one `band` with a splat vconst each.
+    #[test]
+    fn mask_shift_and_mul_fold_to_band() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = b.create_block();
+            b.switch_to_block(entry);
+            let p = b.append_block_param(entry, types::I8X16);
+            let bound = b.ins().iconst(types::I8, 0x1a);
+            let bound = b.ins().splat(types::I8X16, bound);
+            let m = b.ins().icmp(IntCC::UnsignedLessThan, p, bound);
+            let one = b.ins().iconst(types::I8, 1);
+            let one = b.ins().splat(types::I8X16, one);
+            let b1 = b.ins().band(m, one);
+            let k = b.ins().iconst(types::I64, 5);
+            let sh = b.ins().ishl(b1, k);
+            let c7 = b.ins().iconst(types::I8, 7);
+            let c7 = b.ins().splat(types::I8X16, c7);
+            let m2 = b.ins().imul(b1, c7);
+            let c9 = b.ins().iconst(types::I8, 9);
+            let c9 = b.ins().splat(types::I8X16, c9);
+            let m3 = b.ins().imul(m, c9);
+            let r = b.ins().iadd(sh, m2);
+            let r = b.ins().iadd(r, m3);
+            b.ins().return_(&[r]);
+            b.seal_all_blocks();
+        }
+        fold_mask_shifts(&mut func);
+        let mut bands = 0;
+        let mut consts: Vec<u64> = Vec::new();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                match func.dfg.insts[i].opcode() {
+                    Opcode::Ishl | Opcode::Imul => {
+                        panic!("unfolded {}", func.dfg.display_inst(i))
+                    }
+                    Opcode::Band => {
+                        bands += 1;
+                        if let InstructionData::Binary { args, .. } = func.dfg.insts[i]
+                            && let Some(c) = splat_const(&func, args[1])
+                        {
+                            consts.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // The original `band m, 1` plus three folded `band m, splat C`:
+        // shl 5 -> 0x20, mul 7 -> 7, mul-by-(-9) -> 0xf7.
+        assert_eq!(bands, 4, "{func}");
+        consts.sort_unstable();
+        assert_eq!(consts, [1, 7, 0x20, 0xf7]);
     }
 }

@@ -37,6 +37,14 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-25: loopvec's mask-fold covers `mask * C` as well as
+    // `mask<<k`: `band(m, splat 1) * C` -> `band(m, splat C)` and
+    // `m * C` -> `band(m, splat -C)` (m an icmp/fcmp lane mask).
+    // `u8::to_ascii_lowercase`'s `is_ascii_uppercase() as u8 * 32`
+    // vectorizes to LLVM's `cmhi; and #0x20` instead of
+    // `cmhi; and #1; shl #5`. Test mask_shift_and_mul_fold_to_band.
+    // `PLIRON_VEC_MASKSHL=0` off.
+    "PLIRON_VEC_MASKSHL",
     // 2026-11-24: an inlined callee's `&mut` param keeps its `noalias`
     // fact for the inlined body (step `scopedfwd`, phisimp's clone-entry
     // args). macOS instructions on 2026-11-23: html -0.7%, regex -0.9%,

@@ -1322,14 +1322,17 @@ time, memory, code size, stack frames) in ~20 min and writes
   (about 0.5% of functions)
   (`docs/history/2026-11-20-ivsr.md`). `PLIRON_TRACE=pliron::ivsr`
   (`pick` lines); `clif-check vcode` replays `=2` (`ivsr-pick:` line).
-- `PLIRON_VEC_REM=1`, `PLIRON_VEC_MASKSHL=1` (opt-in, 2026-11-20) —
+- `PLIRON_VEC_REM=1` (opt-in, 2026-11-20), `PLIRON_VEC_MASKSHL` (default
+  on since 2026-11-25, `=0` off) —
   `loopvec`: the scalar loop a conversion keeps (up to `vf*4 - 1`
   iterations) is converted once more with one vector per iteration, at
   half width on aarch64 (`i8x8`; plain map/store loops with contiguous
   ascending streams only), so `make_ascii_lowercase` on 8..63 bytes runs
   vector code (40 bytes: 379 -> 86 instructions, LLVM 66). `MASKSHL`
-  folds `ishl(band(cmp, splat 1), k)` to `band(cmp, splat(1 << k))`
-  (`and #0x20` instead of `and #1; shl #5`). Exact counts: `MASKSHL` html
+  folds `ishl(band(cmp, splat 1), k)` to `band(cmp, splat(1 << k))` and
+  `imul` of a mask or `band(mask, splat 1)` by a splat const the same way
+  (`and #0x20` instead of `and #1; shl #5`; matches `splat(iconst)` too,
+  not just `vconst`). Exact counts: `MASKSHL` html
   -1.5k, none worse; `REM` + `MASKSHL` compression -0.025%, html +0.063%
   (lol_html lowercases names under 8 bytes: the extra dispatch costs
   about 7 instructions a call). Tests `tests/loopvec_rem.rs`.
