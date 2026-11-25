@@ -15,7 +15,11 @@
 //! block, which has the chain as its only predecessor and no params. At
 //! least `MIN_CASES` distinct constants. The arguments passed to the hit
 //! targets must be defined outside the chain (they then dominate every
-//! new block). A repeated constant keeps its first hit (the later test
+//! new block), and no value defined inside the chain may be used outside
+//! its own block — the rewrite deletes every chain instruction, so an
+//! escaping def (a test block's `icmp` or `iconst` re-used by its hit arm
+//! or the default) would leave a use pointing at a detached instruction.
+//! A repeated constant keeps its first hit (the later test
 //! can never fire). The chain head is rewritten as the root of a tree:
 //! `x u< K_mid` splits the sorted constants, leaves of at most `LEAF`
 //! constants test them in turn and fall through to the chain's default.
@@ -25,7 +29,7 @@
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Block, BlockArg, Function, InstBuilder, InstructionData, Opcode, Type, Value};
+use cranelift_codegen::ir::{Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value};
 use rustc_hash::FxHashSet;
 
 const MIN_CASES: usize = 6;
@@ -102,6 +106,26 @@ pub fn run(func: &mut Function) -> usize {
         let mut it = cfg.pred_iter(b);
         matches!((it.next(), it.next()), (Some(q), None) if q.block == p)
     };
+    // The rewrite deletes every instruction in a chain, so a chain is
+    // only safe to rewrite when no value defined inside it is used in
+    // another block (a hit arm or the default re-using the test block's
+    // compare or constant is legal SSA — its def dominated the use — but
+    // would be left pointing at a detached instruction). One pass over
+    // the function marks every instruction whose result escapes its
+    // block; uses in blocks the rewrite removes are over-rejected, which
+    // is harmless.
+    let mut escapes: FxHashSet<Inst> = FxHashSet::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            for v in func.dfg.inst_values(i) {
+                if let Some(d) = func.dfg.resolved_value_def(v).inst()
+                    && func.layout.inst_block(d) != Some(b)
+                {
+                    escapes.insert(d);
+                }
+            }
+        }
+    }
     let blocks: Vec<Block> = func.layout.blocks().collect();
     let mut taken: FxHashSet<Block> = FxHashSet::default();
     let mut plans: Vec<(Block, Value, Vec<Link>, Block, Vec<Block>)> = Vec::new();
@@ -141,6 +165,13 @@ pub fn run(func: &mut Function) -> usize {
             }
         };
         if inside(x) || links.iter().any(|l| l.args.iter().any(|a| matches!(a, BlockArg::Value(v) if inside(*v)))) {
+            continue;
+        }
+        // Nothing defined inside the chain may be used outside its block.
+        if members
+            .iter()
+            .any(|&m| func.layout.block_insts(m).any(|i| escapes.contains(&i)))
+        {
             continue;
         }
         // Distinct constants, first hit kept.
