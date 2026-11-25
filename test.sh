@@ -1147,6 +1147,16 @@ t_x16() {
     }
     END { exit bad }
   ' || { echo "x16: value live in x16 across a bl under PLIRON_X16=1 (call clobber missing)" >&2; return 1; }
+  # A borrowed address scratch is saved in the 16 bytes below `sp`: an
+  # sp-based access at an offset that fits imm12 only un-bumped
+  # (4080..4095) must take the mov+RegReg form — without it this used to
+  # ICE in mem_finalize ("the bump is small and aligned", the
+  # compress_to_vec_inner/brotli-decompressor panic).
+  local cc="target/$PROF/clif-check"
+  [ -x "$cc" ] || cc="target/debug/clif-check"
+  if [ -x "$cc" ]; then
+    PLIRON_X16=1 "$cc" codegen tests/x16/clif "$out/x16-far.json" >/dev/null || { echo "x16: far-offset SlotOffset ICEs under PLIRON_X16=1" >&2; return 1; }
+  fi
 }
 
 t_halfclob() {

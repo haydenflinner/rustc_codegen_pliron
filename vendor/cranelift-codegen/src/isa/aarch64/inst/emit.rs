@@ -131,7 +131,17 @@ pub fn mem_finalize(
                 (smallvec![], mem, no_post)
             } else if u64::try_from(off)
                 .ok()
-                .and_then(Imm12::maybe_from_u64)
+                .and_then(|o| {
+                    // A borrowed scratch (PLIRON_X16: save always) bumps
+                    // `sp` down 16 for its slot, so an `sp` base needs
+                    // `off + 16` to fit — check the bumped value here or
+                    // the `expect` below fires for `off` in (4079,4095].
+                    Imm12::maybe_from_u64(if x16_allocatable() && basereg == stack_reg() {
+                        o + 16
+                    } else {
+                        o
+                    })
+                })
                 .is_some()
             {
                 // PLIRON: an offset an `add` immediate holds (a 16-byte

@@ -1,0 +1,18 @@
+; Regression: under PLIRON_X16=1 a borrowed address scratch is saved in
+; the 16 bytes below `sp`, so an `sp`-based access needs `off + 16` to
+; fit imm12. A `SlotOffset` in (4079, 4095] (fits un-bumped, overflows
+; bumped) used to hit `expect("the bump is small and aligned")` in
+; `mem_finalize` — the compress_to_vec_inner / brotli ICE. With the fix
+; the mode takes the `mov` + RegReg form instead. Run:
+;   PLIRON_X16=1 clif-check codegen tests/x16/clif out.json
+function u0:0(i8x16) apple_aarch64 {
+    ss0 = explicit_slot 8192, align = 16
+    sig0 = (i64) apple_aarch64
+    fn0 = colocated u0:1 sig0
+
+block0(v0: i8x16):
+    v1 = stack_addr.i64 ss0
+    store.i8x16 notrap v0, v1+4088
+    call fn0(v1)
+    return
+}
