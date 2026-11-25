@@ -1108,15 +1108,16 @@ t_x18() {
 }
 
 t_x16() {
-  # PLIRON_X16=1 (opt-in, aarch64, all targets): x16 joins the allocatable
-  # set like LLVM. The object under the knob must name x16 in pressure
-  # code; without it x16 may still appear as the emitter scratch, but this
-  # function has no far stack offsets so it must not.
+  # PLIRON_X16 (default on since 2026-11-26, aarch64, all targets): x16
+  # joins the allocatable set like LLVM. The object under the knob must
+  # name x16 in pressure code; with it off x16 may still appear as the
+  # emitter scratch, but this function has no far stack offsets so it
+  # must not.
   case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
   local n
-  rustc $BE --edition 2021 -O --crate-type=lib --emit=obj tests/x16/press.rs -o $out/x16-off.o || return 1
+  PLIRON_X16=0 rustc $BE --edition 2021 -O --crate-type=lib --emit=obj tests/x16/press.rs -o $out/x16-off.o || return 1
   n=$("$llvmod" -d --no-show-raw-insn $out/x16-off.o | grep -cE '[ ,[](x16|w16)([ ,]|$)' || true)
-  (( n == 0 )) || { echo "x16: $n uses of x16 without the knob" >&2; return 1; }
+  (( n == 0 )) || { echo "x16: $n uses of x16 with the knob off" >&2; return 1; }
   PLIRON_X16=1 rustc $BE --edition 2021 -O --crate-type=lib --emit=obj tests/x16/press.rs -o $out/x16-on.o || return 1
   n=$("$llvmod" -d --no-show-raw-insn $out/x16-on.o | grep -cE '[ ,[](x16|w16)([ ,]|$)' || true)
   (( n > 0 )) || { echo "x16: no use of x16 under PLIRON_X16=1 (test lost its pressure)" >&2; return 1; }

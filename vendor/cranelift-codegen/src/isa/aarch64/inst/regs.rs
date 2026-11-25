@@ -187,7 +187,8 @@ pub fn x18_allocatable() -> bool {
         && std::env::var("PLIRON_X18").as_deref() != Ok("0")
 }
 
-/// `PLIRON_X16` (opt-in): x16 is allocatable, as LLVM does (the
+/// `PLIRON_X16` (default on since 2026-11-26; `=0` off): x16 is
+/// allocatable, as LLVM does (the
 /// interprocedural scratch registers are only linker-veneer scratch).
 /// x16 is `spilltmp_reg` — the emit-time scratch for far stack accesses
 /// and pseudo-op expansion — so under the knob the sites that used to
@@ -205,7 +206,7 @@ pub fn x18_allocatable() -> bool {
 /// are allocatable); everywhere else veneers cannot fire at all.
 pub fn x16_allocatable() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_X16").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("PLIRON_X16").as_deref() != Ok("0"))
 }
 
 /// Get a reference to the second temp register. We need this in some edge cases

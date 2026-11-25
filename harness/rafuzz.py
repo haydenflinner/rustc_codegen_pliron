@@ -91,7 +91,7 @@ KNOBS = [
     ("PLIRON_RA_PROOFCOLOR", "0", ["1"], "ra2", "0"),
     ("PLIRON_RA_MCTS_SIMS", "256", ["64", "128", "512"], "ra2", "256"),
     ("PLIRON_RA_MCTS_TOPM", "8", ["4", "16"], "ra2", "8"),
-    ("PLIRON_X16", "0", ["1"], "clif", "1"),
+    ("PLIRON_X16", "1", ["0"], "clif", "1"),
     ("PLIRON_X18", "1", ["0"], "clif", "1"),
     ("PLIRON_REMAT", "1", ["0"], "clif", "1"),
     ("PLIRON_REMAT_STORE", "1", ["0"], "clif", "1"),
