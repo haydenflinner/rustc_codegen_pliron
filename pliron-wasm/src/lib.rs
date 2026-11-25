@@ -5530,6 +5530,52 @@ fn peep_body_opts(
         // adjacent after scheduling fuse here into the single wide
         // load (`i64.load{8,16,32}_{s,u}`); memarg bytes carry over.
         if let (WPeek::Other, Some(&(WPeek::Other, s2, _, _))) = (k, ins.get(wi + 1)) {
+            // Emit a fused load: `mop` + the source memarg, its align
+            // hint clamped to `nat` — a wide source may carry a hint the
+            // narrower fused access may not (`i64.load align=3;
+            // i64.extend8_s` fused verbatim would emit the invalid
+            // `i64.load8_s align=3`).
+            macro_rules! fused_load {
+                ($mop:expr, $nat:expr) => {{
+                    let mut q = s + 1;
+                    match urd(b, &mut q) {
+                        Some(a) => {
+                            nb.push($mop);
+                            leb(&mut nb, a.min($nat));
+                            nb.extend_from_slice(&b[q..e]);
+                            wi += 2;
+                            continue;
+                        }
+                        None => {}
+                    }
+                }};
+            }
+            // i64 load{,N_{s,u}}; i32.wrap_i64 -> the i32 load of the
+            // same bytes (the wrap discards everything above the low
+            // 4). `load*_u; *extendN_s` and wider-than-access extends
+            // missing from `mop` below.
+            match (b[s], b[s2]) {
+                (0x29, 0xa7) => fused_load!(0x28, 2),
+                (0x30, 0xa7) => fused_load!(0x2c, 0),
+                (0x31, 0xa7) => fused_load!(0x2d, 0),
+                (0x32, 0xa7) => fused_load!(0x2e, 1),
+                (0x33, 0xa7) => fused_load!(0x2f, 1),
+                (0x34, 0xa7) | (0x35, 0xa7) => fused_load!(0x28, 2),
+                (0x2e, 0xc0) | (0x2f, 0xc0) => fused_load!(0x2c, 0),
+                (0x2c, 0xc1) => fused_load!(0x2c, 0),
+                (0x2d, 0xc1) => fused_load!(0x2d, 0),
+                (0x32, 0xc2) | (0x33, 0xc2) | (0x34, 0xc2) | (0x35, 0xc2) => {
+                    fused_load!(0x30, 0)
+                }
+                (0x30, 0xc3) => fused_load!(0x30, 0),
+                (0x31, 0xc3) => fused_load!(0x31, 0),
+                (0x34, 0xc3) | (0x35, 0xc3) => fused_load!(0x32, 1),
+                (0x30, 0xc4) => fused_load!(0x30, 0),
+                (0x31, 0xc4) => fused_load!(0x31, 0),
+                (0x32, 0xc4) => fused_load!(0x32, 1),
+                (0x33, 0xc4) => fused_load!(0x33, 1),
+                _ => {}
+            }
             // (fused opcode, operand bytes kept from the first instr).
             // `i32.load*; i64.extend_i32_{s,u}` pairs that only became
             // adjacent after scheduling fuse here into the single wide
@@ -5575,6 +5621,114 @@ fn peep_body_opts(
                 nb.extend_from_slice(tail);
                 wi += 2;
                 continue;
+            }
+            // Identity pairs — both instructions drop:
+            //   i64.extend_i32_{s,u}; i32.wrap_i64 -> the original i32
+            //   {i32,i64}.const 0; <v+0 | v-0 | v|0 | v^0 | v<<0 | v>>0 |
+            //   rotl 0 | rotr 0> -> v   (v - 0 = v too; `0 - v` is not
+            //   this shape — the const is the *top* operand).
+            //   {i32,i64}.const -1/-1-as-unsigned; *.and -> v
+            match (b[s], b[s2]) {
+                (0xac, 0xa7) | (0xad, 0xa7) => {
+                    wi += 2;
+                    continue;
+                }
+                (0x41, 0x6a | 0x6b | 0x72 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78)
+                    if b[s + 1..e] == [0x00] =>
+                {
+                    wi += 2;
+                    continue;
+                }
+                (0x42, 0x7c | 0x7d | 0x84 | 0x85 | 0x86 | 0x87 | 0x88 | 0x89 | 0x8a)
+                    if b[s + 1..e] == [0x00] =>
+                {
+                    wi += 2;
+                    continue;
+                }
+                (0x41, 0x71) if b[s + 1..e] == [0x7f]
+                    || b[s + 1..e] == [0xff, 0xff, 0xff, 0xff, 0x0f] =>
+                {
+                    wi += 2;
+                    continue;
+                }
+                (0x42, 0x83)
+                    if b[s + 1..e] == [0x7f]
+                        || b[s + 1..e]
+                            == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01] =>
+                {
+                    wi += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            // const0 compares that collapse to a single op.
+            let cmp0: Option<u8> = match (b[s], b[s2]) {
+                (0x41, 0x4d) if b[s + 1..e] == [0x00] => Some(0x45), // i32.le_u 0 -> eqz
+                (0x42, 0x59) if b[s + 1..e] == [0x00] => Some(0x50), // i64.le_u 0 -> eqz
+                _ => None,
+            };
+            if let Some(z) = cmp0 {
+                nb.push(z);
+                wi += 2;
+                continue;
+            }
+            // const0 compares that fold to a constant. The compare
+            // also consumed the operand below the const, so the fold
+            // emits a `drop` for it before the (always i32) constant.
+            let cmp01: Option<&[u8]> = match (b[s], b[s2]) {
+                (0x41, 0x49) if b[s + 1..e] == [0x00] => Some(&[0x1a, 0x41, 0x00]), // lt_u 0
+                (0x42, 0x54) if b[s + 1..e] == [0x00] => Some(&[0x1a, 0x41, 0x00]),
+                (0x41, 0x4f) if b[s + 1..e] == [0x00] => Some(&[0x1a, 0x41, 0x01]), // ge_u 0
+                (0x42, 0x5a) if b[s + 1..e] == [0x00] => Some(&[0x1a, 0x41, 0x01]),
+                _ => None,
+            };
+            if let Some(x) = cmp01 {
+                nb.extend_from_slice(x);
+                wi += 2;
+                continue;
+            }
+            // Triples: a mask whose bits a sign-extension ignores is
+            // dead — `v & 0xff; extend8_s` == `extend8_s(v)`,
+            // `v & 0xffffffff; i32.wrap` == `wrap(v)`.
+            if let Some(&(WPeek::Other, s3, _, _)) = ins.get(wi + 2) {
+                let m3: Option<u8> = match (b[s], b[s2], b[s3]) {
+                    (0x41, 0x71, 0xc0) if b[s + 1..e] == [0xff, 0x01] => Some(0xc0),
+                    (0x41, 0x71, 0xc1) if b[s + 1..e] == [0xff, 0xff, 0x03] => Some(0xc1),
+                    (0x42, 0x83, 0xc2) if b[s + 1..e] == [0xff, 0x01] => Some(0xc2),
+                    (0x42, 0x83, 0xc3) if b[s + 1..e] == [0xff, 0xff, 0x03] => Some(0xc3),
+                    (0x42, 0x83, 0xa7) if b[s + 1..e] == [0xff, 0xff, 0xff, 0xff, 0x0f] => {
+                        Some(0xa7)
+                    }
+                    _ => None,
+                };
+                if let Some(z) = m3 {
+                    nb.push(z);
+                    wi += 3;
+                    continue;
+                }
+            }
+            // Quad: `const K; shr_s; wrap; extend_u` with K == 32, and
+            // `const K; shr_u; wrap; extend_u` with K in 32..64, are
+            // both `const K; shr_u` — the wrap+zext pair discards and
+            // rebuilds the same high half. (`shr_s` agrees with `shr_u`
+            // in the low 32 bits only at K == 32; `shr_u`'s own high
+            // half is zero only at K >= 32.)
+            if let (Some(&(WPeek::Other, s2q, _, _)), Some(&(WPeek::Other, s3q, _, _))) =
+                (ins.get(wi + 1), ins.get(wi + 2))
+            {
+                if matches!(ins.get(wi + 3).map(|x| x.0), Some(WPeek::Other))
+                    && b[s] == 0x42
+                    && b[ins[wi + 3].1] == 0xad
+                    && b[s3q] == 0xa7
+                    && e == s + 2
+                    && ((b[s2q] == 0x87 && b[s + 1] == 0x20)
+                        || (b[s2q] == 0x88 && (0x20..=0x3f).contains(&b[s + 1])))
+                {
+                    nb.extend_from_slice(&b[s..e]);
+                    nb.push(0x88);
+                    wi += 4;
+                    continue;
+                }
             }
         }
         // `set L; get L` is exactly `tee L` — decode fuses them, but
@@ -5934,6 +6088,50 @@ mod wpeep_tests {
                 && !has_seq(&out, &[0x43, 0x00, 0x00, 0x80, 0x3f, 0x22, 0x00]),
             "f32 producer wrote i32 local: {out:02x?}"
         );
+    }
+
+    // Emit-loop micro-folds: `i64.load*; i32.wrap_i64` keeps only the
+    // low 4 bytes of the access, so it is the i32 load of the same
+    // bytes (the align hint clamps to the narrower width); a mask the
+    // following op ignores is dead; `const K; shr_s; wrap; extend_u`
+    // at K == 32 is `const K; shr_u`; `const 0` is the identity for
+    // add/sub/or/xor/shifts.
+    #[test]
+    fn emit_micro_folds() {
+        // param 0 = i32 (address), local 1 = i64.
+        let b = body_typed(
+            &[(1, 0x7e)],
+            &[
+                0x20, 0x00, 0x29, 0x03, 0x00, 0xa7, // get0; i64.load a3; wrap
+                0x1a, //                             drop
+                0x20, 0x00, 0xac, 0xa7, 0x1a, //     get0; extend_i32_s; wrap; drop
+                0x20, 0x00, 0x41, 0x00, 0x6a, 0x1a, // get0; const0; i32.add; drop
+                0x20, 0x00, 0x41, 0x7f, 0x71, 0x1a, // get0; const-1; i32.and; drop
+                0x20, 0x00, 0x41, 0xff, 0x01, 0x71, 0xc0, 0x1a, // &0xff;ext8
+                0x20, 0x01, 0x42, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x83, 0xa7, 0x1a,
+                0x20, 0x01, 0x42, 0x20, 0x87, 0xa7, 0xad, 0x1a, // >>_s32 quad
+                0x20, 0x01, 0x42, 0x00, 0x54, 0x1a, //      i64.lt_u 0 -> i32.const 0
+            ],
+        );
+        let out = peep_body_opts(&b, &[], &[], 1, &opts(false, false)).unwrap();
+        assert!(has_seq(&out, &[0x28, 0x02, 0x00]), "wrap-load: {out:02x?}");
+        assert!(!has_seq(&out, &[0x28, 0x03, 0x00]), "unclamped: {out:02x?}");
+        assert!(
+            !has_seq(&out, &[0x29, 0x03, 0x00, 0xa7]),
+            "wrap survived: {out:02x?}"
+        );
+        assert!(!has_seq(&out, &[0xac, 0xa7]), "ext+wrap: {out:02x?}");
+        assert!(!has_seq(&out, &[0x41, 0x00, 0x6a]), "add0: {out:02x?}");
+        assert!(!has_seq(&out, &[0x71, 0x1a]), "and -1: {out:02x?}");
+        assert!(!has_seq(&out, &[0x71, 0xc0]), "mask+ext: {out:02x?}");
+        assert!(!has_seq(&out, &[0x83, 0xa7]), "mask+wrap: {out:02x?}");
+        assert!(!has_seq(&out, &[0x87, 0xa7]), "shr_s+wrap: {out:02x?}");
+        assert!(has_seq(&out, &[0x42, 0x20, 0x88]), "quad: {out:02x?}");
+        // The compare's result is i32 and its deeper operand must be
+        // dropped — the `i64.const`/`missing drop` bugs from
+        // sieve8u128work and flt2dec.
+        assert!(has_seq(&out, &[0x1a, 0x41, 0x00]), "lt_u 0: {out:02x?}");
+        assert!(!has_seq(&out, &[0x42, 0x00, 0x54]), "lt_u kept: {out:02x?}");
     }
 
     // Regression: the `btr` dead-region model must resume liveness at a
