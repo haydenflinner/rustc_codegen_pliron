@@ -3316,6 +3316,106 @@ fn band_acc(pos: &mut FuncCursor, accs: &mut Vec<Value>, m: Value) {
     }
 }
 
+/// Lane-ok masks for one group's early-exit conds, band-accumulated per
+/// mask type. Each check normalizes to a lane-ok mask — `bnot` for
+/// exit-on-hit. A data cond (`band x, 1` of a 0/1 select) holds {0,1}-style
+/// lanes, not a mask: `bnot` would make every lane nonzero, so compare
+/// against zero instead (rayon's split_ascii_whitespace skipped whole
+/// 64-byte groups).
+fn early_masks(
+    pos: &mut FuncCursor,
+    p: &Plan,
+    vmap: &mut FxHashMap<Value, Value>,
+    splats: &mut FxHashMap<Value, Value>,
+    smemo: &mut FxHashMap<Value, Value>,
+    addrs: &[(Value, i64)],
+) -> Vec<Value> {
+    let mut gaccs: Vec<Value> = Vec::new();
+    for &(cv, exits_true) in &p.early {
+        let cv = mask_under_band1(pos.func, &p.masks, cv);
+        let m = emit_val(pos, p, vmap, splats, smemo, addrs, cv, 0);
+        let m = if p.masks.contains(&pos.func.dfg.resolve_aliases(cv)) {
+            if exits_true { pos.ins().bnot(m) } else { m }
+        } else {
+            let mt = pos.func.dfg.value_type(m);
+            let z = pos.ins().iconst(mt.lane_type(), 0);
+            let z = pos.ins().splat(mt, z);
+            let cc = if exits_true { IntCC::Equal } else { IntCC::NotEqual };
+            pos.ins().icmp(cc, m, z)
+        };
+        band_acc(pos, &mut gaccs, m);
+    }
+    gaccs
+}
+
+/// Emit an early-exit resume tail at the cursor: re-enter the scalar loop
+/// at `base + lane*step` (or `base` when `lane` is `None` — the scalar
+/// loop re-walks the window and finds the exit itself). `Step` params
+/// advance `s` per elapsed iteration — `iters = (base - iv0)/step + lane`
+/// (`base` is in iv units; for a pointer iv `step` is the per-iteration
+/// byte advance). Used by both the vector loop's resume (`base = ivv`)
+/// and `PLIRON_VECPROBE`'s (`base = iv0`).
+fn resume_args(pos: &mut FuncCursor, p: &Plan, iv_ty: Type, base: Value, lane: Option<Value>) {
+    let ivr = match lane {
+        Some(l) => {
+            let off = pos.ins().imul_imm(l, p.step);
+            pos.ins().iadd(base, off)
+        }
+        None => base,
+    };
+    let mut it = None;
+    let mut it_of = |pos: &mut FuncCursor| {
+        *it.get_or_insert_with(|| {
+            let d = pos.ins().isub(base, p.iv0);
+            let d = if p.step == 1 {
+                d
+            } else {
+                let sk = pos.ins().iconst(iv_ty, p.step);
+                pos.ins().udiv(d, sk)
+            };
+            match lane {
+                Some(l) => pos.ins().iadd(d, l),
+                None => d,
+            }
+        })
+    };
+    let params = pos.func.dfg.block_params(p.h).to_vec();
+    let mut args: Vec<Value> = Vec::new();
+    for (j, _) in params.iter().enumerate() {
+        if j == p.iv_idx {
+            args.push(ivr);
+            continue;
+        }
+        match p.kinds[j] {
+            Param::Inv => args.push(p.entry_args[j]),
+            Param::Step(_) if p.lagged.contains_key(&j) => {
+                // Deferred value filled in below once `args` is complete.
+                args.push(p.entry_args[j]);
+            }
+            Param::Step(s) => {
+                let it = it_of(pos);
+                args.push(step_resume(pos, iv_ty, p.entry_args[j], it, s));
+            }
+            Param::Other => unreachable!(),
+        }
+    }
+    // Same deferred resume as the epilogue: `q(t) = bv(p(t-1))` for
+    // `t = it ≥ 1`, `entry` when the scalar loop restarts at 0.
+    let mut dmemo: FxHashMap<Value, Value> = FxHashMap::default();
+    for (j, _) in params.iter().enumerate() {
+        let Some(&bv) = p.lagged.get(&j) else {
+            continue;
+        };
+        let d = emit_deferred(pos, p, &args, &mut dmemo, bv, 0);
+        let z = pos.ins().iconst(iv_ty, 0);
+        let t = it_of(pos);
+        let c = pos.ins().icmp(IntCC::Equal, t, z);
+        args[j] = pos.ins().select(c, p.entry_args[j], d);
+    }
+    let bargs: Vec<BlockArg> = args.iter().map(|&v| BlockArg::Value(v)).collect();
+    pos.ins().jump(p.h, &bargs);
+}
+
 /// `PLIRON_VEC_EXACT`: at the bottom of `r`, find the first group whose
 /// lane-ok mask in `oks` has a failing lane (the last one must, since the
 /// fused test failed) and return the failing lane's index in the
@@ -4438,6 +4538,22 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     func.layout.insert_block_after(vb, vh);
     func.layout.insert_block_after(ve, vb);
     let iv_ty = p.iv_ty;
+    // `PLIRON_VECPROBE` (`=1`, opt-in): peel the first vector iteration's
+    // early-exit lane test into `vb0`, ahead of the vector loop's entry —
+    // see the `vb0` emission at the bottom of `apply`. `vb0` runs only
+    // behind `pre`'s `iters >= vf*unroll` guard (its loads cover the whole
+    // first window), so it needs `short`.
+    let probe = !p.early.is_empty()
+        && crate::pass_enabled("PLIRON_VEC_SHORT")
+        && crate::env_is("PLIRON_VECPROBE", "1");
+    let (vb0, pr) = if probe {
+        let vb0 = func.dfg.make_block();
+        func.layout.insert_block_after(vb0, cb);
+        let pr = func.dfg.make_block();
+        (Some(vb0), Some(pr))
+    } else {
+        (None, None)
+    };
     // Redirect the scalar loop's entry edge through the check block.
     {
         let dfg = &mut func.dfg;
@@ -4642,9 +4758,11 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // every group's load/store offset is a non-negative displacement —
     // the unsigned amode form the emit-time ldp/stp fusion requires.
     let mut sr_steps: Vec<i64> = Vec::new();
+    let mut srbases: Vec<Option<Value>> = Vec::new();
     for s in &p.streams {
         if s.direct {
             sr_steps.push(0);
+            srbases.push(None);
             continue;
         }
         let e = i64::from(p.elem.bytes());
@@ -4663,6 +4781,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             base = pos.ins().iadd(base, c);
         }
         v_arg_vals.push(base);
+        srbases.push(Some(base));
         // A lane-gather stream steps `stride` elements per iteration —
         // its carried base advances `stride`× the unit-stream rate.
         sr_steps.push(if s.neg { -e } else { e * s.stride } * p.vf * unroll as i64);
@@ -4675,6 +4794,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
     // dominate the whole vector loop).
     let mut aff_gstep: Vec<Vec<Value>> = Vec::new();
     let mut aff_bstep: Vec<Value> = Vec::new();
+    let mut w0s: Vec<Value> = Vec::new();
     for a in &p.iv_affines {
         let off_v = emit(&mut pos, iv_ty, &a.off);
         let s0 = if a.coeff == 1 {
@@ -4690,6 +4810,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
             pos.ins().isub(sp, iot)
         };
         v_arg_vals.push(w0);
+        w0s.push(w0);
         let mut gs = Vec::new();
         for g in 1..unroll {
             let k = pos
@@ -4704,8 +4825,16 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         aff_bstep.push(pos.ins().splat(p.vt, bk));
     }
     let h_args: Vec<BlockArg> = p.entry_args.iter().map(|&v| BlockArg::Value(v)).collect();
-    let v_args: Vec<BlockArg> = v_arg_vals.iter().map(|&v| BlockArg::Value(v)).collect();
-    pos.ins().brif(ok, vh, &v_args, p.h, &h_args);
+    match vb0 {
+        // `vb0` runs the first iteration's lane test and enters `vh` at
+        // iteration 1, building the stepped entry args itself.
+        Some(vb0) => pos.ins().brif(ok, vb0, &[], p.h, &h_args),
+        None => {
+            let v_args: Vec<BlockArg> =
+                v_arg_vals.iter().map(|&v| BlockArg::Value(v)).collect();
+            pos.ins().brif(ok, vh, &v_args, p.h, &h_args)
+        }
+    };
     // vh: the vector guard. The exit goes through `ve`, which folds each
     // vector accumulator to a scalar so the epilogue resumes mid-accumulation.
     let vaccs: Vec<Vec<Value>> = p
@@ -4972,6 +5101,10 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         let r = pos.func.dfg.make_block();
         pos.func.layout.insert_block_after(r, *vbs.last().unwrap());
         resume = Some(r);
+        // The probe's own resume sits right after.
+        if let Some(pr) = pr {
+            pos.func.layout.insert_block_after(pr, r);
+        }
     }
     let mut splats: FxHashMap<Value, Value> = FxHashMap::default();
     let mut smemo: FxHashMap<Value, Value> = FxHashMap::default();
@@ -5175,34 +5308,7 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         // polarities, and the rare path is just a few extra scalar lanes.
         // (`PLIRON_VEC_EXACT=1`: the resume finds the first failing lane
         // from `group_oks` instead, see the resume block.)
-        let mut gaccs: Vec<Value> = Vec::new();
-        for &(cv, exits_true) in &p.early {
-            let cv = mask_under_band1(pos.func, &p.masks, cv);
-            let m = emit_val(
-                &mut pos,
-                p,
-                &mut vmap,
-                &mut splats,
-                &mut smemo,
-                &addrs,
-                cv,
-                0,
-            );
-            // A data cond (`band x, 1` of a 0/1 select) holds {0,1}-style
-            // lanes, not a mask: `bnot` would make every lane nonzero, so
-            // compare against zero instead (rayon's split_ascii_whitespace
-            // skipped whole 64-byte groups).
-            let m = if p.masks.contains(&pos.func.dfg.resolve_aliases(cv)) {
-                if exits_true { pos.ins().bnot(m) } else { m }
-            } else {
-                let mt = pos.func.dfg.value_type(m);
-                let z = pos.ins().iconst(mt.lane_type(), 0);
-                let z = pos.ins().splat(mt, z);
-                let cc = if exits_true { IntCC::Equal } else { IntCC::NotEqual };
-                pos.ins().icmp(cc, m, z)
-            };
-            band_acc(&mut pos, &mut gaccs, m);
-        }
+        let gaccs = early_masks(&mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs);
         for &m in &gaccs {
             band_acc(&mut pos, &mut exit_accs, m);
         }
@@ -5420,63 +5526,85 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
         let mut pos = FuncCursor::new(pos.func).at_bottom(r);
         let lane = (exact && group_oks.len() == unroll)
             .then(|| exact_lane(&mut pos, r, &group_oks, p.vf, iv_ty));
-        let ivr = match lane {
-            Some(l) => {
-                let off = pos.ins().imul_imm(l, p.step);
-                pos.ins().iadd(ivv, off)
-            }
-            None => ivv,
-        };
-        let mut it = None;
-        let mut it_of = |pos: &mut FuncCursor| {
-            *it.get_or_insert_with(|| {
-                let d = pos.ins().isub(ivv, p.iv0);
-                let d = if p.step == 1 {
-                    d
+        resume_args(&mut pos, p, iv_ty, ivv, lane);
+    }
+    // `vb0` (`PLIRON_VECPROBE`): group 0's lane test, peeled ahead of the
+    // loop — a search loop's hit often lands in the first vector group,
+    // and paying the whole first window's test (~40 instructions) plus
+    // the vector loop's entry (trip rounding, splats, carried bases)
+    // where the scalar loop pays ~15 was the `PLIRON_JTVEC` regression.
+    // The peeled test is the same lane-mask emission the groups use,
+    // over the iteration-0 stream bases, restricted to group 0: on a
+    // hit `pr` re-enters the scalar loop at the exact failing lane (or
+    // `iv0`), on all-ok the vector loop starts at iteration 0 —
+    // re-testing group 0 is wasted work but the window test is pure
+    // loads and compares, which is the same assumption the exact-lane
+    // resume already makes when it scans past the failing lane.
+    if let (Some(vb0), Some(pr)) = (vb0, pr) {
+        let mut pos = FuncCursor::new(pos.func).at_bottom(vb0);
+        let mut splats: FxHashMap<Value, Value> = FxHashMap::default();
+        let mut smemo: FxHashMap<Value, Value> = FxHashMap::default();
+        let mut paccs: Vec<Value> = Vec::new();
+        let mut poks: Vec<Value> = Vec::new();
+        let mut pexact = true;
+        {
+            let mut addrs = Vec::new();
+            for (j, s) in p.streams.iter().enumerate() {
+                let e = i64::from(p.elem.bytes());
+                let (a, off) = if s.direct {
+                    if s.neg {
+                        let c = pos.ins().iconst(iv_ty, -(p.vf - 1) * e);
+                        (pos.ins().iadd(p.iv0, c), 0)
+                    } else {
+                        (p.iv0, 0)
+                    }
                 } else {
-                    let sk = pos.ins().iconst(iv_ty, p.step);
-                    pos.ins().udiv(d, sk)
+                    let a = srbases[j].unwrap();
+                    let off = if s.neg {
+                        (unroll as i64 - 1) * p.vf * e
+                    } else {
+                        0
+                    };
+                    (a, off)
                 };
-                match lane {
-                    Some(l) => pos.ins().iadd(d, l),
-                    None => d,
-                }
-            })
-        };
-        let mut args: Vec<Value> = Vec::new();
-        for (j, _) in params.iter().enumerate() {
-            if j == p.iv_idx {
-                args.push(ivr);
-                continue;
+                addrs.push((a, off));
             }
-            match p.kinds[j] {
-                Param::Inv => args.push(p.entry_args[j]),
-                Param::Step(_) if p.lagged.contains_key(&j) => {
-                    // Deferred value filled in below once `args` is complete.
-                    args.push(p.entry_args[j]);
-                }
-                Param::Step(s) => {
-                    let it = it_of(&mut pos);
-                    args.push(step_resume(&mut pos, iv_ty, p.entry_args[j], it, s));
-                }
-                Param::Other => unreachable!(),
+            let mut vmap: FxHashMap<Value, Value> = FxHashMap::default();
+            let iv_carried = p.iv_affines.iter().any(|a| a.res == p.iv);
+            if let Some(iota) = iota
+                && !iv_carried
+            {
+                let sp = pos.ins().splat(p.vt, p.iv0);
+                vmap.insert(p.iv, pos.ins().iadd(sp, iota));
+            }
+            for (ai, a) in p.iv_affines.iter().enumerate() {
+                vmap.insert(a.res, w0s[ai]);
+            }
+            let gaccs = early_masks(&mut pos, p, &mut vmap, &mut splats, &mut smemo, &addrs);
+            for &m in &gaccs {
+                band_acc(&mut pos, &mut paccs, m);
+            }
+            match gaccs[..] {
+                [m] if pos.func.dfg.value_type(m).lane_count() as i64 == p.vf => poks.push(m),
+                _ => pexact = false,
             }
         }
-        // Same deferred resume as the epilogue: `q(t) = bv(p(t-1))` for
-        // `t = it ≥ 1`, `entry` when the scalar loop restarts at 0.
-        let mut dmemo: FxHashMap<Value, Value> = FxHashMap::default();
-        for (j, _) in params.iter().enumerate() {
-            let Some(&bv) = p.lagged.get(&j) else {
-                continue;
-            };
-            let d = emit_deferred(&mut pos, p, &args, &mut dmemo, bv, 0);
-            let z = pos.ins().iconst(iv_ty, 0);
-            let t = it_of(&mut pos);
-            let c = pos.ins().icmp(IntCC::Equal, t, z);
-            args[j] = pos.ins().select(c, p.entry_args[j], d);
+        let mut ok = pos.ins().vall_true(paccs[0]);
+        for &a in &paccs[1..] {
+            let t = pos.ins().vall_true(a);
+            ok = pos.ins().band(ok, t);
         }
-        let bargs: Vec<BlockArg> = args.iter().map(|&v| BlockArg::Value(v)).collect();
-        pos.ins().jump(p.h, &bargs);
+        // All-ok: enter `vh` at iteration 0 with `cb`'s entry args (the
+        // loop re-tests group 0 — pure, see above).
+        let v_args: Vec<BlockArg> =
+            v_arg_vals.iter().map(|&v| BlockArg::Value(v)).collect();
+        pos.ins().brif(ok, vh, &v_args, pr, &[]);
+        // `pr`: the probe's resume — same re-entry as the loop's resume
+        // block, based at `iv0` with the probe's own lane masks.
+        let mut pos = FuncCursor::new(pos.func).at_bottom(pr);
+        let lane = (pexact && crate::env_is("PLIRON_VEC_EXACT", "1"))
+            .then(|| exact_lane(&mut pos, pr, &poks, p.vf, iv_ty));
+        resume_args(&mut pos, p, iv_ty, p.iv0, lane);
     }
 }
 

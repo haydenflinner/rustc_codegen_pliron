@@ -63,6 +63,54 @@ JTVEC + SELKNOWN_COND + VEC_EXACT: std 4,244 ok / 681 inconclusive, the
 same as the default; clcg every 4th 8,642 / 870; wasm-bench as wasm32
 2,264 / 398; no failing rows. Tests: `pliron-clif-opt/tests/search_vec.rs`.
 
+## Lane-0 probe (`PLIRON_VECPROBE=1`, 2026-11-24)
+
+The "scalar prologue" the last paragraph asks for, done inside
+`loopvec`: a block `vb0` between the trip guard and the vector header
+re-runs group 0's lane test alone (one `load.i8x16` + `icmp` +
+`vall_true` + `brif`). On a hit it resumes the scalar loop at the exact
+lane (`VEC_EXACT`'s mechanism works unchanged — group 0's window is a
+single 16-byte load, so its "first failing lane" is the answer); on
+all-ok it enters the vector header at iteration 0, where group 0's test
+simply re-executes. Peeling only group 0 — not the whole 64-byte
+window's scalar body — is what makes it cheap: ~10 extra instructions
+on a miss or deep hit, vs ~30 for the old full-window peel.
+
+Microbenchmark (instructions/call, `position`-shaped scan, 4 KiB
+buffer): hit=0: llvm ~20 / vec ~97 / **vp ~30**; hit=8: 44/55/30;
+hit=32: 202/64/44; hit=64: 423/75/60. With the probe a hit anywhere in
+the first 16 bytes is ~3x cheaper than before and already beats LLVM's
+scalar from byte 4; the miss/deep-hit cost is +8-12 over `vec`. Tests:
+`pliron-clif-opt/tests/search_vec_probe.rs` (5/5).
+
+ab.py retired instructions, ratio to `pliron` default:
+
+| program | vec | vp |
+|---|---:|---:|
+| pulldown-cmark | +3.0% | +1.4% |
+| rust-html-rewriter | +1.4% | +1.1% |
+| rust-json | +0.9% | +0.9% |
+| regex | -0.2% | -0.2% |
+
+irdiff.py exact counts, pulldown-cmark (def / vec / vp):
+46,702,904 / 47,564,770 / 47,198,378 — the probe recovers 42% of the
+vec regression. Per-function self-Ir vec->vp: `scan_atx_heading` -311k,
+`append_text` -266k (cheap early hits as designed);
+`scalar_iterate_special_bytes` +125k and `scan_code_fence` +61k pay the
+probe on deep hits; `scan_while<ws_no_nl>` is +172k vs def either way —
+its probe's `cbz` never fires in this workload (runs are <64 B or
+all-ws, so the vector path isn't reached) and the residual is the
+scalar path's restructure.
+
+A gotcha that cost a measurement cycle: `ab.py`/`irdiff.py` build
+against `target/release/` by default (`--backend`), while `cargo build`
+writes `target/debug/`. A `vec`-side binary built from a stale release
+dylib silently lacks a new opt-in knob — diff the rlib fingerprint's
+`rustflags` (or disassemble for the probe's `uminv;cbz`) when a knob
+appears not to fire. Also `irdiff.py --env` takes one `K=V` per flag;
+a comma-joined list parses as a single `K="1,K=V,..."` and disables
+everything.
+
 Before a flip: with `PLIRON_JTVEC=1` the `slotpromlt` stanza's
 `PLIRON_RA2_XBLOCK` size check sees no drop (1,456 -> 1,456 instructions;
 the threading removes the moves XBLOCK targets), so that stanza would
