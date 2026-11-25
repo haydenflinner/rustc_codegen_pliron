@@ -5112,6 +5112,19 @@ fn s_panicstub(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_padslot(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // Native only: the callee-save pressure it relieves is a frame
+    // concept; wasm has no prologue saves.
+    if p.target.is_wasm() {
+        return 0;
+    }
+    let k = crate::padslot::run(&mut p.clctx.func, an, crate::target::ptr_type(&p.target));
+    if k > 0 && p.dump {
+        p.dump("padslot");
+    }
+    k
+}
+
 fn s_brhint(p: &mut Pipe, an: &mut Analysis) -> usize {
     crate::brhint::run(&mut p.clctx.func, an)
 }
@@ -6268,6 +6281,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // block of their own instead of being live across the call.
         // After every pass that reshapes edges. Opt-in: `PLIRON_EXNCONST=1`.
         step("exnconst", "exnconst", Gate::OptIn("PLIRON_EXNCONST"), s_exnconst).needs(shape::CALL),
+        step("padslot", "padslot", Gate::OptIn("PLIRON_PADSLOT"), s_padslot).needs(shape::CALL),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),
