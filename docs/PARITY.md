@@ -1624,17 +1624,28 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    functions). Step time 0.8% of the pipeline on wasm-bench, 0.1% on
    std. Not done: dsa timing (tree broken), native kernels, x64.
 
-12. **TODO: `PLIRON_INLINE_GLUET` without its losses** (opened
-   2026-11-19, `history/2026-11-19-sibcall.md`). The drop-glue
-   threshold floor at 90 is html-rewriter -0.84%, protobuf -0.34%,
-   pulldown-cmark -0.31%, json -0.14%, but compression +1.25% and regex
-   +0.35% (non-`nop` exact counts); at 100 json +1.47% and pulldown
-   +0.52% as well, so it stays opt-in. Find which glue the two losers
-   now inline and why it costs (`bench/heldout/irdiff.py
-   rust-compression --env PLIRON_INLINE_GLUET=90`, then `--fn` on the
-   top movers), then narrow the floor (only glue with one warm call,
-   only callers outside loops, or a cap on the caller's growth) until no
-   program loses, and flip it.
+12. **`PLIRON_INLINE_GLUET` narrowed to death — the floor is the wrong
+   lever** (opened 2026-11-19, `history/2026-11-19-sibcall.md`;
+   investigated 2026-11-25, `history/2026-11-25-spill-dig.md`). The
+   drop-glue threshold floor at 90 is html-rewriter -0.84%, protobuf
+   -0.34%, pulldown-cmark -0.31%, json -0.14%, but compression +1.25%
+   and regex +0.35% (non-`nop` exact counts). Narrowing tried: a floor
+   only where an arg is (a gep of) a local alloca still cost compression
+   +2.1% instr (846→251 sites; the drop args there are locals too),
+   and a floor only for leaf glue (`ncalls<=1`, the shape LLVM keeps
+   inlining to `__rust_dealloc`) the same: +1.18M exact instructions,
+   `ProcessCommandsInternal` +649k — partial inlining is strictly worse
+   than none, since temps escaping through surviving calls still pin.
+   Even forced full inlining (`GLUET=300 DUPCOST=0 GROWTH=100000`:
+   pop_up_to ends with 7 direct `__rust_dealloc` like LLVM's 8 and no
+   glue calls) loses +0.8% instr on html — the drop temps stay pinned
+   by the sret→memcpy→drop chain (`accesses: out of range / self-copy`,
+   block-arg flow in the sroa census), so removing the call doesn't
+   dissolve them. LLVM's win is end-to-end temp dissolution
+   (sret promote + sroa + glue inlining iterate), not the calls.
+   Left open: generalize `memcpyopt::run_srcfwd` from temp-from-param to
+   temp-from-alloca forwarding of consuming-drop args, or teach sroa the
+   `out of range / self-copy` and flow shapes the drop temps hit.
 
 Opt-ins waiting only on a quiet-machine kernel timing (a detached batch
 times them; flip each that keeps every kernel): `PLIRON_WASM_PEEP_SIMD`,

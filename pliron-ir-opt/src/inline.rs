@@ -1600,6 +1600,15 @@ pub fn run(
     // TODO(2026-11-19): at 90 this trades (compression +1.25%, regex
     // +0.35%) for html-rewriter -0.84%; narrow it until nothing loses and
     // flip it (docs/PARITY.md codegen queue item 12).
+    // 2026-11-25: narrowed variants measured and abandoned — a floor only
+    // where an arg is (a gep of) a local alloca still cost compression
+    // +2.1% instr (846->251 sites), a floor only for leaf glue
+    // (ncalls<=1) the same (+1.18M exact, `ProcessCommandsInternal` +649k),
+    // and GLUET=300+DUPCOST=0+GROWTH=100000 (every glue call inlined:
+    // pop_up_to 7 direct `__rust_dealloc` like LLVM's 8) still lost
+    // +0.8% instr on html — the temps stay pinned by the
+    // sret->memcpy->drop chain (`accesses: out of range / self-copy`,
+    // block-arg flow), so call removal alone doesn't dissolve them.
     let glue_t: usize = crate::env_get("PLIRON_INLINE_GLUET")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
