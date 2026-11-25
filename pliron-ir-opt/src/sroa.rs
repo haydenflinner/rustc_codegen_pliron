@@ -246,6 +246,19 @@ fn pin_extent(ctx: &Context, st: &State, op: Ptr<Operation>, idx: usize) -> Opti
     r
 }
 
+/// `PLIRON_SROA_PINE` (opt-in): a consuming drop's operand pins only the
+/// callee's arg extent instead of `Escape`-copying the whole alloca.
+fn sroa_pine() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::env_is("PLIRON_SROA_PINE", "1"));
+    TEST_PINE.with(|c| c.get()).unwrap_or(*ON)
+}
+
+thread_local! {
+    /// `Some(on)` overrides the environment, `None` reads it (tests).
+    static TEST_PINE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// A direct call to `core::ptr`'s drop glue (`drop_glue`/`drop_in_place`,
 /// v0 and Itanium mangled components — the `4core3ptr` anchor keeps a
 /// same-named user function from matching). The call consumes the object:
@@ -886,6 +899,27 @@ fn accesses_inner(
                     op,
                     off: base as u64,
                     kind,
+                    flow,
+                });
+            } else if !flow
+                && sroa_pine()
+                && consuming_drop(ctx, op)
+                && pin_extent(ctx, st, op, idx).is_some_and(|(n, _)| in_range(base, n))
+            {
+                // `PLIRON_SROA_PINE` (opt-in): a consuming drop's operand
+                // pins only the callee's arg extent (`&mut T` -> |T|), not
+                // the whole alloca. `Escape` below would copy every slice
+                // into a fresh temp per call site — `drop_glue<RawVec>`
+                // on one field of a 72-byte `ElementDescriptor` temp
+                // stored all nine slices for a 24-byte pointee. The
+                // pinned span joins `pin_a` with writeback-only sync
+                // (a consuming drop needs no reload) and the rest of the
+                // alloca still promotes.
+                let (n, _) = pin_extent(ctx, st, op, idx).unwrap();
+                out.push(Access {
+                    op,
+                    off: base as u64,
+                    kind: Kind::Pin { idx, n },
                     flow,
                 });
             } else if !flow
@@ -2266,7 +2300,7 @@ pub fn run(ctx: &mut Context, st: &mut State) {
                         if !st.promoted.contains(a) {
                             let sz = st.allocas.get(a).map(|x| x.0).unwrap_or(0);
                             if pliron_cfg::tracing_on() {
-                                tracing::info!(target: "pliron::stats", "  whyfn {sz:5}B {} {name}", why2(ctx, st, a))
+                                tracing::info!(target: "pliron::stats", "  whyfn {sz:5}B v{} {} {name}", a.uid(), why2(ctx, st, a))
                             };
                         }
                     }
@@ -2587,6 +2621,7 @@ mod tests {
     use pliron::irfmt::parsers::spaced;
     use pliron::parsable::parse_from_str;
     use pliron_llvm::ops::FuncOp;
+    use pliron_llvm::types::{PointerType, VoidType};
 
     /// Parse `input`, register the `llvm.lifetime.start` ops in
     /// `st.intrinsics` (builder-side state the parser doesn't populate),
@@ -2689,5 +2724,79 @@ mod tests {
         let st = &mut State::default();
         let (a, m) = lt_fixture(&input, st, ctx);
         assert!(!lt_marker_bounded(ctx, st, &mut None, a, m));
+    }
+
+    /// `PLIRON_SROA_PINE`: a `drop_glue` operand pins only the callee's
+    /// arg extent — `drop_glue(&mut a)` on a 72-byte alloca with a
+    /// 24-byte pointee is a `Pin{24}` access, not a whole-alloca `Escape`
+    /// copy (one fresh temp fill per call site).
+    #[test]
+    fn drop_arg_pins_extent() {
+        let input = "        builtin.module @m {\n        ^block_0_0():\n          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {\n          ^entry():\n            one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;\n            p = llvm.alloca [builtin.integer i8 x one] : llvm.ptr (0);\n            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;\n            llvm.store *p <- v;\n            c = llvm.call @s1__RINvNtCscyJ6arFbMDT_4core3ptr9drop_glueE (p) : llvm.func <llvm.void (llvm.ptr (0)) variadic = false>;\n            llvm.return\n          }\n        }\n";
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input)
+            .expect("parse");
+        let mop = Operation::get_op::<ModuleOp>(op, ctx).unwrap();
+        let f = blocks(ctx, mop.get_operation())
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<FuncOp>(o, ctx))
+            .unwrap();
+        let mut a = None;
+        let mut call = None;
+        for b in blocks(ctx, f) {
+            for o in ops(ctx, b) {
+                if Operation::is_op::<AllocaOp>(o, ctx) {
+                    a = Some(o.deref(ctx).get_result(ctx, 0));
+                }
+                if Operation::get_op::<CallOp>(o, ctx).is_some() {
+                    call = Some(o);
+                }
+            }
+        }
+        let (a, call) = (a.unwrap(), call.unwrap());
+        st.allocas.insert(a, (72, 8));
+        let fty = FuncType::get(
+            ctx,
+            VoidType::get(ctx).into(),
+            vec![PointerType::get(ctx, 0).into()],
+            false,
+        );
+        st.calls.insert(
+            call,
+            crate::state::CallInfo {
+                fn_ty: fty.into(),
+                exts: crate::state::Exts::default(),
+                foreign: false,
+                cc: None,
+                tail: false,
+                nocap: Some(vec![true].into_boxed_slice()),
+                sret_nocap: false,
+                arg_extent: Some(vec![(24, 8)].into_boxed_slice()),
+                arg_noalias: None,
+                arg_byval_ro: None,
+                arg_ro: None,
+                bb: false,
+                callee: Some(
+                    "s1__RINvNtCscyJ6arFbMDT_4core3ptr9drop_glueE".to_string(),
+                ),
+                noret: false,
+            },
+        );
+        // Off (the default): the nocap-proven drop arg takes the Escape
+        // arm — a fresh copy of the whole 72-byte alloca per call site.
+        TEST_PINE.with(|c| c.set(Some(false)));
+        let (acc, _) = accesses(ctx, st, a, 72, 0).unwrap();
+        assert!(acc.iter().any(|x| matches!(x.kind, Kind::Escape { idx: 0 })));
+        // On: the same operand pins only the 24-byte arg extent.
+        TEST_PINE.with(|c| c.set(Some(true)));
+        let (acc, _) = accesses(ctx, st, a, 72, 0).unwrap();
+        assert!(
+            acc.iter()
+                .any(|x| matches!(x.kind, Kind::Pin { idx: 0, n: 24 }))
+        );
+        assert!(!acc.iter().any(|x| matches!(x.kind, Kind::Escape { .. })));
+        TEST_PINE.with(|c| c.set(None));
     }
 }

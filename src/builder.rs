@@ -1571,6 +1571,22 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     .get(0)
                     .is_some_and(|d| d.captures_none(self.tcx, env, abi.ret.layout.ty));
             }
+            // A drop-glue call (`core::ptr::drop_in_place`/`drop_glue`)
+            // takes its object by `*mut T`: a raw pointer, so `ext` below
+            // stays empty (pointee_size is deliberately zero for raw
+            // pointers — `slice.as_mut_ptr()` may legally cover the whole
+            // buffer). The dropped type is the instance's generic arg,
+            // and its layout is exactly the range the glue may reach —
+            // hand it to `arg_extent` so SROA pins just it instead of
+            // Escape-copying the operand's whole alloca.
+            let drop_ext = match instance.map(|i| i.def) {
+                Some(ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, ty))) => ty,
+                _ => None,
+            }
+                .and_then(|ty| {
+                    let l = self.cx.layout_of(ty);
+                    l.is_sized().then(|| (l.size.bytes(), l.align.abi.bytes()))
+                });
             for (ai, a) in abi.args.iter().enumerate() {
                 let n = match &a.mode {
                     PassMode::Ignore => 0,
@@ -1634,7 +1650,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                         (n > 0).then(|| (n, attrs.pointee_align.map_or(1, |a| a.bytes())))
                     }
                     _ => None,
-                };
+                }
+                .or((ai == 0 && a.layout.ty.is_raw_ptr())
+                    .then_some(())
+                    .and(drop_ext));
                 // rustc's own `noalias` mark on `&mut`/`&`-frozen/Box params.
                 // The borrow it carries ends when the call returns, so the
                 // callee cannot legally touch the pointee through a retained
