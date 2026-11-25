@@ -3067,6 +3067,101 @@ mod tests {
         );
         assert!(!srcfwd_alloca_try(&input, true));
     }
+
+    /// `PLIRON_SRCFWD_BPSRC` fixture: `sv` is `^loop`'s param — `dst` on
+    /// the `^a` route and on the backedge, `dst2` on `^b` — so `sv`
+    /// names a different alloca's window per traversal. `BPM` is the
+    /// `memcpy(tmp, sv, eight)` fill; `BPT` the loop's tail.
+    const BPH: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            dst = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            dst2 = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            v = llvm.constant <builtin.integer <7: i64>> : builtin.integer i64;
+            flag = llvm.constant <builtin.integer <1: i1>> : builtin.integer i1;
+            llvm.cond_br if flag ^a() else ^b()
+          ^a():
+            llvm.br ^loop(dst)
+          ^b():
+            llvm.br ^loop(dst2)
+          ^loop(sv: llvm.ptr (0)):
+    "#;
+    const BPM: &str = "            m = llvm.call_intrinsic @\"llvm.memcpy\" (tmp, sv, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n";
+    const BPT: &str = "        llvm.cond_br if flag ^loop(dst) else ^exit()\n          ^exit():\n            llvm.return\n        }\n    }\n";
+
+    fn srcfwd_bpsrc_try(input: &str, on: bool) -> bool {
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, _m) = fixture(input, st, ctx);
+        let entry = f.deref(ctx).get_region(ctx, 0).deref(ctx).get_head().unwrap();
+        // First alloca is `tmp` (entry order), the temp to forward.
+        let tmp = blocks(ctx, f)
+            .into_iter()
+            .flat_map(|b| ops(ctx, b))
+            .find(|&o| Operation::is_op::<AllocaOp>(o, ctx))
+            .map(|o| o.deref(ctx).get_result(ctx, 0))
+            .unwrap();
+        TEST_BPSRC.with(|c| c.set(Some(on)));
+        let ok = srcfwd_one(ctx, st, entry, f, tmp, &mut None, &mut None, None, "");
+        TEST_BPSRC.with(|c| c.set(None));
+        ok
+    }
+
+    /// `sv` carries `dst` or `dst2` by route; the fill is `^loop`'s head
+    /// op, so every surviving use sees this traversal's window. The
+    /// temp's uses rebase onto `sv` itself. Off by default.
+    #[test]
+    fn srcfwd_bpsrc_loop_carried_forwarded() {
+        let input = format!("{BPH}{BPM}            r = llvm.load tmp : builtin.integer i64;\n{BPT}");
+        assert!(srcfwd_bpsrc_try(&input, true));
+        assert!(!srcfwd_bpsrc_try(&input, false));
+    }
+
+    /// The same loop with `tmp` read *before* the fill: that read holds
+    /// the previous traversal's window (uninitialized on the first), and
+    /// the rebase would hand it `sv`'s new one. Must refuse.
+    #[test]
+    fn srcfwd_bpsrc_unguarded_use_refused() {
+        let input = format!("{BPH}            r = llvm.load tmp : builtin.integer i64;\n{BPM}{BPT}");
+        assert!(!srcfwd_bpsrc_try(&input, true));
+    }
+
+    /// `sv` is still the loop param but the fill sits on one arm only:
+    /// the `^use` route reaches the load having crossed no fill since
+    /// `sv` moved. Must refuse.
+    #[test]
+    fn srcfwd_bpsrc_arm_unguarded_refused() {
+        let input = format!(
+            "{BPH}            llvm.cond_br if flag ^fill() else ^use()\n          ^fill():\n{BPM}            llvm.br ^join()\n          ^use():\n            r = llvm.load tmp : builtin.integer i64;\n            llvm.br ^join()\n          ^join():\n{BPT}"
+        );
+        assert!(!srcfwd_bpsrc_try(&input, true));
+    }
+
+    /// `tmp` read in `^a`, which `sv`'s block does not dominate: the
+    /// rebase pointer isn't defined there. Must refuse.
+    #[test]
+    fn srcfwd_bpsrc_non_dominating_refused() {
+        let input = format!("{BPH}{BPM}{BPT}").replace(
+            "llvm.br ^loop(dst)",
+            "r = llvm.load tmp : builtin.integer i64;\n            llvm.br ^loop(dst)",
+        );
+        assert!(!srcfwd_bpsrc_try(&input, true));
+    }
+
+    /// A write of `dst` — one of `sv`'s windows — between the fill and
+    /// the read: the rebase would show the new bytes where the temp kept
+    /// the old. Must refuse.
+    #[test]
+    fn srcfwd_bpsrc_write_between_refused() {
+        let input = format!(
+            "{BPH}{BPM}            llvm.store *dst <- v;\n            r = llvm.load tmp : builtin.integer i64;\n{BPT}"
+        );
+        assert!(!srcfwd_bpsrc_try(&input, true));
+    }
 }
 
 /// `PLIRON_MEMCPYOPT_SRCFWD=1`: a temporary that only a copy of an
@@ -3120,10 +3215,25 @@ pub fn run_srcfwd(ctx: &mut Context, st: &mut State) {
                         continue;
                     }
                     let t = op.deref(ctx).get_operand(ctx, 0);
-                    if t.defining_op().is_some_and(|a| Operation::is_op::<AllocaOp>(a, ctx))
-                        && src_base(ctx, st, entry, inc_of(ctx, f, &mut inc_slot), op.deref(ctx).get_operand(ctx, 1)).is_some()
-                        && seen.insert(t)
-                    {
+                    if !t.defining_op().is_some_and(|a| Operation::is_op::<AllocaOp>(a, ctx)) {
+                        continue;
+                    }
+                    let sv = op.deref(ctx).get_operand(ctx, 1);
+                    let resolves = src_base(ctx, st, entry, inc_of(ctx, f, &mut inc_slot), sv).is_some()
+                        || (srcfwd_bpsrc()
+                            && base_offsets(ctx, st, inc_of(ctx, f, &mut inc_slot), sv).is_some());
+                    if !resolves {
+                        if trace {
+                            let kind = match alloca_bases(ctx, st, inc_of(ctx, f, &mut inc_slot), sv) {
+                                Some(bs) => format!("src merges {} allocas", bs.len()),
+                                None if sv.defining_op().is_none() => "src block-param/other value".to_string(),
+                                None => format!("src is {}", sv.defining_op().map(|d| Operation::get_opid(d, ctx).to_string()).unwrap_or_default()),
+                            };
+                            tracing::debug!(target: "pliron::memcpyopt", "srcfwd: {kind} ({})", name.as_deref().unwrap_or(""));
+                        }
+                        continue;
+                    }
+                    if seen.insert(t) {
                         cands.push(t);
                     }
                 }
@@ -3181,13 +3291,119 @@ fn param_base(ctx: &Context, st: &State, entry: Ptr<BasicBlock>, v: Value) -> Op
 /// a later loop iteration hides behind that iteration's copy, only a
 /// write that reaches a read without crossing a fill is a conflict.
 fn srcfwd_alloca() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_SRCFWD_ALLOCA", "0"));
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_SRCFWD_ALLOCA", "1"));
     TEST_ALLOCA.with(|c| c.get()).unwrap_or(*ON)
 }
 
 thread_local! {
     /// `Some(on)` overrides the environment, `None` reads it (tests).
     static TEST_ALLOCA: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `PLIRON_SRCFWD_BPSRC=1` (opt-in): a temp's fill-copy may also read
+/// through a block parameter — `memcpy(t, sv, n)` where `sv` is a param
+/// (or a GEP of one) whose incoming edges resolve to more than one
+/// constant `(alloca, offset)` window, or to a window `alloca_base`
+/// could not pin to a single base+offset (`alloca_bases`'s union: the
+/// html census's "src merges 1 allocas", ~1550 candidate copies vs ~60
+/// accepted temps, 2026-11-19). `sv` itself is the rebase pointer — the
+/// param already names the window the copy read — but it is an SSA name
+/// for a *different* window on each traversal of its block, so besides
+/// `alloca_base`'s per-edge bounds the transform needs two extra checks
+/// `srcfwd_one` spells out: `sv`'s def must dominate every surviving
+/// temp use, and every such use must be reached from that def only by
+/// crossing a fill (an unfilled temp holds an older window's bytes where
+/// the rebase would hand it the newer one).
+fn srcfwd_bpsrc() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env_is("PLIRON_SRCFWD_BPSRC", "1"));
+    TEST_BPSRC.with(|c| c.get()).unwrap_or(*ON)
+}
+
+thread_local! {
+    /// `Some(on)` overrides the environment, `None` reads it (tests).
+    static TEST_BPSRC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `v` as the set of constant `(alloca, byte-offset)` windows it may
+/// point at: `alloca_bases`'s union walk with the offsets kept — constant
+/// GEPs down to an `st.allocas` alloca, block parameters resolved per
+/// incoming edge. `None` when any edge is opaque (a non-constant GEP, a
+/// load, a callee operand, an entry param — `src_base`'s param case owns
+/// those), a cycle bites, or more than 16 windows meet.
+fn base_offsets(
+    ctx: &Context,
+    st: &State,
+    inc: Option<&IncMap>,
+    v: Value,
+) -> Option<FxHashSet<(Value, u64)>> {
+    let mut memo: FxHashMap<Value, Option<FxHashSet<(Value, u64)>>> = FxHashMap::default();
+    let mut on = FxHashSet::default();
+    base_offsets_d(ctx, st, inc, v, &mut memo, &mut on).filter(|s| s.len() <= 16)
+}
+
+fn base_offsets_d(
+    ctx: &Context,
+    st: &State,
+    inc: Option<&IncMap>,
+    mut v: Value,
+    memo: &mut FxHashMap<Value, Option<FxHashSet<(Value, u64)>>>,
+    on: &mut FxHashSet<Value>,
+) -> Option<FxHashSet<(Value, u64)>> {
+    let mut off: i64 = 0;
+    for _ in 0..16 {
+        if let Some(d) = v.defining_op() {
+            if Operation::is_op::<AllocaOp>(d, ctx) {
+                return (st.allocas.contains(v) && off >= 0)
+                    .then(|| [(v, off as u64)].into_iter().collect());
+            }
+            if !Operation::is_op::<GetElementPtrOp>(d, ctx) {
+                return None;
+            }
+            off = off.checked_add(gep_offset(ctx, st, d)?)?;
+            v = d.deref(ctx).get_operand(ctx, 0);
+            continue;
+        }
+        let res = if let Some(r) = memo.get(&v) {
+            r.clone()
+        } else if on.insert(v) {
+            let mut acc: Option<FxHashSet<(Value, u64)>> = Some(FxHashSet::default());
+            if let Some(edges) = inc.and_then(|m| m.get(&v)).filter(|e| !e.is_empty()) {
+                for &(t, si, k) in edges {
+                    let Some(iv) = inc_value(ctx, t, si, k)
+                        .and_then(|iv| base_offsets_d(ctx, st, inc, iv, memo, on))
+                    else {
+                        acc = None;
+                        break;
+                    };
+                    let a = acc.as_mut().unwrap();
+                    a.extend(iv);
+                    if a.len() > 16 {
+                        acc = None;
+                        break;
+                    }
+                }
+            } else {
+                acc = None;
+            }
+            on.remove(&v);
+            memo.insert(v, acc.clone());
+            acc
+        } else {
+            None
+        };
+        // The GEPs above the param shift every edge's window.
+        return res.and_then(|rs| {
+            rs.iter()
+                .map(|&(b, o)| {
+                    (off >= 0)
+                        .then(|| o.checked_add(off as u64))
+                        .flatten()
+                        .map(|o| (b, o))
+                })
+                .collect()
+        });
+    }
+    None
 }
 
 /// `v` as `(base, byte offset, is_alloca)`: constant GEPs (and, for the
@@ -3285,6 +3501,36 @@ fn reached_after(
     Some(out)
 }
 
+/// A fill-copy's resolved source: what the temp's uses rebase onto.
+/// Param and Alloca name a *fixed* base — the rebase pointer is freshly
+/// built (`gep(base, off)`), so only the base's bytes can drift between a
+/// fill and a use. `BParam` names the copy's own source operand — a
+/// pointer that is itself a different window on each traversal of its
+/// block, which carries the two extra checks below.
+enum Src {
+    /// An entry `noalias` param at a byte offset — the original source.
+    Param(Value, u64),
+    /// A local alloca at a byte offset (`PLIRON_SRCFWD_ALLOCA`).
+    Alloca(Value, u64),
+    /// The fill-copy's source operand and the `(alloca, offset)` windows
+    /// its incoming edges resolve to (`PLIRON_SRCFWD_BPSRC`).
+    BParam(Value, FxHashSet<(Value, u64)>),
+}
+
+/// Two fill-copies read the same source bytes: the same base window for
+/// the fixed bases, the same operand value for a param-carried one —
+/// different operands may carry different windows even with equal edge
+/// sets.
+fn same_src(a: &Src, b: &Src) -> bool {
+    match (a, b) {
+        (Src::Param(x, o), Src::Param(y, p)) | (Src::Alloca(x, o), Src::Alloca(y, p)) => {
+            x == y && o == p
+        }
+        (Src::BParam(x, _), Src::BParam(y, _)) => x == y,
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn srcfwd_one(
     ctx: &mut Context,
@@ -3307,7 +3553,7 @@ fn srcfwd_one(
     let mut readers: Vec<Ptr<Operation>> = Vec::new();
     let mut markers: Vec<Ptr<Operation>> = Vec::new();
     let mut drops: Vec<Ptr<Operation>> = Vec::new();
-    let mut src: Option<(Value, u64, bool)> = None;
+    let mut src: Option<Src> = None;
     let mut work = vec![t];
     let mut cone: Vec<Ptr<Operation>> = Vec::new();
     let mut budget = 4096usize;
@@ -3339,10 +3585,22 @@ fn srcfwd_one(
                         if len != Some(n) {
                             sfno!(name, "partial copy into the temp");
                         }
-                        let Some(b) = src_base(ctx, st, entry, inc_of(ctx, f, inc_slot), op.deref(ctx).get_operand(ctx, 1)) else {
+                        let sv = op.deref(ctx).get_operand(ctx, 1);
+                        let b = src_base(ctx, st, entry, inc_of(ctx, f, inc_slot), sv)
+                            .map(|(s, o, isa)| if isa { Src::Alloca(s, o) } else { Src::Param(s, o) })
+                            .or_else(|| {
+                                // `PLIRON_SRCFWD_BPSRC`: a param-carried
+                                // source — the operand value is the rebase
+                                // pointer, its edges give the windows.
+                                srcfwd_bpsrc()
+                                    .then(|| base_offsets(ctx, st, inc_of(ctx, f, inc_slot), sv))
+                                    .flatten()
+                                    .map(|edges| Src::BParam(sv, edges))
+                            });
+                        let Some(b) = b else {
                             sfno!(name, "copy from something else");
                         };
-                        if src.is_some_and(|s| s != b) {
+                        if src.as_ref().is_some_and(|s| !same_src(s, &b)) {
                             sfno!(name, "copies from two sources");
                         }
                         src = Some(b);
@@ -3362,50 +3620,197 @@ fn srcfwd_one(
                 // rebased, may write the param's.
                 drops.push(op);
             } else {
+                // Census (temporary): for a call-arg use, log the facts a
+                // `PLIRON_SRCFWD_CALLARG` rule would need — arg index, the
+                // call-site `nocap`/`arg_ro`/`arg_extent`, and the callee's
+                // `nocapture`/`nowrite` summaries.
+                if pliron_cfg::tracing_on()
+                    && Operation::get_op::<CallOp>(op, ctx).is_some()
+                    && let Some(info) = st.calls.get(op)
+                {
+                    let direct = Operation::get_op::<CallOp>(op, ctx).unwrap().get_attr_llvm_call_callee(ctx).is_some();
+                    let ai = i.wrapping_sub(usize::from(!direct));
+                    let sym = info.callee.as_deref();
+                    tracing::debug!(target: "pliron::memcpyopt",
+                        "srcfwd: temp in {} {:?} ai={ai} nocap={:?} ro={:?} ext={:?} sum_nc={} nowrite={:?} ({})",
+                        Operation::get_opid(op, ctx), sym,
+                        info.nocap.as_ref().and_then(|n| n.get(ai)),
+                        info.arg_ro.as_ref().and_then(|r| r.get(ai)),
+                        info.arg_extent.as_ref().and_then(|e| e.get(ai)),
+                        sym.and_then(|s| st.nocapture.get(s)).map(|s| s.contains(&(ai as u32))).unwrap_or(false),
+                        sym.and_then(|s| st.nowrite.get(s)),
+                        name.unwrap_or(""));
+                }
                 sfno!(name, "temp in {} {:?}", Operation::get_opid(op, ctx), st.calls.get(op).and_then(|c| c.callee.as_deref()));
             }
         }
     }
-    let Some((s, off, isa)) = src else { return false };
+    let Some(src) = src else { return false };
     readers.extend_from_slice(&drops);
     // Where the rebased pointer's `gep(s, off)` is built: at the temp's
     // alloca for a parameter (its def dominates everything), right after
     // the source alloca's own def otherwise — `a_op` dominating `t_op`
     // would be enough but is needlessly narrow (same-block order), so
-    // the check below is per cone op instead.
+    // the check below is per cone op instead. A `BParam` source rebases
+    // onto the operand itself (`ptr_plus` at offset 0 returns it), so
+    // `at` stays unused there.
     let mut at = t_op;
-    let (deref, writable) = if isa {
-        // Alloca source (`PLIRON_SRCFWD_ALLOCA`): the slot's own size is
-        // the dereferenceable bound and it is always writable. `s`'s def
-        // must dominate every op that used a `t`-rooted pointer — the
-        // reads rebase onto `s + off`, so `s` has to be defined wherever
-        // they were — and the source can't be the temp itself (a copy
-        // out of `t` into `t`).
-        if s == t {
-            sfno!(name, "copy out of the temp itself");
+    let (deref, writable) = match &src {
+        Src::Alloca(s, _) => {
+            // Alloca source (`PLIRON_SRCFWD_ALLOCA`): the slot's own size
+            // is the dereferenceable bound and it is always writable.
+            // `s`'s def must dominate every op that used a `t`-rooted
+            // pointer — the reads rebase onto `s + off`, so `s` has to be
+            // defined wherever they were — and the source can't be the
+            // temp itself (a copy out of `t` into `t`).
+            if *s == t {
+                sfno!(name, "copy out of the temp itself");
+            }
+            let Some(&(sz, _)) = st.allocas.get(*s) else { return false };
+            let Some(a_op) = s.defining_op() else { return false };
+            if !cone.iter().all(|&o| op_dominates(ctx, st, dom_slot, f, a_op, o)) {
+                sfno!(name, "source alloca does not dominate a temp use");
+            }
+            let Some(next) = a_op.get_next(ctx) else { return false };
+            at = next;
+            (sz, true)
         }
-        let Some(&(sz, _)) = st.allocas.get(s) else { return false };
-        let Some(a_op) = s.defining_op() else { return false };
-        if !cone.iter().all(|&o| op_dominates(ctx, st, dom_slot, f, a_op, o)) {
-            sfno!(name, "source alloca does not dominate a temp use");
+        Src::Param(s, _) => {
+            let Some(&(deref, writable)) = st.noalias.get(*s) else { return false };
+            (deref, writable)
         }
-        let Some(next) = a_op.get_next(ctx) else { return false };
-        at = next;
-        (sz, true)
-    } else {
-        let Some(&(deref, writable)) = st.noalias.get(s) else { return false };
-        (deref, writable)
+        Src::BParam(..) => (0, true),
     };
     if !drops.is_empty() && !writable {
         sfno!(name, "drop of a temp copied from read-only memory");
     }
-    if off.checked_add(n).is_none_or(|e| e > deref) {
-        sfno!(name, "source range past dereferenceable {deref}");
+    match &src {
+        Src::Param(_, off) | Src::Alloca(_, off) => {
+            if off.checked_add(n).is_none_or(|e| e > deref) {
+                sfno!(name, "source range past dereferenceable {deref}");
+            }
+        }
+        Src::BParam(sv, edges) => {
+            // Every edge's `[off, off + n)` must sit inside its alloca
+            // (a `gep` of the temp's own slot is a copy out of it).
+            for &(b, o) in edges {
+                if b == t {
+                    sfno!(name, "copy out of the temp itself");
+                }
+                let Some(&(sz, _)) = st.allocas.get(b) else { return false };
+                if o.checked_add(n).is_none_or(|e| e > sz) {
+                    sfno!(name, "source window past its base's {sz} bytes");
+                }
+            }
+            // `sv` is the rebase pointer: its definition must dominate
+            // every surviving temp use (the copies and markers are
+            // erased, so they are exempt — their operands die with them).
+            let cset: FxHashSet<Ptr<Operation>> = copies.iter().copied().collect();
+            let surv: FxHashSet<Ptr<Operation>> = cone
+                .iter()
+                .copied()
+                .filter(|o| !cset.contains(o) && !markers.contains(o))
+                .collect();
+            let ok = match sv.defining_op() {
+                Some(d) => cone
+                    .iter()
+                    .all(|&o| !surv.contains(&o) || op_dominates(ctx, st, dom_slot, f, d, o)),
+                None => {
+                    let Some(db) = sv.defining_block() else { return false };
+                    match dom_of(ctx, st, dom_slot, f) {
+                        Some(d) => cone.iter().all(|&o| {
+                            !surv.contains(&o)
+                                || o.deref(ctx)
+                                    .get_parent_block()
+                                    .is_some_and(|ob| d.dominates(db, ob))
+                        }),
+                        None => false,
+                    }
+                }
+            };
+            if !ok {
+                sfno!(name, "source value does not dominate a temp use");
+            }
+            // `sv` names a *different* window on every traversal of its
+            // block: a temp use reached from `sv`'s def without crossing
+            // a fill holds an older window's bytes, which the rebase
+            // would swap for the newer pointer's. The fill copies are
+            // the barriers — a use every path covers with a fill sees the
+            // window this traversal's `sv` already names.
+            let unguarded = match sv.defining_op() {
+                Some(d) => reached_after(ctx, st, &[d], &surv, Some(&cset)),
+                // A param is defined at its block's head; `sv`'s lifetime
+                // starts before the head op, so the walk must cover the
+                // whole block — a seed of the terminator has no next op,
+                // which makes `reached_after` scan the block from its head
+                // (the usual case has the fill AS the head op, and uses
+                // past it are exactly the guarded ones).
+                None => sv.defining_block().and_then(|db| {
+                    let term = db.deref(ctx).get_terminator(ctx)?;
+                    reached_after(ctx, st, &[term], &surv, Some(&cset))
+                }),
+            };
+            match unguarded {
+                Some(u) if u.is_empty() => {}
+                Some(_) => sfno!(name, "a temp use is reached without a fill after the source moved"),
+                None => sfno!(name, "walk budget"),
+            }
+        }
     }
-    let frozen = !isa && drops.is_empty() && st.frozen.get(s).is_some_and(|&d| d >= off + n);
+    let frozen = match &src {
+        Src::Param(s, off) => {
+            drops.is_empty() && st.frozen.get(*s).is_some_and(|&d| d >= off + n)
+        }
+        _ => false,
+    };
     if !frozen {
-        let (lo, hi) = (off, off + n);
-        let Some((users, captured)) = src_touches(ctx, st, s, deref) else {
+        let (lo, hi) = match &src {
+            Src::Param(_, off) | Src::Alloca(_, off) => (*off, *off + n),
+            Src::BParam(..) => (0, n),
+        };
+        let (s, off) = match &src {
+            Src::Param(s, off) | Src::Alloca(s, off) => (*s, *off),
+            Src::BParam(..) => (t, 0), // unused on that path
+        };
+        let Some((users, captured)) = (match &src {
+            Src::BParam(_, edges) => {
+                // The union of every edge's touches of its base's window,
+                // walked through the block params that carry them
+                // (`base_touches` follows `succ_param`; `src_touches`
+                // would call the branch operand itself an escape).
+                let mut out: Touches = FxHashMap::default();
+                for &(b, o) in edges {
+                    let sz = st.allocas.get(b).map(|x| x.0).unwrap_or(0);
+                    let Some(t2) = base_touches(ctx, st, b, sz, o, n) else {
+                        sfno!(name, "source walk budget");
+                    };
+                    for (op, k) in t2 {
+                        let e = out.entry(op).or_insert(k);
+                        if *e != k {
+                            *e = TouchKind::Other;
+                        }
+                    }
+                }
+                Some((
+                    out.into_iter()
+                        .map(|(op, k)| {
+                            (
+                                op,
+                                vec![Touch {
+                                    read: k != TouchKind::Write,
+                                    write: k != TouchKind::Read,
+                                    lo: 0,
+                                    hi: u64::MAX,
+                                    kill: false,
+                                }],
+                            )
+                        })
+                        .collect::<FxHashMap<Ptr<Operation>, Vec<Touch>>>(),
+                    false,
+                ))
+            }
+            _ => src_touches(ctx, st, s, deref),
+        }) else {
             sfno!(name, "source walk budget");
         };
         if readers.iter().any(|r| users.contains_key(r)) {
@@ -3448,7 +3853,9 @@ fn srcfwd_one(
                 // read's temp was last written by a copy that already saw
                 // the write. Off by default: the barriers also widen the
                 // param-source transform, so it goes under the same knob.
-                let cset = srcfwd_alloca()
+                // `PLIRON_SRCFWD_BPSRC` needs them outright — a param
+                // source only exists to be refilled.
+                let cset = (srcfwd_alloca() || matches!(src, Src::BParam(..)))
                     .then(|| copies.iter().copied().collect::<FxHashSet<Ptr<Operation>>>());
                 // `PLIRON_SRCFWD_RANGES=1`: a write conflicts only with a read
                 // after it whose bytes overlap (temp coordinates; unknown
@@ -3456,7 +3863,8 @@ fn srcfwd_one(
                 // field (`drop_in_place::<T>` touches the `T` at its pointer:
                 // rustc's pointee size, `arg_extent`), so an unwind chain
                 // dropping a moved value's fields one by one is no conflict.
-                let precise = srcfwd_ranges() && hit.len() <= 32;
+                // A `BParam` walk has no per-op ranges to be precise with.
+                let precise = srcfwd_ranges() && hit.len() <= 32 && !matches!(src, Src::BParam(..));
                 let late = if precise {
                     let wr = |w: Ptr<Operation>| -> Option<(i64, i64)> {
                         if drops.contains(&w) {
@@ -3510,15 +3918,21 @@ fn srcfwd_one(
     if !crate::bisect_in("memcpyopt-srcfwd", bname) {
         return false;
     }
+    // `(rebase pointer, offset)`: the resolved base for the fixed-base
+    // sources, the copy's own operand for a param-carried one.
+    let (rb, roff, rwhat) = match &src {
+        Src::Param(s, off) | Src::Alloca(s, off) => (*s, *off, "base"),
+        Src::BParam(sv, _) => (*sv, 0, "param"),
+    };
     if pliron_cfg::tracing_on() {
-        tracing::debug!(target: "pliron::memcpyopt", "srcfwd: {n}-byte temp reads param at +{off}: {} copies, {} reads ({})",
+        tracing::debug!(target: "pliron::memcpyopt", "srcfwd: {n}-byte temp reads {rwhat} at +{roff}: {} copies, {} reads ({})",
             copies.len(), readers.len(), name.unwrap_or(""));
     }
     for op in copies.into_iter().chain(markers) {
         st.intrinsics.remove(op);
         Operation::erase(op, ctx);
     }
-    let base = crate::sroa::ptr_plus(ctx, st, s, off, at);
+    let base = crate::sroa::ptr_plus(ctx, st, rb, roff, at);
     t.replace_all_uses_with(ctx, &base);
     st.allocas.remove(t);
     st.promoted.remove(t);
