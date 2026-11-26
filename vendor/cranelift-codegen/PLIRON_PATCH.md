@@ -2519,7 +2519,7 @@ reserved register and its save restores the allocatable one. `bl`
 sites have dead scratch regs regardless; the only remaining hole is
 the `force_veneers` debug hook, which has no in-tree users.
 
-## `PLIRON_CONSTSINK_V` (opt-in): rematerializable-constant sinking
+## `PLIRON_CONSTSINK_V` (on by default, `=0` disables): rematerializable-constant sinking
 
 `src/context.rs` (`Context::pliron_constsink`, runs inside
 `Context::optimize` post-pipeline; the same pass also exists as the

@@ -2163,15 +2163,74 @@ impl Context {
                 );
             }
             // A group is served when a copy lands where it replaces a
-            // use that reads the constant in a register — or where
-            // the copy's materialization can never cost a trip of the
+            // use that reads the constant in a register — or where the
+            // copy's materialization can never cost a trip of the
             // loop's main path. Same- or shallower-level blocks clone
             // only when a use materializes the register (a fold-only
             // group's clone is pure allocation noise); deeper blocks
-            // clone only when the block is off its loop's cyclic path
-            // — it dominates no latch (`off_path`) or is `cold` — and
-            // every use there is cheap, so the copy rides a rare
-            // transition (utf8's bail preds).
+            // clone only when every use there is cheap — an edge arg
+            // that `term_cheap` already proved rides a rare
+            // transition, or an operand that folds into an aarch64
+            // immediate at lowering (`band #0x8080..`, `cmp #0`,
+            // `add #16`) and so costs nothing wherever the copy
+            // lands.
+            //
+            // Clone only when the banked def cannot stay live in a
+            // loop: every NON-home group must be servable — the copies
+            // then cover all out-of-block uses. A surviving def serves
+            // only its own block (`home`), so its range shrinks to a
+            // few instructions either way — a full kill (utf8's
+            // constants `0..=8`, freed from `x2..x11`) or a def that
+            // dies right after its last same-block use. A clone on a
+            // def that survives into another block is pure overhead:
+            // the register stays pinned and every copy adds a
+            // materialization plus allocation noise (brotli's
+            // `literal_cost` partial clones, +357K executed). A
+            // deeper group with a non-cheap use likewise keeps the
+            // banked register alive on the hot path, so coverage must
+            // be total.
+            //
+            // When the def dies outright (no home use) an all-cheap
+            // deeper group is enough: each copy is the last
+            // materializer for its block. When it survives at home,
+            // the register is freed anyway — deeper clones then pay
+            // off only on paths a trip can skip, so require
+            // `off_path`/`cold` too (a main-path copy would just be a
+            // per-trip `mov` whose value folds unused — brotli's
+            // dispatch arms). And survival is only worth it when the
+            // home uses are themselves cheap: a `call`/`store`/`umin`
+            // operand keeps a real register read at home on top of
+            // the copies (literal_cost's dispatch defs).
+            let survive = home_group.is_some();
+            let killable = groups.iter().all(|&(u, ref us)| {
+                if u == home {
+                    return us
+                        .iter()
+                        .all(|&ui| cheap_use(&self.func.dfg, &self.func.layout, u, ui));
+                }
+                if self.loop_analysis.loop_level(u).level() > home_level {
+                    csedge
+                        && us.iter().all(|&ui| {
+                            cheap_use(&self.func.dfg, &self.func.layout, u, ui)
+                        })
+                        && (!survive
+                            || off_path(
+                                &self.cfg,
+                                &self.domtree,
+                                &self.loop_analysis,
+                                &self.func.layout,
+                                u,
+                            )
+                            || self.func.layout.is_cold(u))
+                } else {
+                    us.iter().any(|&ui| {
+                        materializes(&self.func.dfg, &self.func.layout, u, ui)
+                    })
+                }
+            });
+            if !killable {
+                continue;
+            }
             let mut cloned = false;
             let mut served = 0;
             for (lp, gis) in by_loop {
@@ -2237,41 +2296,24 @@ impl Context {
                         // per use block (still guarded below).
                         for &gi in &gis {
                             let (u, ref us) = groups[gi];
-                            // Never materialize into a deeper loop
-                            // nest than the def sits in — unless the
-                            // block is off its loop's cyclic path
-                            // (`off_path`/`cold`) and every use there
-                            // is cheap. A clone on the main path pays
-                            // a `mov` per trip on top of the banked
-                            // register that still reaches the rest
+                            // The same test the `killable` gate
+                            // applied: every use in a deeper block
+                            // must be cheap — a real register use (a
+                            // call arg, `isub`'s LHS) keeps the banked
+                            // def alive and was already refused above
                             // (brotli's Zopfli inner loops: 26 folded
                             // `ishl` clones of `2` per block into
                             // L2/L3 shuffled every in-loop live
                             // range — +236K executed as
                             // reloads/remats; regex's `cached_state`
                             // sank a `mov #1<<32` into an inner slice
-                            // loop — +215K movs).
+                            // loop — +215K movs). The banked def
+                            // keeps serving the rest.
                             if self.loop_analysis.loop_level(u).level() > home_level {
-                                // A deeper clone is only ever free on
-                                // a block the loop's main path skips:
-                                // off the cyclic path or `cold`. And
-                                // every use there must be cheap —
-                                // a real register use (a call arg,
-                                // `isub`'s LHS) pays the copy's `mov`
-                                // whenever the block does run
-                                // (brotli's `SetCost` call arm,
-                                // +358K executed).
                                 if !csedge
                                     || !us.iter().all(|&ui| {
                                         cheap_use(&self.func.dfg, &self.func.layout, u, ui)
                                     })
-                                    || !(off_path(
-                                        &self.cfg,
-                                        &self.domtree,
-                                        &self.loop_analysis,
-                                        &self.func.layout,
-                                        u,
-                                    ) || self.func.layout.is_cold(u))
                                 {
                                     continue;
                                 }
