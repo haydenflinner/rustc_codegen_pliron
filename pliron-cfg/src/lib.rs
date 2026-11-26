@@ -45,6 +45,11 @@ pub const DEFAULT_ON: &[&str] = &[
     // (-0.50%); crates 20/20 under the knob. `PLIRON_INLINE_RECSELF=0`
     // off.
     "PLIRON_INLINE_RECSELF",
+    // 2026-11-26: vrp folds `rem < divisor` when the divisor is proven
+    // nonzero or the rem is multi-use (int_divz trap preserved).
+    // std corpus -2.7k static insts over 28 fns; diffcheck-clean 7,320
+    // fns; held-out effect noise. `PLIRON_UREMCMP=0` off.
+    "PLIRON_UREMCMP",
     // 2026-11-26: frozen_loads peels nested `iadd` chains to the frozen
     // base (`x.data.heap.cap`, smallvec's `capacity()`, montgomery's
     // per-iteration min decode lowers as `iadd(iadd(x, 8), 8)`), so the

@@ -369,12 +369,13 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
         *ON.get_or_init(|| std::env::var("PLIRON_FMUL1").as_deref() == Ok("1"))
     }
 
-    /// PLIRON: `PLIRON_XREDUCE=1` (opt-in), the `xreduce` rules of
+    /// PLIRON: `PLIRON_XREDUCE` (on by default since 2026-11-26;
+    /// `=0` disables), the `xreduce` rules of
     /// `opts/pliron.isle`: `ireduce` leftovers of the packed-field
     /// deposit/extract chains sroa leaves in scalarized key code.
     fn pliron_xreduce_on(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_XREDUCE").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_XREDUCE").as_deref() != Ok("0"))
     }
 
     /// `x << k` keeps no bit below `n` when the effective shift — the
