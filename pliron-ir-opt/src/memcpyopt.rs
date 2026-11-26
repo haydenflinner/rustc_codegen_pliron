@@ -412,6 +412,8 @@ fn tmp_flow(
 thread_local! {
     /// Unit tests turn `PLIRON_MEMCPYOPT_MOVEMARK` on for one case.
     static TEST_MOVEMARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `Some(on)` overrides `PLIRON_MEMCPYOPT_NOPCOPY` (tests).
+    static TEST_NOPCOPY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 fn movemark() -> bool {
@@ -420,6 +422,55 @@ fn movemark() -> bool {
         return true;
     }
     crate::env_is("PLIRON_MEMCPYOPT_MOVEMARK", "1")
+}
+
+/// `PLIRON_MEMCPYOPT_NOPCOPY=1` (opt-in): erase `memcpy`/`memmove` ops
+/// whose dst and src resolve to the same `(base, offset)` — a copy onto
+/// itself is a no-op. MIR identity moves and block-arg forwarding both
+/// leave them (`phisimp` binding `memcpy(p <- a)`'s `p` to `a`), and one
+/// surviving copy keeps its alloca out of `sroa` (`accesses` refuses a
+/// self-copy outright, so the whole temp — e.g. an `Option<enum>` the
+/// caller only discriminates — round-trips through the stack).
+fn nopcopy() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NOPCOPY.with(|c| c.get()) {
+        return on;
+    }
+    crate::env_is("PLIRON_MEMCPYOPT_NOPCOPY", "1")
+}
+
+/// `v` as `(base, byte-offset)` with constant-offset GEPs peeled, `None`
+/// past 16 links. Base may be any value — an alloca, an entry param, a
+/// block argument; only the pair equality matters to the callers.
+fn ptr_base(ctx: &Context, st: &State, mut v: Value) -> Option<(Value, i64)> {
+    let mut off = 0i64;
+    for _ in 0..16 {
+        match v.defining_op() {
+            Some(g) if Operation::is_op::<GetElementPtrOp>(g, ctx) => {
+                off = off.checked_add(gep_offset(ctx, st, g)?)?;
+                v = g.deref(ctx).get_operand(ctx, 0);
+            }
+            _ => return Some((v, off)),
+        }
+    }
+    None
+}
+
+/// Erase `m`, a `memcpy`/`memmove` with identical ends. `llvm.memcpy`
+/// forbids any other overlap, so equal pointers are the only sound
+/// aliasing case; `memmove` self-copies are no-ops the same way.
+fn kill_nopcopy(ctx: &mut Context, st: &mut State, m: Ptr<Operation>) -> bool {
+    let dst = m.deref(ctx).get_operand(ctx, 0);
+    let src = m.deref(ctx).get_operand(ctx, 1);
+    // `None` pairs must not compare equal: two unresolvable pointers are
+    // not known-identical.
+    match (ptr_base(ctx, st, dst), ptr_base(ctx, st, src)) {
+        (Some(d), Some(s)) if d == s => {}
+        _ => return false,
+    }
+    st.intrinsics.remove(m);
+    Operation::erase(m, ctx);
+    true
 }
 
 /// Move `mk`, a `lifetime.start` of `dbase` that sits between the
@@ -509,6 +560,9 @@ fn try_forward(
     }
     let o: Vec<Value> = m.deref(ctx).operands(ctx).collect();
     let (dst, src) = (o[0], o[1]);
+    if nopcopy() && kill_nopcopy(ctx, st, m) {
+        return true;
+    }
     let Some(n) = const_int(ctx, st, o[2]).and_then(|n| u64::try_from(n).ok()) else {
         return false;
     };
@@ -3333,6 +3387,76 @@ mod tests {
         );
         assert!(!srcfwd_wbparam_try(&input, true));
     }
+
+    const NOP_HEAD: &str = r#"
+        builtin.module @m {
+        ^block_0_0():
+          llvm.func @t: llvm.func <llvm.void () variadic = false> [] {
+          ^entry():
+            eight = llvm.constant <builtin.integer <8: i64>> : builtin.integer i64;
+            zero = llvm.constant <builtin.integer <0: i64>> : builtin.integer i64;
+            tmp = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+            dst = llvm.alloca [builtin.integer i8 x eight] : llvm.ptr (0);
+    "#;
+    const NOP_TAIL: &str = "            llvm.return\n        }\n    }\n";
+
+    /// `memcpy(tmp, tmp)` is a no-op: erased under
+    /// `PLIRON_MEMCPYOPT_NOPCOPY`; off, the old "self-copy through the
+    /// temp" refusal keeps it (returning `false`).
+    #[test]
+    fn selfcopy_erased() {
+        let input = format!(
+            "{NOP_HEAD}            m = llvm.call_intrinsic @\"llvm.memcpy\" (tmp, tmp, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n{NOP_TAIL}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        TEST_NOPCOPY.with(|c| c.set(Some(true)));
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+        TEST_NOPCOPY.with(|c| c.set(None));
+        assert!(st.intrinsics.get(m).is_none());
+
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        TEST_NOPCOPY.with(|c| c.set(Some(false)));
+        assert!(!try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+        TEST_NOPCOPY.with(|c| c.set(None));
+        assert!(st.intrinsics.get(m).is_some());
+    }
+
+    /// The same through a GEP'd end: `memcpy(tmp+0, tmp)`.
+    #[test]
+    fn selfcopy_gep_erased() {
+        let input = format!(
+            "{NOP_HEAD}            tmp0 = llvm.gep <builtin.integer i8> (tmp, zero)[OperandIdx(1)] : llvm.ptr (0);\n            m = llvm.call_intrinsic @\"llvm.memcpy\" (tmp0, tmp, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n{NOP_TAIL}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (f, m) = fixture(&input, st, ctx);
+        let g = m.deref(ctx).get_operand(ctx, 0).defining_op().unwrap();
+        st.consts
+            .insert(g.deref(ctx).get_operand(ctx, 1), crate::state::ConstVal::Bits(0));
+        TEST_NOPCOPY.with(|c| c.set(Some(true)));
+        assert!(try_forward(ctx, st, f, &mut None, &mut None, &[], m));
+        TEST_NOPCOPY.with(|c| c.set(None));
+        assert!(st.intrinsics.get(m).is_none());
+    }
+
+    /// `memcpy(dst, tmp)` with distinct ends is untouched by the gate.
+    #[test]
+    fn nonselfcopy_kept() {
+        let input = format!(
+            "{NOP_HEAD}            m = llvm.call_intrinsic @\"llvm.memcpy\" (dst, tmp, eight) : llvm.func <llvm.void (llvm.ptr (0), llvm.ptr (0), builtin.integer i64) variadic = false>;\n{NOP_TAIL}"
+        );
+        let ctx = &mut Context::new();
+        let st = &mut State::default();
+        let (_f, m) = fixture(&input, st, ctx);
+        TEST_NOPCOPY.with(|c| c.set(Some(true)));
+        assert!(!kill_nopcopy(ctx, st, m));
+        TEST_NOPCOPY.with(|c| c.set(None));
+        assert!(st.intrinsics.get(m).is_some());
+    }
 }
 
 /// `PLIRON_MEMCPYOPT_SRCFWD=1`: a temporary that only a copy of an
@@ -3386,6 +3510,13 @@ pub fn run_srcfwd(ctx: &mut Context, st: &mut State) {
             for b in crate::inline::blocks(ctx, f) {
                 for op in crate::inline::ops(ctx, b) {
                     if !matches!(st.intrinsics.get(op).map(|s| s.as_str()), Some("llvm.memcpy" | "llvm.memmove")) {
+                        continue;
+                    }
+                    // `phisimp` binding a copy's block-param end to its
+                    // other end leaves `memcpy(a, a)` — dead, and a
+                    // self-copy keeps the alloca out of sroa.
+                    if nopcopy() && kill_nopcopy(ctx, st, op) {
+                        n += 1;
                         continue;
                     }
                     let t = op.deref(ctx).get_operand(ctx, 0);

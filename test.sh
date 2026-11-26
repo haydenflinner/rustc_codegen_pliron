@@ -11,7 +11,7 @@
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
 #   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 halfclob regionsplit bigtmp fragcopyout
-#   partinline solecopy srcfwd rustfacts
+#   partinline solecopy srcfwd rustfacts nopcopy
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -954,6 +954,23 @@ t_fragcopyout() {
   PLIRON_SROA_FRAGCOPY_OUT=0 rustc $BE --edition 2021 -O tests/fragcopyout/main.rs -o $out/fragcopyout$exe && [[ "$($out/fragcopyout$exe)" == "$want" ]]
 }
 
+t_nopcopy() {
+  # PLIRON_MEMCPYOPT_NOPCOPY=1 (opt-in): erase `memcpy`/`memmove` whose dst
+  # and src resolve to the same `(base, offset)`. `phisimp` binding a
+  # block-parameter copy destination to its source leaves `memcpy(a, a)`;
+  # a surviving self-copy makes sroa refuse the alloca ("accesses: out of
+  # range / self-copy"), so `selfcopy`'s `Option<Fb>` temp round-trips
+  # through the stack. Legs: refusal present without the knob, gone with
+  # it, identical output both ways (also against stock rustc).
+  rustc --edition 2021 -O tests/nopcopy/main.rs -o $out/nopcopy-stock$exe || return 1
+  PLIRON_STATS_WHY=1 PLIRON_SROA_WHYFN=selfcopy rustc $BE --edition 2021 -O -C codegen-units=1 tests/nopcopy/main.rs -o $out/nopcopy-off$exe 2> $out/nopcopy-off.why || return 1
+  grep -q "whyfn .* self-copy .*selfcopy" $out/nopcopy-off.why || { echo "nopcopy: expected sroa self-copy refusal without the fix" >&2; return 1; }
+  PLIRON_MEMCPYOPT_NOPCOPY=1 PLIRON_STATS_WHY=1 PLIRON_SROA_WHYFN=selfcopy rustc $BE --edition 2021 -O -C codegen-units=1 tests/nopcopy/main.rs -o $out/nopcopy-on$exe 2> $out/nopcopy-on.why || return 1
+  ! grep -q "whyfn .* self-copy .*selfcopy" $out/nopcopy-on.why || { echo "nopcopy: sroa self-copy refusal still present" >&2; return 1; }
+  diff <($out/nopcopy-stock$exe) <($out/nopcopy-off$exe) || { echo "nopcopy: output differs (off)" >&2; return 1; }
+  diff <($out/nopcopy-stock$exe) <($out/nopcopy-on$exe) || { echo "nopcopy: output differs (on)" >&2; return 1; }
+}
+
 t_sibcall() {
   # PLIRON_SIBCALL (default on, aarch64): `call; return` becomes `return_call`
   # on the platform ABIs and the internal `tail` one when nothing in the
@@ -1823,6 +1840,7 @@ want cmp3 && t_cmp3
 want sretnosync && t_sretnosync
 want bigtmp && t_bigtmp
 want fragcopyout && t_fragcopyout
+want nopcopy && t_nopcopy
 want shrinkwrap && t_shrinkwrap
 want sibcall && t_sibcall
 want x18 && t_x18
