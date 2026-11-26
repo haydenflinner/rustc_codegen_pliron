@@ -1,0 +1,9 @@
+split {1, 1} [2]+fin1+fin1+fin6+fin7+fin7+fin7+fin8+fin8+fin8
+save slot 3 -> 1+fin1+fin1+fin2+fin7+fin8+fin8+fin8+fin8
+split {5, 1} [2]+fin1+fin1+fin2+fin2+fin2+fin3+fin8
+rsplit {1, 7} ["part 0 of 1", "part 1 of 1", "part 2 of 1"]+fin2+fin2+fin2+fin2+fin3+fin3+fin3+fin3+fin3+fin3+fin4+fin4+fin4+fin4
+split {2, 3} [2]+fin3+fin3+fin4+fin4+fin4+fin5
+save slot 11 -> 3+fin4+fin4+fin4+fin5+fin5+fin5+fin6
+split {13, 4} [2]+fin5+fin5+fin5+fin5+fin6+fin6+fin6+fin6+fin6+fin6+fin7+fin7+fin7+fin7
+seed+fin5+fin6+fin6+fin6+fin7+fin7+fin7+fin8
+done 8 other 0

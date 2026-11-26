@@ -1527,6 +1527,15 @@ pub fn run(
     // LLVM's CGSCC rule for edges inlining created inside an SCC. Original
     // sites still inline one level; re-entering the recursion stops.
     let recstack = crate::env_is("PLIRON_INLINE_RECSTACK", "1");
+    // `PLIRON_INLINE_RECSELF=1` (opt-in): the single-caller bonus may also
+    // fire into a *self*-recursive caller — a one-function loop like
+    // regex's `Compiler::fill` (its Hole::Many arm calls itself) taking
+    // `MaybeInst::fill`, cost 1,686 against the flat 320, ~10.6k calls a
+    // run at ~40 instructions of call overhead each that LLVM inlines
+    // away. The multi-function-SCC clause of `recstack` still applies: a
+    // callee pasted into one member of a mutual cycle still stacks its
+    // frame at every level (`inlinerec`).
+    let recself = crate::env_is("PLIRON_INLINE_RECSELF", "1");
     let once1 = crate::env_is("PLIRON_INLINE_ONCE1", "1");
     let scc_limit = crate::env_is("PLIRON_INLINE_SCCLIMIT", "1");
     // `PLIRON_INLINE_SMALLSCC=1` (small mode only): no inlining at all
@@ -1918,7 +1927,9 @@ pub fn run(
                     // LLVM, which keeps it out of line, 80).
                     let rec_caller = recstack
                         && (scc.get(&sym).is_some_and(|c| scc.get(cs) != Some(c))
-                            || self_rec.contains(sym.as_str()) && !scc.contains_key(&sym));
+                            || (!recself
+                                && self_rec.contains(sym.as_str())
+                                && !scc.contains_key(&sym)));
                     // `PLIRON_INLINE_ONCE1=1`: the bonus at most once per
                     // callee per run. `single` (one calling function) is
                     // computed at run start; a single-caller callee's call

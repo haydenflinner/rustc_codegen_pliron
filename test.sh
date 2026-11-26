@@ -625,6 +625,26 @@ t_inlinerec() {
   $out/inlinerec$exe | diff --strip-trailing-cr - tests/inlinerec/expected.out
 }
 
+# r[verify iropt.inline.recself]
+t_inlinerecself() {
+  # PLIRON_INLINE_RECSELF (opt-in): the single-caller bonus may fire into a
+  # *self*-recursive caller — regex's `Compiler::fill` (a lone Hole::Many
+  # self-loop) taking `MaybeInst::fill` out of line for ~48 insns a call.
+  # The mutual-cycle clause of RECSTACK is untouched (`inlinerec` keeps its
+  # helper a call). Output matches stock rustc's either way.
+  local f n_on
+  for f in off on; do
+    rm -f $out/inlinerecself_$f.log
+    local k=0
+    [ $f = on ] && k=1
+    PLIRON_INLINE_RECSELF=$k PLIRON_TRACE=pliron::inline=debug rustc $BE --edition 2021 -O tests/inlinerecself/main.rs -o $out/inlinerecself_$f$exe 2> $out/inlinerecself_$f.log || { tail -20 $out/inlinerecself_$f.log >&2; return 1; }
+    $out/inlinerecself_$f$exe | diff --strip-trailing-cr - tests/inlinerecself/expected.out || return 1
+  done
+  grep -aqE ' -> .*5patch: n=[0-9]+ .*reject \(score\)' $out/inlinerecself_off.log || { echo "inlinerecself: patch inlined even without the knob" >&2; return 1; }
+  n_on=$(grep -acE ' -> .*5patch: n=[0-9]+ .*accept' $out/inlinerecself_on.log)
+  [ "$n_on" -ge 1 ] || { echo "inlinerecself: patch stayed a call under PLIRON_INLINE_RECSELF=1" >&2; return 1; }
+}
+
 t_inlinerecx() {
   # A caller outside a derived-Clone cycle enters the cycle once
   # (PLIRON_INLINE_RECX): the sites cloned out of that inline stay calls
@@ -1826,6 +1846,7 @@ want invokeblk && t_invokeblk
 [[ -z "$exe" ]] && want resumehoist && t_resumehoist
 want inlinerec && t_inlinerec
 want inlinerecx && t_inlinerecx
+want inlinerecself && t_inlinerecself
 want mcrdwrap && t_mcrdwrap
 want xfactsplugin && t_xfactsplugin
 want deadfree && t_deadfree
