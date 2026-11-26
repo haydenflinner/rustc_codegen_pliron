@@ -102,6 +102,7 @@ fn pass(name: &str) -> Pass {
                     escape: true,
                     edge: true,
                     store: false,
+                    store_icmp: false,
                 },
             )
         },
@@ -114,6 +115,7 @@ fn pass(name: &str) -> Pass {
                     escape: true,
                     edge: true,
                     store: true,
+                    store_icmp: true,
                 },
             )
         },
