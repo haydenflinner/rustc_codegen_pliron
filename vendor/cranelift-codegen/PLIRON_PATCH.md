@@ -2553,7 +2553,7 @@ an aarch64 immediate at lowering. Held-out irdiff vs baseline:
 regex -91K (next_state flat, `c_utf8_seq` -26K), rust-html-rewriter
 -618K (`utf8_valid_up_to` -319K).
 
-## `PLIRON_ALIGNFT` (opt-in, default 0 = off): loop-head pads on hot fallthrough entries
+## `PLIRON_ALIGNFT` (on by default at 2 since 2026-11-26; `=0` disables, `=1` suppress-pads diagnostic): loop-head pads on hot fallthrough entries
 
 `src/machinst/vcode.rs` (`VCode::emit`). The NOP pad that 16-byte-aligns
 a loop head sits on the head's *fallthrough* entry too, and when that

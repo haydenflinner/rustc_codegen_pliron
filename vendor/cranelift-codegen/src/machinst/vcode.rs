@@ -2213,13 +2213,14 @@ impl<I: VCodeInst> VCode<I> {
         // a per-trip cost there. `=1` drops the raised alignment for a
         // head whose fallthrough entry is hot like that; `=2` keeps it
         // and covers the pad with a `b` to the head (one executed
-        // instruction instead of the pad's NOPs). Default 0 = off.
+        // instruction instead of the pad's NOPs). Default 2 since
+        // 2026-11-26; `=0` disables.
         static ALIGNFT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let alignft = *ALIGNFT.get_or_init(|| {
             std::env::var("PLIRON_ALIGNFT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0)
+                .unwrap_or(2)
         });
         let mut loop_span: Vec<i32> = vec![];
         if alignft != 0 {
