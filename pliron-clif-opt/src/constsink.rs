@@ -225,6 +225,24 @@ fn term_cheap(
                 return false;
             }
         }
+        // `res` as a call or return operand of a terminator (`try_call`
+        // counts as one: it has exception edges): the value goes in a
+        // register per execution, like any other non-edge use — never
+        // the free edge-arg remat this routine prices. brotli's
+        // `SetCost(model, 704, .., 0)` inside `BrotliCreateHqZopfli-
+        // BackwardReferences`'s loop cloned a per-trip `mov` into its
+        // call arms (+358K program-wide before this arm).
+        InstructionData::TryCall { args, .. }
+        | InstructionData::TryCallIndirect { args, .. }
+        | InstructionData::MultiAry { args, .. } => {
+            if args
+                .as_slice(&func.dfg.value_lists)
+                .iter()
+                .any(|&a| func.dfg.resolve_aliases(a) == res)
+            {
+                return false;
+            }
+        }
         _ => {}
     }
     // The latches of `ub`'s innermost loop: back-edge sources, the
@@ -821,6 +839,83 @@ mod tests {
             .map(|(b, _)| b)
             .collect();
         assert_eq!(fives, vec![head, mid], "one shared copy at the in-loop NCD");
+        verify(&func);
+    }
+
+    /// A constant passed as a `try_call` argument inside a loop is a
+    /// register use like any other — it rides no edge and must never
+    /// count cheap: the clone would materialize a `mov` per trip
+    /// (brotli's `SetCost(model, 704, .., 0)` inside
+    /// `BrotliCreateHqZopfliBackwardReferences`).
+    #[test]
+    fn call_arg_in_loop_is_not_cheap() {
+        let clif = "
+function %f(i64) -> i64 tail {
+    sig0 = (i64) tail
+    fn0 = %f sig0
+block0(v0: i64):
+    v1 = iconst.i64 5
+    v3 = iconst.i64 100
+    v9 = iconst.i64 7
+    jump block1(v0)
+block1(v10: i64):
+    v2 = icmp ult v10, v3
+    brif v2, block2, block6
+block2:
+    v4 = icmp ult v10, v9
+    brif v4, block4, block7(v10)
+block4:
+    try_call fn0(v1), sig0, block7(v10), [ default: block3(exn0) ]
+block7(v11: i64):
+    v8 = iconst.i64 1
+    v7 = iadd v11, v8
+    jump block1(v7)
+block3(v12: i64) cold:
+    return v12
+block6:
+    return v10
+}
+";
+        let mut func = cranelift_reader::parse_functions(clif).unwrap().remove(0);
+        let v1 = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .find(|&i| {
+                matches!(
+                    func.dfg.insts[i],
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                        ..
+                    } if imm.bits() == 5
+                )
+            })
+            .map(|i| func.dfg.first_result(i))
+            .unwrap();
+        sink(&mut func);
+        // The banked def survives at block0 and nothing materializes
+        // in the loop.
+        let blocks: Vec<Block> = func.layout.blocks().collect();
+        let b0 = blocks[0];
+        assert_eq!(home(&func, v1), Some(b0));
+        let fives: Vec<Block> = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b).map(move |i| (b, i)))
+            .filter(|&(_, i)| {
+                matches!(
+                    func.dfg.insts[i],
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                        ..
+                    } if imm.bits() == 5
+                )
+            })
+            .map(|(b, _)| b)
+            .collect();
+        assert_eq!(fives, vec![b0], "no clone inside the loop");
         verify(&func);
     }
 }

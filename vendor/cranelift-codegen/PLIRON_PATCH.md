@@ -1098,7 +1098,8 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `pliron-clif-opt/tests/ra_callarg_remat.rs` `no_stores_into_remat_only_slots`.
 
 78. Opt-in constant sinking into calling loops (`src/context.rs`
-    `const_sink`, aarch64, `PLIRON_CONSTSINK=1`): a one-instruction
+    `const_sink`, aarch64, `PLIRON_CONSTSINK_OLD=1`, shared
+    `PLIRON_CONSTSINK` with the other sinks until 2026-11-25): a one-instruction
     constant used in a loop that contains a call, but defined outside
     it, gets a copy just inside the outermost such loop (the use block,
     or the preheader of the call-free loop the use sits in). pliron's
@@ -2518,12 +2519,17 @@ reserved register and its save restores the allocatable one. `bl`
 sites have dead scratch regs regardless; the only remaining hole is
 the `force_veneers` debug hook, which has no in-tree users.
 
-## `PLIRON_CONSTSINK` (opt-in): rematerializable-constant sinking
+## `PLIRON_CONSTSINK_V` (opt-in): rematerializable-constant sinking
 
 `src/context.rs` (`Context::pliron_constsink`, runs inside
 `Context::optimize` post-pipeline; the same pass also exists as the
 `s_constsink` pipeline step in `pliron-clif-opt`, where it runs on
-pre-preopt CLIF). `constdedup` and the block-cloning passes park one
+pre-preopt CLIF — gated there on `PLIRON_CONSTSINK`, and the older
+`const_sink` below on `PLIRON_CONSTSINK_OLD`; the three were one knob
+`PLIRON_CONSTSINK` in 469b00c1, split 2026-11-25 when their held-out
+deltas turned out to differ: `_V` carries the html/regex wins, the
+pipeline pass and `const_sink` carry the compression/pulldown
+regressions). `constdedup` and the block-cloning passes park one
 def per distinct constant at a dominating block — often the entry —
 so a constant used only in deep bail arms pins a register across the
 whole function: encoding_rs's `utf8_valid_up_to` banked 0..=8 in
@@ -2537,10 +2543,12 @@ of the earliest use, with use blocks sharing an innermost loop
 getting one shared copy at their in-loop common dominator. A deeper
 loop block only gets a copy when it kills the banked def outright —
 every deeper group's uses must be cheap: a `brif`/`br_table`
-selector arg never is; a terminator use is cheap iff the block
-dominates no latch of its innermost loop and no carrying edge feeds
-a latch (regex's `next_state`, `c_utf8_seq` paid per trip
-otherwise); an inst use is cheap iff the operand folds into an
-aarch64 immediate at lowering. Held-out irdiff vs baseline:
+selector arg never is, nor is a `try_call`/`return` operand — those
+take a register per execution (brotli's `SetCost(model, 704, .., 0)`
+clone paid a `mov` per trip until 2026-11-25); a terminator use is
+cheap iff the block dominates no latch of its innermost loop and no
+carrying edge feeds a latch (regex's `next_state`, `c_utf8_seq` paid
+per trip otherwise); an inst use is cheap iff the operand folds into
+an aarch64 immediate at lowering. Held-out irdiff vs baseline:
 regex -91K (next_state flat, `c_utf8_seq` -26K), rust-html-rewriter
 -618K (`utf8_valid_up_to` -319K).

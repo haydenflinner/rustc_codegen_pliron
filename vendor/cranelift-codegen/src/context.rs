@@ -1060,7 +1060,7 @@ impl Context {
         use crate::ir::{InstructionData, Opcode, Value};
         use crate::{FxHashMap, FxHashSet};
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK").as_deref() == Ok("1")) {
+        if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK_OLD").as_deref() == Ok("1")) {
             return;
         }
         // One aarch64 instruction: `movz`/`movn` (one non-zero halfword in
@@ -1667,7 +1667,7 @@ impl Context {
         use crate::loop_analysis::Loop;
         use crate::{FxHashMap, FxHashSet};
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK").as_deref() == Ok("1")) {
+        if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK_V").as_deref() == Ok("1")) {
             return;
         }
         if self.func.layout.num_blocks() > 16384 {
@@ -1776,6 +1776,25 @@ impl Context {
                 InstructionData::Brif { arg, .. }
                 | InstructionData::BranchTable { arg, .. } => {
                     if dfg.resolve_aliases(*arg) == res {
+                        return false;
+                    }
+                }
+                // `res` as a call or return operand of a terminator
+                // (`try_call` counts as one: it has exception edges):
+                // the value goes in a register per execution, like any
+                // other non-edge use — never the free edge-arg remat
+                // this routine prices. brotli's
+                // `SetCost(model, 704, .., 0)` inside
+                // `BrotliCreateHqZopfliBackwardReferences`'s loop
+                // cloned a per-trip `mov` into its call arms.
+                InstructionData::TryCall { args, .. }
+                | InstructionData::TryCallIndirect { args, .. }
+                | InstructionData::MultiAry { args, .. } => {
+                    if args
+                        .as_slice(&dfg.value_lists)
+                        .iter()
+                        .any(|&a| dfg.resolve_aliases(a) == res)
+                    {
                         return false;
                     }
                 }
