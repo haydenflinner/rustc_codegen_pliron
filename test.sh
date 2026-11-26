@@ -619,8 +619,10 @@ t_resumehoist() {
 t_inlinerec() {
   # A big single-caller helper stays a call from a recursive visitor
   # (PLIRON_INLINE_RECSTACK: every recursion level would carry its frame);
-  # output matches stock rustc's.
-  PLIRON_INLINE_RECSTACK=1 PLIRON_TRACE=pliron::inline=debug rustc $BE --edition 2021 -O tests/inlinerec/main.rs -o $out/inlinerec$exe 2> $out/inlinerec.log || { tail -20 $out/inlinerec.log >&2; return 1; }
+  # output matches stock rustc's. RECSELF=0: the self-recursive-caller
+  # clause is what keeps it a call under the default flip — this stanza
+  # exercises that clause's off-path (the on-path is inlinerecself's).
+  PLIRON_INLINE_RECSELF=0 PLIRON_INLINE_RECSTACK=1 PLIRON_TRACE=pliron::inline=debug rustc $BE --edition 2021 -O tests/inlinerec/main.rs -o $out/inlinerec$exe 2> $out/inlinerec.log || { tail -20 $out/inlinerec.log >&2; return 1; }
   if grep -qE '5check: n=[0-9]+ .*accept' $out/inlinerec.log; then echo "inlinerec: check inlined into the recursive visit" >&2; return 1; fi
   $out/inlinerec$exe | diff --strip-trailing-cr - tests/inlinerec/expected.out
 }

@@ -37,6 +37,14 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-26: the inliner's free-bonus may land in self-recursive
+    // callers (MaybeInst::fill -> Compiler::fill: 10,644 out-of-line
+    // calls folded; merged frame 208B is smaller than LLVM's own 288B
+    // merged frame, so we keep more headroom than stock at equal
+    // depth). Sweep: only regex differs across all 8 binaries
+    // (-0.50%); crates 20/20 under the knob. `PLIRON_INLINE_RECSELF=0`
+    // off.
+    "PLIRON_INLINE_RECSELF",
     // 2026-11-26: frozen_loads peels nested `iadd` chains to the frozen
     // base (`x.data.heap.cap`, smallvec's `capacity()`, montgomery's
     // per-iteration min decode lowers as `iadd(iadd(x, 8), 8)`), so the
