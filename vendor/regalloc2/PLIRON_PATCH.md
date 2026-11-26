@@ -684,14 +684,40 @@ recomputed (merge_bundles skips its overlap scan on flagged bundles).
 printed by clif-check under the knob; the `ra2x: bp-evict:` explain
 line names them.
 
-Held-out exact-instruction deltas (non-nop): pulldown-cmark -0.21%,
-rust-protobuf -0.10%, blind-sig -0.07%, rust-html-rewriter -0.05%,
-blake3/regex flat, rust-json +0.003% (noise); rust-compression +0.10%
-in `BrotliCreateHqZopfliBackwardReferences` — a second-order effect,
-not an allocation defect: eviction perturbed the compiled-cost numbers
-`ivsr::pick` sees by ~0.3%, which flipped a take decision near its
-margin (827 vs 825) and dropped the pointer-IV rewrite, leaving index
-recomputes in the depth-3 loop. rafuzz: 35k seeds mixed combos, clean.
+`PLIRON_RA2_EVICT_SPAN` (default 4, `=0` off) vetoes one eviction case
+the edge-cost test cannot see: a squatter whose to-bundle ranges cover
+a block more than EVICT_SPAN times hotter than the merge edge is never
+evicted. The ratio test compares the edge's weight against the moves
+eviction restores, but an evicted vreg must also hold a register alone
+through every block its ranges cover — when one of those blocks is a
+hot loop and the fresh singleton bundle goes minimal, the spill and
+per-use reloads land inside it. `bp_merge_evict` computes each
+candidate's hottest covered block weight (`hot_bonus` max over
+`insn_block` of its to-bundle ranges — those are the ranges the
+eviction moves) and refuses when it exceeds `EVICT_SPAN * incoming`;
+refusals count as `hotspan` in `EVICTWHY`.
+`PLIRON_RA2_EVICTDBG=1` (reporting only) prints each candidate's
+arg-edge cost, the edge weight, and its span/use heat maxima. The
+ratio was tuned on the held-out set: 4 beats both 2 and 8 on
+rust-compression and pulldown-cmark.
+
+Measured (EVICT on with SPAN=4 vs SPAN=0, exact instructions):
+rust-compression recovers the whole eviction regression — 41,092,802
+vs `PLIRON_RA2_EVICT=0`'s 41,093,028 on callgrind (the hot-loop
+evictions in `BrotliCreateHqZopfliBackwardReferences` all refused) —
+and beats or matches SPAN=0 on pulldown-cmark, blind-sig,
+rust-html-rewriter and rust-protobuf, so the veto is a net win, not a
+trade. Std
+corpus: 365 evictions vs 402 without it (-9%), weighted codegen score
+a hair better. The `evictspan` test.sh stanza pins core's
+`Big64x20::mul_pow2` (five evictions under `SPAN=0`, none under the
+default) via clif-check's evict table.
+
+Held-out exact-instruction deltas of EVICT itself (non-nop):
+pulldown-cmark -0.21%, rust-protobuf -0.10%, blind-sig -0.07%,
+rust-html-rewriter -0.05%, blake3/regex flat, rust-json +0.003%
+(noise); rust-compression was +0.10% until EVICT_SPAN (above).
+rafuzz: 35k seeds mixed combos, clean.
 
 ## `PLIRON_RA2_MINCLUS` (2026-11-26, opt-in `=1`, `PLIRON_RA2_MINCLUS_SPAN` default 192): cluster nearby uses into one minimal-bundle reload range
 

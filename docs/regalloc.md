@@ -517,6 +517,33 @@ arm). Per-kind weighted (non-remat / remat):
   weight exceeds the merge gain — only 2 evictions fire, −450
   weighted), `cap` 12 @ 4.7k, `tied` 4 @ 2k, `cold` 2 @ 1k.
 
+### `PLIRON_RA2_EVICT_SPAN`: hot-span squatters are unevictable (2026-11-26)
+
+EVICT's rust-compression regression (+39.5k exact vs `EVICT=0`) was a
+real allocation defect, not the ivsr second-order effect it was logged
+as. In `BrotliCreateHqZopfliBackwardReferences`, merge edges weighted
+~10²–10³ evicted squatter vregs whose to-bundle ranges spanned
+~10⁶-weight loops; each evicted vreg landed alone in a fresh singleton
+bundle that `split_into_minimal_bundles` cut to per-use minimal —
+`literal_cost.rs:31` went 1 → 60,001 executions. The edge-cost ratio
+test cannot see this: it prices the moves eviction restores, not the
+register the singleton must hold through the hot block.
+
+Fix: `PLIRON_RA2_EVICT_SPAN` (default 4, `=0` off) refuses to evict a
+conflicting vreg whose to-bundle ranges cover a block more than
+EVICT_SPAN× the merge edge's weight (`hot_bonus` max over
+`insn_block`; refusal reason `hotspan` in `EVICTWHY`;
+`PLIRON_RA2_EVICTDBG=1` prints every candidate's acost/edge/span/use
+numbers). Callgrind: 41,092,802 vs `EVICT=0`'s 41,093,028 — the whole
+regression gone — and SPAN=4 beats SPAN=0 on pulldown-cmark (−70k) and
+blind-sig (−50k), flat on rust-html-rewriter and rust-protobuf:
+evicting hot-span squatters was hurting elsewhere a little too, not
+only in Zopfli. 4 beats both 2 and 8 on rust-compression and pulldown-cmark.
+Std corpus: 365 evictions vs 402 (−9%), weighted codegen a hair
+better, `evictspan` stanza pins `Big64x20::mul_pow2` (5 evictions
+under `SPAN=0`, 0 default). Scanned all 4,979 std corpus fns for a
+small reproducer; 351 hit `hotspan`, 27 change an eviction outcome.
+
 ### blake3 `portable::compress_in_place` reloads (2026-11-17)
 
 Executed per call (51,465 calls): ours 11 spill stores, 62 reloads, 4

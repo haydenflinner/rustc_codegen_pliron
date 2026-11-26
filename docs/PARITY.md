@@ -1440,7 +1440,9 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    perturbation elsewhere (e.g. `PLIRON_RA2_EVICT` moving moves off hot
    edges) flips `ivsr::pick`'s choice on a hot function and surfaces as a
    regression attributed to the unrelated change (EVICT's compression
-   +0.10%: under `PLIRON_IVSR=0` EVICT wins there too, −24k). When an A/B
+   +0.10% — resolved 2026-11-26 by `PLIRON_RA2_EVICT_SPAN`: the edges
+   whose evictions caused it were cold beside a squatting vreg's hot
+   span, a real allocation defect, not only the ivsr flip). When an A/B
    shows a single-program regression from an unrelated change, re-run with
    `PLIRON_IVSR=0` before blaming the mechanism; long-term the pick wants
    a margin/tie-break so near-equal candidates stop oscillating.

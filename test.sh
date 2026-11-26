@@ -10,7 +10,7 @@
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
 #   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm inlinelean inlinev8cap maskelimloop retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
-#   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 halfclob regionsplit bigtmp fragcopyout
+#   o0std mcrdwrap sretnosync shrinkwrap sibcall x18 halfclob regionsplit evictspan bigtmp fragcopyout
 #   partinline solecopy srcfwd rustfacts nopcopy
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
@@ -1227,6 +1227,30 @@ t_regionsplit() {
   done
 }
 
+t_evictspan() {
+  # PLIRON_RA2_EVICT_SPAN (default 4, vendored regalloc2): a third-party
+  # vreg whose live span reaches a block more than EVICT_SPAN times
+  # hotter than the merge edge may not be evicted — alone in its fresh
+  # bundle it must hold a register through that block, and one forced
+  # spill there outweighs the edge move the merge removes (the
+  # BrotliCreateHqZopfli regression: a cold edge evicted a squatter
+  # spanning a 60k-trip loop, and the singleton bundle went minimal —
+  # spill+reload per use). Fixture: core's Big64x20::mul_pow2, where
+  # the merge edge would evict five vregs spanning hotter blocks.
+  # Asserts both directions: the veto refuses them all, and with the
+  # veto off the fixture still evicts (otherwise it no longer exercises
+  # the gate).
+  local cc="target/$PROF/clif-check"
+  [ -x "$cc" ] || cc="target/debug/clif-check"
+  [ -x "$cc" ] || return 0
+  local on off
+  on=$(PLIRON_RA2_MOVESTATS=1 PLIRON_RA2_EVICT=1 "$cc" codegen tests/evictspan/clif "$out/evictspan-on.json" 2>/dev/null) || return 1
+  off=$(PLIRON_RA2_MOVESTATS=1 PLIRON_RA2_EVICT=1 PLIRON_RA2_EVICT_SPAN=0 "$cc" codegen tests/evictspan/clif "$out/evictspan-off.json" 2>/dev/null) || return 1
+  echo "$on" | grep -q "0 vregs evicted" || { echo "evictspan: hot-span squatters evicted under the veto" >&2; return 1; }
+  echo "$on" | grep -qE "hotspan +[1-9]" || { echo "evictspan: no hotspan refusal recorded" >&2; return 1; }
+  echo "$off" | grep -qE "[1-9][0-9]* vregs evicted" || { echo "evictspan: SPAN=0 evicts nothing — the fixture drifted" >&2; return 1; }
+}
+
 # r[verify clif.vendor.noret]
 t_noret() {
   # PLIRON_NORETTRAP (default on): no trap after a call that cannot return
@@ -1851,6 +1875,7 @@ want solecopy && t_solecopy
 want srcfwd && t_srcfwd
 want rustfacts && t_rustfacts
 want regionsplit && t_regionsplit
+want evictspan && t_evictspan
 want edgemerge && t_edgemerge
 want asmcfi && t_asmcfi
 want asmextern && t_asmextern

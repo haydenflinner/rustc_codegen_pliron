@@ -73,6 +73,7 @@ KNOBS = [
     ("PLIRON_RA2_EVICT", "1", ["0", "3", "5", "7"], "ra2", "1"),
     ("PLIRON_RA2_EVICT_RATIO", "2", ["1", "4"], "ra2", "2"),
     ("PLIRON_RA2_EVICT_CAP", "4", ["1", "8"], "ra2", "4"),
+    ("PLIRON_RA2_EVICT_SPAN", "4", ["0", "1", "16"], "ra2", "4"),
     # Cranelift (vendor/cranelift-codegen/src/machinst, isa/aarch64).
     ("PLIRON_RA2_REMATW", "7", ["0", "1", "2", "3", "4", "5", "6"], "clif", "7"),
     ("PLIRON_RA2_REMATW_MAXUSES", "4", ["2", "8", "16"], "clif", "4"),
@@ -109,7 +110,7 @@ IGNORED = {"PLIRON_RA2_STATS", "PLIRON_RA2_VERBOSE", "PLIRON_RA2_EDITS", "PLIRON
            "PLIRON_RA2_POSTOPT_STATS", "PLIRON_RA_CHECK", "PLIRON_RA_CHECK_LABELS", "PLIRON_RA_EXPLAIN",
            "PLIRON_RA_STATS", "PLIRON_RA2_",
            # REGION / spill tuners and probes (behaviour only via REGION=1)
-           "PLIRON_RA2_COPYHINT", "PLIRON_RA2_MOVESTATS", "PLIRON_RA2_REGION_CAP",
+           "PLIRON_RA2_COPYHINT", "PLIRON_RA2_EVICTDBG", "PLIRON_RA2_MOVESTATS", "PLIRON_RA2_REGION_CAP",
            "PLIRON_RA2_REGION_K", "PLIRON_RA2_REGION_MAX", "PLIRON_RA2_REGION_MAXB",
            "PLIRON_RA2_REGION_RATIO", "PLIRON_RA2_SLOTLIVE", "PLIRON_RA2_SLOTLIVE_PROBES"}
 SOURCES = ["vendor/regalloc2/src", "vendor/cranelift-codegen/src/machinst"]

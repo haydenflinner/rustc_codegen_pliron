@@ -231,7 +231,7 @@ class Plan:
                     self.waffle = True
                     self.add_stanzas(["wasm_smoke"])
                 if len(parts) > 1 and parts[1] == "regalloc2":
-                    self.add_stanzas(["regionsplit"])
+                    self.add_stanzas(["regionsplit", "evictspan"])
                 self.glue = True
                 self.clif_opt = True
                 self.flags.update(["gate", "crates", "stage2"])

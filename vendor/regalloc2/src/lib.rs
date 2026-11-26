@@ -684,6 +684,26 @@ pub(crate) fn evict_ratio() -> f32 {
     2.0
 }
 
+/// `PLIRON_RA2_EVICT_SPAN` (default 4.0, `=0` off): a conflicting vreg
+/// whose ranges in the merge's to-bundle cover a block more than this
+/// factor hotter than the merge edge's move weight is never evicted.
+/// Alone, it would have to hold a register through that block; one
+/// spill there costs more than the edge move the merge removes.
+pub(crate) fn evict_span() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static R: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *R.get_or_init(|| {
+            std::env::var("PLIRON_RA2_EVICT_SPAN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4.0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    4.0
+}
+
 /// `PLIRON_RA2_EVICT_CAP` (default 4): most third-party vregs one merge
 /// retry may evict.
 pub(crate) fn evict_cap() -> usize {
@@ -699,6 +719,20 @@ pub(crate) fn evict_cap() -> usize {
     }
     #[cfg(not(feature = "std"))]
     4
+}
+
+/// PLIRON (`PLIRON_RA2_EVICTDBG=1`, reporting only): `bp_merge_evict`
+/// prints each eviction candidate's restored-move cost, the merge
+/// edge's weight, and the hottest block its to-bundle ranges and its
+/// uses cover.
+pub(crate) fn evictdbg_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_EVICTDBG").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
 }
 
 /// `PLIRON_RA2_EVICT` counters: [0] merges that succeeded after
@@ -720,11 +754,11 @@ pub fn evictstats_snapshot() -> [u64; 4] {
 /// `bp_merge_evict` when `PLIRON_RA2_MOVESTATS=1`: why a merge that
 /// failed on overlap was not rescued by eviction. `[2*i]` counts,
 /// `[2*i+1]` sums the incoming edge's block weight (thousandths).
-pub static EVICTWHY: [core::sync::atomic::AtomicU64; 20] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 20];
+pub static EVICTWHY: [core::sync::atomic::AtomicU64; 22] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 22];
 
 /// Names for `EVICTWHY` (index i counts at `2*i`, weight at `2*i+1`).
-pub const EVICTWHY_NAMES: [&str; 10] = [
+pub const EVICTWHY_NAMES: [&str; 11] = [
     "tried",   // overlap-failed merge reaching bp_merge_evict
     "steps",   // conflict scan exceeded 400 steps
     "cap",     // more distinct conflicting vregs than EVICT_CAP
@@ -735,6 +769,7 @@ pub const EVICTWHY_NAMES: [&str; 10] = [
     "cold",    // edge not EVICT_RATIO x hotter than restored moves
     "req",     // merged requirement still conflicts post-eviction
     "evicted", // eviction performed (== EVICTSTATS[0]+[2])
+    "hotspan", // a conflicting vreg's span reaches a hotter block (EVICT_SPAN)
 ];
 
 /// Record one `EVICTWHY` outcome: count plus the edge's weight.
@@ -745,8 +780,8 @@ pub(crate) fn evictwhy_add(reason: usize, weight: f32) {
 }
 
 /// Snapshot of `EVICTWHY`: `[reason][0 count, 1 weighted*1000]`.
-pub fn evictwhy_snapshot() -> [[u64; 2]; 10] {
-    let mut o = [[0u64; 2]; 10];
+pub fn evictwhy_snapshot() -> [[u64; 2]; 11] {
+    let mut o = [[0u64; 2]; 11];
     for (i, v) in o.iter_mut().enumerate() {
         v[0] = EVICTWHY[2 * i].load(core::sync::atomic::Ordering::Relaxed);
         v[1] = EVICTWHY[2 * i + 1].load(core::sync::atomic::Ordering::Relaxed);

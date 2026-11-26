@@ -90,6 +90,7 @@ IGNORED = frozenset({
     "PLIRON_MCPROF",            # memcache counters
     "PLIRON_CACHE_LOG",         # step-cache log
     "PLIRON_RA_EXPLAIN",        # regalloc2 decision log
+    "PLIRON_RA2_EVICTDBG",      # regalloc2 eviction census log
     "PLIRON_OPT_BISECT_DEBUG",  # names bisect units (PLIRON_OPT_BISECT itself is in the key)
     "PLIRON_OPT_FNS_LOG",       # lists selected functions (PLIRON_OPT_FNS itself is in the key)
     "PLIRON_MEM_MARK",          # footprint marks

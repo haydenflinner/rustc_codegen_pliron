@@ -486,12 +486,59 @@ impl<'a, F: Function> Env<'a, F> {
             why!(3);
             return false;
         }
+        // PLIRON (`PLIRON_RA2_EVICTDBG`): eviction candidate frequency
+        // landscape — `span` = the hottest block the conflicting
+        // vreg's `to_b` ranges cover (the EVICT_SPAN test's value),
+        // `usehot` = its hottest use anywhere.
+        let evictdbg = crate::evictdbg_on();
+        if evictdbg {
+            for &v in &conf {
+                let (mut hot, mut hotb) = (0.0f32, usize::MAX);
+                let (mut uhot, mut ub, mut nu) = (0.0f32, usize::MAX, 0usize);
+                for r in &self.vregs[v].ranges {
+                    if self.ranges[r.index].bundle == to_b {
+                        let lo =
+                            self.ctx.cfginfo.insn_block[r.range.from.inst().index()].index();
+                        let hi =
+                            self.ctx.cfginfo.insn_block[r.range.to.prev().inst().index()].index();
+                        for b in lo..=hi {
+                            let h = self.ctx.cfginfo.hot_bonus.get(b).copied().unwrap_or(1.0);
+                            if h > hot {
+                                hot = h;
+                                hotb = b;
+                            }
+                        }
+                    }
+                    for u in &self.ranges[r.index].uses {
+                        let b = self.ctx.cfginfo.insn_block[u.pos.inst().index()].index();
+                        let h = self.ctx.cfginfo.hot_bonus.get(b).copied().unwrap_or(1.0);
+                        if h > uhot {
+                            uhot = h;
+                            ub = b;
+                        }
+                        nu += 1;
+                    }
+                }
+                std::eprintln!(
+                    "ra2ev: cand v{}: acost {} incoming {} span b{} w{} uses {} hottest b{} w{}",
+                    v.index(),
+                    arg_cost[v.index()],
+                    incoming,
+                    hotb,
+                    hot,
+                    nu,
+                    ub,
+                    uhot,
+                );
+            }
+        }
         // Cost of evicting a vreg: it sits in its own bundle again, so
         // every merged edge that carried it in gets its edge move back.
         // `ecost[v]` is the sum of the edge weights that touch `v` as
         // arg or param — an over-count of the restored moves (it
         // charges edges that never merged), hence conservative.
         let evict_params = crate::evict_mode() & 2 != 0;
+        let span_lim = crate::evict_span();
         let mut cost = 0.0f32;
         for &v in &conf {
             if self.vregs[v].blockparam.is_valid() && !evict_params {
@@ -506,6 +553,40 @@ impl<'a, F: Function> Env<'a, F> {
             if !(c > 0.0) {
                 why!(6);
                 return false;
+            }
+            // PLIRON (`PLIRON_RA2_EVICT_SPAN`): a squatter whose
+            // `to_b` ranges reach a block more than EVICT_SPAN times
+            // hotter than this edge may not be evicted: alone in the
+            // fresh bundle it must hold a register through that block,
+            // and one forced spill there costs more than the edge move
+            // the merge removes (BrotliCreateHqZopfli: a 913-weight
+            // edge evicted a squatter spanning a 1.6M-weight loop,
+            // which went minimal and paid a reload per iteration).
+            // Only `to_b` ranges count — the eviction moves those
+            // alone; a vreg's ranges in other bundles are unaffected.
+            // Not memoized: the to_b partition changes as merges and
+            // evictions move ranges between bundles.
+            if span_lim > 0.0 {
+                let mut h = 0.0f32;
+                for r in &self.vregs[v].ranges {
+                    if self.ranges[r.index].bundle != to_b {
+                        continue;
+                    }
+                    let lo =
+                        self.ctx.cfginfo.insn_block[r.range.from.inst().index()].index();
+                    let hi =
+                        self.ctx.cfginfo.insn_block[r.range.to.prev().inst().index()].index();
+                    for b in lo..=hi {
+                        let hb = self.ctx.cfginfo.hot_bonus.get(b).copied().unwrap_or(1.0);
+                        if hb > h {
+                            h = hb;
+                        }
+                    }
+                }
+                if h > span_lim * incoming {
+                    why!(10);
+                    return false;
+                }
             }
             cost += c;
         }
@@ -601,6 +682,16 @@ impl<'a, F: Function> Env<'a, F> {
             self.blockparam_outs[arg_i].from_block.index(),
             to_vreg.index()
         );
+        if evictdbg {
+            std::eprintln!(
+                "ra2ev: EVICT {:?} edge block{} -> block{} v{} incoming {}",
+                conf,
+                self.blockparam_outs[arg_i].from_block.index(),
+                self.blockparam_outs[arg_i].to_block.index(),
+                to_vreg.index(),
+                incoming,
+            );
+        }
 
         // `to_b`'s cached flags, limit and spillset extent may have been
         // widened by the evicted vregs; recompute over what remains.
