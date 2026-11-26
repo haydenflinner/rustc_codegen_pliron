@@ -1606,7 +1606,8 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     /// operand? Only when it has a single use (see `rot_fold_ok` in
     /// `lower.isle`); `PLIRON_RORFOLD_MULTI=1` folds multi-use rotates too.
     ///
-    /// `PLIRON_RORFOLD_DIRECT=1` additionally folds when the rotate has
+    /// `PLIRON_RORFOLD_DIRECT` (on by default since 2026-11-26; `=0`
+    /// disables) additionally folds when the rotate has
     /// at most one *direct* use (`value_direct_uses`), even if the
     /// transitive `ValueUseState` marks it `Multiple` because its single
     /// consumer's result fans out (a loop's `bxor` feeding both the
@@ -1625,7 +1626,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *MULTI.get_or_init(|| std::env::var("PLIRON_RORFOLD_MULTI").as_deref() == Ok("1"))
             || !self.lower_ctx.value_has_multiple_uses(val)
-            || (*DIRECT.get_or_init(|| std::env::var("PLIRON_RORFOLD_DIRECT").as_deref() == Ok("1"))
+            || (*DIRECT.get_or_init(|| std::env::var("PLIRON_RORFOLD_DIRECT").as_deref() != Ok("0"))
                 && self.lower_ctx.value_single_direct_use(val))
     }
 
