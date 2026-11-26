@@ -2205,6 +2205,69 @@ impl<I: VCodeInst> VCode<I> {
             }
         }
 
+        // PLIRON (`PLIRON_ALIGNFT`): emission positions covered by an
+        // emitted backward edge — the span of a loop. The pad that
+        // aligns a head is executed by the edge that *falls into* it;
+        // a source inside such a span runs that edge once per
+        // enclosing-loop trip, not once per loop entry, so the pad is
+        // a per-trip cost there. `=1` drops the raised alignment for a
+        // head whose fallthrough entry is hot like that; `=2` keeps it
+        // and covers the pad with a `b` to the head (one executed
+        // instruction instead of the pad's NOPs). Default 0 = off.
+        static ALIGNFT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let alignft = *ALIGNFT.get_or_init(|| {
+            std::env::var("PLIRON_ALIGNFT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        let mut loop_span: Vec<i32> = vec![];
+        if alignft != 0 {
+            let nhot = final_order.len() - cold_blocks.len();
+            loop_span.resize(final_order.len() + 1, 0);
+            for (pred, range) in self.block_succ_range.iter() {
+                for succ in &self.block_succs[range] {
+                    // Through critical-edge blocks: a back edge entered
+                    // through one (succ names the edge block, which sits
+                    // at its own emission position, usually outside the
+                    // span it creates) still loops to the edge's real
+                    // target — resolve to it for the span start.
+                    let mut t = succ.index();
+                    for _ in 0..8 {
+                        if t >= self.num_blocks() {
+                            break;
+                        }
+                        match self.block_order.lowered_order().get(t) {
+                            Some(crate::machinst::blockorder::LoweredBlock::CriticalEdge {
+                                ..
+                            }) => {
+                                let tr = self.block_succ_range.get(t);
+                                let ts = &self.block_succs[tr];
+                                if ts.len() == 1 {
+                                    t = ts[0].index();
+                                } else {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if t < self.num_blocks() {
+                        let (so, po) = (order_of[t], order_of[pred]);
+                        if so <= po && po < nhot {
+                            loop_span[so] += 1;
+                            loop_span[po + 1] -= 1;
+                        }
+                    }
+                }
+            }
+            let mut run = 0i32;
+            for v in loop_span.iter_mut() {
+                run += *v;
+                *v = run;
+            }
+        }
+
         // Compute/save info we need for the prologue: clobbers and
         // number of spillslots.
         //
@@ -2815,8 +2878,76 @@ impl<I: VCodeInst> VCode<I> {
 
             // Emit NOPs to align the block.
             let mut new_offset = I::align_basic_block(buffer.cur_offset());
+            // PLIRON (`PLIRON_ALIGNFT`): is this head entered by
+            // fallthrough from a block inside a loop — making the pad a
+            // per-trip cost? Walk back to the last block that emits
+            // bytes before the head and ask whether its end falls into
+            // the pad.
+            let mut hot_fall = false;
+            if alignft != 0 && loop_head[block.index()] {
+                let mut i = oi;
+                while i > 0 {
+                    i -= 1;
+                    let q = final_order[i].index();
+                    if merged[q]
+                        || (oi + 1 < final_order.len()
+                            && q != self.entry.index()
+                            && noret_dead.as_ref().is_some_and(|d| d[q]))
+                    {
+                        continue;
+                    }
+                    let r = self.block_ranges.get(q);
+                    let qs = &self.block_succs[self.block_succ_range.get(q)];
+                    // An unconditional-jump-only block (label-aliased):
+                    // its `b` is dropped when it leads to this head
+                    // (the `skip_jmp` below) — look further back. A `b`
+                    // to anywhere else is emitted and leaves the pad
+                    // unreachable.
+                    if r.len() == 1
+                        && ra_edits_per_block[q] == 0
+                        && qs.len() == 1
+                        && self.insts[r.start].is_term() == MachTerminator::Branch
+                    {
+                        if qs[0].index() == block.index() {
+                            continue;
+                        }
+                        break;
+                    }
+                    // q's last emitted instruction: a `b` to this head
+                    // is dropped (`skip_jmp`), so whatever precedes it
+                    // ends the stream.
+                    let mut ix = r.end - 1;
+                    if self.insts[ix].is_term() == MachTerminator::Branch
+                        && qs.len() == 1
+                        && qs[0].index() == block.index()
+                        && ix > r.start
+                    {
+                        ix -= 1;
+                    }
+                    let falls = match self.insts[ix].is_term() {
+                        MachTerminator::None => true,
+                        // A lone conditional end keeps its not-taken
+                        // arm on the fallthrough: the head is then its
+                        // fall-through successor. An unconditional end
+                        // (a `b` elsewhere, the trampoline after a
+                        // conditional, a jump-table sequence) leaves
+                        // the pad dead — the head is not its successor
+                        // then, or more than one terminator precedes.
+                        MachTerminator::Branch => {
+                            qs.len() <= 2
+                                && qs.iter().any(|s| s.index() == block.index())
+                                && !(ix > r.start
+                                    && self.insts[ix - 1].is_term()
+                                        == MachTerminator::Branch)
+                        }
+                        _ => false,
+                    };
+                    hot_fall = falls && loop_span[i] > 0;
+                    break;
+                }
+            }
             // PLIRON: loop headers get 16-byte alignment.
-            if loop_head[block.index()] {
+            if loop_head[block.index()] && !(alignft == 1 && hot_fall) {
                 // PLIRON: emitted size of the loop body (insts × inst
                 // size), for the size gates below.
                 let (mut est, mut calls) = (0u32, false);
@@ -2891,11 +3022,22 @@ impl<I: VCodeInst> VCode<I> {
             let padjump = *PADJUMP.get_or_init(|| {
                 std::env::var("PLIRON_PADJUMP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
             });
-            if let Some(sz) = I::fixed_inst_size()
-                && padjump > 0
-                && block != self.entry
-                && new_offset - buffer.cur_offset() >= padjump * sz
-            {
+            let pad_starts_jump = match I::fixed_inst_size() {
+                // `PLIRON_ALIGNFT=2`: a pad on a hot fallthrough entry is
+                // covered by a jump to the head — one executed
+                // instruction instead of the pad's NOPs, the head keeps
+                // its alignment (a 4-byte pad is just the `b`).
+                Some(sz) if alignft == 2 && hot_fall => {
+                    new_offset - buffer.cur_offset() > sz
+                }
+                Some(sz) => {
+                    padjump > 0
+                        && block != self.entry
+                        && new_offset - buffer.cur_offset() >= padjump * sz
+                }
+                None => false,
+            };
+            if pad_starts_jump {
                 let j = I::gen_jump(MachLabel::from_block(block));
                 j.emit(&mut buffer, &self.emit_info, &mut Default::default());
             }
@@ -4479,13 +4621,29 @@ impl<I: VCodeInst> VCode<I> {
             // PLIRON: for a skipped header jump, land the pad here — the
             // block falls through it to the aligned header label.
             if skip_jmp.is_some() {
-                if cost_nopad {
-                    pad_cum += (16 - (buffer.cur_offset() & 15)) & 15;
+                // PLIRON_ALIGNFT: this pad sits on the head's
+                // fallthrough entry too (the `b` it replaces landed the
+                // same way). When the block is inside a loop span the
+                // pad costs per trip: `=1` drops it (the head lands
+                // unaligned); `=2` covers it with a `b` to the head —
+                // one executed instruction on the hot entry, the NOPs
+                // become dead bytes, and the head keeps its alignment
+                // for the backedge, which binds after the pad.
+                let hot = alignft != 0 && loop_span[oi] > 0;
+                if alignft == 2 && hot && (buffer.cur_offset() & 15) != 0 {
+                    let j =
+                        I::gen_jump(MachLabel::from_block(final_order[oi + 1]));
+                    j.emit(&mut buffer, &self.emit_info, &mut Default::default());
                 }
-                while buffer.cur_offset() & 15 != 0 {
-                    let pad = 16 - (buffer.cur_offset() & 15) as usize;
-                    let nop = I::gen_nop(pad);
-                    nop.emit(&mut buffer, &self.emit_info, &mut Default::default());
+                if !(alignft == 1 && hot) {
+                    if cost_nopad {
+                        pad_cum += (16 - (buffer.cur_offset() & 15)) & 15;
+                    }
+                    while buffer.cur_offset() & 15 != 0 {
+                        let pad = 16 - (buffer.cur_offset() & 15) as usize;
+                        let nop = I::gen_nop(pad);
+                        nop.emit(&mut buffer, &self.emit_info, &mut Default::default());
+                    }
                 }
             }
 

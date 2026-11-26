@@ -1667,9 +1667,19 @@ impl Context {
         use crate::loop_analysis::Loop;
         use crate::{FxHashMap, FxHashSet};
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static CSMOVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static CSCLONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK_V").as_deref() == Ok("1")) {
             return;
         }
+        let dbg = *DBG.get_or_init(|| std::env::var_os("PLIRON_CSDBG").is_some());
+        // PLIRON: bisection aids — `=0` disables the def-move /
+        // remat-clone half of the pass (debug only).
+        let csmove = *CSMOVE.get_or_init(|| std::env::var("PLIRON_CSMOVE").as_deref() != Ok("0"));
+        let csclone = *CSCLONE.get_or_init(|| std::env::var("PLIRON_CSCLONE").as_deref() != Ok("0"));
+        static CSEDGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let csedge = *CSEDGE.get_or_init(|| std::env::var("PLIRON_CSEDGE").as_deref() != Ok("0"));
         if self.func.layout.num_blocks() > 16384 {
             return;
         }
@@ -1845,6 +1855,29 @@ impl Context {
             }
             true
         }
+        // Is `ub` off its innermost loop's cyclic path — it dominates
+        // no latch, so no trip is guaranteed to run it (utf8's bail
+        // preds). A block on the main path dominates a back-edge
+        // source: every trip through the loop ran it (Zopfli's loop
+        // bodies). The block-level version of `term_cheap`'s test.
+        fn off_path(
+            cfg: &crate::flowgraph::ControlFlowGraph,
+            dt: &crate::dominator_tree::DominatorTree,
+            la: &crate::loop_analysis::LoopAnalysis,
+            layout: &crate::ir::Layout,
+            ub: Block,
+        ) -> bool {
+            if let Some(l) = la.innermost_loop(ub) {
+                let h = la.loop_header(l);
+                for p in cfg.pred_iter(h) {
+                    let pb = p.block;
+                    if dt.dominates(h, pb, layout) && dt.dominates(ub, pb, layout) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
         // One pass: candidate defs in layout order, plus every use site
         // per def (args resolved through aliases, in layout order so a
         // block's sites arrive inst-ordered and contiguous).
@@ -1931,68 +1964,12 @@ impl Context {
                     _ => groups.push((b, vec![u])),
                 }
             }
-            let home_group = groups.iter().position(|&(b, _)| b == home);
-            if home_group.is_none() {
-                // Every use sits strictly below: the deepest position
-                // still dominating them all is their common dominator (a
-                // branch-arg use counts at its own block — the def must
-                // dominate the edge's tail). Moving there adds nothing.
-                let mut target = groups[0].0;
-                let mut ok = self.domtree.is_reachable(target);
-                for &(b, _) in &groups[1..] {
-                    if !self.domtree.is_reachable(b) {
-                        ok = false;
-                        break;
-                    }
-                    match ncd(target, b, &self.domtree, &mut memo) {
-                        Some(t) => target = t,
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok && target != home
-                    && self.loop_analysis.loop_level(target).level() <= home_level
-                {
-                    if let Some(anchor) = self.func.layout.first_inst(target) {
-                        self.func.layout.remove_inst(d);
-                        self.func.layout.insert_inst(d, anchor);
-                        n += 1;
-                        continue;
-                    }
-                }
-            }
-            // The uses either share the def's own block or are scattered
-            // under sibling subtrees: rematerialize a copy per use site,
-            // just ahead of the site's earliest use. Use args reach `res`
-            // possibly through aliases; collect the raw spellings once
-            // so the rewrite can match them directly.
+            // Whether any use actually consumes the constant as a
+            // register operand decides both the move below and every
+            // clone further down, so the fold machinery is defined
+            // ahead of both.
             let data = self.func.dfg.insts[d];
             let ctv = self.func.dfg.ctrl_typevar(d);
-            let mut raw: FxHashSet<Value> = FxHashSet::default();
-            for &(_, u) in sites {
-                raw.extend(
-                    self.func
-                        .dfg
-                        .inst_values(u)
-                        .filter(|&v| self.func.dfg.resolve_aliases(v) == res),
-                );
-            }
-            // Partition the other use blocks by innermost loop.
-            // Top-level uses clone per block; blocks sharing one loop
-            // share a single copy at their common dominator, so one
-            // trip can never pay more materializations than the banked
-            // def would (regex's `cached_state` otherwise doubled a
-            // `mov #1<<32` in its DFA loop, +215K executed movs).
-            //
-            // Deeper than `home` a block keeps the banked def unless
-            // every use in it is cheap: an edge arg in a block off
-            // its loop's main path (LLVM's per-edge remat —
-            // utf8's bail preds) or an operand that folds into an
-            // aarch64 immediate at lowering (`band #0x8080..`,
-            // `cmp #0`, `add #16`) and so costs nothing wherever the
-            // copy lands.
             let (cbits, cty) = match data {
                 InstructionData::UnaryImm { imm, .. } => {
                     let m = if ctv.bits() >= 64 {
@@ -2026,6 +2003,104 @@ impl Context {
                 let Some(bits) = cbits else { return false };
                 folds_imm(dfg, res, bits, cty, ui)
             };
+            // A use whose constant folds into an aarch64 immediate is
+            // cheap wherever the def sits — the banked def serves it
+            // for free too. Only a genuine edge-arg use (a cheap
+            // terminator under `term_cheap`) gains anything from a
+            // closer copy: it needs the constant in a register, and
+            // the clone moves that materialization onto a rare path.
+            let edge_use = |dfg: &crate::ir::DataFlowGraph,
+                            layout: &crate::ir::Layout,
+                            ub: Block,
+                            ui: Inst|
+             -> bool {
+                dfg.insts[ui].opcode().is_terminator()
+                    && cheap_use(dfg, layout, ub, ui)
+            };
+            // Does a use need the constant in a register at all? A
+            // non-cheap operand does; a cheap terminator arg does (the
+            // edge carries it); a fold-immediate use does not — the
+            // banked def serves it for free already, so relocating or
+            // cloning for it alone buys nothing and only perturbs the
+            // register allocation (brotli's Zopfli loops shuffled every
+            // in-loop live range over fold-imm clones of `2`/`1`/`128`,
+            // +336K executed as reloads and per-trip remats).
+            let materializes = |dfg: &crate::ir::DataFlowGraph,
+                                layout: &crate::ir::Layout,
+                                ub: Block,
+                                ui: Inst|
+             -> bool {
+                !cheap_use(dfg, layout, ub, ui) || edge_use(dfg, layout, ub, ui)
+            };
+            let home_group = groups.iter().position(|&(b, _)| b == home);
+            if home_group.is_none() {
+                // Every use sits strictly below: the deepest position
+                // still dominating them all is their common dominator (a
+                // branch-arg use counts at its own block — the def must
+                // dominate the edge's tail). Moving there adds nothing
+                // unless some use reads the value in a register.
+                let mut target = groups[0].0;
+                let mut ok = self.domtree.is_reachable(target)
+                    && groups.iter().any(|&(b, ref us)| {
+                        us.iter().any(|&ui| {
+                            materializes(&self.func.dfg, &self.func.layout, b, ui)
+                        })
+                    });
+                for &(b, _) in &groups[1..] {
+                    if !self.domtree.is_reachable(b) {
+                        ok = false;
+                        break;
+                    }
+                    match ncd(target, b, &self.domtree, &mut memo) {
+                        Some(t) => target = t,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && target != home && csmove
+                    && self.loop_analysis.loop_level(target).level() <= home_level
+                {
+                    if let Some(anchor) = self.func.layout.first_inst(target) {
+                        self.func.layout.remove_inst(d);
+                        self.func.layout.insert_inst(d, anchor);
+                        n += 1;
+                        continue;
+                    }
+                }
+            }
+            if !csclone {
+                continue;
+            }
+            // The uses either share the def's own block or are scattered
+            // under sibling subtrees: rematerialize a copy per use site,
+            // just ahead of the site's earliest use. Use args reach `res`
+            // possibly through aliases; collect the raw spellings once
+            // so the rewrite can match them directly.
+            let mut raw: FxHashSet<Value> = FxHashSet::default();
+            for &(_, u) in sites {
+                raw.extend(
+                    self.func
+                        .dfg
+                        .inst_values(u)
+                        .filter(|&v| self.func.dfg.resolve_aliases(v) == res),
+                );
+            }
+            // Partition the other use blocks by innermost loop.
+            // Top-level uses clone per block; blocks sharing one loop
+            // share a single copy at their common dominator, so one
+            // trip can never pay more materializations than the banked
+            // def would (regex's `cached_state` otherwise doubled a
+            // `mov #1<<32` in its DFA loop, +215K executed movs).
+            //
+            // Deeper than `home` a block keeps the banked def unless
+            // every use in it is cheap: an edge arg in a block off
+            // its loop's main path (LLVM's per-edge remat —
+            // utf8's bail preds) or an operand that folds into an
+            // aarch64 immediate at lowering (`band #0x8080..`,
+            // `cmp #0`, `add #16`) and so costs nothing wherever the
+            // copy lands.
             // A deeper-loop clone is only a win when the banked def
             // dies outright — every use then got a strictly-closer
             // copy and the clone is pure live-range shortening
@@ -2054,6 +2129,49 @@ impl Context {
                 func.layout.insert_inst(ni, anchor);
                 func.dfg.first_result(ni)
             };
+            if dbg {
+                use alloc::string::ToString as _;
+                let imm = match data {
+                    InstructionData::UnaryImm { imm, .. } => alloc::format!("{}", imm.bits() as i64),
+                    _ => "?".to_string(),
+                };
+                let gs: Vec<alloc::string::String> = groups
+                    .iter()
+                    .map(|&(u, ref us)| {
+                        let cheap: Vec<bool> = us
+                            .iter()
+                            .map(|&ui| cheap_use(&self.func.dfg, &self.func.layout, u, ui))
+                            .collect();
+                        alloc::format!(
+                            "{u}@L{}{}{}({:?})[{}]",
+                            self.loop_analysis.loop_level(u).level(),
+                            if off_path(&self.cfg, &self.domtree, &self.loop_analysis, &self.func.layout, u) { ":op" } else { "" },
+                            if self.func.layout.is_cold(u) { ":cold" } else { "" },
+                            cheap,
+                            us.iter()
+                                .map(|&ui| alloc::format!("{}", self.func.dfg.insts[ui].opcode()))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "cs {} def {d} {res}={} home {home}@L{home_level} dc={deep_cheap} groups [{}]",
+                    self.func.name,
+                    imm,
+                    gs.join(" ")
+                );
+            }
+            // A group is served when a copy lands where it replaces a
+            // use that reads the constant in a register — or where
+            // the copy's materialization can never cost a trip of the
+            // loop's main path. Same- or shallower-level blocks clone
+            // only when a use materializes the register (a fold-only
+            // group's clone is pure allocation noise); deeper blocks
+            // clone only when the block is off its loop's cyclic path
+            // — it dominates no latch (`off_path`) or is `cold` — and
+            // every use there is cheap, so the copy rides a rare
+            // transition (utf8's bail preds).
             let mut cloned = false;
             let mut served = 0;
             for (lp, gis) in by_loop {
@@ -2079,7 +2197,19 @@ impl Context {
                     None
                 };
                 match shared {
-                    Some(t) if self.loop_analysis.loop_level(t).level() <= home_level => {
+                    Some(t)
+                        if self.loop_analysis.loop_level(t).level() <= home_level
+                            && gis.iter().any(|&gi| {
+                                groups[gi].1.iter().any(|&ui| {
+                                    materializes(
+                                        &self.func.dfg,
+                                        &self.func.layout,
+                                        groups[gi].0,
+                                        ui,
+                                    )
+                                })
+                            }) =>
+                    {
                         // If the dominator is itself a use block, land
                         // ahead of its earliest use; else at its top.
                         let anchor = gis
@@ -2088,6 +2218,9 @@ impl Context {
                             .map(|&gi| groups[gi].1[0])
                             .or_else(|| self.func.layout.first_inst(t));
                         let Some(anchor) = anchor else { continue };
+                        if dbg {
+                            eprintln!("cs   clone {res} shared at {t}@L{}", self.loop_analysis.loop_level(t).level());
+                        }
                         let nv = remat(&mut self.func, anchor);
                         for &gi in &gis {
                             for &ui in &groups[gi].1 {
@@ -2106,14 +2239,55 @@ impl Context {
                             let (u, ref us) = groups[gi];
                             // Never materialize into a deeper loop
                             // nest than the def sits in — unless the
-                            // copies would kill the banked def
-                            // (`deep_cheap` above). The banked def
-                            // keeps serving the rest (regex's
-                            // `cached_state` sank a `mov #1<<32` from
-                            // an outer DFA block into an inner slice
+                            // block is off its loop's cyclic path
+                            // (`off_path`/`cold`) and every use there
+                            // is cheap. A clone on the main path pays
+                            // a `mov` per trip on top of the banked
+                            // register that still reaches the rest
+                            // (brotli's Zopfli inner loops: 26 folded
+                            // `ishl` clones of `2` per block into
+                            // L2/L3 shuffled every in-loop live
+                            // range — +236K executed as
+                            // reloads/remats; regex's `cached_state`
+                            // sank a `mov #1<<32` into an inner slice
                             // loop — +215K movs).
-                            if self.loop_analysis.loop_level(u).level() > home_level && !deep_cheap {
+                            if self.loop_analysis.loop_level(u).level() > home_level {
+                                // A deeper clone is only ever free on
+                                // a block the loop's main path skips:
+                                // off the cyclic path or `cold`. And
+                                // every use there must be cheap —
+                                // a real register use (a call arg,
+                                // `isub`'s LHS) pays the copy's `mov`
+                                // whenever the block does run
+                                // (brotli's `SetCost` call arm,
+                                // +358K executed).
+                                if !csedge
+                                    || !us.iter().all(|&ui| {
+                                        cheap_use(&self.func.dfg, &self.func.layout, u, ui)
+                                    })
+                                    || !(off_path(
+                                        &self.cfg,
+                                        &self.domtree,
+                                        &self.loop_analysis,
+                                        &self.func.layout,
+                                        u,
+                                    ) || self.func.layout.is_cold(u))
+                                {
+                                    continue;
+                                }
+                            } else if !us.iter().any(|&ui| {
+                                materializes(&self.func.dfg, &self.func.layout, u, ui)
+                            }) {
+                                // Same- or shallower-level block where
+                                // every use folds the constant into an
+                                // immediate: the banked def already
+                                // serves those for free, so the clone
+                                // only renames a dead register and
+                                // perturbs allocation.
                                 continue;
+                            }
+                            if dbg {
+                                eprintln!("cs   clone {res} per-block at {u}@L{} before {us0:?}", self.loop_analysis.loop_level(u).level(), us0 = us[0]);
                             }
                             let nv = remat(&mut self.func, us[0]);
                             for &ui in &groups[gi].1 {
@@ -2132,7 +2306,7 @@ impl Context {
                 // The def keeps serving its in-block uses: slide it down
                 // to the first of them.
                 let first_use = groups[hg].1[0];
-                if self.func.layout.next_inst(d) != Some(first_use) {
+                if csmove && self.func.layout.next_inst(d) != Some(first_use) {
                     self.func.layout.remove_inst(d);
                     self.func.layout.insert_inst(d, first_use);
                     cloned = true;

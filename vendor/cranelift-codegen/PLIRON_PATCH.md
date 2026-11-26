@@ -2552,3 +2552,36 @@ per trip otherwise); an inst use is cheap iff the operand folds into
 an aarch64 immediate at lowering. Held-out irdiff vs baseline:
 regex -91K (next_state flat, `c_utf8_seq` -26K), rust-html-rewriter
 -618K (`utf8_valid_up_to` -319K).
+
+## `PLIRON_ALIGNFT` (opt-in, default 0 = off): loop-head pads on hot fallthrough entries
+
+`src/machinst/vcode.rs` (`VCode::emit`). The NOP pad that 16-byte-aligns
+a loop head sits on the head's *fallthrough* entry too, and when that
+entry comes from inside an enclosing loop the pad is a per-trip cost
+(rust-html-rewriter ran ~537k pad NOPs to LLVM's ~11). `loop_span` is a
+difference array over `final_order` positions marking emitted
+backward-edge spans (cold blocks excepted, edge blocks resolved to
+their real target); a head's fallthrough entry is "hot" when the last
+byte-emitting block before it is inside such a span and actually falls
+through — the walk-back skips `merged`/`noret_dead` blocks and
+label-aliased `b`-only blocks, mirrors `skip_jmp` (a trailing `b` to
+the head is dropped, so the inst before it ends the stream), and then
+reads the ending terminator: `None` falls through, a lone `Branch`
+with the head in its (≤2) successors is a `b.cond`'s not-taken arm,
+anything else (a `b` elsewhere, a condbr-plus-trampoline pair, a jump
+table) leaves the pad dead.
+
+Two sites emit those pads and both check the same predicate: the head's
+own `new_offset` pad (predecessor ends mid-stream or in a `b.cond`),
+and the `skip_jmp` tail pad that lands the head's 16-byte alignment at
+the end of a block whose `b` to the head was dropped — that second
+site is where nearly all the executed pads are. `=1` drops the pad on
+a hot entry (the head lands unaligned on every path); `=2` keeps the
+pad but starts it with a `b` to the head — one executed instruction
+on the hot entry, the NOPs dead bytes, the head still aligned for the
+backedge (its label binds after the pad). Measured (aarch64-linux
+callgrind, macOS `ab.py`): mode 2 -135k executed NOPs on
+rust-html-rewriter (-0.10% instructions, cycles ~neutral); mode 1
+removed the same pads but cost +0.8% cycles from the lost alignment,
+so `=1` is kept only as a diagnostic. pulldown-cmark and blake3-scalar
+within noise.

@@ -290,6 +290,30 @@ fn term_cheap(
     true
 }
 
+/// Is `ub` off its innermost loop's cyclic path — it dominates no
+/// latch, so no trip is guaranteed to run it (utf8's bail preds). A
+/// block on the main path dominates a back-edge source: every trip
+/// through the loop ran it (Zopfli's loop bodies). The block-level
+/// version of `term_cheap`'s test.
+fn off_path(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    la: &LoopAnalysis,
+    ub: Block,
+) -> bool {
+    if let Some(l) = la.innermost_loop(ub) {
+        let h = la.loop_header(l);
+        for p in cfg.pred_iter(h) {
+            let pb = p.block;
+            if dt.dominates(h, pb, &func.layout) && dt.dominates(ub, pb, &func.layout) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// `fold_imm`: the backend's immediate encodings are known (aarch64),
 /// so an operand that provably folds counts as a cheap deeper use.
 pub fn run(
@@ -342,15 +366,64 @@ pub fn run(
                 _ => groups.push((b, vec![u])),
             }
         }
+        // Whether any use actually consumes the constant as a register
+        // operand decides both the move below and every clone further
+        // down, so the fold machinery is defined ahead of both.
+        let id = func.dfg.insts[i];
+        let ty = func.dfg.value_type(res);
+        // The constant's value masked to its type, for the foldable
+        // half of the cheap-use test below (`f32const`/`f64const`
+        // never fold into an immediate operand).
+        let cbits = match id {
+            InstructionData::UnaryImm { imm, .. } => {
+                let m = if ty.bits() >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << ty.bits()) - 1
+                };
+                Some(imm.bits() as u64 & m)
+            }
+            _ => None,
+        };
+        let cheap_use = |func: &Function, ub: Block, u: Inst| -> bool {
+            if func.dfg.insts[u].opcode().is_terminator() {
+                return term_cheap(func, cfg, dt, la, res, u, ub);
+            }
+            fold_imm && cbits.is_some_and(|bits| folds_imm(func, res, bits, ty, u))
+        };
+        // A use whose constant folds into an immediate is cheap
+        // wherever the def sits — the banked def serves it for free
+        // too. Only a genuine edge-arg use (a cheap terminator under
+        // `term_cheap`) gains anything from a closer copy: it needs
+        // the constant in a register, and the clone moves that
+        // materialization onto a rare path.
+        let edge_use = |func: &Function, ub: Block, u: Inst| -> bool {
+            func.dfg.insts[u].opcode().is_terminator() && cheap_use(func, ub, u)
+        };
+        // Does a use need the constant in a register at all? A
+        // non-cheap operand does; a cheap terminator arg does (the
+        // edge carries it); a fold-immediate use does not — the
+        // banked def serves it for free already, so relocating or
+        // cloning for it alone buys nothing and only perturbs the
+        // register allocation (brotli's Zopfli loops shuffled every
+        // in-loop live range over fold-imm clones of `2`/`1`/`128`,
+        // +336K executed as reloads and per-trip remats).
+        let materializes = |func: &Function, ub: Block, u: Inst| -> bool {
+            !cheap_use(func, ub, u) || edge_use(func, ub, u)
+        };
         let home_group = groups.iter().position(|&(b, _)| b == home);
 
         if home_group.is_none() {
             // Every use sits strictly below: the deepest position still
             // dominating them all is their NCD (a branch-arg use counts
             // at its own block — the def must dominate the edge's
-            // tail). Moving there never adds an instruction.
+            // tail). Moving there never adds an instruction, but an
+            // all-fold graph has nothing reading the banked register —
+            // leave the def put.
             let mut target = groups[0].0;
-            let mut ok = true;
+            let mut ok = groups
+                .iter()
+                .any(|&(b, ref us)| us.iter().any(|&ui| materializes(func, b, ui)));
             for &(b, _) in &groups[1..] {
                 match ncd(target, b, dt, &mut memo) {
                     Some(t) => target = t,
@@ -376,28 +449,6 @@ pub fn run(
         // just ahead of the site's earliest use. Use args reach `res`
         // possibly through aliases; collect the raw spellings once so
         // the rewrite can match them directly.
-        let id = func.dfg.insts[i];
-        let ty = func.dfg.value_type(res);
-        // The constant's value masked to its type, for the foldable
-        // half of the cheap-use test below (`f32const`/`f64const`
-        // never fold into an immediate operand).
-        let cbits = match id {
-            InstructionData::UnaryImm { imm, .. } => {
-                let m = if ty.bits() >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << ty.bits()) - 1
-                };
-                Some(imm.bits() as u64 & m)
-            }
-            _ => None,
-        };
-        let cheap_use = |func: &Function, ub: Block, u: Inst| -> bool {
-            if func.dfg.insts[u].opcode().is_terminator() {
-                return term_cheap(func, cfg, dt, la, res, u, ub);
-            }
-            fold_imm && cbits.is_some_and(|bits| folds_imm(func, res, bits, ty, u))
-        };
         let mut raw: FxHashSet<Value> = FxHashSet::default();
         for &(_, u) in sites {
             raw.extend(
@@ -428,18 +479,15 @@ pub fn run(
                     .push(gi);
             }
         }
-        // A deeper-loop clone is only a win when the banked def dies
-        // outright — then every use got a strictly-closer copy and the
-        // clone is pure live-range shortening (encoding_rs's utf8
-        // bail path). If any deeper group has a non-cheap use the
-        // banked register survives anyway, and a partial clone just
-        // adds per-trip materializations on top of it (regex's
-        // `c_utf8_seq` bled +129K that way).
-        let deep_cheap = groups.iter().all(|&(u, ref us)| {
-            u == home
-                || la.loop_level(u).level() <= home_level
-                || us.iter().all(|&ui| cheap_use(func, u, ui))
-        });
+        // A group is served when a copy lands where it replaces a use
+        // that reads the constant in a register — or where the copy's
+        // materialization can never cost a trip of the loop's main
+        // path. Same- or shallower-level blocks clone only when a use
+        // materializes the register (a fold-only group's clone is
+        // pure allocation noise); deeper blocks clone only when the
+        // block is off its loop's cyclic path — it dominates no latch
+        // (`off_path`) or is `cold` — and every use there is cheap,
+        // so the copy rides a rare transition (utf8's bail preds).
         let mut cloned = false;
         let mut served = 0;
         for (lp, gis) in by_loop {
@@ -465,7 +513,15 @@ pub fn run(
                 None
             };
             match shared {
-                Some(t) if la.loop_level(t).level() <= home_level => {
+                Some(t)
+                    if la.loop_level(t).level() <= home_level
+                        && gis.iter().any(|&gi| {
+                            groups[gi]
+                                .1
+                                .iter()
+                                .any(|&ui| materializes(func, groups[gi].0, ui))
+                        }) =>
+                {
                     // If the dominator is itself a use block, land
                     // ahead of its earliest use; else at its top.
                     let anchor = gis
@@ -491,11 +547,32 @@ pub fn run(
                     for &gi in &gis {
                         let (u, ref us) = groups[gi];
                         // Never materialize into a deeper loop nest
-                        // than the def sits in — unless the copies
-                        // would kill the banked def (`deep_cheap`
-                        // above). The banked def keeps serving the
-                        // rest.
-                        if la.loop_level(u).level() > home_level && !deep_cheap {
+                        // than the def sits in — unless the block is
+                        // off its loop's cyclic path
+                        // (`off_path`/`cold`) and every use there is
+                        // cheap. A clone on the main path pays a
+                        // `mov` per trip on top of the banked
+                        // register that still reaches the rest; a
+                        // real register use (a call arg, `isub`'s
+                        // LHS) pays the copy's `mov` whenever the
+                        // block does run (brotli's Zopfli inner loops
+                        // bled +236K as reloads/remats; `SetCost`'s
+                        // call arm +358K). The banked def keeps
+                        // serving the rest.
+                        if la.loop_level(u).level() > home_level {
+                            if !us.iter().all(|&ui| cheap_use(func, u, ui))
+                                || !(off_path(func, cfg, dt, la, u)
+                                    || func.layout.is_cold(u))
+                            {
+                                continue;
+                            }
+                        } else if !us.iter().any(|&ui| materializes(func, u, ui)) {
+                            // Same- or shallower-level block where
+                            // every use folds the constant into an
+                            // immediate: the banked def already serves
+                            // those for free, so the clone only
+                            // renames a dead register and perturbs
+                            // allocation.
                             continue;
                         }
                         let nv = remat(func, us[0]);
@@ -583,7 +660,9 @@ mod tests {
         let mut cur = FuncCursor::new(&mut func).at_bottom(b1);
         cur.ins().return_(&[hot]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(b2);
-        let s = cur.ins().iadd(c, hot);
+        // `c` on the `isub`'s LHS has no immediate encoding — the use
+        // needs the constant in a register.
+        let s = cur.ins().isub(c, hot);
         cur.ins().return_(&[s]);
 
         sink(&mut func);
@@ -611,16 +690,18 @@ mod tests {
         let t = cur.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, k, 0);
         cur.ins().brif(t, a, &[], r, &[]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(a);
-        let s = cur.ins().iadd(c, k);
+        // `c` on the `isub` LHS needs a register: `isub c, x` cannot
+        // fold into an immediate operand.
+        let s = cur.ins().isub(c, k);
         cur.ins().jump(l, &[BlockArg::Value(s)]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(r);
         cur.ins().return_(&[k]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(l);
         let p = cur.func.dfg.append_block_param(l, types::I64);
-        let s2 = cur.ins().iadd(p, c);
+        let s2 = cur.ins().isub(c, p);
         cur.ins().return_(&[s2]);
 
-        // Uses are in `a` (iadd) and `l` (iadd); NCD = a.
+        // Uses are in `a` (isub) and `l` (isub); NCD = a.
         sink(&mut func);
         assert_eq!(home(&func, c), Some(a));
         verify(&func);
@@ -646,10 +727,12 @@ mod tests {
         let t = cur.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, k, 0);
         cur.ins().brif(t, l, &[], r, &[]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(l);
-        let s = cur.ins().iadd(c, k);
+        // `c` on the `isub` LHS needs a register (no `isub c, x`
+        // immediate encoding); `k` on the RHS folds.
+        let s = cur.ins().isub(c, k);
         cur.ins().return_(&[s]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(r);
-        let s = cur.ins().iadd(c, c);
+        let s = cur.ins().isub(c, c);
         cur.ins().return_(&[s]);
 
         sink(&mut func);
@@ -669,9 +752,12 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(iconsts(l), 2); // clones of `c` and `k` (both iadd args)
+        // `l` gets a copy of `c` only: its use of `k` folds into the
+        // `isub`'s immediate operand, so `k`'s banked def serves it for
+        // free and no clone is made.
+        assert_eq!(iconsts(l), 1);
         assert_eq!(iconsts(r), 1);
-        assert_eq!(iconsts(b0), 2); // `c` is gone; `k` and `icmp_imm`'s own iconst stay
+        assert_eq!(iconsts(b0), 2); // `c` is gone; `k` and `icmp`'s own iconst stay
         verify(&func);
     }
 
@@ -729,41 +815,152 @@ mod tests {
         verify(&func);
     }
 
-    /// The mirror image: a loop-invariant constant whose only deeper
-    /// uses fold into immediate operands gets its copy anyway — the
-    /// `iconst` is dead once `add #5`/`and #0x80`/`cmp #0` encode it,
-    /// so sinking it costs nothing and frees the banked register.
+    /// The mirror image: a loop-invariant constant whose deeper use
+    /// folds into an immediate operand keeps its banked def — the fold
+    /// encodes the constant anyway, so a copy would emit nothing and
+    /// only perturb the register allocation (brotli's Zopfli loops,
+    /// +336K executed). The one deeper use worth a copy is an edge arg
+    /// on a rare path (encoding_rs's utf8 bail edge): it needs the
+    /// constant in a register, and killing the banked def shortens its
+    /// live range out of the loop.
     #[test]
-    fn deeper_foldable_uses_get_a_copy() {
-        let mut sig = Signature::new(CallConv::Fast);
-        sig.returns.push(AbiParam::new(types::I64));
-        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
-        let b0 = func.dfg.make_block();
-        let head = func.dfg.make_block();
-        let out = func.dfg.make_block();
-        for b in [b0, head, out] {
-            func.layout.append_block(b);
-        }
-        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
-        let c = cur.ins().iconst(types::I64, 5);
-        let mask = cur.ins().iconst(types::I64, 0x80);
-        let zero = cur.ins().iconst(types::I64, 0);
-        cur.ins().jump(head, &[BlockArg::Value(zero)]);
-        let mut cur = FuncCursor::new(&mut func).at_bottom(head);
-        let iv = cur.func.dfg.append_block_param(head, types::I64);
-        let a = cur.ins().iadd(iv, c);
-        let m = cur.ins().band(a, mask);
-        let cond = cur.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan, iv, 10);
-        cur.ins().brif(cond, head, &[BlockArg::Value(m)], out, &[]);
-        let mut cur = FuncCursor::new(&mut func).at_bottom(out);
-        cur.ins().return_(&[iv]);
-
-        // `add iv, #5` and `and .., #0x80` both encode the constant in
-        // the instruction: cloning `c` and `mask` into the deeper
-        // block is free, so the banked defs die.
+    fn deeper_edge_arg_use_gets_a_copy() {
+        let clif = "
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 5
+    v9 = iconst.i64 10
+    v8 = iconst.i64 1
+    jump block1(v0)
+block1(v10: i64):
+    v2 = icmp ult v10, v9
+    brif v2, block2, block3
+block2:
+    v3 = icmp ult v10, v8
+    brif v3, block5(v1), block3
+block3:
+    v4 = iadd v10, v8
+    jump block1(v4)
+block5(v11: i64):
+    return v11
+}
+";
+        let mut func = cranelift_reader::parse_functions(clif).unwrap().remove(0);
+        let v1 = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .find(|&i| {
+                matches!(
+                    func.dfg.insts[i],
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                        ..
+                    } if imm.bits() == 5
+                )
+            })
+            .map(|i| func.dfg.first_result(i))
+            .unwrap();
         sink(&mut func);
-        assert_eq!(home(&func, c), None);
-        assert_eq!(home(&func, mask), None);
+        // `block2` carries `v1` onto the rare `block5` exit edge (it
+        // dominates no latch and the edge feeds none): the clone kills
+        // the banked def, while the other constants' loop uses all
+        // fold and keep theirs.
+        assert_eq!(home(&func, v1), None);
+        let fives: Vec<Block> = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b).map(move |i| (b, i)))
+            .filter(|&(_, i)| {
+                matches!(
+                    func.dfg.insts[i],
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                        ..
+                    } if imm.bits() == 5
+                )
+            })
+            .map(|(b, _)| b)
+            .collect();
+        let blocks: Vec<Block> = func.layout.blocks().collect();
+        assert_eq!(fives, vec![blocks[2]], "one clone in block2");
+        verify(&func);
+    }
+
+    /// A constant whose uses all fold into immediate operands is left
+    /// exactly where the allocator left it — not moved to the uses'
+    /// NCD, not cloned per block. The fold encodes the constant
+    /// either way, so relocation buys nothing, while every dead copy
+    /// and every moved def perturbs the register allocation
+    /// (brotli's Zopfli loops paid +336K executed in reloads and
+    /// per-trip remats over such clones of `2`/`1`/`128`).
+    #[test]
+    fn fold_imm_only_uses_neither_move_nor_clone() {
+        let clif = "
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 2
+    v8 = iconst.i64 0xffff
+    v9 = iconst.i64 128
+    v2 = icmp ult v0, v9
+    brif v2, block1, block2
+block1:
+    v3 = ishl v0, v1
+    v5 = band v3, v8
+    return v5
+block2:
+    v4 = band v0, v8
+    return v4
+}
+";
+        let mut func = cranelift_reader::parse_functions(clif).unwrap().remove(0);
+        let find = |func: &Function, bits: u64| {
+            func.layout
+                .blocks()
+                .flat_map(|b| func.layout.block_insts(b))
+                .find(|&i| {
+                    matches!(
+                        func.dfg.insts[i],
+                        InstructionData::UnaryImm {
+                            opcode: Opcode::Iconst,
+                            imm,
+                            ..
+                        } if imm.bits() as u64 == bits
+                    )
+                })
+                .map(|i| func.dfg.first_result(i))
+                .unwrap()
+        };
+        let (v1, v8) = (find(&func, 2), find(&func, 0xffff));
+        sink(&mut func);
+        let blocks: Vec<Block> = func.layout.blocks().collect();
+        // `ishl`'s shift amount and `band`'s mask both encode in the
+        // instruction: `v1`'s single fold use cannot pull the def down
+        // to `block1`, and `v8`'s two fold uses get no clones — the
+        // banked defs stay in `block0`.
+        assert_eq!(home(&func, v1), Some(blocks[0]));
+        assert_eq!(home(&func, v8), Some(blocks[0]));
+        let copies = |func: &Function, bits: u64| -> Vec<Block> {
+            func.layout
+                .blocks()
+                .flat_map(|b| func.layout.block_insts(b).map(move |i| (b, i)))
+                .filter(|&(_, i)| {
+                    matches!(
+                        func.dfg.insts[i],
+                        InstructionData::UnaryImm {
+                            opcode: Opcode::Iconst,
+                            imm,
+                            ..
+                        } if imm.bits() as u64 == bits
+                    )
+                })
+                .map(|(b, _)| b)
+                .collect()
+        };
+        assert_eq!(copies(&func, 2), vec![blocks[0]]);
+        assert_eq!(copies(&func, 0xffff), vec![blocks[0]]);
         verify(&func);
     }
 
@@ -790,12 +987,13 @@ mod tests {
         cur.ins().jump(head, &[BlockArg::Value(zero)]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(head);
         let iv = cur.func.dfg.append_block_param(head, types::I64);
-        // `c` is defined inside the loop (level 1) with a use here,
-        // plus uses in `then` and `tail` at the same nest level.
+        // `c` is defined inside the loop (level 1) and used only in
+        // `then` and `tail` at the same nest level — no use at home,
+        // so the copies kill the banked def outright.
         let c = cur.ins().iconst(types::I64, 5);
         let t = cur
             .ins()
-            .icmp(cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan, iv, c);
+            .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan, iv, 9);
         cur.ins().brif(t, mid, &[], out, &[]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(mid);
         let t2 = cur
@@ -804,11 +1002,14 @@ mod tests {
         cur.ins()
             .brif(t2, then, &[], tail, &[BlockArg::Value(iv)]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(then);
-        let s1 = cur.ins().iadd(iv, c);
+        // `c` on the `isub` LHS cannot fold into an immediate — the
+        // uses below need the constant in a register, so they get
+        // copies.
+        let s1 = cur.ins().isub(c, iv);
         cur.ins().jump(tail, &[BlockArg::Value(s1)]);
         let mut cur = FuncCursor::new(&mut func).at_bottom(tail);
         let tp = cur.func.dfg.append_block_param(tail, types::I64);
-        let s2 = cur.ins().iadd(tp, c);
+        let s2 = cur.ins().isub(c, tp);
         let cond = cur
             .ins()
             .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan, s2, 10);
@@ -817,11 +1018,11 @@ mod tests {
         cur.ins().return_(&[iv]);
 
         // `then` and `tail` share the innermost loop and their NCD is
-        // `mid`, dominated by `head`: one shared copy lands at `mid`
-        // rather than a copy per block — a trip pays one
-        // materialization, never two. The def stays for `head`'s use.
+        // `mid`, dominated by `head` and at its own level: the def
+        // moves there rather than copying per block — a trip pays one
+        // materialization, never two.
         sink(&mut func);
-        assert_eq!(home(&func, c), Some(head));
+        assert_eq!(home(&func, c), Some(mid));
         let fives: Vec<Block> = func
             .layout
             .blocks()
@@ -838,7 +1039,7 @@ mod tests {
             })
             .map(|(b, _)| b)
             .collect();
-        assert_eq!(fives, vec![head, mid], "one shared copy at the in-loop NCD");
+        assert_eq!(fives, vec![mid], "one copy at the in-loop NCD");
         verify(&func);
     }
 
