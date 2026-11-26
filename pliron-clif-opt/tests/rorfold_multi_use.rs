@@ -61,3 +61,26 @@ block0(v0: i32, v1: i32, v2: i32):
 }");
     assert_eq!(shifted_ror(&a), 0, "{a}");
 }
+
+/// One direct use but transitively `Multiple` (the `bxor` feeds the
+/// backedge, the exit test and the return): the default gate still
+/// refuses; `PLIRON_RORFOLD_DIRECT=1` folds it (rorfold_direct.rs).
+#[test]
+fn transitive_multi_use_stays_separate_by_default() {
+    let a = asm("
+function %f(i64, i64) -> i64 apple_aarch64 {
+block0(v0: i64, v1: i64):
+    v13 = iconst.i64 13
+    jump block1(v0)
+
+block1(v6: i64):
+    v3 = rotl v6, v13
+    v4 = bxor v3, v1
+    v5 = icmp ne v4, v0
+    brif v5, block1(v4), block2()
+
+block2:
+    return v4
+}");
+    assert_eq!(shifted_ror(&a), 0, "{a}");
+}

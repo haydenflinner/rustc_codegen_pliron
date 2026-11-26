@@ -1032,6 +1032,19 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     `pliron-clif-opt/tests/rorfold_multi_use.rs` (the multi-use case fails
     with the old rule).
 
+    `PLIRON_RORFOLD_DIRECT=1` (2026-11-26, opt-in) also folds when the
+    rotate has at most one *direct* use (`value_direct_uses`) even if the
+    transitive `ValueUseState` is `Multiple` — i.e. the single consumer's
+    own result fans out (a loop's `bxor` feeding both the backedge and the
+    exit args). The mark exists for producers that could be emitted once
+    per consumer site, but a fold here never materializes the rotate: with
+    one direct use the `ror` simply dies — strictly fewer instructions, no
+    added latency (the blake3 hazard is the genuinely multi-use case,
+    still refused). SipHash-1-3's chunk loop (`RandomState::hash_one` on
+    regex's DFA-state cache) is exactly this shape: -163k executed
+    instructions on regex (aarch64-linux callgrind), loop 21 -> 17 insts.
+    Test: `pliron-clif-opt/tests/rorfold_direct.rs`.
+
 72. aarch64 unsigned-carry idiom (`src/isa/aarch64/lower.isle`
     `iadd_carry_*`, `carry_cinc_on` in `src/isa/aarch64/lower/isle.rs`;
     `PLIRON_CARRYCINC=0` disables): `iadd x, (select (icmp ult (iadd a b), a|b), 1, 0)`

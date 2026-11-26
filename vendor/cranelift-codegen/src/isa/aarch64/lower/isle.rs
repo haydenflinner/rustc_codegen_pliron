@@ -1605,10 +1605,28 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     /// PLIRON: may a constant rotate be folded into a logic op's shifted
     /// operand? Only when it has a single use (see `rot_fold_ok` in
     /// `lower.isle`); `PLIRON_RORFOLD_MULTI=1` folds multi-use rotates too.
+    ///
+    /// `PLIRON_RORFOLD_DIRECT=1` additionally folds when the rotate has
+    /// at most one *direct* use (`value_direct_uses`), even if the
+    /// transitive `ValueUseState` marks it `Multiple` because its single
+    /// consumer's result fans out (a loop's `bxor` feeding both the
+    /// backedge and the exit args). That mark exists for producers that
+    /// could be emitted once per consumer site — but a fold here never
+    /// materializes the rotate: with one direct use the `ror` simply
+    /// dies, which is strictly fewer instructions and no added latency
+    /// (unlike the genuinely multi-use case, where the `ror` is emitted
+    /// anyway and the shifted-operand op costs a cycle on Apple cores —
+    /// blake3's mixing chain). SipHash-1-3's round loop
+    /// (`RandomState::hash_one` on regex's DFA-state cache) keeps every
+    /// compress rotate singly-used but transitively `Multiple`:
+    /// -163k executed instructions on regex.
     fn rot_fold_ok(&mut self, val: Value) -> bool {
         static MULTI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *MULTI.get_or_init(|| std::env::var("PLIRON_RORFOLD_MULTI").as_deref() == Ok("1"))
             || !self.lower_ctx.value_has_multiple_uses(val)
+            || (*DIRECT.get_or_init(|| std::env::var("PLIRON_RORFOLD_DIRECT").as_deref() == Ok("1"))
+                && self.lower_ctx.value_single_direct_use(val))
     }
 
     /// PLIRON: `PLIRON_TBNZ_IREDUCE=0` off (default on), see `lower.isle`.
