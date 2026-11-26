@@ -173,17 +173,17 @@ fn enc_log_bits(v: u64) -> bool {
 /// have no immediate encoding (which is what keeps regex's hot-loop
 /// `mov #1<<32` banked).
 fn folds_imm(func: &Function, res: Value, bits: u64, ty: Type, u: Inst) -> bool {
-    let (args, enc, rhs_only) = match func.dfg.insts[u] {
+    let (op, args, enc, rhs_only) = match func.dfg.insts[u] {
         InstructionData::Binary { opcode, args } => match opcode {
-            Opcode::Iadd => (args, enc_add(bits), false),
-            Opcode::Isub => (args, enc_add(bits), true),
-            Opcode::Band | Opcode::Bor | Opcode::Bxor => (args, enc_log(bits, ty), false),
+            Opcode::Iadd => (opcode, args, enc_add(bits), false),
+            Opcode::Isub => (opcode, args, enc_add(bits), true),
+            Opcode::Band | Opcode::Bor | Opcode::Bxor => (opcode, args, enc_log(bits, ty), false),
             Opcode::Ishl | Opcode::Ushr | Opcode::Sshr | Opcode::Rotl | Opcode::Rotr => {
-                (args, bits < 64, true)
+                (opcode, args, bits < 64, true)
             }
             _ => return false,
         },
-        InstructionData::IntCompare { args, .. } => (args, enc_add(bits), true),
+        InstructionData::IntCompare { opcode, args, .. } => (opcode, args, enc_add(bits), true),
         _ => return false,
     };
     let mut any = false;
@@ -193,6 +193,35 @@ fn folds_imm(func: &Function, res: Value, bits: u64, ty: Type, u: Inst) -> bool 
                 return false;
             }
             any = true;
+            // The immediate slot exists only for the plain
+            // add/sub/cmp/logic lowering: when the OTHER operand is
+            // itself fusible into a register-only form the constant
+            // needs a `mov` after all — `iadd` of an `imul` becomes
+            // `madd`, `iadd` of an `ishl`/`ushr` and
+            // `band`/`bor`/`bxor` of a constant shift/rotate or a
+            // `bnot` become the shifted/inverted-register forms
+            // (lower.isle `iadd_imul_*`, `iadd_ishl_*`, `iadd_ushr_*`,
+            // `*_lsl_op*`, `*_not_*`, all outranking the immediate
+            // rules). prost's `encoded_len_varint` (`(bits*9+73)/64`)
+            // cloned a per-trip `mov w_, #73` into every `madd` site
+            // of the encode loop (+65K on rust-protobuf).
+            let sib = func.dfg.resolve_aliases(args[1 - k]);
+            if let Some(si) = func.dfg.value_def(sib).inst() {
+                let fused = match func.dfg.insts[si].opcode() {
+                    Opcode::Imul => op == Opcode::Iadd,
+                    Opcode::Ishl | Opcode::Ushr => {
+                        op == Opcode::Iadd
+                            || matches!(op, Opcode::Band | Opcode::Bor | Opcode::Bxor)
+                    }
+                    Opcode::Sshr | Opcode::Rotl | Opcode::Rotr | Opcode::Bnot => {
+                        matches!(op, Opcode::Band | Opcode::Bor | Opcode::Bxor)
+                    }
+                    _ => false,
+                };
+                if fused {
+                    return false;
+                }
+            }
         }
     }
     any && enc
@@ -1075,6 +1104,124 @@ block2:
             .map(|(b, _)| b)
             .collect();
         assert_eq!(fives, vec![mid], "one copy at the in-loop NCD");
+        verify(&func);
+    }
+
+    /// `iadd (imul ..), c` lowers to `madd`, which has no immediate
+    /// operand — the constant needs a register wherever the copy
+    /// lands, so a deeper clone is a per-trip `mov` (prost's
+    /// `encoded_len_varint` `(bits*9+73)/64` inside
+    /// `message::encode::<User>`: +65K executed on rust-protobuf).
+    /// The use is not cheap: the banked def stays.
+    #[test]
+    fn imul_sibling_iadd_use_keeps_banked_def() {
+        let clif = "
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 73
+    v9 = iconst.i64 9
+    v10 = iconst.i64 1000
+    jump block1(v0)
+block1(v11: i64):
+    v12 = imul v11, v9
+    v13 = iadd v12, v1
+    v14 = icmp ult v13, v10
+    brif v14, block1(v13), block2
+block2:
+    return v13
+}
+";
+        let mut func = cranelift_reader::parse_functions(clif).unwrap().remove(0);
+        let find = |func: &Function, bits: u64| {
+            func.layout
+                .blocks()
+                .flat_map(|b| func.layout.block_insts(b))
+                .find(|&i| {
+                    matches!(
+                        func.dfg.insts[i],
+                        InstructionData::UnaryImm {
+                            opcode: Opcode::Iconst,
+                            imm,
+                            ..
+                        } if imm.bits() as u64 == bits
+                    )
+                })
+                .map(|i| func.dfg.first_result(i))
+                .unwrap()
+        };
+        let (v1, v9) = (find(&func, 73), find(&func, 9));
+        sink(&mut func);
+        let blocks: Vec<Block> = func.layout.blocks().collect();
+        // `v1` (73): its only use is the `iadd` of `v12`'s `imul` —
+        // not cheap, so no clone into the loop and the def stays at
+        // the entry. `v9` (9) is an `imul` operand — never foldable,
+        // also banked.
+        assert_eq!(home(&func, v1), Some(blocks[0]));
+        assert_eq!(home(&func, v9), Some(blocks[0]));
+        let copies = func
+            .layout
+            .block_insts(blocks[1])
+            .filter(|&i| {
+                matches!(
+                    func.dfg.insts[i],
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                        ..
+                    } if imm.bits() == 73
+                )
+            })
+            .count();
+        assert_eq!(copies, 0, "no `73` materialization inside the loop");
+        verify(&func);
+    }
+
+    /// The dual: an `iadd` whose sibling is a plain value keeps the
+    /// fold — the const really does encode in `add #imm`, so the
+    /// deeper edge-arg copy rule still applies (regression control
+    /// for the `imul` veto above).
+    #[test]
+    fn plain_sibling_iadd_use_still_folds() {
+        let clif = "
+function %f(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 73
+    v9 = iconst.i64 1
+    v5 = iconst.i64 4
+    jump block1(v0)
+block1(v11: i64):
+    v12 = iadd v11, v9
+    v2 = icmp ult v11, v5
+    brif v2, block2, block3
+block2:
+    v3 = iadd v12, v1
+    jump block1(v3)
+block3:
+    return v12
+}
+";
+        let mut func = cranelift_reader::parse_functions(clif).unwrap().remove(0);
+        let v1 = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .find(|&i| {
+                matches!(
+                    func.dfg.insts[i],
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                        ..
+                    } if imm.bits() == 73
+                )
+            })
+            .map(|i| func.dfg.first_result(i))
+            .unwrap();
+        sink(&mut func);
+        // `v1`'s only use is an `iadd` of a plain `iadd` result in the
+        // loop's latch — it folds, so it gets a clone and the banked
+        // def dies, exactly as before the sibling veto.
+        assert_eq!(home(&func, v1), None);
         verify(&func);
     }
 

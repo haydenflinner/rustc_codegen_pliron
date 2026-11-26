@@ -1737,17 +1737,21 @@ impl Context {
             ty: crate::ir::Type,
             u: Inst,
         ) -> bool {
-            let (args, enc, rhs_only) = match dfg.insts[u] {
+            let (op, args, enc, rhs_only) = match dfg.insts[u] {
                 InstructionData::Binary { opcode, args } => match opcode {
-                    Opcode::Iadd => (args, enc_add(bits), false),
-                    Opcode::Isub => (args, enc_add(bits), true),
-                    Opcode::Band | Opcode::Bor | Opcode::Bxor => (args, enc_log(bits, ty), false),
+                    Opcode::Iadd => (opcode, args, enc_add(bits), false),
+                    Opcode::Isub => (opcode, args, enc_add(bits), true),
+                    Opcode::Band | Opcode::Bor | Opcode::Bxor => {
+                        (opcode, args, enc_log(bits, ty), false)
+                    }
                     Opcode::Ishl | Opcode::Ushr | Opcode::Sshr | Opcode::Rotl | Opcode::Rotr => {
-                        (args, bits < 64, true)
+                        (opcode, args, bits < 64, true)
                     }
                     _ => return false,
                 },
-                InstructionData::IntCompare { args, .. } => (args, enc_add(bits), true),
+                InstructionData::IntCompare { opcode, args, .. } => {
+                    (opcode, args, enc_add(bits), true)
+                }
                 _ => return false,
             };
             let mut any = false;
@@ -1757,6 +1761,37 @@ impl Context {
                         return false;
                     }
                     any = true;
+                    // The immediate slot exists only for the plain
+                    // add/sub/cmp/logic lowering: when the OTHER
+                    // operand is itself fusible into a register-only
+                    // form the constant needs a `mov` after all —
+                    // `iadd` of an `imul` becomes `madd`, `iadd` of an
+                    // `ishl`/`ushr` and `band`/`bor`/`bxor` of a
+                    // constant shift/rotate or a `bnot` become the
+                    // shifted/inverted-register forms (lower.isle
+                    // `iadd_imul_*`, `iadd_ishl_*`, `iadd_ushr_*`,
+                    // `*_lsl_op*`, `*_not_*`, all outranking the
+                    // immediate rules). prost's `encoded_len_varint`
+                    // (`(bits*9+73)/64`) cloned a per-trip
+                    // `mov w_, #73` into every `madd` site of the
+                    // encode loop (+65K on rust-protobuf).
+                    let sib = dfg.resolve_aliases(args[1 - k]);
+                    if let Some(si) = dfg.value_def(sib).inst() {
+                        let fused = match dfg.insts[si].opcode() {
+                            Opcode::Imul => op == Opcode::Iadd,
+                            Opcode::Ishl | Opcode::Ushr => {
+                                op == Opcode::Iadd
+                                    || matches!(op, Opcode::Band | Opcode::Bor | Opcode::Bxor)
+                            }
+                            Opcode::Sshr | Opcode::Rotl | Opcode::Rotr | Opcode::Bnot => {
+                                matches!(op, Opcode::Band | Opcode::Bor | Opcode::Bxor)
+                            }
+                            _ => false,
+                        };
+                        if fused {
+                            return false;
+                        }
+                    }
                 }
             }
             any && enc
