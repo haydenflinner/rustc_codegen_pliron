@@ -2620,6 +2620,15 @@ fn s_stepcmp(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::stepcmp(&mut p.clctx.func)
 }
 
+fn s_carrychain(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    // i128 on wasm legalizes to pairs of i64 ops — strictly worse than
+    // the select the chain replaces.
+    if p.target.is_wasm() {
+        return 0;
+    }
+    clifpeep::carrychain(&mut p.clctx.func)
+}
+
 fn s_mulcarry(p: &mut Pipe, _an: &mut Analysis) -> usize {
     clifpeep::mulcarry(&mut p.clctx.func)
 }
@@ -6199,6 +6208,14 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             },
             site: std::sync::OnceLock::new(),
         },
+        // `h + (a+b <u a ? 1 : 0)` carry chains -> one i128 pair add, so
+        // isel emits `adds;adc` (aarch64) / `add;adc` (x64) riding the
+        // sum's own flags. aarch64's CARRYCINC+flag_twin already reach
+        // `adds;csinc` from the i64 spelling (a wash there); x64 has no
+        // `select`-form fold — this is its route to `adc`. montgomery's
+        // per-limb `c = c_ + z1`. Native only: i128 on wasm legalizes
+        // to more i64 ops than the select it replaces.
+        step("carrychain", "", Gate::OptIn("PLIRON_CARRYCHAIN"), s_carrychain),
         // After everything: the `end + -1` bound and the stepped pointer
         // only settle into one block at the end (parse_only).
         step("stepcmp", "", Gate::OptIn("PLIRON_STEPCMP"), s_stepcmp).needs(shape::LOOPS),

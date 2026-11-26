@@ -10365,6 +10365,172 @@ fn alias_to(pos: &mut FuncCursor, inst: Inst, res: Value, v: Value) -> bool {
     true
 }
 
+/// `PLIRON_CARRYCHAIN` (opt-in): the add-with-carry idiom
+///
+///   sum = iadd.i64 a, b
+///   cf  = icmp ult sum, a            (or `sum, b`; `ugt a, sum` too)
+///   c   = select.i64 cf, 1, 0        (or `uextend.i64 cf`)
+///   out = iadd.i64 h, c
+///
+/// is one 128-bit pair add `(h + carry) : (a + b)` — `isplit (iadd.i128
+/// (iconcat a, h), (uextend b))`. The pair add lowers to `adds lo, a, b;
+/// adc hi, h, xzr` on aarch64 and `add lo, a, b; adc hi, 0` on x64: the
+/// sum's own add produces the carry in flags and the chain's tail rides
+/// it — no separate `cmp`, no materialized 0/1. On aarch64 the
+/// `PLIRON_CARRYCINC` isel fold plus vcode `flag_twin` already reach an
+/// equivalent `adds; csinc` from the i64 spelling, so the rewrite is a
+/// wash there (measured: csinc↔adc swap, blind-sig montgomery); x64 has
+/// no fold for the `select` form (`iadd_uext_ucmp` only matches
+/// `uextend(icmp)`), so this is the route to `add;adc` there — vs
+/// `add;cmp;cmov;add` for the select. num-bigint-dig `add_mul_vvw`'s
+/// `c = c_ + z1` pays the pair for every montgomery inner-loop element
+/// (blind-sig). Native only: i128 on wasm legalizes to more i64 ops
+/// than the select it replaces. i64 limbs only: an i32 `iconcat`
+/// materializes a shift+or instead of riding a register pair. `cf` and
+/// `c` must be single-use — with another reader the flag still
+/// materializes and the split is a wash. The sum's other uses all move
+/// to the pair's `lo` half, which is exactly its value.
+pub fn carrychain(func: &mut Function) -> usize {
+    // (out-iadd, carry-materialization, flag-icmp, sum-iadd, hi, a, b)
+    let mut cands: Vec<(Inst, Inst, Inst, Inst, Value, Value, Value)> = Vec::new();
+    let mut uses: Option<FxHashMap<Value, usize>> = None;
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args,
+            } = func.dfg.insts[i]
+            else {
+                continue;
+            };
+            if func.dfg.value_type(func.dfg.first_result(i)) != types::I64 {
+                continue;
+            }
+            for k in 0..2 {
+                let c = func.dfg.resolve_aliases(args[k]);
+                let h = func.dfg.resolve_aliases(args[k ^ 1]);
+                let Some(sc) = func.dfg.value_def(c).inst() else {
+                    continue;
+                };
+                let cf = match func.dfg.insts[sc] {
+                    InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args: [f, t, e],
+                    } => {
+                        if iconst(func, t) != Some(1) || iconst(func, e) != Some(0) {
+                            continue;
+                        }
+                        f
+                    }
+                    InstructionData::Unary {
+                        opcode: Opcode::Uextend,
+                        arg: f,
+                    } => f,
+                    _ => continue,
+                };
+                let cf = func.dfg.resolve_aliases(cf);
+                let Some(fc) = func.dfg.value_def(cf).inst() else {
+                    continue;
+                };
+                let (sv, u) = match func.dfg.insts[fc] {
+                    InstructionData::IntCompare {
+                        opcode: Opcode::Icmp,
+                        cond: IntCC::UnsignedLessThan,
+                        args: [s, u],
+                    } => (s, u),
+                    // `a >u sum` is `sum <u a` — the same carry.
+                    InstructionData::IntCompare {
+                        opcode: Opcode::Icmp,
+                        cond: IntCC::UnsignedGreaterThan,
+                        args: [u, s],
+                    } => (s, u),
+                    _ => continue,
+                };
+                let s = func.dfg.resolve_aliases(sv);
+                let u = func.dfg.resolve_aliases(u);
+                let Some(sd) = func.dfg.value_def(s).inst() else {
+                    continue;
+                };
+                let InstructionData::Binary {
+                    opcode: Opcode::Iadd,
+                    args: [a, b],
+                } = func.dfg.insts[sd]
+                else {
+                    continue;
+                };
+                if func.dfg.value_type(s) != types::I64 {
+                    continue;
+                }
+                let (a, b) = (func.dfg.resolve_aliases(a), func.dfg.resolve_aliases(b));
+                if (u != a && u != b) || h == s {
+                    continue;
+                }
+                // The carry chain is single-use: the icmp feeds only
+                // the 0/1 materialization and that feeds only this
+                // iadd. The sum's uses are unconstrained — they all
+                // move to the pair's `lo` half.
+                let u_map = uses.get_or_insert_with(|| use_counts(func));
+                if u_map.get(&cf).copied() != Some(1) || u_map.get(&c).copied() != Some(1) {
+                    continue;
+                }
+                cands.push((i, sc, fc, sd, h, a, b));
+                break;
+            }
+        }
+    }
+    let mut n = 0;
+    let mut dom: Option<DominatorTree> = None;
+    let mut dead: FxHashSet<Inst> = FxHashSet::default();
+    for (i, sc, fc, sd, h, a, b) in cands {
+        if dead.contains(&i) || dead.contains(&sc) || dead.contains(&fc) || dead.contains(&sd) {
+            continue;
+        }
+        // The pair add emits at `sd`'s site (so `lo` inherits the
+        // sum's dominance); `h` must reach that site too.
+        let d = dom.get_or_insert_with(|| {
+            let cfg = ControlFlowGraph::with_function(func);
+            DominatorTree::with_function(func, &cfg)
+        });
+        let h_ok = match func.dfg.value_def(h) {
+            ValueDef::Result(hd, _) => hd != sd && d.try_dominates(hd, sd, &func.layout),
+            ValueDef::Param(hb, _) => func
+                .layout
+                .inst_block(sd)
+                .is_some_and(|sb| d.block_dominates(hb, sb)),
+            _ => false,
+        };
+        if !h_ok {
+            continue;
+        }
+        let (a, b, h) = (
+            func.dfg.resolve_aliases(a),
+            func.dfg.resolve_aliases(b),
+            func.dfg.resolve_aliases(h),
+        );
+        let s = func.dfg.first_result(sd);
+        let i_res = func.dfg.first_result(i);
+        let (lo2, hi2) = {
+            let mut pos = FuncCursor::new(func).at_inst(sd);
+            let pair = pos.ins().iconcat(a, h);
+            let ub = pos.ins().uextend(types::I128, b);
+            let res = pos.ins().iadd(pair, ub);
+            pos.ins().isplit(res)
+        };
+        // Detach the results before aliasing (`change_to_alias`
+        // requires unattached values); every use of the sum goes to the
+        // pair's `lo`, every use of the chain's tail to `hi`.
+        for d in [i, sc, fc, sd] {
+            func.dfg.clear_results(d);
+            func.layout.remove_inst(d);
+            dead.insert(d);
+        }
+        func.dfg.change_to_alias(s, lo2);
+        func.dfg.change_to_alias(i_res, hi2);
+        n += 1;
+    }
+    n
+}
+
 /// The last-sweep cleanups `iconst128` runs after the pipeline's final
 /// mutating step — the wasm emitter walks every inst into a real op
 /// with no DCE behind it, so pure leftovers cost real code:
@@ -14780,5 +14946,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `h + (a + b <u a ? 1 : 0)` — montgomery's `c = c_ + z1` — becomes
+    /// one i128 pair add (`adds; adc` on aarch64): the icmp and select
+    /// are gone, the sum's other use (the store stand-in `ret`) moves
+    /// to the pair's `lo` half and the chain tail to `hi`.
+    #[test]
+    fn carrychain_pair_add() {
+        let src = "function %f(i64, i64, i64) -> i64 {
+        block0(v0: i64, v1: i64, v2: i64):
+            v3 = iadd v0, v1
+            v4 = icmp ult v3, v0
+            v5 = iconst.i64 1
+            v6 = iconst.i64 0
+            v7 = select v4, v5, v6
+            v8 = iadd v2, v7
+            v9 = iadd v3, v8
+            return v9
+        }";
+        let mut func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        assert_eq!(carrychain(&mut func), 1, "\n{}", func.display());
+        let mut pair_adds = 0;
+        let mut splits = 0;
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                match func.dfg.insts[i].opcode() {
+                    Opcode::Iadd => {
+                        pair_adds += (func.dfg.ctrl_typevar(i) == types::I128) as usize;
+                    }
+                    Opcode::Isplit => splits += 1,
+                    Opcode::Icmp | Opcode::Select => {
+                        panic!("carry chain left over\n{}", func.display())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!((pair_adds, splits), (1, 1), "\n{}", func.display());
+        // The surviving i64 `iadd` reads the two halves back.
+        let flags =
+            cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("carrychain produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// Same shape through `uextend` + `icmp ugt` instead of `select` +
+    /// `icmp ult`.
+    #[test]
+    fn carrychain_uextend_ugt() {
+        let src = "function %f(i64, i64, i64) -> i64 {
+        block0(v0: i64, v1: i64, v2: i64):
+            v3 = iadd v0, v1
+            v4 = icmp ugt v0, v3
+            v7 = uextend.i64 v4
+            v8 = iadd v7, v2
+            v9 = iadd v3, v8
+            return v9
+        }";
+        let mut func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        assert_eq!(carrychain(&mut func), 1, "\n{}", func.display());
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                match func.dfg.insts[i].opcode() {
+                    // the pair add's own `uextend.i128` stays.
+                    Opcode::Uextend => assert_eq!(
+                        func.dfg.ctrl_typevar(i),
+                        types::I128,
+                        "\n{}",
+                        func.display()
+                    ),
+                    Opcode::Icmp => panic!("carry chain left over\n{}", func.display()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// A second use of the 0/1 carry keeps the materialization; the
+    /// pair add would be a wash.
+    #[test]
+    fn carrychain_multiuse_carry_kept() {
+        let src = "function %f(i64, i64, i64) -> i64 {
+        block0(v0: i64, v1: i64, v2: i64):
+            v3 = iadd v0, v1
+            v4 = icmp ult v3, v0
+            v5 = iconst.i64 1
+            v6 = iconst.i64 0
+            v7 = select v4, v5, v6
+            v8 = iadd v2, v7
+            v9 = iadd v3, v8
+            v10 = iadd v9, v7
+            return v10
+        }";
+        let mut func = cranelift_reader::parse_functions(src).unwrap().remove(0);
+        assert_eq!(carrychain(&mut func), 0, "\n{}", func.display());
     }
 }
