@@ -3326,6 +3326,14 @@ fn s_constdedup(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_constsink(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let uses = an.uses(&p.clctx.func);
+    let CfgDtLa { cfg, dt, la } = an.cfg_dt_la(&p.clctx.func);
+    let k = constsink::run(&mut p.clctx.func, cfg, dt, la, &uses, p.target.is_aarch64());
+    p.dump("constsink");
+    k
+}
+
 fn s_splink(p: &mut Pipe, an: &mut Analysis) -> usize {
     let CfgDtLa { la, .. } = an.cfg_dt_la(&p.clctx.func);
     let k = splink::run(&mut p.clctx.func, la, p.target.is_x64());
@@ -6324,6 +6332,16 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
             s_sameargs,
         )
         .needs_any(shape::BPARAM | shape::ICONST),
+        // Rematerializable constants parked at a high dominator
+        // (`constdedup` merges; cloning passes stamp them at entry)
+        // pin a register across everything between — utf8_valid_up_to
+        // banked 0..=8 in x2-x11 and paid five callee-saved pairs for
+        // the ASCII loop's working set. Sink each def to the deepest
+        // block still dominating its uses (never a deeper loop nest):
+        // no new instructions, only shorter live ranges. Opt-in:
+        // `PLIRON_CONSTSINK=1`.
+        step("constsink", "constsink", Gate::OptIn("PLIRON_CONSTSINK"), s_constsink)
+            .needs(shape::ICONST),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),

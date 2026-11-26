@@ -242,6 +242,7 @@ impl Context {
             self.load_remat();
             self.amode_split();
             self.shrink_split();
+            self.pliron_constsink();
         }
 
         // PLIRON: reorder pure insts so a shared operand's last use lands
@@ -1630,6 +1631,499 @@ impl Context {
                 }
             }
             n += 1;
+        }
+        if n > 0 {
+            self.compute_cfg();
+            self.compute_domtree();
+            self.compute_loop_analysis();
+        }
+    }
+
+    /// PLIRON: rematerializable-constant sinking (`PLIRON_CONSTSINK=1`,
+    /// opt-in). `constdedup` and the block-cloning passes park one def
+    /// per distinct constant at a dominating block — often the entry —
+    /// and the compile-path egraph re-merges any clones a pipeline pass
+    /// made, so a constant used only in deep bail arms pins a register
+    /// across the whole function: encoding_rs's `utf8_valid_up_to`
+    /// banked 0..=8 in x2-x11 and paid five callee-saved pairs for the
+    /// ASCII loop's working set, where LLVM materializes a `mov` inside
+    /// each cold exit and spills nothing.
+    ///
+    /// For every `iconst`/`f32const`/`f64const` def: when every use
+    /// sits below one deeper common dominator T, move the def to T's
+    /// top (no new instruction, only a shorter live range — but never
+    /// into a deeper loop nest, which would re-materialize a licm-hoisted
+    /// invariant per trip). When the uses share the def's own block or
+    /// scatter over sibling subtrees, clone one copy into each use
+    /// block just ahead of its earliest use — the same per-site
+    /// rematerialization LLVM's spiller performs: uses that fold into
+    /// an immediate operand cost nothing at isel, and edge-arg uses get
+    /// their `mov` in the block that runs it. Use blocks sharing one
+    /// innermost loop get a single shared copy at their in-loop common
+    /// dominator instead, so one trip never pays more materializations
+    /// than the banked def would.
+    fn pliron_constsink(&mut self) {
+        use crate::ir::{Block, Inst, InstructionData, Opcode, Value};
+        use crate::loop_analysis::Loop;
+        use crate::{FxHashMap, FxHashSet};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK").as_deref() == Ok("1")) {
+            return;
+        }
+        if self.func.layout.num_blocks() > 16384 {
+            return;
+        }
+        let is_const = |d: InstructionData| {
+            matches!(
+                d,
+                InstructionData::UnaryImm {
+                    opcode: Opcode::Iconst,
+                    ..
+                } | InstructionData::UnaryIeee32 { .. }
+                    | InstructionData::UnaryIeee64 { .. }
+            )
+        };
+        // aarch64 immediate encodability for the foldable-use test
+        // below: `enc_add` covers add/sub/cmp (`Imm12`, or the negated
+        // value — `icmp x, #-16` lowers to `cmn`); `enc_log` covers
+        // `band`/`bor`/`bxor` bitmask immediates. Narrow logical ops
+        // lower through the 32-bit form, so try both extensions.
+        #[cfg(feature = "arm64")]
+        fn enc_add(v: u64) -> bool {
+            crate::isa::aarch64::inst::Imm12::maybe_from_u64(v).is_some()
+                || crate::isa::aarch64::inst::Imm12::maybe_from_u64(v.wrapping_neg()).is_some()
+        }
+        #[cfg(not(feature = "arm64"))]
+        fn enc_add(_v: u64) -> bool {
+            false
+        }
+        #[cfg(feature = "arm64")]
+        fn enc_log(v: u64, ty: crate::ir::Type) -> bool {
+            use crate::isa::aarch64::inst::ImmLogic;
+            if ty.bits() >= 32 {
+                ImmLogic::maybe_from_u64(v, ty).is_some()
+            } else {
+                let s = 64 - ty.bits();
+                let sext = (((v << s) as i64) >> s) as u32 as u64;
+                ImmLogic::maybe_from_u64(v, crate::ir::types::I32).is_some()
+                    || ImmLogic::maybe_from_u64(sext, crate::ir::types::I32).is_some()
+            }
+        }
+        #[cfg(not(feature = "arm64"))]
+        fn enc_log(_v: u64, _ty: crate::ir::Type) -> bool {
+            false
+        }
+        // Does `u`'s use of `res` (an `iconst` of `bits` in `ty`) fold
+        // into an aarch64 immediate operand at lowering? Only the
+        // shapes checked here; every other use keeps the banked def.
+        // For noncommutative ops the constant must sit in the RHS arg
+        // — `isub c, x` and `cmp c, x` have no immediate encoding
+        // (which is what keeps regex's hot-loop `mov #1<<32` banked).
+        fn folds_imm(
+            dfg: &crate::ir::DataFlowGraph,
+            res: Value,
+            bits: u64,
+            ty: crate::ir::Type,
+            u: Inst,
+        ) -> bool {
+            let (args, enc, rhs_only) = match dfg.insts[u] {
+                InstructionData::Binary { opcode, args } => match opcode {
+                    Opcode::Iadd => (args, enc_add(bits), false),
+                    Opcode::Isub => (args, enc_add(bits), true),
+                    Opcode::Band | Opcode::Bor | Opcode::Bxor => (args, enc_log(bits, ty), false),
+                    Opcode::Ishl | Opcode::Ushr | Opcode::Sshr | Opcode::Rotl | Opcode::Rotr => {
+                        (args, bits < 64, true)
+                    }
+                    _ => return false,
+                },
+                InstructionData::IntCompare { args, .. } => (args, enc_add(bits), true),
+                _ => return false,
+            };
+            let mut any = false;
+            for (k, &v) in args.iter().enumerate() {
+                if dfg.resolve_aliases(v) == res {
+                    if rhs_only && k != 1 {
+                        return false;
+                    }
+                    any = true;
+                }
+            }
+            any && enc
+        }
+        // A terminator use of `res` in block `ub` is cheap only when
+        // the const rides a rare transition, not the loop's main
+        // flow — LLVM's per-edge remat into a rarely-run pred (utf8's
+        // bail `jump block276`). The clone lands at the use block's
+        // top, so a block on a trip's main path pays the
+        // materialization per iteration (regex's `next_state` fed two
+        // zeros on an internal jump — +305K `movz`s). Cheap means the
+        // block dominates no latch of its innermost loop and every
+        // carrying edge leaves that loop or feeds a latch (see
+        // below). A selector arg (`brif` cond, `br_table` index)
+        // always needs the register and never counts cheap.
+        fn term_cheap(
+            dfg: &crate::ir::DataFlowGraph,
+            cfg: &crate::flowgraph::ControlFlowGraph,
+            dt: &crate::dominator_tree::DominatorTree,
+            la: &crate::loop_analysis::LoopAnalysis,
+            layout: &crate::ir::Layout,
+            res: Value,
+            u: Inst,
+            ub: Block,
+        ) -> bool {
+            let d = &dfg.insts[u];
+            match d {
+                InstructionData::Brif { arg, .. }
+                | InstructionData::BranchTable { arg, .. } => {
+                    if dfg.resolve_aliases(*arg) == res {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            // The latches of `ub`'s innermost loop: back-edge sources,
+            // the preds of the header dominated by it.
+            let mut latches: FxHashSet<Block> = FxHashSet::default();
+            if let Some(l) = la.innermost_loop(ub) {
+                let h = la.loop_header(l);
+                for p in cfg.pred_iter(h) {
+                    let pb = p.block;
+                    if dt.dominates(h, pb, layout) {
+                        latches.insert(pb);
+                    }
+                }
+                // `ub` dominates a latch: every trip through that
+                // back edge ran `ub` first — the copy pays the loop's
+                // main path (regex's `next_state`, `c_utf8_seq`).
+                if latches.iter().any(|&p| dt.dominates(ub, p, layout)) {
+                    return false;
+                }
+                // Nor may a carrying edge feed a latch: that routes
+                // the copy into the back-edge flow, so it
+                // materializes every trip the same way
+                // (`c_utf8_seq`'s `iconst` args into latch blocks —
+                // +103K). An edge into a plain in-loop block is fine
+                // — those are the rare transition paths that pay for
+                // this (encoding_rs's utf8 bail edge `jump
+                // block276`).
+                if !d
+                    .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+                    .iter()
+                    .all(|bc| {
+                        let carries = bc
+                            .args(&dfg.value_lists)
+                            .any(|a| match a {
+                                crate::ir::BlockArg::Value(v) => {
+                                    dfg.resolve_aliases(v) == res
+                                }
+                                _ => false,
+                            });
+                        !carries || !latches.contains(&bc.block(&dfg.value_lists))
+                    })
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        // One pass: candidate defs in layout order, plus every use site
+        // per def (args resolved through aliases, in layout order so a
+        // block's sites arrive inst-ordered and contiguous).
+        let mut defs: Vec<Inst> = Vec::new();
+        let mut sites: FxHashMap<Inst, Vec<(Block, Inst)>> = FxHashMap::default();
+        for b in self.func.layout.blocks() {
+            for i in self.func.layout.block_insts(b) {
+                if is_const(self.func.dfg.insts[i]) {
+                    defs.push(i);
+                }
+                for v in self.func.dfg.inst_values(i) {
+                    let v = self.func.dfg.resolve_aliases(v);
+                    let Some(d) = self.func.dfg.value_def(v).inst() else {
+                        continue;
+                    };
+                    if is_const(self.func.dfg.insts[d]) {
+                        sites.entry(d).or_default().push((b, i));
+                    }
+                }
+            }
+        }
+        if defs.is_empty() {
+            return;
+        }
+        self.compute_domtree();
+        self.compute_loop_analysis();
+        // Dominator-tree depth, memoized (entry = 0).
+        let mut memo: FxHashMap<Block, u32> = FxHashMap::default();
+        fn depth(
+            b: Block,
+            dt: &crate::dominator_tree::DominatorTree,
+            memo: &mut FxHashMap<Block, u32>,
+        ) -> Option<u32> {
+            if let Some(&d) = memo.get(&b) {
+                return Some(d);
+            }
+            let d = match dt.idom(b) {
+                Some(p) if p != b => depth(p, dt, memo)? + 1,
+                _ => 0,
+            };
+            memo.insert(b, d);
+            Some(d)
+        }
+        fn ncd(
+            mut a: Block,
+            mut b: Block,
+            dt: &crate::dominator_tree::DominatorTree,
+            memo: &mut FxHashMap<Block, u32>,
+        ) -> Option<Block> {
+            let mut da = depth(a, dt, memo)?;
+            let mut db = depth(b, dt, memo)?;
+            while da > db {
+                a = dt.idom(a)?;
+                da -= 1;
+            }
+            while db > da {
+                b = dt.idom(b)?;
+                db -= 1;
+            }
+            while a != b {
+                a = dt.idom(a)?;
+                b = dt.idom(b)?;
+            }
+            Some(a)
+        }
+        let mut n = 0;
+        for d in defs {
+            let Some(home) = self.func.layout.inst_block(d) else {
+                continue;
+            };
+            let res = self
+                .func
+                .dfg
+                .resolve_aliases(self.func.dfg.first_result(d));
+            let Some(sites) = sites.get(&d) else { continue };
+            if sites.is_empty() {
+                continue;
+            }
+            let home_level = self.loop_analysis.loop_level(home).level();
+            let mut groups: Vec<(Block, Vec<Inst>)> = Vec::new();
+            for &(b, u) in sites {
+                match groups.last_mut() {
+                    Some((gb, us)) if *gb == b => us.push(u),
+                    _ => groups.push((b, vec![u])),
+                }
+            }
+            let home_group = groups.iter().position(|&(b, _)| b == home);
+            if home_group.is_none() {
+                // Every use sits strictly below: the deepest position
+                // still dominating them all is their common dominator (a
+                // branch-arg use counts at its own block — the def must
+                // dominate the edge's tail). Moving there adds nothing.
+                let mut target = groups[0].0;
+                let mut ok = self.domtree.is_reachable(target);
+                for &(b, _) in &groups[1..] {
+                    if !self.domtree.is_reachable(b) {
+                        ok = false;
+                        break;
+                    }
+                    match ncd(target, b, &self.domtree, &mut memo) {
+                        Some(t) => target = t,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && target != home
+                    && self.loop_analysis.loop_level(target).level() <= home_level
+                {
+                    if let Some(anchor) = self.func.layout.first_inst(target) {
+                        self.func.layout.remove_inst(d);
+                        self.func.layout.insert_inst(d, anchor);
+                        n += 1;
+                        continue;
+                    }
+                }
+            }
+            // The uses either share the def's own block or are scattered
+            // under sibling subtrees: rematerialize a copy per use site,
+            // just ahead of the site's earliest use. Use args reach `res`
+            // possibly through aliases; collect the raw spellings once
+            // so the rewrite can match them directly.
+            let data = self.func.dfg.insts[d];
+            let ctv = self.func.dfg.ctrl_typevar(d);
+            let mut raw: FxHashSet<Value> = FxHashSet::default();
+            for &(_, u) in sites {
+                raw.extend(
+                    self.func
+                        .dfg
+                        .inst_values(u)
+                        .filter(|&v| self.func.dfg.resolve_aliases(v) == res),
+                );
+            }
+            // Partition the other use blocks by innermost loop.
+            // Top-level uses clone per block; blocks sharing one loop
+            // share a single copy at their common dominator, so one
+            // trip can never pay more materializations than the banked
+            // def would (regex's `cached_state` otherwise doubled a
+            // `mov #1<<32` in its DFA loop, +215K executed movs).
+            //
+            // Deeper than `home` a block keeps the banked def unless
+            // every use in it is cheap: an edge arg in a block off
+            // its loop's main path (LLVM's per-edge remat —
+            // utf8's bail preds) or an operand that folds into an
+            // aarch64 immediate at lowering (`band #0x8080..`,
+            // `cmp #0`, `add #16`) and so costs nothing wherever the
+            // copy lands.
+            let (cbits, cty) = match data {
+                InstructionData::UnaryImm { imm, .. } => {
+                    let m = if ctv.bits() >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << ctv.bits()) - 1
+                    };
+                    (Some(imm.bits() as u64 & m), ctv)
+                }
+                _ => (None, ctv),
+            };
+            // `layout` goes in as an argument: the closure must not
+            // capture `self.func`, which the rewrite mutates below.
+            let cheap_use = |dfg: &crate::ir::DataFlowGraph,
+                             layout: &crate::ir::Layout,
+                             ub: Block,
+                             ui: Inst|
+             -> bool {
+                if dfg.insts[ui].opcode().is_terminator() {
+                    return term_cheap(
+                        dfg,
+                        &self.cfg,
+                        &self.domtree,
+                        &self.loop_analysis,
+                        layout,
+                        res,
+                        ui,
+                        ub,
+                    );
+                }
+                let Some(bits) = cbits else { return false };
+                folds_imm(dfg, res, bits, cty, ui)
+            };
+            // A deeper-loop clone is only a win when the banked def
+            // dies outright — every use then got a strictly-closer
+            // copy and the clone is pure live-range shortening
+            // (encoding_rs's utf8 bail path). If any deeper group has
+            // a non-cheap use the banked register survives anyway, and
+            // a partial clone just adds per-trip materializations on
+            // top of it (regex's `c_utf8_seq` bled +129K that way).
+            let deep_cheap = groups.iter().all(|&(u, ref us)| {
+                u == home
+                    || self.loop_analysis.loop_level(u).level() <= home_level
+                    || us.iter()
+                        .all(|&ui| cheap_use(&self.func.dfg, &self.func.layout, u, ui))
+            });
+            let mut by_loop: FxHashMap<Option<Loop>, Vec<usize>> = FxHashMap::default();
+            for (gi, &(u, _)) in groups.iter().enumerate() {
+                if u != home {
+                    by_loop
+                        .entry(self.loop_analysis.innermost_loop(u))
+                        .or_default()
+                        .push(gi);
+                }
+            }
+            let remat = |func: &mut crate::ir::Function, anchor: Inst| -> Value {
+                let ni = func.dfg.make_inst(data);
+                func.dfg.make_inst_results(ni, ctv);
+                func.layout.insert_inst(ni, anchor);
+                func.dfg.first_result(ni)
+            };
+            let mut cloned = false;
+            let mut served = 0;
+            for (lp, gis) in by_loop {
+                // A multi-block loop group's copies merge at the
+                // group's common dominator (always inside the loop:
+                // its header dominates every member). Anything else —
+                // a lone block, top-level uses, a failed or `home`
+                // NCD — keeps one copy per use block.
+                let shared = if lp.is_some() && gis.len() > 1 {
+                    let mut t = groups[gis[0]].0;
+                    let mut ok = t != home;
+                    for &gi in &gis[1..] {
+                        match ncd(t, groups[gi].0, &self.domtree, &mut memo) {
+                            Some(x) => t = x,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    (ok && t != home).then_some(t)
+                } else {
+                    None
+                };
+                match shared {
+                    Some(t) if self.loop_analysis.loop_level(t).level() <= home_level => {
+                        // If the dominator is itself a use block, land
+                        // ahead of its earliest use; else at its top.
+                        let anchor = gis
+                            .iter()
+                            .find(|&&gi| groups[gi].0 == t)
+                            .map(|&gi| groups[gi].1[0])
+                            .or_else(|| self.func.layout.first_inst(t));
+                        let Some(anchor) = anchor else { continue };
+                        let nv = remat(&mut self.func, anchor);
+                        for &gi in &gis {
+                            for &ui in &groups[gi].1 {
+                                self.func
+                                    .dfg
+                                    .map_inst_values(ui, |v| if raw.contains(&v) { nv } else { v });
+                            }
+                        }
+                        cloned = true;
+                        served += gis.len();
+                    }
+                    _ => {
+                        // A failed/deeper NCD falls back to one copy
+                        // per use block (still guarded below).
+                        for &gi in &gis {
+                            let (u, ref us) = groups[gi];
+                            // Never materialize into a deeper loop
+                            // nest than the def sits in — unless the
+                            // copies would kill the banked def
+                            // (`deep_cheap` above). The banked def
+                            // keeps serving the rest (regex's
+                            // `cached_state` sank a `mov #1<<32` from
+                            // an outer DFA block into an inner slice
+                            // loop — +215K movs).
+                            if self.loop_analysis.loop_level(u).level() > home_level && !deep_cheap {
+                                continue;
+                            }
+                            let nv = remat(&mut self.func, us[0]);
+                            for &ui in &groups[gi].1 {
+                                self.func
+                                    .dfg
+                                    .map_inst_values(ui, |v| if raw.contains(&v) { nv } else { v });
+                            }
+                            served += 1;
+                            cloned = true;
+                        }
+                    }
+                }
+            }
+            let all_served = served == groups.len() - usize::from(home_group.is_some());
+            if let Some(hg) = home_group {
+                // The def keeps serving its in-block uses: slide it down
+                // to the first of them.
+                let first_use = groups[hg].1[0];
+                if self.func.layout.next_inst(d) != Some(first_use) {
+                    self.func.layout.remove_inst(d);
+                    self.func.layout.insert_inst(d, first_use);
+                    cloned = true;
+                }
+            } else if all_served {
+                // Every use got a closer copy: the banked def is dead.
+                self.func.layout.remove_inst(d);
+                self.func.dfg.clear_results(d);
+            }
+            n += usize::from(cloned);
         }
         if n > 0 {
             self.compute_cfg();

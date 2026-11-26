@@ -2517,3 +2517,30 @@ combinations never needed it: the veneer's target carrier is the
 reserved register and its save restores the allocatable one. `bl`
 sites have dead scratch regs regardless; the only remaining hole is
 the `force_veneers` debug hook, which has no in-tree users.
+
+## `PLIRON_CONSTSINK` (opt-in): rematerializable-constant sinking
+
+`src/context.rs` (`Context::pliron_constsink`, runs inside
+`Context::optimize` post-pipeline; the same pass also exists as the
+`s_constsink` pipeline step in `pliron-clif-opt`, where it runs on
+pre-preopt CLIF). `constdedup` and the block-cloning passes park one
+def per distinct constant at a dominating block — often the entry —
+so a constant used only in deep bail arms pins a register across the
+whole function: encoding_rs's `utf8_valid_up_to` banked 0..=8 in
+x2-x11 and paid five callee-saved pairs for the ASCII loop's working
+set, where LLVM materializes a `mov` inside each cold exit.
+
+For every `iconst`/`f32const`/`f64const` def: when every use sits
+below one deeper common dominator, move the def to its top (never
+into a deeper loop nest); otherwise clone a copy per use block ahead
+of the earliest use, with use blocks sharing an innermost loop
+getting one shared copy at their in-loop common dominator. A deeper
+loop block only gets a copy when it kills the banked def outright —
+every deeper group's uses must be cheap: a `brif`/`br_table`
+selector arg never is; a terminator use is cheap iff the block
+dominates no latch of its innermost loop and no carrying edge feeds
+a latch (regex's `next_state`, `c_utf8_seq` paid per trip
+otherwise); an inst use is cheap iff the operand folds into an
+aarch64 immediate at lowering. Held-out irdiff vs baseline:
+regex -91K (next_state flat, `c_utf8_seq` -26K), rust-html-rewriter
+-618K (`utf8_valid_up_to` -319K).

@@ -58,6 +58,7 @@ pub mod guardsink;
 pub mod wide128;
 pub mod slotconst;
 pub mod constdedup;
+pub mod constsink;
 pub mod copypair;
 pub mod diffcheck;
 pub mod divconst;
