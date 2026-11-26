@@ -8922,7 +8922,7 @@ fn divchk(pos: &mut FuncCursor, inst: Inst, cond: IntCC, args: [Value; 2], ty: T
 
 /// `imul x, d·2^k` (d ∈ {3,5,9}, k ∈ 1..=3) → `ishl (imul x, d), k` —
 /// the odd factor lowers to one `lea (x, x·(d-1))` (x64
-/// `PLIRON_X64_IMULEA` rule) and the `ishl` folds into a consuming
+/// `PLIRON_FPEEL64_IMULEA` rule) and the `ishl` folds into a consuming
 /// `iadd`'s amode as `base + idx<<k`. `parse::<u32>`'s `acc·10 + digit`
 /// then emits `lea` + `lea` like LLVM instead of `imul` + `lea`.
 /// Gated on every use being an `iadd`: anywhere else the `ishl`
@@ -8969,7 +8969,7 @@ fn mulea_sweep(func: &mut Function) -> usize {
     n
 }
 
-/// Every use of `v` is an `iadd` — the `PLIRON_X64_IMULEA` split of
+/// Every use of `v` is an `iadd` — the `PLIRON_FPEEL64_IMULEA` split of
 /// `x·(d·2^k)` into `imul x, d` + `ishl …, k` is a strict win only
 /// then: x64 folds the `ishl` into each `iadd`'s `base + idx<<k` amode.
 /// Lazily builds one `Uses` index for the whole sweep.
@@ -10574,7 +10574,7 @@ fn post_sweep(func: &mut Function, x64: bool) -> usize {
             n += 1;
         }
     }
-    if x64 && crate::pass_enabled("PLIRON_X64_IMULEA") {
+    if x64 && crate::pass_enabled("PLIRON_FPEEL64_IMULEA") {
         n += mulea_sweep(func);
     }
     if crate::pass_enabled("PLIRON_BITMERGE") {
@@ -10888,6 +10888,7 @@ pub fn iconst128(func: &mut Function, reap: bool, x64: bool) -> usize {
 /// can_move`, which Cranelift's egraph treats as pure: it merges repeats and
 /// hoists them out of loops, as LLVM's LICM/GVN do with the same facts.
 pub fn frozen_loads(func: &mut Function, frozen: &rustc_hash::FxHashMap<Value, u64>) -> usize {
+    let fpeel = crate::env_is("PLIRON_FPEEL", "1");
     let mut n = 0;
     let mut hoist = Vec::new();
     let insts: Vec<Inst> = func
@@ -10913,14 +10914,34 @@ pub fn frozen_loads(func: &mut Function, frozen: &rustc_hash::FxHashMap<Value, u
             _ => continue,
         };
         let a = func.dfg.resolve_aliases(arg);
-        let (base, k) = if frozen.contains_key(&a) {
-            (a, 0)
-        } else {
-            match bin_k(func, a, Opcode::Iadd) {
-                Some(xk) => xk,
-                None => continue,
+        // Peel nested `iadd` chains to the frozen base (`PLIRON_FPEEL` opt-in):
+        // `x.data.heap.cap` (smallvec's `capacity()`, montgomery's
+        // per-iteration min decode) lowers as `iadd(iadd(x, 8), 8)` and a
+        // single-level peel missed it.
+        let mut base = a;
+        let mut k: i64 = 0;
+        if fpeel {
+            for _ in 0..8 {
+                if frozen.contains_key(&base) {
+                    break;
+                }
+                match bin_k(func, base, Opcode::Iadd) {
+                    Some((b, c)) => {
+                        base = b;
+                        k = k.wrapping_add(c);
+                    }
+                    None => break,
+                }
             }
-        };
+        } else if !frozen.contains_key(&base) {
+            match bin_k(func, base, Opcode::Iadd) {
+                Some((b, c)) => {
+                    base = b;
+                    k = c;
+                }
+                None => {}
+            }
+        }
         let Some(&size) = frozen.get(&base) else {
             continue;
         };
@@ -11112,6 +11133,10 @@ pub fn lcse(func: &mut Function) -> usize {
     let memoff_nest = crate::pass_enabled("PLIRON_MEMOFF_NEST");
     let negfold = crate::pass_enabled("PLIRON_NEGFOLD");
     let subsub = crate::pass_enabled("PLIRON_SUBSUB");
+    // In-loop ident folds onto a value already live into the loop
+    // (`PLIRON_LCSLIVE=1` opt-in — relaxes the live-range guard when the alias
+    // target is already paid for).
+    let xlive = crate::env_is("PLIRON_LCSLIVE", "1");
     let key = cse_key;
     type Seen = FxHashMap<CseKey, Value>;
     // `uses`/`dec`/`inc` maintain an exact use tally (`usecnt` below) —
@@ -11154,6 +11179,11 @@ pub fn lcse(func: &mut Function) -> usize {
     // `lcse` only removes insts, never edges, so a lazily-built `la`
     // sees the same CFG an eager one would.
     let mut la: Option<cranelift_codegen::loop_analysis::LoopAnalysis> = None;
+    // In-loop use tally per (value, ancestor loop) — built on first
+    // in-loop ident-alias candidate (see `live_into_loop` below).
+    let mut use_loops: Option<
+        FxHashMap<Value, FxHashMap<cranelift_codegen::loop_analysis::Loop, u32>>,
+    > = None;
     // `x*1` / `x+0` / `x|0` / `x^0` / `x&-1` / `x<<0` / `x>>0` -> `x`: these
     // survive GVN when rustc's `index*elemsize` idiom degenerates to *1.
     let ident = |func: &Function, data: InstructionData, res_ty: Type| -> Option<Value> {
@@ -11673,7 +11703,14 @@ pub fn lcse(func: &mut Function) -> usize {
                 // still fold; `Union` defs (no single block) fold too.
                 && (lcse_la(func, &mut la).loop_level(b).level() == 0
                     || matches!(def_block(func, x), Some(xb) if xb == b)
-                    || def_block(func, x).is_none())
+                    || def_block(func, x).is_none()
+                    // `res → x` stretches `x`'s live range only if `x`
+                    // isn't already live into the loop: an out-of-loop
+                    // def used per-iteration (montgomery's loop bound)
+                    // stays live either way, so the fold is free — and
+                    // the in-loop chain it feeds (`*8>>3` len decodes,
+                    // `min`) then hoists.
+                    || (xlive && live_into_loop(func, &mut la, &mut use_loops, x, i, b)))
             {
                 // `res`'s uses now resolve to `x` — move its tally over.
                 let nu = uses(func, &usecnt, res);
@@ -11742,6 +11779,90 @@ fn lcse_la<'a>(
         la.compute(func, &cfg, &dt);
         la
     })
+}
+
+/// `lcse`'s ident-alias guard, relaxed (`PLIRON_LCSLIVE`): is `x` already live
+/// into `b`'s innermost loop through a use *other than* `i`'s own args?
+/// When it is, folding a loop-carried `res` onto `x` (`isub (iadd i, n),
+/// i → n` and friends) adds no live-range stretch — `x` crosses the
+/// backedge either way — while the loop loses the whole chain `res` fed
+/// (montgomery's `z[i..n+i]` len/min decode, ~13 insts per outer
+/// iteration).
+///
+/// `use_loops` counts, per value and per ancestor loop, every arg use
+/// (a use in `ub` tags `ub`'s innermost loop and all ancestors). Built
+/// once, on the first in-loop candidate — folding only *moves* uses onto
+/// their survivors afterwards, so the tally can under-count, never
+/// over-count: a stale miss just keeps the old guard's answer. `i`'s own
+/// occurrences are subtracted so the candidate can't justify itself.
+fn live_into_loop(
+    func: &Function,
+    la: &mut Option<cranelift_codegen::loop_analysis::LoopAnalysis>,
+    use_loops: &mut Option<FxHashMap<Value, FxHashMap<cranelift_codegen::loop_analysis::Loop, u32>>>,
+    x: Value,
+    i: Inst,
+    b: Block,
+) -> bool {
+    let la = lcse_la(func, la);
+    let Some(lp) = la.innermost_loop(b) else {
+        return false;
+    };
+    let ul = use_loops.get_or_insert_with(|| {
+        // Ancestor chain per block, once — then each arg use is one
+        // increment per loop on the chain.
+        let mut chains: FxHashMap<Block, Vec<cranelift_codegen::loop_analysis::Loop>> =
+            FxHashMap::default();
+        let mut m: FxHashMap<Value, FxHashMap<cranelift_codegen::loop_analysis::Loop, u32>> =
+            FxHashMap::default();
+        let mut tag = |v: Value, b: Block| {
+            let chain = chains.entry(b).or_insert_with(|| {
+                let mut c = Vec::with_capacity(4);
+                let mut cur = la.innermost_loop(b);
+                while let Some(l) = cur {
+                    c.push(l);
+                    cur = la.loop_parent(l);
+                }
+                c
+            });
+            if chain.is_empty() {
+                return;
+            }
+            let e = m.entry(func.dfg.resolve_aliases(v)).or_default();
+            for &l in chain.iter() {
+                *e.entry(l).or_default() += 1;
+            }
+        };
+        for bb in func.layout.blocks() {
+            for j in func.layout.block_insts(bb) {
+                for &a in func.dfg.inst_args(j) {
+                    tag(a, bb);
+                }
+                for bc in func
+                    .dfg
+                    .insts[j]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    for a in bc.args(&func.dfg.value_lists) {
+                        if let BlockArg::Value(v) = a {
+                            tag(v, bb);
+                        }
+                    }
+                }
+            }
+        }
+        m
+    });
+    let total = ul.get(&x).and_then(|s| s.get(&lp)).copied().unwrap_or(0);
+    // `i` reads `x` itself; don't let the candidate count as its own
+    // justification. `i` is in `b` (⊂ `lp`), so every one of its `x`
+    // args is already inside the tally for `lp`.
+    let own = func
+        .dfg
+        .inst_args(i)
+        .iter()
+        .filter(|&&a| func.dfg.resolve_aliases(a) == x)
+        .count() as u32;
+    total > own
 }
 
 /// Dominator-scoped value numbering. `lcse` clears its table per block,
