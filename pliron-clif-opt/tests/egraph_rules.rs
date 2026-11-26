@@ -106,3 +106,131 @@ block2:
     assert!(!t.contains("band"), "48n + 7 rounded down to 8 is 48n:\n{t}");
     assert!(!t.contains("icmp"), "48n + 7 cannot wrap:\n{t}");
 }
+
+/// `PLIRON_XREDUCE`: `ireduce` leftovers of packed-field deposits —
+/// regex `c_utf8_seq`'s suffix-cache loop computes `ireduce.i8 (ishl
+/// end, 8)` (always 0) and `ireduce.i8 (ushr ((k & -65281) | end<<8),
+/// 8)` (re-extracting the just-deposited byte) every iteration.
+#[test]
+fn xreduce_ishl_past_width_is_zero() {
+    unsafe { std::env::set_var("PLIRON_XREDUCE", "1") };
+    let t = opt("function %f(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 8
+    v2 = ishl v0, v1
+    v3 = ireduce.i8 v2
+    return v3
+}");
+    assert!(t.contains("iconst.i8 0"), "x << 8 has no low byte:\n{t}");
+    assert!(!t.contains("ishl"), "{t}");
+}
+
+#[test]
+fn xreduce_ishl_below_width_kept() {
+    unsafe { std::env::set_var("PLIRON_XREDUCE", "1") };
+    let t = opt("function %f(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 4
+    v2 = ishl v0, v1
+    v3 = ireduce.i8 v2
+    return v3
+}");
+    assert!(t.contains("ishl"), "x << 4 keeps low bits:\n{t}");
+}
+
+#[test]
+fn xreduce_masked_out_low_bits_is_zero() {
+    unsafe { std::env::set_var("PLIRON_XREDUCE", "1") };
+    let t = opt("function %f(i64) -> i8 {
+block0(v0: i64):
+    v1 = iconst.i64 -256
+    v2 = band v0, v1
+    v3 = ireduce.i8 v2
+    return v3
+}");
+    assert!(t.contains("iconst.i8 0"), "x & -256 has no low byte:\n{t}");
+}
+
+#[test]
+fn xreduce_extracts_the_deposited_field() {
+    unsafe { std::env::set_var("PLIRON_XREDUCE", "1") };
+    let t = opt("function %f(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 -65281
+    v3 = band v0, v2
+    v4 = iconst.i64 8
+    v5 = ishl v1, v4
+    v6 = bor v3, v5
+    v7 = ushr v6, v4
+    v8 = ireduce.i8 v7
+    return v8
+}");
+    assert!(t.contains("ireduce.i8 v1"), "byte 1 of `(x & ~0xff00) | y<<8` is y:\n{t}");
+    assert!(!t.contains("ushr") && !t.contains("bor"), "{t}");
+}
+
+#[test]
+fn xreduce_extract_needs_the_mask_window_clear() {
+    unsafe { std::env::set_var("PLIRON_XREDUCE", "1") };
+    let t = opt("function %f(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 -255
+    v3 = band v0, v2
+    v4 = iconst.i64 8
+    v5 = ishl v1, v4
+    v6 = bor v3, v5
+    v7 = ushr v6, v4
+    v8 = ireduce.i8 v7
+    return v8
+}");
+    assert!(t.contains("ushr"), "x & -255 keeps bits in [8,16): no fold:\n{t}");
+}
+
+/// The exact `c_utf8_seq` shape: `uextend`ed bytes deposited through a
+/// two-mask chain, the top byte re-extracted.
+#[test]
+fn xreduce_corpus_shape() {
+    unsafe { std::env::set_var("PLIRON_XREDUCE", "1") };
+    let t = opt("function %f(i64, i8, i8) -> i8 {
+block0(v0: i64, v117: i8, v120: i8):
+    v121 = uextend.i64 v117
+    v123 = iconst.i64 0
+    v124 = ishl v121, v123
+    v125 = iconst.i64 -256
+    v126 = band.i64 v0, v125
+    v127 = bor v126, v124
+    v128 = uextend.i64 v120
+    v129 = iconst.i64 8
+    v130 = ishl v128, v129
+    v131 = iconst.i64 -65281
+    v132 = band v127, v131
+    v133 = bor v132, v130
+    v160 = iconst.i64 8
+    v161 = ushr.i64 v133, v160
+    v162 = ireduce.i8 v161
+    return v162
+}");
+    println!("{t}");
+    // The extract folds all the way: the deposited field is `v120`
+    // itself and every `band`/`bor`/`ishl`/`ushr` in between is dead.
+    assert!(t.contains("return v120") || t.contains("ireduce.i8 v120")
+        || (t.contains("ireduce.i8") && !t.contains("ushr")), "{t}");
+}
+
+/// Post-push-down shape: `bor.i8` of an `ireduce.i8` and
+/// `ireduce.i8 (ishl x, 8)` — the latter is always 0.
+#[test]
+fn xreduce_post_pushdown_shape() {
+    unsafe { std::env::set_var("PLIRON_XREDUCE", "1") };
+    let t = opt("function %f(i8, i8) -> i8 {
+block0(v117: i8, v120: i8):
+    v128 = uextend.i64 v120
+    v1719 = iconst.i64 8
+    v130 = ishl v128, v1719
+    v1608 = ireduce.i8 v130
+    v1609 = bor.i8 v117, v1608
+    return v1609
+}");
+    println!("{t}");
+    assert!(!t.contains("ishl") && !t.contains("ireduce.i8 v130"), "{t}");
+}

@@ -81,6 +81,9 @@ fn collect(
 ) -> Vec<Fix> {
     let mut fixes: Vec<Fix> = Vec::new();
     let mut rs = Ranges::new(func, cfg).with_facts(facts);
+    // Lazily built — only the `urem` compare fold consults it, and only
+    // when the divisor's range does not already prove the trap dead.
+    let mut uses: Option<crate::uses::Uses> = None;
         for b in func.layout.blocks() {
             if !dt.is_reachable(b) {
                 continue;
@@ -116,6 +119,62 @@ fn collect(
                                 if no_carry(&ra, &rb) {
                                     fixes.push(Fix::Const(r, 0));
                                 }
+                            }
+                        }
+                        // `icmp ucc (urem a, y), y` and its mirror
+                        // (PLIRON_UREMCMP=1, opt-in): a remainder is
+                        // below its divisor — rustc's `h % sparse.len()`
+                        // bounds-checks the index it just derived. Exact
+                        // only where the `urem`'s int_divz trap can
+                        // still fire or can never fire — the divisor
+                        // known nonzero here, or the `urem` value read
+                        // by another use: folding the compare must not
+                        // dead-code the trap.
+                        if pliron_cfg::env_is("PLIRON_UREMCMP", "1") {
+                            let urem_div = |v: Value| -> Option<Value> {
+                                let ValueDef::Result(si, _) = func.dfg.value_def(v) else {
+                                    return None;
+                                };
+                                match func.dfg.insts[si] {
+                                    InstructionData::Binary {
+                                        opcode: Opcode::Urem,
+                                        args: [_, d],
+                                    } => Some(func.dfg.resolve_aliases(d)),
+                                    _ => None,
+                                }
+                            };
+                            let (remv, divv, t) = if urem_div(x) == Some(y) {
+                                let t = match cond {
+                                    IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => 1,
+                                    IntCC::UnsignedGreaterThan
+                                    | IntCC::UnsignedGreaterThanOrEqual => 0,
+                                    IntCC::Equal => 0,
+                                    IntCC::NotEqual => 1,
+                                    _ => continue,
+                                };
+                                (x, y, t)
+                            } else if urem_div(y) == Some(x) {
+                                let t = match cond {
+                                    IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => 0,
+                                    IntCC::UnsignedGreaterThan
+                                    | IntCC::UnsignedGreaterThanOrEqual => 1,
+                                    IntCC::Equal => 0,
+                                    IntCC::NotEqual => 1,
+                                    _ => continue,
+                                };
+                                (y, x, t)
+                            } else {
+                                continue;
+                            };
+                            let rd = rs.at(func, dt, divv, b);
+                            if rd.ulo > 0
+                                || uses
+                                    .get_or_insert_with(|| crate::uses::Uses::new(func))
+                                    .sites(remv)
+                                    .len()
+                                    > 1
+                            {
+                                fixes.push(Fix::Const(r, t));
                             }
                         }
                     }

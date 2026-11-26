@@ -2598,3 +2598,24 @@ rust-html-rewriter (-0.10% instructions, cycles ~neutral); mode 1
 removed the same pads but cost +0.8% cycles from the lost alignment,
 so `=1` is kept only as a diagnostic. pulldown-cmark and blake3-scalar
 within noise.
+
+## xreduce: `ireduce` of packed-field deposits (`PLIRON_XREDUCE`, opt-in `=1`)
+
+`src/opts/pliron.isle`, `src/opts.rs` (`pliron_xreduce_on`,
+`pliron_ishl_clears`, `pliron_band_clears`, `pliron_field_clear`):
+truncation leftovers the upstream `ireduce` push-down rules
+(`(ireduce ty (bor a b))` and friends) create in scalarized
+packed-field code — key/enum types whose bytes get deposited into and
+extracted out of a word.
+
+- `ireduce.N (x << k)` is 0 when the effective shift reaches `N`.
+- `ireduce.N (x & m)` is 0 when `m` clears every bit below `N`.
+- `ireduce.N (((x & m) | (y << k)) >> k)` is `ireduce.N y` when `m`
+  clears the `[k, k+N)` window (either `bor` order) — extracting the
+  field a deposit chain just wrote.
+
+regex's `c_utf8_seq` suffix-cache loop ran `lsl; uxtb; orr` for the
+first fold and `ubfx` for the second every iteration (LLVM keeps the
+byte registers directly). `cargo test -p pliron-clif-opt --test
+egraph_rules` covers all three; `--tag xr` callgrind on regex for the
+measurement.

@@ -369,6 +369,36 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
         *ON.get_or_init(|| std::env::var("PLIRON_FMUL1").as_deref() == Ok("1"))
     }
 
+    /// PLIRON: `PLIRON_XREDUCE=1` (opt-in), the `xreduce` rules of
+    /// `opts/pliron.isle`: `ireduce` leftovers of the packed-field
+    /// deposit/extract chains sroa leaves in scalarized key code.
+    fn pliron_xreduce_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_XREDUCE").as_deref() == Ok("1"))
+    }
+
+    /// `x << k` keeps no bit below `n` when the effective shift — the
+    /// amount modulo the word width, CLIF's masking semantics — is at
+    /// least `n`.
+    fn pliron_ishl_clears(&mut self, n: u64, sbits: u64, k: u64) -> bool {
+        sbits > 0 && n > 0 && n <= sbits && k % sbits >= n
+    }
+
+    /// `x & m` keeps no bit below `n` when `m` clears them all.
+    fn pliron_band_clears(&mut self, n: u64, m: u64) -> bool {
+        n > 0 && n < 64 && m & ((1u64 << n) - 1) == 0
+    }
+
+    /// `(x & m) | (y << k)` reads as `y` alone in `[k, k+n)` when `m`
+    /// clears that window and it lies inside the `sbits`-wide word (a
+    /// wider window would have lost `y`'s top bits at the `ishl`).
+    fn pliron_field_clear(&mut self, n: u64, k: u64, m: u64, sbits: u64) -> bool {
+        if n == 0 || k >= sbits || sbits > 64 || k + n > sbits {
+            return false;
+        }
+        m & (((1u128 << n) - 1) << k) as u64 == 0
+    }
+
     fn f32_cmp_fold(&mut self, cc: &FloatCC, a: Ieee32, b: Ieee32) -> u64 {
         pliron_fcmp(
             *cc,

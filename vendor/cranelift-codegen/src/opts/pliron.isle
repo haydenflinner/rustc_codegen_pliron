@@ -193,3 +193,45 @@
       (if-let true (pliron_lowbits_on))
       (if-let true (pliron_lowbits_nowrap k c))
       (iconst_u ty 0))
+
+;;;; xreduce (PLIRON_XREDUCE=1, opt-in): truncation leftovers the
+;; `ireduce` push-down rules (`(ireduce ty (bor a b))` and friends)
+;; leave behind when sroa scalarizes packed-field code — key/enum
+;; types whose bytes get deposited into and extracted out of a word.
+;; regex's `c_utf8_seq` recomputes all three in its suffix-cache loop:
+;; `ireduce.i8 (ishl x, 8)` is always 0, `ireduce.i8 (band x, -256)`
+;; likewise, and `ireduce.i8 (ushr ((x & -65281) | (y << 8)), 8)`
+;; re-extracts the field the deposit chain just wrote (`ubfx` where
+;; `y`'s byte was already in a register).
+(decl pure pliron_xreduce_on () bool)
+(extern constructor pliron_xreduce_on pliron_xreduce_on)
+;; `x << k` has no bit below `n` when the effective shift reaches `n`.
+(decl pure pliron_ishl_clears (u64 u64 u64) bool)
+(extern constructor pliron_ishl_clears pliron_ishl_clears)
+;; `x & m` has no bit below `n` when `m` clears them all.
+(decl pure pliron_band_clears (u64 u64) bool)
+(extern constructor pliron_band_clears pliron_band_clears)
+;; `(x & m) | (y << k)` has `y`'s bits alone in `[k, k+n)` when `m`
+;; clears that window and the window lies inside the word.
+(decl pure pliron_field_clear (u64 u64 u64 u64) bool)
+(extern constructor pliron_field_clear pliron_field_clear)
+
+(rule (simplify (ireduce ty (ishl (ty_int sty) _ (iconst_u _ k))))
+      (if-let true (pliron_xreduce_on))
+      (if-let true (pliron_ishl_clears (ty_bits_u64 ty) (ty_bits_u64 sty) k))
+      (subsume (iconst_u ty 0)))
+
+(rule (simplify (ireduce ty (band _ _ (iconst_u _ m))))
+      (if-let true (pliron_xreduce_on))
+      (if-let true (pliron_band_clears (ty_bits_u64 ty) m))
+      (subsume (iconst_u ty 0)))
+
+(rule (simplify (ireduce ty (ushr (ty_int sty) (bor _ (band _ _ (iconst_u _ m)) (ishl _ y (iconst_u _ k))) (iconst_u _ k))))
+      (if-let true (pliron_xreduce_on))
+      (if-let true (pliron_field_clear (ty_bits_u64 ty) k m (ty_bits_u64 sty)))
+      (ireduce ty y))
+
+(rule (simplify (ireduce ty (ushr (ty_int sty) (bor _ (ishl _ y (iconst_u _ k)) (band _ _ (iconst_u _ m))) (iconst_u _ k))))
+      (if-let true (pliron_xreduce_on))
+      (if-let true (pliron_field_clear (ty_bits_u64 ty) k m (ty_bits_u64 sty)))
+      (ireduce ty y))
