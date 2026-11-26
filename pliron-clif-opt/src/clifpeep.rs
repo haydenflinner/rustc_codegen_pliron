@@ -10914,7 +10914,7 @@ pub fn frozen_loads(func: &mut Function, frozen: &rustc_hash::FxHashMap<Value, u
             _ => continue,
         };
         let a = func.dfg.resolve_aliases(arg);
-        // Peel nested `iadd` chains to the frozen base (`PLIRON_FPEEL` opt-in):
+        // Peel nested `iadd` chains to the frozen base (`PLIRON_FPEEL=0` off):
         // `x.data.heap.cap` (smallvec's `capacity()`, montgomery's
         // per-iteration min decode) lowers as `iadd(iadd(x, 8), 8)` and a
         // single-level peel missed it.
@@ -11134,7 +11134,7 @@ pub fn lcse(func: &mut Function) -> usize {
     let negfold = crate::pass_enabled("PLIRON_NEGFOLD");
     let subsub = crate::pass_enabled("PLIRON_SUBSUB");
     // In-loop ident folds onto a value already live into the loop
-    // (`PLIRON_LCSLIVE=1` opt-in — relaxes the live-range guard when the alias
+    // (`PLIRON_LCSLIVE=0` off — relaxes the live-range guard when the alias
     // target is already paid for).
     let xlive = crate::env_is("PLIRON_LCSLIVE", "1");
     let key = cse_key;

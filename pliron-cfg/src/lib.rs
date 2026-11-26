@@ -37,6 +37,22 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-26: frozen_loads peels nested `iadd` chains to the frozen
+    // base (`x.data.heap.cap`, smallvec's `capacity()`, montgomery's
+    // per-iteration min decode lowers as `iadd(iadd(x, 8), 8)`), so the
+    // load goes `readonly can_move` and the egraph hoists it. Exact
+    // counts (aarch64-musl callgrind, all eight held-out): blind-sig
+    // -0.74% alone (-1.01% with LCSLIVE); the other seven within
+    // +-0.01%. `PLIRON_FPEEL=0` off.
+    "PLIRON_FPEEL",
+    // 2026-11-26: lcse's in-loop ident-alias guard relaxes when the fold
+    // target is already live into the loop (the `isub (iadd i, n), i ->
+    // n` fold: `n`'s own uses already pay the live-through). Exact
+    // counts: blind-sig -0.33% alone; pulldown-cmark +0.071%, all of it
+    // `FirstPass::parse_block`'s byte loop (+32.8k, a live range the
+    // fold stretches — accepted, net strongly positive); the rest within
+    // +-0.01%. `PLIRON_LCSLIVE=0` off.
+    "PLIRON_LCSLIVE",
     // 2026-11-25: loopvec's mask-fold covers `mask * C` as well as
     // `mask<<k`: `band(m, splat 1) * C` -> `band(m, splat C)` and
     // `m * C` -> `band(m, splat -C)` (m an icmp/fcmp lane mask).
