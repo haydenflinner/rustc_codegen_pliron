@@ -1670,7 +1670,8 @@ impl Context {
         static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static CSMOVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static CSCLONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK_V").as_deref() == Ok("1")) {
+        // PLIRON: on by default; `PLIRON_CONSTSINK_V=0` disables.
+        if !*ON.get_or_init(|| std::env::var("PLIRON_CONSTSINK_V").as_deref() != Ok("0")) {
             return;
         }
         let dbg = *DBG.get_or_init(|| std::env::var_os("PLIRON_CSDBG").is_some());
