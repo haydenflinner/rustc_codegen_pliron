@@ -2672,3 +2672,17 @@ an `iconst 0` half via `stp xzr` through `put_in_reg_or_zr`. protobuf
 executed `mov xN,#0` is ~561k vs LLVM's ~13k `movz` + ~483k `mov wN,wzr`;
 the remaining delta is folding `zr` into `str`/`csel`/`csinc`/`cmp`
 operand positions — not yet implemented.
+
+## carrycmp: `icmp ult (a+b), a` emits `cmn a,b` for flag_twin (`PLIRON_CARRYCMP`, opt-in `=1`)
+
+`src/isa/aarch64/inst.isle` emit_icmp rules 14/15 + extern
+`carry_cmp_cond` in `lower/isle.rs`: the checked_add idiom
+`icmp ult (a+b), {a|b}` (and `uge`/`ugt`/`ule` mirrors) is the carry-out
+of `a+b` — emit `cmn a,b` with the remapped cond (`hs`/`lo`) instead of
+`subs sum,a`. The `cmn`'s operands are the iadd's own, so vcode's
+flag_twin merges it with the sum's `add` into one `adds` — LLVM's
+`adds; b.hs` shape. Count-neutral when the twin doesn't reach (madd-
+fused sums — `mul;madd;cmn;b.lo` — and iadds in different blocks).
+protobuf −63.6k executed. Residual: the madd shape needs a def-tracking
+twin variant (`madd`+`cmn` → `adds`), the `uge`/`ule` forms a flag-negated
+consumer.

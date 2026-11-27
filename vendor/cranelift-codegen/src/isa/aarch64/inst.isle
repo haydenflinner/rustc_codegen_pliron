@@ -5641,6 +5641,25 @@
   (CondResult.Cond
     (cmn_imm (OperandSize.Size32) (put_in_reg_sext32_sink rn) imm)
     (cond_code cc)))
+;; PLIRON (`PLIRON_CARRYCMP=1`, opt-in): `icmp ult (a+b), a` is the
+;; carry-out of `a+b` itself — `cmn a, b` reads it as `hs`, where the
+;; generic rule compares the sum (`subs sum, a`, then `lo`). The `cmn`'s
+;; operands are the iadd's own, so vcode's flag_twin merges it with the
+;; sum's `add` into one `adds` — LLVM's `adds; b.hs` shape for
+;; `checked_add`'s overflow branch (prost's varint decode: `mul; madd;
+;; cmp; b.lo` becomes `mul; adds; b.hs`). Same count when the twin does
+;; not reach. `uge sum, x` / `x ugt sum` / `x ule sum` are the same
+;; carry with the relation or operands flipped; `ult x, sum` and
+;; `uge x, sum` need two flags and stay generic.
+(decl pure partial carry_cmp_cond (IntCC Value Value Value bool) Cond)
+(extern constructor carry_cmp_cond carry_cmp_cond)
+(rule 14 (emit_icmp cc (iadd ty @ (ty_32_or_64 _) a b) c)
+  (if-let fcc (carry_cmp_cond cc c a b true))
+  (CondResult.Cond (cmn (operand_size ty) a b) fcc))
+(rule 15 (emit_icmp cc c (iadd ty @ (ty_32_or_64 _) a b))
+  (if-let fcc (carry_cmp_cond cc c a b false))
+  (CondResult.Cond (cmn (operand_size ty) a b) fcc))
+
 ;; The operand sign-extended to 32 bits; a single-use narrow load becomes
 ;; the extending load itself (`ldrsb`), as `sextend` of a load does.
 (decl put_in_reg_sext32_sink (Value) Reg)

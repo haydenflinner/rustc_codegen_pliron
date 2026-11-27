@@ -1544,6 +1544,39 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         *ON.get_or_init(|| std::env::var("PLIRON_ZRSTP").as_deref() == Ok("1"))
     }
 
+    /// PLIRON (`PLIRON_CARRYCMP=1`, opt-in): the carry-check idiom
+    /// `icmp ult (a+b), a` (and the `uge`/`ugt`/`ule` mirrors) is the
+    /// carry-out of `a+b` — return the `Cond` that reads it off the `cmn`
+    /// the emit_icmp rules emit, or None when `other` is not an `iadd`
+    /// operand or the relation isn't a single flag. `sum_lhs` says which
+    /// side of the compare the sum sits on.
+    fn carry_cmp_cond(
+        &mut self,
+        cc: &IntCC,
+        other: Value,
+        a: Value,
+        b: Value,
+        sum_lhs: bool,
+    ) -> Option<Cond> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_CARRYCMP").as_deref() == Ok("1")) {
+            return None;
+        }
+        if other != a && other != b {
+            return None;
+        }
+        let c = match (cc, sum_lhs) {
+            // `sum <u x` / `x >u sum`: the add wrapped.
+            (IntCC::UnsignedLessThan, true) | (IntCC::UnsignedGreaterThan, false) => Cond::Hs,
+            // `sum >=u x` / `x <=u sum`: it did not.
+            (IntCC::UnsignedGreaterThanOrEqual, true) | (IntCC::UnsignedLessThanOrEqual, false) => {
+                Cond::Lo
+            }
+            _ => return None,
+        };
+        Some(c)
+    }
+
     /// PLIRON (`PLIRON_AMODENEG`, default on, `=0` off): `-off` as an `Imm12` for a negative
     /// `off`, so `amode_add` subtracts it instead of materializing it.
     fn amode_neg_imm12(&mut self, off: i32) -> Option<Imm12> {
