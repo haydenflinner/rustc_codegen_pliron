@@ -219,3 +219,7 @@
 2026-11-16T08:59:54	6c7fd69	Darwin-arm64	pliron	tokenize	2888589	0	0
 2026-11-16T08:59:54	6c7fd69	Darwin-arm64	pliron	varint	4346372	0	0
 2026-11-16T08:59:54	6c7fd69	Darwin-arm64	pliron	varint_postcard	3532254	0	0
+2026-11-26T21:09:19	380412dd	Darwin-arm64	llvm	fib	14478526	0	0
+2026-11-26T21:09:19	380412dd	Darwin-arm64	pliron	fib	12785792	0	0
+2026-11-26T21:09:35	380412dd	Darwin-arm64	llvm	fib	14440386	0	0
+2026-11-26T21:09:35	380412dd	Darwin-arm64	pliron	fib	12800234	0	0
