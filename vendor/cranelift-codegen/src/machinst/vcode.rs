@@ -2550,9 +2550,18 @@ impl<I: VCodeInst> VCode<I> {
         // the insts before the terminator (`=1` takes the default 3,
         // covering the `ldr xA; ldr xB; ldr xC; b head` restart/relay
         // blocks; `=N` sets it directly).
-        let taildup = match pliron_mode("PLIRON_TAILDUP", 0) {
+        let taildup = match pliron_mode("PLIRON_TAILDUP", 1) {
             1 => 3,
             n => n,
+        };
+        // PLIRON TAILDUP_BUDGET: total insts duplicated into one
+        // function, so a pathological body (a giant generated fn where
+        // every block ends `b T`) cannot grow without bound — worst
+        // observed was ~38 sites ≈ 150 insts on protobuf; 96 keeps
+        // nearly all of that and caps growth at ~384B. `0` = off.
+        let td_budget = match pliron_mode("PLIRON_TAILDUP_BUDGET", 96) {
+            0 => usize::MAX,
+            n => usize::from(n),
         };
         let mut order_pos = vec![usize::MAX; self.num_blocks()];
         for (i, &b) in final_order.iter().enumerate() {
@@ -2938,6 +2947,7 @@ impl<I: VCodeInst> VCode<I> {
             v
         };
         let mut td_count = 0usize;
+        let mut td_used = 0usize;
         let mut tdp = 0usize;
         let tda = td_items.iter().flatten().count();
 
@@ -4450,9 +4460,13 @@ impl<I: VCodeInst> VCode<I> {
                 } else {
                     None
                 };
+                // PLIRON TAILDUP_BUDGET: stop splicing once the function's
+                // duplicated total reaches the cap.
+                let copy = copy.filter(|tits| td_used + tits.len() <= td_budget);
                 if let Some(tits) = copy {
                     items.pop();
                     td_copy_start = items.len();
+                    td_used += tits.len();
                     items.extend(tits.iter().cloned());
                     td_count += 1;
                 }

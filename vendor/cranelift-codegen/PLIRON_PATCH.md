@@ -2656,9 +2656,12 @@ and miscompiled cmp3/lto — the fallthrough landed on whatever followed
 the pred in `final_order`). Cold preds are skipped (size for nothing)
 and `b T` where T is the next block in emission order (MachBuffer folds
 it anyway). Spliced copies do not update `inst_offsets` (T's own site
-keeps the canonical record). LLVM's analog is `TailDuplicator`; unlike
-it this has no per-function duplication budget, which is why the flip
-is held: at `=6` protobuf −10.7k / pulldown −49.2k executed insts for
+keeps the canonical record). LLVM's analog is `TailDuplicator`.
+`PLIRON_TAILDUP_BUDGET` (default 96, `=0` unlimited) caps the total
+insts duplicated into one function — the outlier is a giant generated
+body where every block ends `b T` (protobuf worst: ~38 sites ≈ 150
+insts; 96 covers ~24 sites at the 4-inst `=3` maximum). Earlier `=6`
+measurement: protobuf −10.7k / pulldown −49.2k executed insts for
 +0.6% / +2.1% `.text`. Gate 139 green under `PLIRON_TAILDUP=6`.
 
 ## zrmov / zrstp: `iconst 0` rides the zero register (`PLIRON_ZRMOV` / `PLIRON_ZRSTP`, opt-in `=1`)

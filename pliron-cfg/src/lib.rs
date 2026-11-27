@@ -745,6 +745,12 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // `=2` merge-everything, EDGEMERGE `=3` merge-everything-outside-loops).
     ("PLIRON_EDGEMERGE", "3"),
     ("PLIRON_EPIMERGE", "2"),
+    // Post-RA tail dup at emit (`=1` ⇒ 3 insts per tail): pulldown
+    // -88k, protobuf -8k executed insts at `=3`/`=6` for bounded .text
+    // growth; BUDGET caps duplicated insts per fn at 96 (worst observed
+    // ~38 sites ≈ 150 insts; `=0` unlimited). `PLIRON_TAILDUP=0` off.
+    ("PLIRON_TAILDUP", "1"),
+    ("PLIRON_TAILDUP_BUDGET", "96"),
     // Cap inlining of high-fan-in callees (2026-10-27-ir-size.md). lockf
     // ctime: FANIN=8 cut syn text 1.94→1.46x / RSS 1.81→1.52x. `=0` off.
     ("PLIRON_INLINE_FANIN", "8"),
