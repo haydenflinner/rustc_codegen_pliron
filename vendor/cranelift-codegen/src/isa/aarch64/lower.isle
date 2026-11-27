@@ -139,6 +139,76 @@
 (rule iadd_imul_left 6 (lower (iadd (ty_int_ref_scalar_64_extract ty) (imul _ x y) z))
       (madd ty x y z))
 
+;; PLIRON: `iadd (imul x, 2^n+1), y` is `add x,x,lsl #n` then the add of
+;; `y` — LLVM's shape: two ALU ops, no materialized constant; `madd`
+;; needs a `movz` for the multiplier (and, for a constant addend, a
+;; second `movz` where `add #imm` needs none).
+(rule 26 (lower (iadd (ty_int_ref_scalar_64_extract ty) x
+                     (imul _ y (iconst _ (u64_from_imm64 c)))))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((yy Reg (put_in_reg y))
+            (m Reg (add_shift ty yy yy (lshl_from_u64 ty (u8_into_u64 n))))
+            (xx Reg (put_in_reg x)))
+        (add ty xx m)))
+
+(rule 27 (lower (iadd (ty_int_ref_scalar_64_extract ty)
+                     (imul _ y (iconst _ (u64_from_imm64 c))) x))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((yy Reg (put_in_reg y))
+            (m Reg (add_shift ty yy yy (lshl_from_u64 ty (u8_into_u64 n))))
+            (xx Reg (put_in_reg x)))
+        (add ty m xx)))
+
+;; Constant addend that encodes as `add #imm`.
+(rule 32 (lower (iadd (ty_int_ref_scalar_64_extract ty)
+                      (imm12_from_value i2)
+                      (imul _ y (iconst _ (u64_from_imm64 c)))))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((yy Reg (put_in_reg y))
+            (m Reg (add_shift ty yy yy (lshl_from_u64 ty (u8_into_u64 n)))))
+        (add_imm ty m i2)))
+
+(rule 33 (lower (iadd (ty_int_ref_scalar_64_extract ty)
+                      (imul _ y (iconst _ (u64_from_imm64 c)))
+                      (imm12_from_value i2)))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((yy Reg (put_in_reg y))
+            (m Reg (add_shift ty yy yy (lshl_from_u64 ty (u8_into_u64 n)))))
+        (add_imm ty m i2)))
+
+;; The multiplier constant on the `imul`'s left.
+(rule 28 (lower (iadd (ty_int_ref_scalar_64_extract ty) x
+                      (imul _ (iconst _ (u64_from_imm64 c)) y)))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((yy Reg (put_in_reg y))
+            (m Reg (add_shift ty yy yy (lshl_from_u64 ty (u8_into_u64 n))))
+            (xx Reg (put_in_reg x)))
+        (add ty xx m)))
+
+(rule 29 (lower (iadd (ty_int_ref_scalar_64_extract ty)
+                      (imul _ (iconst _ (u64_from_imm64 c)) y) x))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((yy Reg (put_in_reg y))
+            (m Reg (add_shift ty yy yy (lshl_from_u64 ty (u8_into_u64 n))))
+            (xx Reg (put_in_reg x)))
+        (add ty m xx)))
+
+(rule 34 (lower (iadd (ty_int_ref_scalar_64_extract ty)
+                      (imm12_from_value i2)
+                      (imul _ (iconst _ (u64_from_imm64 c)) y)))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((yy Reg (put_in_reg y))
+            (m Reg (add_shift ty yy yy (lshl_from_u64 ty (u8_into_u64 n)))))
+        (add_imm ty m i2)))
+
+(rule 35 (lower (iadd (ty_int_ref_scalar_64_extract ty)
+                      (imul _ (iconst _ (u64_from_imm64 c)) y)
+                      (imm12_from_value i2)))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((yy Reg (put_in_reg y))
+            (m Reg (add_shift ty yy yy (lshl_from_u64 ty (u8_into_u64 n)))))
+        (add_imm ty m i2)))
+
 ;; Fold an `isub` and `imul` combination into a `msub` instruction.
 (rule isub_imul (lower (isub (ty_int_ref_scalar_64_extract ty) x (imul _ y z)))
       (msub ty y z x))
