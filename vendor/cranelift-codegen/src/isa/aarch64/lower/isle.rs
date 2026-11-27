@@ -1527,13 +1527,14 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         *ON.get_or_init(|| std::env::var("PLIRON_UNCHECKDIV").as_deref() == Ok("1"))
     }
 
-    /// PLIRON (`PLIRON_ZRMOV=1`, opt-in): materialize `iconst 0` as
+    /// PLIRON (`PLIRON_ZRMOV`, default on, `=0` off): materialize `iconst 0` as
     /// `mov wN/xN, wzr/xzr` (the ORR register-move form LLVM uses) instead of
     /// `movz wN, #0`. Same instruction count; the register-move form is a
-    /// move-elimination candidate where `movz` executes on an ALU.
+    /// move-elimination candidate where `movz` executes on an ALU
+    /// (rust-protobuf ~560k sites: cycles 0.992x at 1.001x instr).
     fn pliron_zrmov(&mut self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_ZRMOV").as_deref() == Ok("1"))
+        *ON.get_or_init(|| std::env::var("PLIRON_ZRMOV").as_deref() != Ok("0"))
     }
 
     /// PLIRON (`PLIRON_ZRSTP=1`, opt-in): an `iconst 0` half of an `iconcat`

@@ -158,8 +158,18 @@ block0(v0: i64, v1: i64, v2: i64, v3: i64):
 #[test]
 fn forwarded_params_one_parallel_move() {
     let a = asm(SHIFT);
-    let movs: Vec<&str> =
-        a.lines().map(str::trim).filter(|l| l.starts_with("mov x") || l.starts_with("movz x")).collect();
-    let x0 = movs.iter().filter(|l| l.starts_with("mov x0,") || l.starts_with("movz x0,")).count();
+    // `orr xN, xzr, xzr` is PLIRON_ZRMOV's zero materialization — a `mov`
+    // for the purposes of this count.
+    let movs: Vec<&str> = a
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            l.starts_with("mov x") || l.starts_with("movz x") || l.starts_with("orr x")
+        })
+        .collect();
+    let x0 = movs
+        .iter()
+        .filter(|l| l.starts_with("mov x0,") || l.starts_with("movz x0,") || l.starts_with("orr x0,"))
+        .count();
     assert!(movs.len() <= 6 && x0 == 1, "argument shuffle:\n{a}");
 }
