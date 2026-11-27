@@ -190,6 +190,27 @@ fn slot_contained(func: &Function, r: Root) -> bool {
     SLOTS.with(|s| s.borrow().as_ref().is_some_and(|sp| sp.slot_of(func, r).is_some()))
 }
 
+/// `addr_arms`'s bound provider: `pf`'s param edges plus a lazy `Ranges`
+/// — built on the first bound query; many loops never need one.
+struct ArmBnd<'a> {
+    pf: &'a crate::proots::Facts,
+    cfg: &'a ControlFlowGraph,
+    dt: &'a DominatorTree,
+    rs: std::cell::RefCell<Option<crate::ranges::Ranges>>,
+}
+
+impl ArmBnd<'_> {
+    /// `v`'s unsigned range at block `at`, or `None` when unbounded.
+    fn bound(&self, func: &Function, v: Value, at: Option<Block>) -> Option<(u64, u64)> {
+        let at = at?;
+        let mut rs = self.rs.borrow_mut();
+        let r = rs
+            .get_or_insert_with(|| crate::ranges::Ranges::new(func, self.cfg))
+            .at(func, self.dt, v, at);
+        (!r.is_full()).then_some((r.ulo, r.uhi))
+    }
+}
+
 /// Whether a write-ish instruction `w` can touch `loc`.
 #[allow(clippy::too_many_arguments)]
 fn clobbers(
@@ -203,6 +224,7 @@ fn clobbers(
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
     noalias: &FxHashSet<Value>,
+    ac: &ArmBnd,
 ) -> bool {
     // A `noalias`+`readonly` (`deref` with `!writable`) pointee is
     // exclusively read through this root for the call's duration —
@@ -266,42 +288,112 @@ fn clobbers(
         // use of such an address escapes analysis — and this store IS a use.
         InstructionData::Store { args, offset, .. } => {
             let ty = func.dfg.value_type(func.dfg.resolve_aliases(args[0]));
-            let (r2, o2) = loadfwd::concrete(func, ps, args[1]);
-            let o2 = o2.wrapping_add(i64::from(i32::from(offset)));
-            // A loc on a rustc-`noalias` entry param can be written only
-            // through addresses derived from that param (LLVM
-            // arg-`noalias`: accessing the pointee through a non-derived
-            // pointer during the call is UB). `provescapes` tracks that
-            // provenance precisely: for a `live` root — no escape the
-            // loop can observe — only a store through a still-`rv`-based
-            // address (`taint`) can clobber; loaded pointers and
-            // unrelated roots can't be `rv`-based (`&mut self` field
-            // loads hoist past stores through pointers loaded from it,
-            // `compress_inner`). Without shelter a store is still safe
-            // when `not_derived` proves its address `rv`-free. The
-            // entry-param `noalias` set only: a scoped claim holds
-            // inside its clone's region, not function-wide.
-            if let Some(s) = shel
-                && let Root::V(rv) = cloc.0
-                && noalias.contains(&rv)
-                && !scoped_na.contains(&rv)
-                && r2 != cloc.0
-            {
-                if let Some(&bit) = s.live.get(&rv) {
-                    return match r2 {
-                        Root::V(x) => s
-                            .pe
-                            .taint
-                            .get(&func.dfg.resolve_aliases(x))
-                            .is_some_and(|&m| m & bit != 0),
-                        _ => false,
-                    };
+            let imm = i64::from(i32::from(offset));
+            // Arm decomposition (`loadfwd::addr_arms`): a merged
+            // (multi-source param / `select`) store address resolves
+            // into its `(root, off-range)` arms — the `SmallVec`
+            // spilled/inline union — and every arm must be provably
+            // disjoint for the store not to clobber `cloc`. `concrete`
+            // alone bails to the whole-address root on the merge, which
+            // taints sibling fields against `z.data` stores
+            // (blind-sig's montgomery header reloads).
+            // Whole-address provenance fast-path: when nothing feeding
+            // the store's address carries `rv`'s provenance, arg
+            // `noalias` says the store can't touch `*rv` — the per-arm
+            // split below only refines where a merged address IS
+            // possibly `rv`-based (`taint` propagates through every
+            // producer, so one lookup covers all operands).
+            let addr_v = func.dfg.resolve_aliases(args[1]);
+            let wc = shel.is_some_and(|s| {
+                if let Root::V(rv) = cloc.0
+                    && noalias.contains(&rv)
+                    && !scoped_na.contains(&rv)
+                    && let Some(&bit) = s.live.get(&rv)
+                {
+                    match s.pe.taint.get(&addr_v) {
+                        Some(&m) => m & bit == 0,
+                        None => func.dfg.value_def(addr_v).inst().is_some(),
+                    }
+                } else {
+                    false
                 }
-                if let Root::V(x) = r2 {
-                    return !not_derived(func, x, noalias, scoped_na, rv);
-                }
+            });
+            if wc {
+                return false;
             }
-            !overlap_keeps(func, (r2, o2, ty), cloc, iso)
+            let wb = func.layout.inst_block(w);
+            let pf = ac.pf;
+            let arms = loadfwd::addr_arms(func, ps, pf, &mut |f, v| ac.bound(f, v, wb), args[1]);
+            let l = i128::from(cloc.1);
+            let lhi = l + i128::from(cloc.2.bytes());
+            let res = arms.iter().any(|&(r2, alo, ahi)| {
+                // The arm's store covers bytes `[alo+imm, ahi+imm+ty)`.
+                let lo = i128::from(alo) + i128::from(imm);
+                let hi = i128::from(ahi) + i128::from(imm) + i128::from(ty.bytes());
+                // A loc on a rustc-`noalias` entry param can be written
+                // only through addresses derived from that param (LLVM
+                // arg-`noalias`: accessing the pointee through a
+                // non-derived pointer during the call is UB).
+                // `provescapes` tracks that provenance precisely: for a
+                // `live` root — no escape the loop can observe — only a
+                // store through a still-`rv`-based address (`taint`)
+                // can clobber; loaded pointers and unrelated roots
+                // can't be `rv`-based (`&mut self` field loads hoist
+                // past stores through pointers loaded from it,
+                // `compress_inner`). Without shelter a store is still
+                // safe when `not_derived` proves its address `rv`-free.
+                // The entry-param `noalias` set only: a scoped claim
+                // holds inside its clone's region, not function-wide.
+                // Applies per arm: the heap-pointer arm of a merged
+                // address is `rv`-free even when a sibling arm is not.
+                let shel_ans = (|| {
+                    let s = shel?;
+                    let Root::V(rv) = cloc.0 else { return None };
+                    if !noalias.contains(&rv) || scoped_na.contains(&rv) || r2 == cloc.0 {
+                        return None;
+                    }
+                    if let Some(&bit) = s.live.get(&rv) {
+                        return Some(match r2 {
+                            Root::V(x) => {
+                                let x = func.dfg.resolve_aliases(x);
+                                match s.pe.taint.get(&x) {
+                                    Some(&m) => m & bit != 0,
+                                    // Untainted inst results are clean:
+                                    // in-loop derivation is tracked and under
+                                    // shelter no `rv` was planted in memory.
+                                    // A param's provenance is caller-chosen —
+                                    // it may be `rv`-based (`&mut s.field`
+                                    // beside `&mut s`) — so absence from
+                                    // `taint` proves nothing.
+                                    None => func.dfg.value_def(x).inst().is_none(),
+                                }
+                            }
+                            _ => false,
+                        });
+                    }
+                    if let Root::V(x) = r2 {
+                        return Some(!not_derived(func, x, noalias, scoped_na, rv));
+                    }
+                    None
+                })();
+                let ans = if let Some(ans) = shel_ans {
+                    ans
+                } else {
+                    // `overlap_keeps`'s keep-rule with the arm's byte
+                    // span in place of the exact offset.
+                    !(match (cloc.0, r2) {
+                        _ if r2 == cloc.0 => l >= hi || lo >= lhi,
+                        (Root::S(_), Root::S(_)) => true,
+                        _ => {
+                            iso.contains(&cloc.0)
+                                || iso.contains(&r2)
+                                || slots_apart(func, cloc.0, r2)
+                        }
+                    })
+                };
+                ans
+            });
+            res
         }
         _ if op.can_store()
             || op.other_side_effects()
@@ -387,10 +479,11 @@ fn hoists(
     rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     gte: &FxHashSet<Inst>,
+    ac: &ArmBnd,
     pb: Block,
     i: Inst,
 ) -> bool {
-    hoists_inner(func, ps, na, noalias, inv, writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, gte, pb, i)
+    hoists_inner(func, ps, na, noalias, inv, writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, gte, ac, pb, i)
         && (!func.dfg.insts[i].opcode().can_load() || pliron_cfg::bisect("licm-load"))
 }
 
@@ -412,6 +505,7 @@ fn hoists_inner(
     rpar: &pliron::cols::ColMap<Region, Region>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
     gte: &FxHashSet<Inst>,
+    ac: &ArmBnd,
     pb: Block,
     i: Inst,
 ) -> bool {
@@ -547,7 +641,7 @@ fn hoists_inner(
     // come back clean before an in-region hoist can skip it.
     let nw_w = writers
         .iter()
-        .filter(|&&w| clobbers(func, ps, w, loc, iso, shel, nw, deref, scoped_na, noalias))
+        .filter(|&&w| clobbers(func, ps, w, loc, iso, shel, nw, deref, scoped_na, noalias, ac))
         .count();
     if !own_write && nw_w == 0 && let Some(&target) = scoped.get(&i) {
         let mut r = breg.get(&pb).copied();
@@ -613,7 +707,7 @@ fn hoists_inner(
         };
         for &w in writers {
             if let InstructionData::Store { args, offset, .. } = func.dfg.insts[w]
-                && clobbers(func, ps, w, loc, iso, shel, nw, deref, scoped_na, noalias)
+                && clobbers(func, ps, w, loc, iso, shel, nw, deref, scoped_na, noalias, ac)
             {
                 let (r2, o2) = loadfwd::root(func, ps, na, args[1]);
                 if pliron_cfg::tracing_on() {
@@ -864,6 +958,19 @@ fn run_loop(
     if let Some(s) = shel {
         tracing::debug!(target: "pliron::licm", "licm shel {}: {h} live={:?}", func.name, s.live);
     }
+    // `pf` powers `addr_arms`' per-source decomposition of merged
+    // store addresses (`clobbers`). Computed on this iteration's fresh
+    // `func`/`cfg`: edge splits made earlier this `run_loop` only add
+    // params — a stale `detail` entry's arg still names the value
+    // flowing in (the split block just forwards it), so keeping the
+    // snapshot conservative is enough.
+    let pf = crate::proots::facts_cfg(func, cfg);
+    let ac = ArmBnd {
+        pf: &pf,
+        cfg,
+        dt,
+        rs: std::cell::RefCell::new(None),
+    };
     // Exactly one branch destination in from outside.
     let mut entry: Option<(Inst, usize)> = None;
     for p in cfg.pred_iter(h) {
@@ -1092,7 +1199,7 @@ fn run_loop(
                 }
                 if hoists(
                     func, ps, na, noalias, &inv, &writers, iso, shel, nw, deref, scoped_na, scoped, breg, rpar, ofz, &gte,
-                    pb, i,
+                    &ac, pb, i,
                 ) {
                     if debug {
                         if pliron_cfg::tracing_on() {
@@ -1277,7 +1384,7 @@ fn run_loop(
     }
     cn + n
         + promote(
-            func, ps, na, noalias, cfg, dt, la, lp, iso, shel, escapes, deref, scoped_na, nw, nounwind, ofz, debug,
+            func, ps, na, noalias, cfg, dt, la, lp, iso, shel, escapes, deref, scoped_na, nw, nounwind, ofz, &ac, debug,
         )
 }
 
@@ -1302,6 +1409,7 @@ fn promote(
     nw: &FxHashMap<FuncRef, bool>,
     nounwind: &FxHashSet<FuncRef>,
     ofz: &FxHashMap<Value, Vec<(u64, Region)>>,
+    ac: &ArmBnd,
     debug: bool,
 ) -> usize {
     let h = la.loop_header(lp);
@@ -1569,6 +1677,7 @@ fn promote(
             nw,
             deref,
             scoped_na,
+            &ac,
             debug,
         );
     }
@@ -1597,6 +1706,7 @@ fn promote_loc(
     nw: &FxHashMap<FuncRef, bool>,
     deref: &FxHashMap<Value, (u64, bool)>,
     scoped_na: &FxHashSet<Value>,
+    ac: &ArmBnd,
     debug: bool,
 ) -> usize {
     let ty = loc.2;
@@ -1820,7 +1930,7 @@ fn promote_loc(
             {
                 seed = Some(func.dfg.resolve_aliases(args[0]));
             }
-            _ if clobbers(func, ps, i, loc, iso, shel, nw, deref, scoped_na, noalias) => seed = None,
+            _ if clobbers(func, ps, i, loc, iso, shel, nw, deref, scoped_na, noalias, ac) => seed = None,
             _ => {}
         }
     }
@@ -2951,5 +3061,86 @@ mod tests {
             build(true),
             "store through the derived address must still clobber"
         );
+    }
+
+    /// `z.len`-style reload past `z.data` stores: the store's merged-param
+    /// address (`{inline v0+8, loaded heap ptr}` arms — `SmallVec`'s
+    /// spilled/inline union) taints every sibling field as one whole-address
+    /// root. `addr_arms` decomposes it: the `v0`-arm clears on bounded byte
+    /// disjointness (index `& 3` caps stores below the `+40` field), the
+    /// loaded-pointer arm clears on provenance — so the field load hoists.
+    #[test]
+    fn merged_param_store_arms_clear_sibling_field() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let out = func.dfg.make_block();
+        for b in [b0, h, out] {
+            func.layout.append_block(b);
+        }
+        let v0 = func.dfg.append_block_param(b0, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let c0 = cur.ins().iconst(types::I8, 0);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let inline = cur.ins().iadd_imm(v0, 8);
+        let len_addr = cur.ins().iadd_imm(v0, 40);
+        let heap = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), v0, 16);
+        // `vp`'s single edge-arg — the select — decomposes to the
+        // `{v0+8, loaded}` pair, exactly the param-merge arms.
+        let sel = cur.ins().select(c0, inline, heap);
+        cur.ins().jump(h, &[sel.into(), zero.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let vp = cur.func.dfg.append_block_param(h, types::I64);
+        let vi = cur.func.dfg.append_block_param(h, types::I64);
+        let len = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), len_addr, 0);
+        let _ = len;
+        let idx = cur.ins().band_imm(vi, 3);
+        let addr = cur.ins().iadd(vp, idx);
+        let seven = cur.ins().iconst(types::I64, 7);
+        cur.ins().store(MemFlagsData::new().with_notrap(), seven, addr, 0);
+        let next = cur.ins().iadd_imm(vi, 8);
+        let cnd = cur.ins().icmp_imm(IntCC::UnsignedLessThan, next, 64);
+        cur.ins().brif(cnd, h, &[vp.into(), next.into()], out, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(out);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        let mut noalias = FxHashSet::default();
+        noalias.insert(v0);
+        let mut deref = FxHashMap::default();
+        deref.insert(v0, (48, true));
+        run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            &noalias,
+            &FxHashSet::default(),
+            &deref,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            true,
+            false,
+        );
+        let loads_in_loop = func
+            .layout
+            .block_insts(h)
+            .filter(|&i| matches!(func.dfg.insts[i], InstructionData::Load { .. }))
+            .count();
+        assert_eq!(loads_in_loop, 0, "field load should hoist past merged-ptr stores");
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("licm produced invalid IR: {e}\n{}", func.display());
+        }
     }
 }

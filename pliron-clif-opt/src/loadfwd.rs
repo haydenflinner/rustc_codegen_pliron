@@ -476,6 +476,238 @@ pub fn concrete(func: &Function, ps: &VMap<Value>, v: Value) -> (Root, i64) {
     root(func, ps, &FxHashSet::default(), v)
 }
 
+/// Arm decomposition of an address: the set of `(root, lo, hi)`
+/// alternatives it can take — `root + o` for some arm, with `o ∈ [lo,
+/// hi]` (inclusive bounds). A `select` and a param fed by several edge
+/// args union their arms (the `SmallVec` spilled/inline merge: `z.data`
+/// is either `z + 8` or the loaded heap pointer); `iadd` accumulates
+/// constant offsets and `bnd`-bounded dynamic addends (`bnd` gives a
+/// value's unsigned range at the query point — a range that reaches
+/// the type's top is no bound). An operand that resolves no further
+/// leafs at its own `(V, lo, hi)`, so the arm set always covers the
+/// real address — callers must keep treating `V` roots as may-alias.
+///
+/// `concrete` alone can't answer `clobbers` for such addresses: it
+/// bails to `(V(addr), 0)` on the merge, which neither byte-compares
+/// against a sibling-field loc nor proves the heap arm's provenance.
+/// Capped at `MAX_ARMS`: past it a wild `(V, MIN, MAX)` arm keeps the
+/// set sound.
+pub fn addr_arms(
+    func: &Function,
+    ps: &VMap<Value>,
+    pf: &crate::proots::Facts,
+    bnd: &mut dyn FnMut(&Function, Value) -> Option<(u64, u64)>,
+    v: Value,
+) -> Vec<(Root, i64, i64)> {
+    const MAX_ARMS: usize = 16;
+    let mut out: Vec<(Root, i64, i64)> = Vec::new();
+    let mut full = false;
+    arms_rec(func, ps, pf, bnd, v, 0, 0, 0, &mut out, MAX_ARMS, &mut full);
+    if full || out.is_empty() {
+        return vec![(Root::V(func.dfg.resolve_aliases(v)), i64::MIN, i64::MAX)];
+    }
+    // Same-root arms merge to their union reach; `V` arms whose values
+    // resolve to the same root merge likewise (already resolved on
+    // push — `Root` is the dedup key).
+    out.sort_by_key(|&(r, lo, hi)| (root_key(&r), lo, hi));
+    let mut merged: Vec<(Root, i64, i64)> = Vec::with_capacity(out.len());
+    for (r, lo, hi) in out {
+        match merged.last_mut() {
+            Some((r2, lo2, hi2)) if *r2 == r => {
+                *lo2 = (*lo2).min(lo);
+                *hi2 = (*hi2).max(hi);
+            }
+            _ => merged.push((r, lo, hi)),
+        }
+    }
+    merged
+}
+
+fn root_key(r: &Root) -> u64 {
+    match r {
+        Root::V(v) => (v.as_u32() as u64) << 1,
+        Root::S(ss) => ((ss.as_u32() as u64) << 1) | 1,
+    }
+}
+
+/// Whether `a`'s value derives from `needle` through its operand tree
+/// (bounded — the answer matters only for near-loop-carried chains).
+fn contains(func: &Function, a: Value, needle: Value, depth: u32) -> bool {
+    let a = func.dfg.resolve_aliases(a);
+    if a == needle {
+        return true;
+    }
+    if depth >= 8 {
+        return false;
+    }
+    match func.dfg.value_def(a) {
+        ValueDef::Result(i, _) => func
+            .dfg
+            .inst_args(i)
+            .iter()
+            .any(|&x| contains(func, x, needle, depth + 1)),
+        _ => false,
+    }
+}
+
+fn push_arm(out: &mut Vec<(Root, i64, i64)>, max: usize, r: Root, lo: i64, hi: i64) {
+    if out.len() < max {
+        out.push((r, lo, hi));
+    }
+}
+
+fn arms_rec(
+    func: &Function,
+    ps: &VMap<Value>,
+    pf: &crate::proots::Facts,
+    bnd: &mut dyn FnMut(&Function, Value) -> Option<(u64, u64)>,
+    v: Value,
+    lo: i64,
+    hi: i64,
+    depth: u32,
+    out: &mut Vec<(Root, i64, i64)>,
+    max: usize,
+    full: &mut bool,
+) {
+    const MAX_DEPTH: u32 = 16;
+    // Once `out` is full the set is already a truncated superset —
+    // stop the traversal (the alternatives — keep decomposing into a
+    // dropped tail or fold to a wild arm — either burn exponential
+    // time or lose the roots the checks need).
+    if out.len() >= max {
+        *full = true;
+        return;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    if depth >= MAX_DEPTH {
+        push_arm(out, max, Root::V(v), lo, hi);
+        return;
+    }
+    // A single-source param is its source (`param_src`); a multi-source
+    // param unions every incoming edge's arm.
+    if let Some(&s) = ps.get(&v) {
+        arms_rec(func, ps, pf, bnd, s, lo, hi, depth + 1, out, max, full);
+        return;
+    }
+    match func.dfg.value_def(v) {
+        ValueDef::Param(..) => {
+            match pf.detail.get(&v) {
+                _ if pf.blocked.contains(&v) => push_arm(out, max, Root::V(v), lo, hi),
+                Some(det) if !det.is_empty() => {
+                    let det = det.clone();
+                    let before = out.len();
+                    let mut self_derived = false;
+                    for &(_, _, _, a) in det.iter() {
+                        let a2 = func.dfg.resolve_aliases(a);
+                        // A self-edge just propagates the param's own
+                        // value — it introduces no root the other
+                        // edges don't already cover.
+                        if a2 == v {
+                            continue;
+                        }
+                        // An arg derived from the param itself (a
+                        // loop IV's `v4 + 1` back-edge) contributes
+                        // the same roots with a per-iteration shift;
+                        // wild high offsets cover any count.
+                        if contains(func, a2, v, 0) {
+                            self_derived = true;
+                            continue;
+                        }
+                        // A `bnd`-bounded arg is an integer, not a
+                        // pointer — its contribution is an offset, not
+                        // a base arm (the sibling `iadd` interpretation
+                        // already accounts for it).
+                        if bnd(func, a).is_some() {
+                            continue;
+                        }
+                        arms_rec(func, ps, pf, bnd, a, lo, hi, depth + 1, out, max, full);
+                        if *full {
+                            return;
+                        }
+                    }
+                    if self_derived {
+                        for (_, _, hi2) in out[before..].iter_mut() {
+                            *hi2 = i64::MAX;
+                        }
+                    }
+                    // Every arg was an integer or self-derived: `v` is
+                    // provably not a pointer — it contributes no arms
+                    // of its own (its value feeds the offset). Unknown
+                    // provenance falls through to the wild param arm.
+                    if out.len() == before && !self_derived && bnd(func, v).is_none() {
+                        push_arm(out, max, Root::V(v), lo, hi);
+                    }
+                }
+                _ => push_arm(out, max, Root::V(v), lo, hi),
+            }
+        }
+        ValueDef::Union(..) => push_arm(out, max, Root::V(v), lo, hi),
+        ValueDef::Result(i, _) => match func.dfg.insts[i] {
+            InstructionData::StackAddr {
+                stack_slot, offset, ..
+            } => push_arm(
+                out,
+                max,
+                Root::S(stack_slot),
+                lo.saturating_add(i64::from(i32::from(offset))),
+                hi.saturating_add(i64::from(i32::from(offset))),
+            ),
+            InstructionData::Unary {
+                opcode: Opcode::BlackBox,
+                arg,
+            } => arms_rec(func, ps, pf, bnd, arg, lo, hi, depth + 1, out, max, full),
+            InstructionData::Binary {
+                opcode: Opcode::Iadd,
+                args: [x, y],
+            } => {
+                let c = |x: Value| match &func.dfg.insts[func.dfg.value_def(x).inst()?] {
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                    } => Some(imm.bits()),
+                    _ => None,
+                };
+                let (x, y) = (func.dfg.resolve_aliases(x), func.dfg.resolve_aliases(y));
+                if let Some(k) = c(y) {
+                    arms_rec(func, ps, pf, bnd, x, lo.saturating_add(k), hi.saturating_add(k), depth + 1, out, max, full);
+                } else if let Some(k) = c(x) {
+                    arms_rec(func, ps, pf, bnd, y, lo.saturating_add(k), hi.saturating_add(k), depth + 1, out, max, full);
+                } else {
+                    // Both interpretations stay: either operand can be
+                    // the pointer — a `bnd` bound is a value-range fact,
+                    // not proof the operand isn't a pointer (a masked or
+                    // shifted pointer stays bounded, and wasm pointers
+                    // fit any small bound). Each side's base arms take
+                    // the other's range as their addend, a `[0, ∞)`
+                    // addend when unbounded (a pointer plus a u64
+                    // addend can't wrap back under its base — the same
+                    // model `root_min`'s `bnd` peel uses).
+                    let ax = bnd(func, x).map(|(l, h)| (l as i64, h.min(i64::MAX as u64) as i64));
+                    let ay = bnd(func, y).map(|(l, h)| (l as i64, h.min(i64::MAX as u64) as i64));
+                    let (axl, axh) = ax.unwrap_or((0, i64::MAX));
+                    let (ayl, ayh) = ay.unwrap_or((0, i64::MAX));
+                    arms_rec(func, ps, pf, bnd, y, lo.saturating_add(axl), hi.saturating_add(axh), depth + 1, out, max, full);
+                    if *full {
+                        return;
+                    }
+                    arms_rec(func, ps, pf, bnd, x, lo.saturating_add(ayl), hi.saturating_add(ayh), depth + 1, out, max, full);
+                }
+            }
+            InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: [_, t, e],
+            } => {
+                arms_rec(func, ps, pf, bnd, t, lo, hi, depth + 1, out, max, full);
+                if *full {
+                    return;
+                }
+                arms_rec(func, ps, pf, bnd, e, lo, hi, depth + 1, out, max, full);
+            }
+            _ => push_arm(out, max, Root::V(v), lo, hi),
+        },
+    }
+}
+
 /// `root` normalized for disjointness/dereferenceability checks: when a
 /// `V` scope name (`noalias` param, operand-frozen operand) peels to a
 /// `stack_addr`, report the slot itself so two scoped pointers into
@@ -3968,5 +4200,41 @@ mod tests {
         let pm = pmroots(&func, &ps, &na, &bnd, &pf);
         assert_eq!(pm.get(&p), Some(&(Root::V(base), 8)));
         assert!(!pm.contains_key(&q));
+    }
+
+    /// Past `MAX_ARMS` the set is a truncated superset — useless for
+    /// `clobbers` (a dropped arm is a real root the checks never see)
+    /// and the traversal itself went exponential on a fuzz seed
+    /// (compile-timeout, rustlantis 12309: symmetric `iadd` doubles the
+    /// recursion per level). The give-up answer is one wild arm.
+    #[test]
+    fn addr_arms_over_cap_gives_up_wild() {
+        let mut sig = Signature::new(CallConv::Fast);
+        for _ in 0..25 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b = func.dfg.make_block();
+        func.layout.append_block(b);
+        let leaves: Vec<Value> = (0..25)
+            .map(|_| func.dfg.append_block_param(b, types::I64))
+            .collect();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b);
+        let c = cur.ins().iconst(types::I8, 0);
+        let mut acc = leaves[0];
+        for &l in &leaves[1..] {
+            acc = cur.ins().select(c, acc, l);
+        }
+        cur.ins().return_(&[acc]);
+
+        let pf = crate::proots::facts(&func);
+        let ps = crate::proots::alias_of(&pf);
+        let arms = addr_arms(&func, &ps, &pf, &mut |_, _| None, acc);
+        assert_eq!(
+            arms,
+            vec![(Root::V(func.dfg.resolve_aliases(acc)), i64::MIN, i64::MAX)],
+            "over-cap decomposition must give up wild, not truncate"
+        );
     }
 }

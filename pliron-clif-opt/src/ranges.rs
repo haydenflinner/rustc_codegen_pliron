@@ -754,13 +754,27 @@ impl Ranges {
     /// Range of `v` at the entry of `at`: the definition range refined by
     /// the compare facts of dominating single-predecessor edges.
     pub fn at(&mut self, func: &Function, dt: &DominatorTree, v: Value, at: Block) -> Range {
+        self.at_d(func, dt, v, at, 0)
+    }
+
+    /// `at` at transitive-fact depth `depth`: an edge fact's `other`
+    /// operand bounds conditionally too — `i < len` where `len < 5` on
+    /// a dominating `!spilled` edge gives `i ≤ 3` (SmallVec's inline
+    /// arm: `z.data[i]` stays inside `[v0+8, v0+40)`, disjoint from the
+    /// `len` field). Depth-capped; the memoized range is the depth-0
+    /// answer, which any depth may reuse (a shallower query's bound is
+    /// only ever as strong).
+    fn at_d(&mut self, func: &Function, dt: &DominatorTree, v: Value, at: Block, depth: u32) -> Range {
+        const MAX_TRANS_DEPTH: u32 = 4;
         let v = func.dfg.resolve_aliases(v);
         if let Some(&r) = self.at_memo.get(&(v, at)) {
             return r;
         }
         let mut r = self.def(func, v);
         let Some(bits) = width(func.dfg.value_type(v)) else {
-            self.at_memo.insert((v, at), r);
+            if depth == 0 {
+                self.at_memo.insert((v, at), r);
+            }
             return r;
         };
         let mut b = at;
@@ -771,7 +785,13 @@ impl Ranges {
                 .get(&b)
                 .map(|(c, arm, m)| (*c, *arm, m.clone()));
             if let Some((c, arm, arg_map)) = ef {
-                if let Some(f) = self.fact(func, c, arm, v, bits, &arg_map) {
+                if let Some(f) = self.fact(func, c, arm, v, bits, &arg_map, &mut |s: &mut Self, f2, o| {
+                    if depth < MAX_TRANS_DEPTH {
+                        s.at_d(f2, dt, o, b, depth + 1)
+                    } else {
+                        s.def(f2, o)
+                    }
+                }) {
                     if let Some(m) = r.meet(&f) {
                         r = m;
                     }
@@ -785,7 +805,13 @@ impl Ranges {
                 let edges = edges.clone();
                 let mut u = None;
                 for (c, arm, arg_map) in edges.iter() {
-                    match self.fact(func, *c, *arm, v, bits, arg_map) {
+                    match self.fact(func, *c, *arm, v, bits, arg_map, &mut |s: &mut Self, f2, o| {
+                        if depth < MAX_TRANS_DEPTH {
+                            s.at_d(f2, dt, o, b, depth + 1)
+                        } else {
+                            s.def(f2, o)
+                        }
+                    }) {
                         Some(f) => {
                             u = Some(u.map_or(f, |u: Range| u.join(&f)));
                         }
@@ -813,14 +839,18 @@ impl Ranges {
                 break;
             }
         }
-        self.at_memo.insert((v, at), r);
+        if depth == 0 {
+            self.at_memo.insert((v, at), r);
+        }
         r
     }
 
     /// What `brif c` taking arm `arm` says about `v`. `arg_map` renames
     /// the edge's branch args to the dest block's params so the fact
-    /// reaches values bound on the edge.
-    fn fact(&mut self, func: &Function, c: Value, arm: bool, v: Value, bits: u32, arg_map: &FxHashMap<Value, Value>) -> Option<Range> {
+    /// reaches values bound on the edge. `ob` bounds the compare's other
+    /// operand — unconditional definition ranges normally, an `at_d`
+    /// recursion when the caller wants transitive edge facts.
+    fn fact(&mut self, func: &Function, c: Value, arm: bool, v: Value, bits: u32, arg_map: &FxHashMap<Value, Value>, ob: &mut dyn FnMut(&mut Self, &Function, Value) -> Range) -> Option<Range> {
         // `c` itself (or the param it binds on this edge): 0 on the
         // false arm, nonzero on the true (brif tests != 0 at any width).
         if arg_map.get(&c).copied().unwrap_or(c) == v {
@@ -849,7 +879,7 @@ impl Ranges {
             return None;
         };
         let cc = if arm { cc } else { cc.complement() };
-        let o = self.def(func, other);
+        let o = ob(self, func, other);
         let m = umask(bits);
         Some(match cc {
             IntCC::Equal => o,
