@@ -37,6 +37,13 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-27: isub M,t -> bxor for all-ones M covering t (ranges
+    // proof) — NonZero::ilog2's `63 - clz` -> `clz ^ 63` (eor
+    // immediate, no movz+sub). With the ctlz_nz range seed and the
+    // clz/ctz + bor range tightenings. protobuf -187k executed; gate
+    // 138/139 under the knob (debuginfo env-fails at clean HEAD —
+    // lldb attach). `PLIRON_SUBXOR=0` off.
+    "PLIRON_SUBXOR",
     // 2026-11-27: aarch64 emit_icmp spells the unsigned checked_add
     // carry check `icmp ult (a+b), a` as `cmn a,b` (hs/lo remaps), so
     // post-RA flag_twin merges it with the sum's add -> adds; the madd
