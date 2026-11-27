@@ -1,9 +1,10 @@
-//! licm `PLIRON_LICM_INNERPRESS=2`: a load used only outside a loop's
-//! inner loops still hoists while every inner loop has register room
-//! (regex's state-decode loop around a tiny varint loop), and stays put
-//! when an inner loop is already crowded (montgomery: ~20 values live
-//! across its multiply loops). Config is read once per process, so this
-//! binary holds only `=2` tests.
+//! licm `PLIRON_LICM_INNERPRESS=2`: a `notrap` load used only outside a
+//! loop's inner loops hoists even when an inner loop is already crowded
+//! (montgomery's `m` fields). regalloc2 cannot rematerialize a load, so
+//! the worst case under pressure is a reload per use — the per-iteration
+//! cost the unhoisted load already pays — while a held register saves
+//! the reload outright. Config is read once per process, so this binary
+//! holds only `=2` tests.
 
 use cranelift_codegen::ir::{Block, Function, Opcode, Value};
 use pliron_clif_opt::pipeline::Analysis;
@@ -73,7 +74,8 @@ fn roomy_inner_loop_lets_the_load_hoist() {
 
 /// The same shape with 26 values defined before the outer loop and used
 /// after the inner one: all live across the inner loop, past the 24-value
-/// budget, so the load stays.
+/// budget, and the `notrap` load still hoists — under `=2` it doesn't
+/// spend `room` (only `=1` keeps refusing it).
 fn crowded() -> String {
     let n = 26;
     let mut defs = String::new();
@@ -112,7 +114,7 @@ block4:
 }
 
 #[test]
-fn crowded_inner_loop_keeps_the_load() {
+fn crowded_inner_loop_still_hoists_the_notrap_load() {
     let f = run(&crowded());
-    assert_eq!(loads_in(&f, Block::from_u32(1)), 1, "{}", f.display());
+    assert_eq!(loads_in(&f, Block::from_u32(1)), 0, "{}", f.display());
 }

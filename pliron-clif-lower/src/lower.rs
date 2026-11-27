@@ -7420,7 +7420,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     }
                     None => {
                         let (p, es) = self.spill_vec(opnds[0], &a);
-                        let addr = self.dyn_index(p, opnds[1], es);
+                        let addr = self.dyn_index(p, opnds[1], es, false);
                         self.b.ins().load(et, MemFlagsData::trusted(), addr, 0)
                     }
                 }
@@ -7429,7 +7429,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     Some(i) => a[i as usize],
                     None => {
                         let (p, es) = self.spill_vec(opnds[0], &a);
-                        let addr = self.dyn_index(p, opnds[1], es);
+                        let addr = self.dyn_index(p, opnds[1], es, false);
                         let t = self.b.func.dfg.value_type(a[0]);
                         self.b.ins().load(t, MemFlagsData::trusted(), addr, 0)
                     }
@@ -7450,7 +7450,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     }
                     None => {
                         let (p, es) = self.spill_vec(opnds[0], &a);
-                        let addr = self.dyn_index(p, opnds[2], es);
+                        let addr = self.dyn_index(p, opnds[2], es, false);
                         self.b.ins().store(MemFlagsData::trusted(), e, addr, 0);
                         for (j, x) in a.iter_mut().enumerate() {
                             let o = (j as u32 * vt.bytes()) as i32;
@@ -7464,7 +7464,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 Some(i) => a[i as usize] = e,
                 None => {
                     let (p, es) = self.spill_vec(opnds[0], &a);
-                    let addr = self.dyn_index(p, opnds[2], es);
+                    let addr = self.dyn_index(p, opnds[2], es, false);
                     self.b.ins().store(MemFlagsData::trusted(), e, addr, 0);
                     let t = self.b.func.dfg.value_type(a[0]);
                     for (i, x) in a.iter_mut().enumerate() {
@@ -7715,13 +7715,37 @@ impl<'a, 'b> FnLower<'a, 'b> {
         (p, es)
     }
 
-    fn dyn_index(&mut self, base: ir::Value, idx: Value, scale: u64) -> ir::Value {
+    fn dyn_index(&mut self, base: ir::Value, idx: Value, scale: u64, nuw: bool) -> ir::Value {
         let x = self.get1(idx);
         // Index arithmetic happens at pointer width: `base + idx*scale`
         // needs both operands at the pointer type.
         let x = self.resize(x, self.tcfg.pointer_type(), true);
         let off = self.b.ins().imul_imm_s(x, scale as i64);
-        self.b.ins().iadd(base, off)
+        let addr = self.b.ins().iadd(base, off);
+        // `gep nuw` (`ptr.add`, slice indexing): LangRef makes each
+        // `idx*size` product and the offset add `nuw` too. Record the
+        // fact (`vfacts.nw`) so `(x*size)>>log2(size)` round-trips —
+        // `end.sub_ptr(start)` inside `slice::Iter::len` — can fold
+        // back to `x`, and `ranges` can tighten `imul` bounds.
+        if nuw {
+            use pliron_clif_opt::vfacts::{NUW, Nw};
+            for v in [off, addr] {
+                if *VFACTS_NW
+                    && let cranelift_codegen::ir::ValueDef::Result(i, 0) =
+                        self.b.func.dfg.value_def(v)
+                    && let cranelift_codegen::ir::InstructionData::Binary { opcode, args } =
+                        self.b.func.dfg.insts[i]
+                    && matches!(
+                        opcode,
+                        cranelift_codegen::ir::Opcode::Iadd | cranelift_codegen::ir::Opcode::Imul
+                    )
+                    && !self.vfacts.nw.contains_key(&v)
+                {
+                    self.vfacts.nw.insert(v, Nw { bits: NUW, op: opcode, args });
+                }
+            }
+        }
+        addr
     }
 
     fn fcvt_sat(&mut self, signed: bool, t: ClType, x: ir::Value) -> ir::Value {
@@ -7806,6 +7830,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
         let ctx = self.ctx;
         let gep = Operation::get_op::<GetElementPtrOp>(op, ctx).unwrap();
         let idxs = gep.indices(ctx);
+        let gep_nuw = gep.no_wrap_flags(ctx).contains(GepNoWrapFlags::NUW);
         let mut cur = gep.src_elem_type(ctx);
         let mut addr = self.get1(base);
         let base_v = addr;
@@ -7842,7 +7867,7 @@ impl<'a, 'b> FnLower<'a, 'b> {
                             .iadd_imm_s(addr, (c as i64).wrapping_mul(scale as i64));
                     }
                 }
-                (None, GepIndex::Value(v)) => addr = self.dyn_index(addr, *v, scale),
+                (None, GepIndex::Value(v)) => addr = self.dyn_index(addr, *v, scale, gep_nuw),
                 _ => unreachable!(),
             }
         }

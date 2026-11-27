@@ -11292,6 +11292,12 @@ static CSE_SYM_BLOCK: std::sync::LazyLock<bool> =
 /// Per-block CSE with the shared keying: later insts in a block alias
 /// the earliest equivalent def, which dominates them.
 pub fn lcse(func: &mut Function) -> usize {
+    lcse_facts(func, &crate::vfacts::VFacts::default())
+}
+
+/// `lcse` with rustc's value facts (`vfacts`): `nuw` on a mul lets the
+/// ident fold take `(x*2^k)>>k` to `x` without a `vmax` bound.
+pub fn lcse_facts(func: &mut Function, vf: &crate::vfacts::VFacts) -> usize {
     // `pass_enabled` is two string-keyed lookups — read once per pass,
     // not per inst/candidate.
     let extred = crate::pass_enabled("PLIRON_EXTRED");
@@ -11422,7 +11428,78 @@ pub fn lcse(func: &mut Function) -> usize {
                     (kb == Some(-1)).then_some(a)
                 }
             }
-            Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => (kb == Some(0)).then_some(a),
+            Opcode::Ishl | Opcode::Sshr => (kb == Some(0)).then_some(a),
+            Opcode::Ushr | Opcode::Udiv => {
+                // `udiv x, 0` still traps — only the shift folds `>>0`.
+                if opcode == Opcode::Ushr && kb == Some(0) {
+                    return Some(a);
+                }
+                // `(x*C)>>k` / `(x<<k)>>k` / `(x*C)/C` is `x` — `C` is
+                // `1<<k` for the shift forms, `k` for the div — when
+                // the product provably keeps the result's top `k` bits:
+                // `mul nuw` recorded by lowering (`vfacts.nw`, rustc's
+                // `unchecked_*` or a `gep nuw` index scale) or `x`
+                // bounded to `umax/C`. rustc's `len*size >> log2(size)`
+                // byte/element round-trips (`min(n, len)` inside
+                // `data()[i..n+i]`, `slice::Iter::len`'s
+                // `end.sub_ptr(start)`) cost a mul+lsr per slice op
+                // otherwise. An unbounded `x` keeps the pair — the
+                // round-trip is a real clamp there, and a masked form
+                // would only move the work.
+                let w = res_ty.bits();
+                if w > 64 {
+                    return None;
+                }
+                let Some(k) = kb.filter(|&k| k > 0) else { return None };
+                let (x, c) = 'm: {
+                    let Some(d) = func.dfg.value_def(a).inst() else {
+                        return None;
+                    };
+                    let InstructionData::Binary { opcode: mop, args: ma } = func.dfg.insts[d]
+                    else {
+                        return None;
+                    };
+                    let [m0, m1] = ma.map(|m| func.dfg.resolve_aliases(m));
+                    if mop == Opcode::Imul {
+                        if let Some(c) = iconst(func, m1) {
+                            break 'm (m0, c as u64);
+                        }
+                        if let Some(c) = iconst(func, m0) {
+                            break 'm (m1, c as u64);
+                        }
+                        return None;
+                    }
+                    if mop == Opcode::Ishl
+                        && opcode == Opcode::Ushr
+                        && let Some(s) = iconst(func, m1)
+                        && let Some(c) = 1u64.checked_shl(s as u32)
+                    {
+                        break 'm (m0, c);
+                    }
+                    return None;
+                };
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                // The mul's constant must be exactly the divisor: `1<<k`
+                // for an in-range shift, `k` for the divide.
+                let want = if opcode == Opcode::Ushr {
+                    if k as u64 >= w as u64 {
+                        return None;
+                    }
+                    1u64 << k
+                } else {
+                    k as u64 & mask
+                };
+                if c & mask != want {
+                    return None;
+                }
+                let nuw =
+                    vf.nw_of(func, a).is_some_and(|b| b & crate::vfacts::NUW != 0);
+                if nuw || vmax(func, x) <= mask / c {
+                    Some(x)
+                } else {
+                    None
+                }
+            }
             Opcode::Isub => {
                 // `isub (iadd x, y), x` → `y` — cursor deltas like
                 // `(cur + len) - cur` collapse to the byte length. Only
