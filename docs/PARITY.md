@@ -1144,6 +1144,25 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    −233.9k), `XREDUCE`+`UREMCMP` (static −2.7k, held-out noise).
    Details: `history/2026-11-25-moveedge.md`. Earlier figures
    below.)
+   2026-11-26 overnight (`0b81ce82`, `31759502`): aarch64
+   `LoadP32`/`StoreP32` pair fusion extends the post-RA scan to
+   `ULoad32`/`Store32` — blake3 `compress_in_place` +463k → +103k
+   (whole program 47.77M → 47.41M, x1.017). loopvec `VPred::Pair`:
+   same-stride same-direction stream pairs get the single-icmp
+   `(alo-blo)+(L-1) >=u 2L-1` disjointness test (ring arithmetic,
+   no wrap guards) — ~7 insts vs ~13; html −12k. Measured and
+   rejected: `PLIRON_VFACTS` flip (gate-clean but protobuf +187k
+   worse, blind-sig noise — rustc never marks the montgomery
+   `cap*8` mul `nuw`); `PLIRON_VEC_REM=1` (LLVM-style 8B vector
+   epilogue fires but nets nothing on html); `PLIRON_MEMFAST=0`
+   (html +110k worse — the inline cascade beats the libcall).
+   Remaining html-rewriter gap (+6.38M, x1.074): `token_produced`
+   `into_bytes` refused by the inliner at cost 5101 vs t=1440 (per-
+   chunk vtable-shim bounce +563k), exec-RA spill storms around
+   calls, `ptr::swap` memmove cascade, aggregate slot-to-slot arg
+   copies. Open env issue: `debuginfo` gate stanza needs user-run
+   `DevToolsSecurity -enable` (lldb can't attach since the OrbStack
+   restart).
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
