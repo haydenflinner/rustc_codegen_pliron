@@ -4604,6 +4604,113 @@ impl MachInstEmit for Inst {
         }
     }
 
+    fn flag_tested_reg(&self) -> Option<Reg> {
+        match self {
+            Inst::CondBr { kind, .. } | Inst::TrapIf { kind, .. } => match kind {
+                // `cbz`/`cbnz` on `xzr` have a fixed direction regardless
+                // of any flags — not a flag test.
+                &CondBrKind::Zero(rn, _) | &CondBrKind::NotZero(rn, _)
+                    if rn != zero_reg() =>
+                {
+                    Some(rn)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn flag_test_on_cset(&self, cs: &Self) -> Option<Self> {
+        let tested = self.flag_tested_reg()?;
+        // `cset rd, cc` = `cc ? 1 : 0`; `csetm rd, cc` = `cc ? -1 : 0` —
+        // both nonzero iff `cc` holds.
+        let cc = match cs {
+            &Inst::CSet { rd, cond } | &Inst::CSetm { rd, cond }
+                if rd.to_reg() == tested =>
+            {
+                cond
+            }
+            _ => return None,
+        };
+        let kind = |k: &CondBrKind| match k {
+            CondBrKind::NotZero(..) => Some(CondBrKind::Cond(cc)),
+            CondBrKind::Zero(..) => Some(CondBrKind::Cond(cc.invert())),
+            _ => None,
+        };
+        match self {
+            &Inst::CondBr { taken, not_taken, kind: k } => {
+                Some(Inst::CondBr { taken, not_taken, kind: kind(&k)? })
+            }
+            &Inst::TrapIf { kind: k, trap_code } => {
+                Some(Inst::TrapIf { kind: kind(&k)?, trap_code })
+            }
+            _ => None,
+        }
+    }
+
+    fn flag_cc_branch(&self) -> bool {
+        matches!(
+            self,
+            Inst::CondBr { kind: CondBrKind::Cond(_), .. }
+                | Inst::TrapIf { kind: CondBrKind::Cond(_), .. }
+        )
+    }
+
+    fn flag_zero_test(&self) -> Option<Reg> {
+        match self {
+            // `cmp rn, #0`.
+            &Inst::AluRRImm12 { alu_op: ALUOp::SubS, rd, rn, imm12, .. }
+                if rd.to_reg() == zero_reg()
+                    && imm12.bits == 0
+                    && !imm12.shift12 =>
+            {
+                Some(rn)
+            }
+            // `tst rn, rn` (`ands xzr, rn, rn`).
+            &Inst::AluRRR { alu_op: ALUOp::AndS, rd, rn, rm, .. }
+                if rd.to_reg() == zero_reg() && rn == rm =>
+            {
+                Some(rn)
+            }
+            // `tst rn, #mask` with bit 0 set — on the 0/1 a `cset`
+            // produces this is the nonzero test.
+            &Inst::AluRRImmLogic { alu_op: ALUOp::AndS, rd, rn, imml, .. }
+                if rd.to_reg() == zero_reg() && (imml.value() & 1) == 1 =>
+            {
+                Some(rn)
+            }
+            _ => None,
+        }
+    }
+
+    fn flag_branch_cset_fuse(&self, s: &Self, cs: &Self) -> Option<Self> {
+        let zr = s.flag_zero_test()?;
+        // `cset rd, cc` = `cc ? 1 : 0`; `csetm rd, cc` = `cc ? -1 : 0` —
+        // both nonzero iff `cc` holds.
+        let cc = match cs {
+            &Inst::CSet { rd, cond } | &Inst::CSetm { rd, cond }
+                if rd.to_reg() == zr =>
+            {
+                cond
+            }
+            _ => return None,
+        };
+        let map = |k: &CondBrKind| match k {
+            CondBrKind::Cond(Cond::Ne) => Some(CondBrKind::Cond(cc)),
+            CondBrKind::Cond(Cond::Eq) => Some(CondBrKind::Cond(cc.invert())),
+            _ => None,
+        };
+        match self {
+            &Inst::CondBr { taken, not_taken, kind: k } => {
+                Some(Inst::CondBr { taken, not_taken, kind: map(&k)? })
+            }
+            &Inst::TrapIf { kind: k, trap_code } => {
+                Some(Inst::TrapIf { kind: map(&k)?, trap_code })
+            }
+            _ => None,
+        }
+    }
+
     fn nzcv_free(&self) -> bool {
         let quiet = |op: ALUOp| {
             !matches!(

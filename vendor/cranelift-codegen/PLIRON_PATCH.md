@@ -2696,3 +2696,20 @@ still fuses. Fires whenever a `cmn` sits adjacent — practical trigger is
 the carrycmp emit path. protobuf +1 net site (its checked_add sites are
 mostly not this shape); digit-accumulation loops (the /tmp/cadd repro)
 fuse every iteration.
+
+## csetbr: `cset;tst;b.ne` / `cset;cbnz` → `b.cc` (`PLIRON_CSETBR`, opt-in `=1`)
+
+`machinst/vcode.rs` post-RA pass + `MachInst::flag_tested_reg`/
+`flag_test_on_cset`/`flag_cc_branch`/`flag_zero_test`/
+`flag_branch_cset_fuse` hooks (aarch64 impls in emit.rs). The
+`uadd_overflow`+`brif` residual: ISel can't look through a
+multi-result def, so the flag materializes as `adds; cset of,cc; tst
+of,#0xff; b.ne`. The pass removes *both* the `tst` (itself a flag
+write — the fused branch inherits the flags the `cset` sampled, which
+is why the zero-test must be deleted rather than rewritten) and, when
+the materialized bool has no other use (inst operands + block-param
+`edit_vregs` use-count == 1), the `cset` — `adds; b.cc` remains, LLVM's
+ISel shape. The direct `cset; cbz/cbnz` arm rewrites the branch in
+place (no flag writer between). Gaps allow only `nzcv_free` insts and
+flag-free regalloc edge moves; `rd`'s def-scan runs ≤15 items back.
+Gate clean under the knob; protobuf −61k executed.

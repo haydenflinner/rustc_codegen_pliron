@@ -3861,6 +3861,160 @@ impl<I: VCodeInst> VCode<I> {
                 }
             }
 
+            // PLIRON (`PLIRON_CSETBR=1`, opt-in): a materialized flag
+            // consumed only by a branch — the shape `uadd_overflow` +
+            // `brif` leaves (`adds; cset of,hs; tst of,#0xff; b.ne`,
+            // ISel can't look through a multi-result def) — collapses
+            // to `b.cc`: the cset froze the flags at its position, so
+            // deleting the zero-test and the cset leaves the branch
+            // testing the flag `of` sampled — as long as nothing else
+            // on (cset, branch) writes nzcv and the materialized bool
+            // isn't redefined. Two arm shapes:
+            //   `cset f,cc; tst/cmp f; b.{ne,eq}` → `b.cc` (the `tst`
+            //   is itself a flag write — the fuse works by *removing*
+            //   it, which makes the flag the cset sampled the one the
+            //   branch tests)
+            //   `cset f,cc; cbz/cbnz f` → `b.cc` (direct reg test)
+            // Regalloc edge moves are flag-free and may sit in either
+            // gap. When `f` has no other use (inst operands +
+            // block-param `edit_vregs`), the cset dies too.
+            static CSETBR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *CSETBR.get_or_init(|| pliron_mode("PLIRON_CSETBR", 0) != 0) {
+                let mut vuse: Option<FxHashMap<usize, u32>> = None;
+                for k in 0..items.len() {
+                    let InstOrEdit::Inst(bix) = items[k] else {
+                        continue;
+                    };
+                    if squashed[bix.index()] {
+                        continue;
+                    }
+                    // (cset-ix, fused branch, zero-test-ix to kill)
+                    let mut hit: Option<(InsnIndex, I, Option<InsnIndex>)> = None;
+                    'find: {
+                        if let Some(rn) = self.insts[bix.index()].flag_tested_reg() {
+                            // Direct arm: `rn`'s def must be the cset.
+                            for j in (k.saturating_sub(15)..k).rev() {
+                                match items[j] {
+                                    InstOrEdit::Inst(cix) => {
+                                        if squashed[cix.index()] {
+                                            break;
+                                        }
+                                        if preg_ops[cix.index()].1.iter().any(|r| *r == rn) {
+                                            hit = self.insts[bix.index()]
+                                                .flag_test_on_cset(&self.insts[cix.index()])
+                                                .map(|f| (cix, f, None));
+                                            break;
+                                        }
+                                        if !self.insts[cix.index()].nzcv_free() {
+                                            break;
+                                        }
+                                    }
+                                    // A move writes no flags; one that
+                                    // writes `rn` is its def.
+                                    InstOrEdit::Edit(Edit::Move { to, .. }) => {
+                                        if to.as_reg() == rn.to_real_reg().map(PReg::from)
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            break 'find;
+                        }
+                        if !self.insts[bix.index()].flag_cc_branch() {
+                            break 'find;
+                        }
+                        // Indirect arm: the branch's flag producer is
+                        // the first flag-touching inst going back; it
+                        // must be a zero-test of the cset's result.
+                        let mut s = None;
+                        for j in (k.saturating_sub(15)..k).rev() {
+                            match items[j] {
+                                InstOrEdit::Inst(cix) => {
+                                    if squashed[cix.index()] {
+                                        break;
+                                    }
+                                    if self.insts[cix.index()].nzcv_free() {
+                                        continue;
+                                    }
+                                    s = Some((j, cix));
+                                    break;
+                                }
+                                InstOrEdit::Edit(Edit::Move { .. }) => {}
+                            }
+                        }
+                        let Some((sj, six)) = s else {
+                            break 'find;
+                        };
+                        let Some(zr) = self.insts[six.index()].flag_zero_test() else {
+                            break 'find;
+                        };
+                        // `zr`'s def must be the cset; the gap must be
+                        // flag-clean (a writer would change what the
+                        // branch inherits once the test is removed).
+                        for j in (sj.saturating_sub(15)..sj).rev() {
+                            match items[j] {
+                                InstOrEdit::Inst(cix) => {
+                                    if squashed[cix.index()] {
+                                        break;
+                                    }
+                                    if preg_ops[cix.index()].1.iter().any(|r| *r == zr) {
+                                        hit = self.insts[bix.index()]
+                                            .flag_branch_cset_fuse(
+                                                &self.insts[six.index()],
+                                                &self.insts[cix.index()],
+                                            )
+                                            .map(|f| (cix, f, Some(six)));
+                                        break;
+                                    }
+                                    if !self.insts[cix.index()].nzcv_free() {
+                                        break;
+                                    }
+                                }
+                                InstOrEdit::Edit(Edit::Move { to, .. }) => {
+                                    if to.as_reg() == zr.to_real_reg().map(PReg::from) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let Some((cix, fused, zero_test)) = hit else {
+                        continue;
+                    };
+                    self.insts[bix.index()] = fused;
+                    if let Some(six) = zero_test {
+                        self.insts[six.index()] = I::gen_nop(0);
+                        squashed[six.index()] = true;
+                    }
+                    // Kill the cset too when the branch was its last
+                    // use (inst operands + edit move sources).
+                    let counts = vuse.get_or_insert_with(|| {
+                        let mut m: FxHashMap<usize, u32> = FxHashMap::default();
+                        for op in &self.operands {
+                            if op.kind() == OperandKind::Use {
+                                *m.entry(op.vreg().vreg()).or_default() += 1;
+                            }
+                        }
+                        for ev in &regalloc.edit_vregs {
+                            if let Some(v) = ev {
+                                *m.entry(v.vreg()).or_default() += 1;
+                            }
+                        }
+                        m
+                    });
+                    let dead = self
+                        .inst_operands(cix)
+                        .iter()
+                        .find(|o| o.kind() == OperandKind::Def)
+                        .is_some_and(|o| counts.get(&o.vreg().vreg()).copied() == Some(1));
+                    if dead {
+                        self.insts[cix.index()] = I::gen_nop(0);
+                        squashed[cix.index()] = true;
+                    }
+                }
+            }
+
             // Pair fusion (e.g. `ldp`/`stp`): the partner must follow
             // with no regalloc edit between them — a move there could
             // clobber either inst's registers. A gap of pure-ALU insts

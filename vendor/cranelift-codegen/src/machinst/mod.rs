@@ -799,6 +799,47 @@ pub trait MachInstEmit: MachInst {
         None
     }
 
+    /// PLIRON: this instruction is a conditional branch or conditional
+    /// trap that tests a register for zero/nonzero (`cbz`/`cbnz`-family
+    /// — the shape a materialized flag takes when nothing keeps the
+    /// machine condition). Return the tested register.
+    fn flag_tested_reg(&self) -> Option<Reg> {
+        None
+    }
+
+    /// PLIRON: `self` is a `flag_tested_reg` branch/trap and `cs` is
+    /// `rd = cset{,m} cc` (a flag materialized into a register) whose
+    /// `rd` is exactly the tested register: return the form that tests
+    /// the machine condition directly (`b.cc` / conditional trap on
+    /// `cc`, inverted where the register test was). The caller proves
+    /// nzcv survives unchanged from `cs` to `self`.
+    fn flag_test_on_cset(&self, _cs: &Self) -> Option<Self> {
+        None
+    }
+
+    /// PLIRON: this instruction is a conditional branch or conditional
+    /// trap that tests the target's condition flags directly (`b.cc`).
+    fn flag_cc_branch(&self) -> bool {
+        false
+    }
+
+    /// PLIRON: this instruction sets the condition flags by testing a
+    /// register for nonzero-ness (`tst`/`cmp #0` forms): return the
+    /// tested register. The produced Z flag is `reg == 0`.
+    fn flag_zero_test(&self) -> Option<Reg> {
+        None
+    }
+
+    /// PLIRON: `self` is a `flag_cc_branch`, `s` is a `flag_zero_test`
+    /// of `cs`'s dest where `cs` is `rd = cset{,m} cc`: return the
+    /// branch that tests `cc` directly — the zero test and the
+    /// materialization collapse into the flag `cs` sampled. The caller
+    /// proves nothing on (cs, branch) writes flags besides `s` and
+    /// that `rd` still holds `cs`'s value.
+    fn flag_branch_cset_fuse(&self, _s: &Self, _cs: &Self) -> Option<Self> {
+        None
+    }
+
     /// PLIRON: this instruction neither reads nor writes the condition
     /// flags, and has no control flow (conservative: `false`).
     fn nzcv_free(&self) -> bool {
