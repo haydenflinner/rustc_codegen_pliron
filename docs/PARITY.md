@@ -1132,7 +1132,17 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    (`str` vs `ldr+add+str` at vec:2955; same reload after the outlined
    `reserve_one_unchecked`); the delta is copy count and register
    coverage, not a missing pass — `ncc` call-kill, `edge_pre` load-PRE,
-   `PLIRON_SHRINKWRAP` and the remat stack are all on. Earlier figures
+   `PLIRON_SHRINKWRAP` and the remat stack are all on. 2026-11-25→26
+   (`176f1dce`+`84f0ff4f`, exact callgrind): regex 1.006x, rust-json
+   1.017x, pulldown-cmark 1.020x, blake3 1.025x, compression 1.034x,
+   protobuf 1.054x, blind-sig 1.055x, html 1.076x; geomean ~1.036x
+   (mean +3.98%, was +4.41% that morning) — `CONSTSINK_V` +
+   sibling-fusion veto (html −513k), `ALIGNFT` (skip_jmp pad nops →
+   one covering `b`, all 8 ~−870k), `EVICT_SPAN` (recovered a +38.5k
+   Zopfli regression, nets −120k), `FPEEL`+`LCSLIVE` (blind-sig
+   −340.6k), `RORFOLD_DIRECT` (regex −163k), `INLINE_RECSELF` (regex
+   −233.9k), `XREDUCE`+`UREMCMP` (static −2.7k, held-out noise).
+   Details: `history/2026-11-25-moveedge.md`. Earlier figures
    below.)
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
