@@ -4679,43 +4679,57 @@ fn apply(func: &mut Function, p: &Plan, pty: Type, x64: bool) {
                         Box::new(Ins::K(i64::from(p.elem.bytes()) * str_)),
                     )
                 };
-                let (lena, lenb) = (
-                    emit(&mut pos, pty, &len_of(*a_str)),
-                    emit(&mut pos, pty, &len_of(*b_str)),
-                );
-                // A descending stream touches `[a(iv_last), a(iv0)+e)`:
-                // evaluate its base at the last iteration's iv instead.
-                let last = Ins::Add(
-                    Box::new(Ins::Val(p.iv0)),
-                    Box::new(Ins::Mul(
-                        Box::new(Ins::Sub(Box::new(p.iters.clone()), Box::new(Ins::K(1)))),
-                        Box::new(Ins::K(p.step)),
-                    )),
-                );
-                let ivl = emit(&mut pos, iv_ty, &last);
-                let lo = |e: &Ins, neg: bool, pos: &mut FuncCursor| {
-                    emit(pos, pty, &subst(e, p.iv, if neg { ivl } else { p.iv0 }))
-                };
-                let (alo, blo) = (lo(a, *a_neg, &mut pos), lo(b, *b_neg, &mut pos));
-                let hi = |e: &Ins, neg: bool, lo: Value, len: Value, pos: &mut FuncCursor| {
-                    if neg {
-                        // Top of the range is one element past `e(iv0)`.
-                        let t = emit(pos, pty, &subst(e, p.iv, p.iv0));
-                        let eb = pos.ins().iconst(pty, i64::from(p.elem.bytes()));
-                        pos.ins().iadd(t, eb)
-                    } else {
-                        pos.ins().iadd(lo, len)
-                    }
-                };
-                let ahi = hi(a, *a_neg, alo, lena, &mut pos);
-                let bhi = hi(b, *b_neg, blo, lenb, &mut pos);
-                let nwa = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, alo, ahi);
-                let nwb = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, blo, bhi);
-                let x = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, ahi, blo);
-                let y = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, bhi, alo);
-                let nw = pos.ins().band(nwa, nwb);
-                let xy = pos.ins().bor(x, y);
-                pos.ins().band(nw, xy)
+                let lena = emit(&mut pos, pty, &len_of(*a_str));
+                if !a_neg && !b_neg && a_str == b_str {
+                    // Same-length forward ranges `[alo, alo+L)`,
+                    // `[blo, blo+L)`: disjoint iff `|alo-blo| >=u L`,
+                    // i.e. `(alo-blo) + (L-1) >=u 2L-1`. The ring
+                    // interval arithmetic is exact for wrapped ranges
+                    // too, so no no-wrap guards; `L < 2^63` since a
+                    // real slice is <= isize::MAX bytes.
+                    let alo = emit(&mut pos, pty, &subst(a, p.iv, p.iv0));
+                    let blo = emit(&mut pos, pty, &subst(b, p.iv, p.iv0));
+                    let d = pos.ins().isub(alo, blo);
+                    let lm1 = pos.ins().iadd_imm_s(lena, -1);
+                    let u = pos.ins().iadd(d, lm1);
+                    let lim = pos.ins().iadd(lm1, lena);
+                    pos.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, u, lim)
+                } else {
+                    let lenb = emit(&mut pos, pty, &len_of(*b_str));
+                    // A descending stream touches `[a(iv_last), a(iv0)+e)`:
+                    // evaluate its base at the last iteration's iv instead.
+                    let last = Ins::Add(
+                        Box::new(Ins::Val(p.iv0)),
+                        Box::new(Ins::Mul(
+                            Box::new(Ins::Sub(Box::new(p.iters.clone()), Box::new(Ins::K(1)))),
+                            Box::new(Ins::K(p.step)),
+                        )),
+                    );
+                    let ivl = emit(&mut pos, iv_ty, &last);
+                    let lo = |e: &Ins, neg: bool, pos: &mut FuncCursor| {
+                        emit(pos, pty, &subst(e, p.iv, if neg { ivl } else { p.iv0 }))
+                    };
+                    let (alo, blo) = (lo(a, *a_neg, &mut pos), lo(b, *b_neg, &mut pos));
+                    let hi = |e: &Ins, neg: bool, lo: Value, len: Value, pos: &mut FuncCursor| {
+                        if neg {
+                            // Top of the range is one element past `e(iv0)`.
+                            let t = emit(pos, pty, &subst(e, p.iv, p.iv0));
+                            let eb = pos.ins().iconst(pty, i64::from(p.elem.bytes()));
+                            pos.ins().iadd(t, eb)
+                        } else {
+                            pos.ins().iadd(lo, len)
+                        }
+                    };
+                    let ahi = hi(a, *a_neg, alo, lena, &mut pos);
+                    let bhi = hi(b, *b_neg, blo, lenb, &mut pos);
+                    let nwa = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, alo, ahi);
+                    let nwb = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, blo, bhi);
+                    let x = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, ahi, blo);
+                    let y = pos.ins().icmp(IntCC::UnsignedLessThanOrEqual, bhi, alo);
+                    let nw = pos.ins().band(nwa, nwb);
+                    let xy = pos.ins().bor(x, y);
+                    pos.ins().band(nw, xy)
+                }
             }
         };
         ok = Some(match ok {
