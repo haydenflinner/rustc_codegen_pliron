@@ -852,7 +852,7 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     changes no code. On regex-syntax, `=1` removes 1,291 `b`s and 14.7 KB
     of `__text`, and `=2` removes 1,716 `b`s and 20.4 KB
     (docs/history/2026-10-27-branches.md).
-67. Shared epilogue, `PLIRON_EPIMERGE=1|2` (default mode `2`, `=0` off;
+67. Shared epilogue, `PLIRON_EPIMERGE=1|2|3|4|5` (default mode `2`, `=0` off;
     `src/machinst/vcode.rs`). The first `return` that merges binds a label
     in front of its epilogue. Each later merging `return` jumps to that
     label in place of its own copy. `=2` merges every epilogue of 2 or more
@@ -860,7 +860,16 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     −1,728 B `__text` on rust-html-rewriter's benchmark). `=1` merges an
     epilogue of 5 or more insts, or any epilogue in a cold block: `fib`'s
     3-inst base-case return is hot (+8% when merged). Frameless `ret`
-    stays inline, and return calls are not changed.
+    stays inline, and return calls are not changed. `=3` (opt-in) keeps
+    the `=2` merge set but hosts the shared epilogue at the hottest
+    `return` by `block_freq` rather than the first one in emission
+    order, so the hottest exit falls through and colder returns pay the
+    `b`; without frequency data the first `return` wins as under `=2`.
+    `=4`/`=5` (opt-in) instead shrink the merge set: only a `return`
+    that is cold — by block-order cold mark or a `block_freq` of at
+    most 2% of the entry's — jumps to the shared copy, so a hot exit
+    never pays a taken `b`; `=5` additionally keeps the `=1`-style
+    unconditional merge of 5+-inst epilogues.
 68. Eager bare-jump label aliasing, `PLIRON_BJALIAS` (default `1`,
     `=0` off;
     `src/machinst/vcode.rs` `emit`). A block that is a single
@@ -2619,3 +2628,15 @@ first fold and `ubfx` for the second every iteration (LLVM keeps the
 byte registers directly). `cargo test -p pliron-clif-opt --test
 egraph_rules` covers all three; `--tag xr` callgrind on regex for the
 measurement.
+
+## uncheckdiv: unchecked `/`/`%` lowering (`PLIRON_UNCHECKDIV`, opt-in `=1`)
+
+`src/isa/aarch64/lower.isle` (rules `udiv_*_unchecked`, `sdiv_*_unchecked`,
+`urem_*_unchecked`, `srem_*_unchecked`, `pliron_unchecked_div` extern in
+`lower/isle.rs`): skip `trap_if_zero_divisor` and, for `sdiv`,
+`intmin_check`+`trap_if_div_overflow` when `PLIRON_UNCHECKDIV=1`. rustc MIR
+dominates every `/`/`%` with its own `Assert` that calls
+`panic_const_*`, so the `cbz`+dead-trap-edge cranelift appends per op is a
+duplicate LLVM doesn't have (`h % sparse.len()` in regex's c_utf8_seq runs
+it ~29k times). Off by default: a CLIF producer that relies on the CLIF
+trap semantics (e.g. a fuzzer feeding bare `urem x, 0`) keeps them.

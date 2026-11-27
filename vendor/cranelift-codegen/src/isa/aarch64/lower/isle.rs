@@ -1519,6 +1519,14 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         *ON.get_or_init(|| std::env::var("PLIRON_MINMAXIMM").as_deref() != Ok("0"))
     }
 
+    /// PLIRON (`PLIRON_UNCHECKDIV=1`, opt-in): MIR's `Assert` dominates every
+    /// `/`/`%`, so the `cbz`+trap `trap_if_zero_divisor`/`trap_if_div_overflow`
+    /// add on each op is dead — emit bare `udiv`/`sdiv`+`msub` like LLVM.
+    fn pliron_unchecked_div(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_UNCHECKDIV").as_deref() == Ok("1"))
+    }
+
     /// PLIRON (`PLIRON_AMODENEG`, default on, `=0` off): `-off` as an `Imm12` for a negative
     /// `off`, so `amode_add` subtracts it instead of materializing it.
     fn amode_neg_imm12(&mut self, off: i32) -> Option<Imm12> {

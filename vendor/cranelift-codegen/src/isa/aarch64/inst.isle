@@ -4104,6 +4104,18 @@
       (let ((_ Unit (emit (MInst.TrapIf (cond_br_zero reg size ) (trap_code_division_by_zero)))))
         reg))
 
+;; PLIRON (`PLIRON_UNCHECKDIV=1`, opt-in): rustc MIR always dominates `/`/`%`
+;; with its `Assert` (divisor nonzero — and, for `sdiv`, not INT_MIN/-1 —
+;; else a `panic_const_*` call), so the `cbz`+dead-trap-edge these helpers
+;; append per op is a duplicate LLVM doesn't have (c_utf8_seq's hash
+;; `h % sparse.len()` runs it ~29k times). With the flag on, div/rem lower
+;; unchecked; off, CLIF producers that rely on the trap keep it.
+(decl pure pliron_unchecked_div () bool)
+(extern constructor pliron_unchecked_div pliron_unchecked_div)
+(rule 1 (trap_if_zero_divisor reg _)
+      (if-let true (pliron_unchecked_div))
+      reg)
+
 (spec (size_from_ty ty)
       (provide
             (= result (if (<= (:bits ty) 32) (OperandSize.Size32) (OperandSize.Size64))))
@@ -4140,6 +4152,12 @@
         )
         x))
 
+;; PLIRON (`PLIRON_UNCHECKDIV=1`): see `trap_if_zero_divisor` above — MIR's
+;; Assert already rejects INT_MIN/-1, so the ccmp/vs trap is dead.
+(rule 1 (trap_if_div_overflow _ _ x _)
+      (if-let true (pliron_unchecked_div))
+      x)
+
 ;; In the cases narrower than a register width, subtracting 1 from the
 ;; min_value will not cause overflow (e.g., I8's min_value of -128 stored in
 ;; a 32-bit register produces -129 with no overflow). However, if we left shift
@@ -4155,6 +4173,12 @@
 
 ;; In the I32 or I64 case, checking x itself against the min_value is fine.
 (rule -1 (intmin_check ty x) x)
+
+;; PLIRON (`PLIRON_UNCHECKDIV=1`): the overflow trap is gated off anyway, so
+;; don't even emit the i8/i16 shift producing `xcheck`.
+(rule 1 (intmin_check _ x)
+      (if-let true (pliron_unchecked_div))
+      x)
 
 ;; Check for unsigned overflow.
 (attr trap_if_overflow (veri chain))
