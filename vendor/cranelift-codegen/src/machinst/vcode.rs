@@ -2836,10 +2836,59 @@ impl<I: VCodeInst> VCode<I> {
         // every later `return` jumps to it, for epilogues of 3+ insts. `=1`
         // keeps a hot return's own copy unless the epilogue is 5+ insts
         // (a hot leaf like `fib`'s base case pays a taken branch); `=2`
-        // merges every return.
+        // merges every return, hosting the shared copy at the first merged
+        // `return` in emission order; `=3` (opt-in) instead hosts it at the
+        // hottest `return` by `block_freq` so the hottest exit falls
+        // through and the colder ones pay the `b`; `=4`/`=5` (opt-in)
+        // shrink the merge set: only a `return` cold by block-order mark
+        // or by `block_freq` (<= 2% of the entry's) jumps to the shared
+        // copy — a hot exit never pays a taken `b` — and `=5` still
+        // always merges epilogues of 5+ insts like `=1`.
         static EPIMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let epimerge = *EPIMERGE.get_or_init(|| pliron_mode("PLIRON_EPIMERGE", 2));
-        let mut epi_label: Option<MachLabel> = None;
+        // PLIRON: `=3` host selection — the `Ret` block in `final_order`
+        // with the highest `block_freq` that would take the shared
+        // epilogue (not a frame-only return, a merged block or a
+        // `noret_dead` one; `merged` only ever covers jump-terminated
+        // edge blocks, but check anyway). Without frequency data
+        // (`block_freq` empty) every block reads 0.0 and the first
+        // `return` wins — the same host `=2` picks. Only `=3` uses it:
+        // under `=4`/`=5` the hottest `return` need not be in the merge
+        // set, so those modes host at the first merging `return`.
+        let epi_site: Option<BlockIndex> = if epimerge == 3 {
+            let mut site = None;
+            let mut site_freq = f32::NEG_INFINITY;
+            for &b in &final_order {
+                let bi = b.index();
+                if merged[bi]
+                    || noret_dead.as_ref().is_some_and(|d| d[bi])
+                    || shrink.as_ref().is_some_and(|(_, full)| !full[bi])
+                {
+                    continue;
+                }
+                let r = self.block_ranges.get(bi);
+                if r.is_empty() || self.insts[r.end - 1].is_term() != MachTerminator::Ret {
+                    continue;
+                }
+                let f = self.block_freq.get(bi).copied().unwrap_or(0.0);
+                if f > site_freq {
+                    site_freq = f;
+                    site = Some(b);
+                }
+            }
+            site
+        } else {
+            None
+        };
+        // `=3` pre-allocates the label: `return`s emitted before the host
+        // block need it for their (forward) `b`. The label is bound at
+        // the host below; if no `return` merges (epilogue < 2 insts)
+        // nobody references it and it stays unbound, which is harmless.
+        let mut epi_label: Option<MachLabel> = if epi_site.is_some() {
+            Some(buffer.get_label())
+        } else {
+            None
+        };
 
         // PLIRON: `PLIRON_EH_LOCAL=N` bounds applied edgehoists within
         // this function (deterministic bisect); `PLIRON_EH_FN=<substr>`
@@ -4190,10 +4239,36 @@ impl<I: VCodeInst> VCode<I> {
                                     epi.len() >= 5
                                         || (epi.len() >= 3 && self.block_order.is_cold(block))
                                 }
+                                // `=4|5`: cold exits only, by cold mark
+                                // or a static freq of <= 2% of entry.
+                                // `block_freq` absent -> treat as hot
+                                // (the `=1` merge set, roughly).
+                                4 | 5 => {
+                                    (epi.len() >= 2
+                                        && (self.block_order.is_cold(block)
+                                            || self
+                                                .block_freq
+                                                .get(block.index())
+                                                .copied()
+                                                .unwrap_or(1.0)
+                                                <= 0.02))
+                                        || (epimerge == 5 && epi.len() >= 5)
+                                }
                                 _ => epi.len() >= 2,
                             };
                             if epi_ok {
-                                if let Some(l) = epi_label {
+                                if epi_site == Some(block) {
+                                    // PLIRON `=3`: the hottest `return`
+                                    // hosts the shared epilogue and falls
+                                    // through to it.
+                                    buffer.bind_label(
+                                        epi_label.unwrap(),
+                                        state.ctrl_plane_mut(),
+                                    );
+                                    for inst in epi {
+                                        do_emit(&inst, &mut disasm, &mut buffer, &mut state);
+                                    }
+                                } else if let Some(l) = epi_label {
                                     do_emit(&I::gen_jump(l), &mut disasm, &mut buffer, &mut state);
                                 } else {
                                     let l = buffer.get_label();
