@@ -110,9 +110,10 @@ fn imul_address_is_shared_across_stores() {
         a.lines()
             .filter(|l| {
                 let l = l.trim_start();
-                l.starts_with("str w") || l.starts_with("stur w")
+                l.starts_with("str w") || l.starts_with("stur w") || l.starts_with("stp w")
             })
-            .count(),
+            .map(|l| if l.trim_start().starts_with("stp w") { 2 } else { 1 })
+            .sum::<usize>(),
         4,
         "all four stores present:\n{a}"
     );

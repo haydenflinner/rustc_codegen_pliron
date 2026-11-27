@@ -1479,6 +1479,73 @@ impl MachInstEmit for Inst {
                     }
                 }
             }
+            &Inst::StoreP32 {
+                rt,
+                rt2,
+                ref mem,
+                flags,
+            } => {
+                let mem = mem.clone();
+                if let Some(trap_code) = flags.trap_code() {
+                    // Register the offset at which the actual store instruction starts.
+                    sink.add_trap(trap_code);
+                }
+                match &mem {
+                    &PairAMode::SignedOffset { reg, simm7 } => {
+                        assert_eq!(simm7.scale_ty, I32);
+                        sink.put4(enc_ldst_pair(0b0010100100, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::SPPreIndexed { simm7 } => {
+                        assert_eq!(simm7.scale_ty, I32);
+                        let reg = stack_reg();
+                        sink.put4(enc_ldst_pair(0b0010100110, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::SPPostIndexed { simm7 } => {
+                        assert_eq!(simm7.scale_ty, I32);
+                        let reg = stack_reg();
+                        sink.put4(enc_ldst_pair(0b0010100010, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert_eq!(simm7.scale_ty, I32);
+                        sink.put4(enc_ldst_pair(0b0010100010, simm7, reg, rt, rt2));
+                    }
+                }
+            }
+            &Inst::LoadP32 {
+                rt,
+                rt2,
+                ref mem,
+                flags,
+            } => {
+                let rt = rt.to_reg();
+                let rt2 = rt2.to_reg();
+                let mem = mem.clone();
+                if let Some(trap_code) = flags.trap_code() {
+                    // Register the offset at which the actual load instruction starts.
+                    sink.add_trap(trap_code);
+                }
+
+                match &mem {
+                    &PairAMode::SignedOffset { reg, simm7 } => {
+                        assert_eq!(simm7.scale_ty, I32);
+                        sink.put4(enc_ldst_pair(0b0010100101, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::SPPreIndexed { simm7 } => {
+                        assert_eq!(simm7.scale_ty, I32);
+                        let reg = stack_reg();
+                        sink.put4(enc_ldst_pair(0b0010100111, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::SPPostIndexed { simm7 } => {
+                        assert_eq!(simm7.scale_ty, I32);
+                        let reg = stack_reg();
+                        sink.put4(enc_ldst_pair(0b0010100011, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert_eq!(simm7.scale_ty, I32);
+                        sink.put4(enc_ldst_pair(0b0010100011, simm7, reg, rt, rt2));
+                    }
+                }
+            }
             &Inst::FpuLoadP64 {
                 rt,
                 rt2,
@@ -4275,6 +4342,22 @@ impl MachInstEmit for Inst {
                 })
             }
             (
+                &Inst::ULoad32 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::ULoad32 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 || r1.to_reg() == r2.to_reg() {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I32, state)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::LoadP32 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
                 &Inst::FpuStore128 { rd: r1, mem: ref m1, flags: f1 },
                 &Inst::FpuStore128 { rd: r2, mem: ref m2, flags: f2 },
             ) => {
@@ -4316,6 +4399,22 @@ impl MachInstEmit for Inst {
                 let (mem, swap) = pair_amode(m1, m2, I64, state)?;
                 let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
                 Some(Inst::StoreP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::Store32 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::Store32 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I32, state)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::StoreP32 {
                     rt,
                     rt2,
                     mem,
@@ -4402,6 +4501,12 @@ impl MachInstEmit for Inst {
                 }
                 _ => None,
             },
+            Inst::LoadP32 { mem, .. } | Inst::StoreP32 { mem, .. } => match mem {
+                &PairAMode::SignedOffset { reg, simm7 } => {
+                    Some((reg, i64::from(simm7.value), I32))
+                }
+                _ => None,
+            },
             Inst::FpuLoadP64 { mem, .. } | Inst::FpuStoreP64 { mem, .. } => match mem {
                 &PairAMode::SignedOffset { reg, simm7 } => {
                     Some((reg, i64::from(simm7.value), F64))
@@ -4451,6 +4556,7 @@ impl MachInstEmit for Inst {
     fn post_index_imm_ok(&self, wb: i64) -> bool {
         let ty = match self {
             Inst::LoadP64 { .. } | Inst::StoreP64 { .. } => I64,
+            Inst::LoadP32 { .. } | Inst::StoreP32 { .. } => I32,
             Inst::FpuLoadP64 { .. } | Inst::FpuStoreP64 { .. } => F64,
             Inst::FpuLoadP128 { .. } | Inst::FpuStoreP128 { .. } => I8X16,
             _ => return SImm9::maybe_from_i64(wb).is_some(),
@@ -4464,6 +4570,7 @@ impl MachInstEmit for Inst {
         // writeback chain.
         let defs_base = match self {
             Inst::LoadP64 { rt, rt2, mem, .. }
+            | Inst::LoadP32 { rt, rt2, mem, .. }
             | Inst::FpuLoadP64 { rt, rt2, mem, .. }
             | Inst::FpuLoadP128 { rt, rt2, mem, .. } => match &*mem {
                 &PairAMode::SignedOffset { reg, .. } => {
@@ -4476,6 +4583,8 @@ impl MachInstEmit for Inst {
         match self {
             Inst::LoadP64 { mem, .. }
             | Inst::StoreP64 { mem, .. }
+            | Inst::LoadP32 { mem, .. }
+            | Inst::StoreP32 { mem, .. }
             | Inst::FpuLoadP64 { mem, .. }
             | Inst::FpuStoreP64 { mem, .. }
             | Inst::FpuLoadP128 { mem, .. }
@@ -4766,6 +4875,8 @@ impl MachInstEmit for Inst {
         match self {
             Inst::LoadP64 { mem, .. }
             | Inst::StoreP64 { mem, .. }
+            | Inst::LoadP32 { mem, .. }
+            | Inst::StoreP32 { mem, .. }
             | Inst::FpuLoadP64 { mem, .. }
             | Inst::FpuStoreP64 { mem, .. }
             | Inst::FpuLoadP128 { mem, .. }
@@ -4790,6 +4901,8 @@ impl MachInstEmit for Inst {
         match self {
             Inst::LoadP64 { mem, .. }
             | Inst::StoreP64 { mem, .. }
+            | Inst::LoadP32 { mem, .. }
+            | Inst::StoreP32 { mem, .. }
             | Inst::FpuLoadP64 { mem, .. }
             | Inst::FpuStoreP64 { mem, .. }
             | Inst::FpuLoadP128 { mem, .. }

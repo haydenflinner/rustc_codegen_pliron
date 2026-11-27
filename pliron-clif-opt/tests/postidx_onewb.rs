@@ -61,7 +61,13 @@ fn record_fill_has_one_writeback_and_negative_offsets() {
     let a = asm(FILL);
     assert_eq!(count(&a, |l| l.contains("], #")), 1, "one post-index writeback:\n{a}");
     assert!(count(&a, |l| l.contains("], #20") || l.contains("], #0x14")) == 1, "writeback is the whole bump:\n{a}");
-    assert_eq!(count(&a, |l| l.starts_with("stur ")), 4, "the later stores re-addressed below the bumped base:\n{a}");
+    assert_eq!(
+        count(&a, |l| {
+            (l.starts_with("stur ") || l.starts_with("stp ") || l.starts_with("str ")) && l.contains(", #-")
+        }),
+        2,
+        "the later stores re-addressed below the bumped base (pairs count once):\n{a}"
+    );
     assert_eq!(count(&a, |l| l.starts_with("add ")), 0, "the pointer bump folded away:\n{a}");
 }
 

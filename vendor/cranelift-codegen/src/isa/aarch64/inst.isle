@@ -188,6 +188,20 @@
         (mem PairAMode)
         (flags MemFlagsData))
 
+       ;; A store of a pair of 32-bit registers.
+       (StoreP32
+        (rt Reg)
+        (rt2 Reg)
+        (mem PairAMode)
+        (flags MemFlagsData))
+
+       ;; A load of a pair of 32-bit registers.
+       (LoadP32
+        (rt WritableReg)
+        (rt2 WritableReg)
+        (mem PairAMode)
+        (flags MemFlagsData))
+
        ;; A MOV instruction. These are encoded as ORR's (AluRRR form).
        ;; The 32-bit version zeroes the top 32 bits of the
        ;; destination, which is effectively an alias for an unsigned

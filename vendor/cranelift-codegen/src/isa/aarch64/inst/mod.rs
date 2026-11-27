@@ -472,6 +472,16 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_def(rt2);
             pairmemarg_operands(mem, collector);
         }
+        Inst::StoreP32 { rt, rt2, mem, .. } => {
+            collector.reg_use(rt);
+            collector.reg_use(rt2);
+            pairmemarg_operands(mem, collector);
+        }
+        Inst::LoadP32 { rt, rt2, mem, .. } => {
+            collector.reg_def(rt);
+            collector.reg_def(rt2);
+            pairmemarg_operands(mem, collector);
+        }
         Inst::Mov { rd, rm, .. } => {
             collector.reg_def(rd);
             collector.reg_use(rm);
@@ -1203,6 +1213,7 @@ impl MachInst for Inst {
             | &Inst::SLoad32 { .. }
             | &Inst::ULoad64 { .. }
             | &Inst::LoadP64 { .. }
+            | &Inst::LoadP32 { .. }
             | &Inst::FpuLoad16 { .. }
             | &Inst::FpuLoad32 { .. }
             | &Inst::FpuLoad64 { .. }
@@ -1214,6 +1225,7 @@ impl MachInst for Inst {
             | &Inst::Store32 { .. }
             | &Inst::Store64 { .. }
             | &Inst::StoreP64 { .. }
+            | &Inst::StoreP32 { .. }
             | &Inst::FpuStore16 { .. }
             | &Inst::FpuStore32 { .. }
             | &Inst::FpuStore64 { .. }
@@ -1430,6 +1442,9 @@ impl MachInst for Inst {
             | Inst::FpuLoad128 { mem, .. }
             | Inst::FpuStore128 { mem, .. } => am(mem),
             Inst::LoadP64 { mem, .. } | Inst::StoreP64 { mem, .. } => {
+                matches!(mem, PairAMode::SignedOffset { reg, .. } if ok(reg))
+            }
+            Inst::LoadP32 { mem, .. } | Inst::StoreP32 { mem, .. } => {
                 matches!(mem, PairAMode::SignedOffset { reg, .. } if ok(reg))
             }
             _ => false,
@@ -1837,6 +1852,24 @@ impl Inst {
             } => {
                 let rt = pretty_print_ireg(rt.to_reg(), OperandSize::Size64);
                 let rt2 = pretty_print_ireg(rt2.to_reg(), OperandSize::Size64);
+                let mem = mem.clone();
+                let mem = mem.pretty_print_default();
+                format!("ldp {rt}, {rt2}, {mem}")
+            }
+            &Inst::StoreP32 {
+                rt, rt2, ref mem, ..
+            } => {
+                let rt = pretty_print_ireg(rt, OperandSize::Size32);
+                let rt2 = pretty_print_ireg(rt2, OperandSize::Size32);
+                let mem = mem.clone();
+                let mem = mem.pretty_print_default();
+                format!("stp {rt}, {rt2}, {mem}")
+            }
+            &Inst::LoadP32 {
+                rt, rt2, ref mem, ..
+            } => {
+                let rt = pretty_print_ireg(rt.to_reg(), OperandSize::Size32);
+                let rt2 = pretty_print_ireg(rt2.to_reg(), OperandSize::Size32);
                 let mem = mem.clone();
                 let mem = mem.pretty_print_default();
                 format!("ldp {rt}, {rt2}, {mem}")

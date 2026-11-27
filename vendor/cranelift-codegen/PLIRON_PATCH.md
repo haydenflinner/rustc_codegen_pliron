@@ -107,7 +107,11 @@ once proven out on the stage2 benchmark, then drop this copy.
     precede defs) or late (this inst moves down — symmetric hazard set on
     this inst's regs). The `fmul; str` interleave produced by
     demand-driven lowering fuses via the late placement, yielding
-    `ldp/fmul/stp` blocks for vectorized map loops.
+    `ldp/fmul/stp` blocks for vectorized map loops. The pairing set
+    covers `ULoad64`/`Store64` plus 32-bit `ULoad32`/`Store32` via
+    `LoadP32`/`StoreP32` (`ldp`/`stp` on W registers, `opc=0b00`);
+    `SLoad32` (`ldrsw`) and the sub-32-bit widths have no pair
+    encodings.
 
 12. x64 `psadbw`: new CLIF op `x86_psadbw` (`i8x16,i8x16 -> i64x2`, added in
     `vendor/cranelift-codegen-meta/src/shared/instructions.rs`), plus
