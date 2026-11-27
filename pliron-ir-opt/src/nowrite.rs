@@ -25,6 +25,7 @@ const LIBC: &[&str] = &["memcmp", "bcmp", "strlen"];
 pub(crate) const PURE: &[&str] = &[
     "llvm.ctlz.",
     "llvm.cttz.",
+    "llvm.ctlz_nz",
     "llvm.cttz_nz",
     "llvm.ctpop.",
     "llvm.bswap.",

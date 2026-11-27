@@ -233,7 +233,8 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let ty = self.val_ty(x);
                 let i = match name {
                     sym::ctpop => "llvm.ctpop",
-                    sym::ctlz | sym::ctlz_nonzero => "llvm.ctlz",
+                    sym::ctlz => "llvm.ctlz",
+                    sym::ctlz_nonzero => "llvm.ctlz_nz",
                     sym::cttz => "llvm.cttz",
                     _ => "llvm.cttz_nz",
                 };

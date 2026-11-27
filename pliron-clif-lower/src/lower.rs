@@ -9278,16 +9278,36 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             "llvm.ctpop" => self.b.ins().popcnt(a[0]),
             "llvm.ctlz" => self.b.ins().clz(a[0]),
+            // `ctlz_nonzero`: the count is below the bit width, recorded
+            // as a value range (`pliron_clif_opt::vfacts`) so `63 - clz`
+            // (`NonZero::ilog2`) folds to `clz ^ 63`.
+            "llvm.ctlz_nz" => {
+                let r = self.b.ins().clz(a[0]);
+                if *VFACTS_RANGE {
+                    let ty = self.b.func.dfg.value_type(r);
+                    if ty.is_int() && ty.bits() <= 64 {
+                        self.vfacts.range.insert(r, (ty.bits(), 0, ty.bits() as u64 - 1));
+                    }
+                }
+                r
+            }
             "llvm.cttz" => self.b.ins().ctz(a[0]),
             "llvm.cttz_nz" => {
                 let ty = self.b.func.dfg.value_type(a[0]);
-                if self.m.isa().triple().architecture == target_lexicon::Architecture::X86_64
+                let r = if self.m.isa().triple().architecture == target_lexicon::Architecture::X86_64
                     && ty.bits() <= 64
                 {
                     self.b.ins().ctz_nonzero(a[0])
                 } else {
                     self.b.ins().ctz(a[0])
+                };
+                if *VFACTS_RANGE {
+                    let rt = self.b.func.dfg.value_type(r);
+                    if rt.is_int() && rt.bits() <= 64 {
+                        self.vfacts.range.insert(r, (rt.bits(), 0, rt.bits() as u64 - 1));
+                    }
                 }
+                r
             }
             "llvm.bswap" => {
                 if self.b.func.dfg.value_type(a[0]) == clt::I8 {

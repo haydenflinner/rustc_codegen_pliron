@@ -32,6 +32,8 @@ enum Fix {
     Jump(Inst, usize),
     /// `uadd_overflow` at `inst` never carries.
     NoCarry(Inst),
+    /// `isub` at `inst` is `bxor` (all-ones minuend covers the subtrahend).
+    ToBxor(Inst),
 }
 
 pub fn run(func: &mut Function, an: &mut Analysis) -> usize {
@@ -228,6 +230,22 @@ fn collect(
                                     fixes.push(Fix::NoCarry(inst));
                                 }
                             }
+                            // `M - t` with `M` an all-ones mask and
+                            // `t <= M` is `t ^ M` (the borrow propagates
+                            // through every set bit) — `63 - clz` for a
+                            // `NonZero`'s `ilog2`, `eor` with the mask
+                            // as an immediate instead of `movz` + `sub`.
+                            Opcode::Isub if pliron_cfg::env_is("PLIRON_SUBXOR", "1") => {
+                                let Some(k) = crate::loopidiom::iconst(func, x) else { continue };
+                                let k = k as u64 & wmask;
+                                if k.count_ones() != k.trailing_ones() {
+                                    continue;
+                                }
+                                let r = rs.at(func, dt, y, b);
+                                if r.uhi <= k {
+                                    fixes.push(Fix::ToBxor(inst));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -299,6 +317,10 @@ fn apply(func: &mut Function, an: &mut Analysis, fixes: Vec<Fix>) -> usize {
                     destination: cranelift_codegen::ir::BlockCall::new(block, args.iter().copied(), &mut func.dfg.value_lists),
                 };
                 cfg_changed = true;
+            }
+            Fix::ToBxor(inst) => {
+                let InstructionData::Binary { opcode: Opcode::Isub, args } = func.dfg.insts[inst] else { continue };
+                func.dfg.insts[inst] = InstructionData::Binary { opcode: Opcode::Bxor, args };
             }
             Fix::NoCarry(inst) => {
                 let InstructionData::Binary { args: [x, y], .. } = func.dfg.insts[inst] else { continue };

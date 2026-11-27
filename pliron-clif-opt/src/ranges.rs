@@ -574,7 +574,15 @@ impl Ranges {
                                     None
                                 }
                             }
-                            Opcode::Clz | Opcode::Ctz | Opcode::Popcnt => Some(Range::unsigned(bits, 0, bits as u64)),
+                            Opcode::Popcnt => Some(Range::unsigned(bits, 0, bits as u64)),
+                            // `clz`/`ctz` of a nonzero value is below
+                            // the bit width — `NonZero`'s `ilog2` is
+                            // `BITS-1 - lz` = `lz ^ (BITS-1)`.
+                            Opcode::Clz | Opcode::Ctz => Some(if a.ulo > 0 {
+                                Range::unsigned(bits, 0, bits as u64 - 1)
+                            } else {
+                                Range::unsigned(bits, 0, bits as u64)
+                            }),
                             Opcode::Bmask => Some(full),
                             _ => None,
                         }
@@ -629,8 +637,21 @@ impl Ranges {
                 };
                 Some(Range::unsigned(bits, 0, hi))
             }
-            Opcode::Bor | Opcode::Bxor => {
+            Opcode::Bor => {
+                // `x | y >= max(x, y)` — or'ing a nonzero constant in
+                // proves the result nonzero (`ctlz`/`cttz` then stay
+                // below the bit width). `lo` holds even when `hi` can't
+                // be tightened below the top bit.
+                let lo = a.ulo.max(b.ulo);
                 // Below the next power of two above both tops.
+                let top = a.uhi.max(b.uhi);
+                if top == m || top.leading_zeros() == 0 {
+                    return Some(Range::unsigned(bits, lo, m));
+                }
+                let hi = if top == 0 { 0 } else { (1u64 << (64 - top.leading_zeros())) - 1 };
+                Some(Range::unsigned(bits, lo, hi.min(m)))
+            }
+            Opcode::Bxor => {
                 let top = a.uhi.max(b.uhi);
                 if top == m || top.leading_zeros() == 0 {
                     return None;

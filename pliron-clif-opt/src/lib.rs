@@ -13,6 +13,7 @@ pub mod scev;
 pub mod brhint;
 pub mod coldmark;
 pub mod ranges;
+pub mod subxor;
 pub mod vrp;
 pub mod bcheck;
 pub mod bunroll;
