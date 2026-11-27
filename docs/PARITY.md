@@ -1190,6 +1190,23 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    non-iconst divisor path, ~noise). `PLIRON_RA2_COLDSPLIT=1`
    measured on html: 92.42M x1.077 — regressed, exec unchanged,
    do not retry.
+   2026-11-27 late: the blind-sig leaf-loop callees rustc's MIR
+   inliner declined and ours scored out (`mac_digit` n=370/5 cold
+   calls, `sub2` n=516/7, `div_rem_digit` n=512/8) inline once the
+   `PLIRON_INLINE_WARMCALLS=3` warm-body bound spends the loop-bonus
+   budget (`limit + limit*LOOP/4` = 960 at the defaults — the bound
+   was `limit`, tuned when regex's `peek` at 387 warm ops had to stay
+   out; regex does not regress now) and `PLIRON_XCGU_LEAF` 100->128
+   copies `sub2` (108 MIR stmts, leaf-closeable) into its foreign
+   CGUs. Exact callgrind, same dylib, old knobs vs new defaults:
+   blind-sig x1.019 -> x1.015 (+0.60M -> +0.46M), rust-json x1.015
+   -> x1.012 (LEAF alone carries it), html x1.074 -> x1.072, regex
+   x0.996 -> x0.990. An unconditional lean rescore
+   (`PLIRON_INLINE_LEANCOST=2`) reaches further on blind-sig
+   (x1.014) but regresses json +0.78M by inlining `serialize_str`
+   everywhere — left opt-in. `set_digit`/`div_rem_digit` at
+   straight-line sites, `mac3`, `mul3` and the monty.rs header
+   reloads are the remaining gap.
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and

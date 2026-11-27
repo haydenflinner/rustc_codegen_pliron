@@ -798,8 +798,14 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // -0.42%, regex -0.08%, protobuf -0.07%, blind-sig -0.02%, blake3 flat;
     // rust-compression +0.03% (HistogramSelfAddHistogram RA residual, was
     // +0.23% before REGION). Plain SIZE=100 still costs protobuf +1.18%.
-    // `PLIRON_XCGU_LEAF=0` / `PLIRON_XCGU_LASTCALL=0` off.
-    ("PLIRON_XCGU_LEAF", "100"),
+    // 2026-11-27: 100 -> 128 admits num-bigint-dig's `sub2` (108 stmts,
+    // leaf-closeable through split_at/zip/all), which sat as a cross-CGU
+    // call into karatsuba/monty_modpow/extended_gcd and the BigUint
+    // Sub/SubAssign impls. Exact callgrind alone: rust-json x1.015 ->
+    // x1.012; with the WARMCALLS warm-body bound fix in inline.rs,
+    // blind-sig x1.019 -> x1.015. `PLIRON_XCGU_LEAF=100` restores it,
+    // `=0` / `PLIRON_XCGU_LASTCALL=0` off.
+    ("PLIRON_XCGU_LEAF", "128"),
     ("PLIRON_XCGU_LASTCALL", "20"),
     // 2026-11-22: the leaf walk goes 12 levels deep (was 8): a by-value
     // `Vec::push` reaches the allocator through ten levels of unwind

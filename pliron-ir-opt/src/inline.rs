@@ -128,6 +128,13 @@ pub fn wasm_cold_keep(sym: &str) -> bool {
         || sym.contains("11utf8_decode")
 }
 
+/// The `PLIRON_INLINE_WARMCALLS=3` warm-body bound for the loop bonus:
+/// the base limit plus what the bonus itself adds (`limit * lb / 4`, so
+/// `PLIRON_INLINE_LOOP=0` restores the plain base-limit bound).
+fn warm_ops_bound(limit: usize, lb: usize) -> usize {
+    limit.saturating_add(limit.saturating_mul(lb) / 4)
+}
+
 /// rustc's drop paths (`drop_in_place<T>` monomorphizations lower to the
 /// `4core3ptr9drop_glue` v0 fragment; same test as `memcpyopt`'s).
 /// `is_drop_glue` for other passes' diagnostics.
@@ -1505,16 +1512,29 @@ pub fn run(
     let warm_cost = warm_mode == 2;
     // `3` (the default) keeps the all-calls gate but also lets a
     // warm-call-sparse call-carrier earn the loop bonus when its warm
-    // body alone fits the base limit and it passes the `fanin` growth
-    // bound: brotli's
+    // body alone fits the loop-bonus budget `limit + limit*LOOP/4` and
+    // it passes the `fanin` growth bound: brotli's
     // `EvaluateNode` (18 calls, 1 warm — the rest are `panic_bounds_check`
     // scaffolding — 297 warm ops, 3 callers, all in the zopfli node loop;
     // LLVM inlines it) gets the bonus, while regex's `bump`/`char`
-    // (61–132 callers — the d21d9da growth regression) and `peek` (387
-    // warm ops — a real worker, not a small body plus scaffolding) stay
-    // out. The warm calls are what run each iteration; fanin bounds the
-    // total growth across the callee's remaining sites.
+    // (61–132 callers — the d21d9da growth regression) stay out on
+    // fanin. The warm calls are what run each iteration, so the warm
+    // body may spend the bonus the site earns — the base-limit bound
+    // this replaced kept num-bigint-dig's `mac_digit` (352 warm ops,
+    // LLVM-inlined into its multiply loops) and `sub2`/`div_rem_digit`
+    // calls at ~200-330 machine instructions; with it they were calls
+    // inside their loops (blind-sig x1.019 -> x1.015, 2026-11-27; fanin
+    // still bounds the total growth across the callee's remaining
+    // sites).
     let warm_fanin = warm_mode == 3;
+    // `PLIRON_INLINE_LOOP` = bonus in limit/4 units.
+    // A callsite in a loop pays the call+prologue cost
+    // every iteration, so a fatter callee is worth it
+    // (hashbrown's `hash_one`: SipHash inlined into the
+    // probe loop wins ~30% on `HashMap::get`).
+    let lb: usize = crate::env_get("PLIRON_INLINE_LOOP")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
     let call_w: usize = crate::env_get("PLIRON_INLINE_CALLW")
         .and_then(|s| s.parse().ok())
@@ -2149,16 +2169,20 @@ pub fn run(
                         // only; `=3` (default): a call-carrier over
                         // `loop_calls` total calls still qualifies when its
                         // warm calls fit, its warm body alone scores under
-                        // the base limit (the bonus then pays for cold panic
-                        // scaffolding, not a real worker — regex's `peek` is
-                        // 387 warm ops), and total growth stays under the
-                        // `fanin` bound.
+                        // the loop-bonus budget `limit + limit*LOOP/4` — the
+                        // warm body is the per-iteration code the bonus pays
+                        // for, so it may spend it (num-bigint-dig's
+                        // `mac_digit`, 352 warm ops, is LLVM-inlined into its
+                        // multiply loops); the cold scaffolding a call-carrier
+                        // trails stays outside that bound — and total growth
+                        // stays under the `fanin` bound. `PLIRON_INLINE_LOOP=0`
+                        // restores the old base-limit warm-body bound.
                         let leafish =
                             (if warm_gate { ci.nwarm } else { ci.ncalls }) <= loop_calls;
                         let warm_leaf = warm_fanin
                             && !leafish
                             && ci.nwarm <= loop_calls
-                            && ci.nwarm_ops <= limit
+                            && ci.nwarm_ops <= warm_ops_bound(limit, lb)
                             && fanin > 0
                             && adj
                                 .as_ref()
@@ -2171,14 +2195,6 @@ pub fn run(
                                 .get_or_insert_with(|| loop_blocks(ctx, st, caller))
                                 .contains(&b)
                         {
-                            // `PLIRON_INLINE_LOOP` = bonus in limit/4 units.
-                            // A callsite in a loop pays the call+prologue cost
-                            // every iteration, so a fatter callee is worth it
-                            // (hashbrown's `hash_one`: SipHash inlined into the
-                            // probe loop wins ~30% on `HashMap::get`).
-                            let lb: usize = crate::env_get("PLIRON_INLINE_LOOP")
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(8);
                             t = t.saturating_add(limit * lb / 4);
                         }
                         if pair > 0
@@ -4418,6 +4434,19 @@ mod coldkeep_tests {
         assert!(!wasm_cold_keep(
             "_RNvNtNtNtCsf5r1dCIKy5h_17compiler_builtins4math9libm_math6scalbn6scalbn"
         ));
+    }
+
+    #[test]
+    fn warm_body_bound_spends_the_loop_bonus() {
+        use super::warm_ops_bound;
+        // The bonus budget on top of the base limit: a warm-leaf callee's
+        // per-iteration body may spend it (num-bigint-dig's `mac_digit`,
+        // 352 warm ops, past the 320 base but inside the bonus budget).
+        assert_eq!(warm_ops_bound(320, 8), 960);
+        assert!(352 <= warm_ops_bound(320, 8));
+        assert!(352 > warm_ops_bound(320, 0));
+        // `PLIRON_INLINE_LOOP=0` restores the old base-limit bound.
+        assert_eq!(warm_ops_bound(320, 0), 320);
     }
 
     #[test]
