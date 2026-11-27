@@ -3879,7 +3879,7 @@ impl<I: VCodeInst> VCode<I> {
             // gap. When `f` has no other use (inst operands +
             // block-param `edit_vregs`), the cset dies too.
             static CSETBR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *CSETBR.get_or_init(|| pliron_mode("PLIRON_CSETBR", 0) != 0) {
+            if *CSETBR.get_or_init(|| pliron_mode("PLIRON_CSETBR", 1) != 0) {
                 let mut vuse: Option<FxHashMap<usize, u32>> = None;
                 for k in 0..items.len() {
                     let InstOrEdit::Inst(bix) = items[k] else {
