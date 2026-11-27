@@ -1164,6 +1164,58 @@ fn run_loop(
     // `SparseSet` fields in registers around a tiny varint loop, where
     // montgomery's crowded multiply loops still refuse.
     // r[impl clif.licm.innerpress]
+    //
+    // Except when the hoist is free: a result is live across an inner
+    // loop only when some use sits inside one (`u`, already free) or in
+    // a block an inner loop can reach without re-crossing `h` — the use
+    // forces liveness through it. `inner_down` is that reachable set plus
+    // `h` (a use at the header or as a backedge arg is live across the
+    // whole loop); `used_down` is every value used there — inst operands,
+    // and edge args flowing in, which are live on the incoming edge.
+    let inner_down: Option<FxHashSet<Block>> = inner_uses.as_ref().map(|_| {
+        let lvl = la.loop_level(h).level();
+        let mut down = FxHashSet::default();
+        let mut stack: Vec<Block> = body
+            .iter()
+            .copied()
+            .filter(|&b| la.loop_level(b).level() > lvl)
+            .collect();
+        while let Some(b) = stack.pop() {
+            if b == h || !body.contains(&b) || !down.insert(b) {
+                continue;
+            }
+            for s in cfg.succ_iter(b) {
+                stack.push(s);
+            }
+        }
+        down
+    });
+    let used_down: Option<FxHashSet<Value>> = inner_down.as_ref().map(|down| {
+        let mut ud: FxHashSet<Value> = FxHashSet::default();
+        for &b in down.iter().chain(std::iter::once(&h)) {
+            for i in func.layout.block_insts(b) {
+                ud.extend(func.dfg.inst_values(i).map(|v| func.dfg.resolve_aliases(v)));
+            }
+            for p in cfg.pred_iter(b) {
+                if !body.contains(&p.block) {
+                    continue;
+                }
+                for bc in func.dfg.insts[p.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    if bc.block(&func.dfg.value_lists) != b {
+                        continue;
+                    }
+                    for a in bc.args(&func.dfg.value_lists) {
+                        if let BlockArg::Value(v) = a {
+                            ud.insert(func.dfg.resolve_aliases(v));
+                        }
+                    }
+                }
+            }
+        }
+        ud
+    });
     let mut room: u32 = 0;
     if inner_uses.is_some() && ip_mode == "2" {
         let pr = press.get_or_insert_with(|| block_pressure(func, cfg));
@@ -1217,6 +1269,17 @@ fn run_loop(
                     && func.dfg.insts[i].opcode().can_load()
                     && la.loop_level(b).level() == la.loop_level(h).level()
                     && func.dfg.inst_results(i).iter().all(|r| !u.contains(r))
+                    // ...and only costs a register when a result would
+                    // live across an inner loop: dead inside all of
+                    // them (every use upstream), the hoist is free —
+                    // montgomery's x/y `SmallVec` fields feed selects
+                    // and bounds that all sit before the first inner
+                    // multiply loop.
+                    && func.dfg.inst_results(i).iter().any(|&r| {
+                        used_down
+                            .as_ref()
+                            .is_some_and(|ud| ud.contains(&func.dfg.resolve_aliases(r)))
+                    })
                 {
                     if room == 0 {
                         continue;
@@ -3270,6 +3333,124 @@ mod tests {
             build(0),
             1,
             "bytes == 0 is no extent claim: the wild arm keeps the load"
+        );
+    }
+
+    /// `PLIRON_LICM_INNERPRESS`'s room counts only hoists that would live
+    /// across an inner loop: a result used downstream of one stays
+    /// charged, but a result whose every use sits upstream of all inner
+    /// loops hoists free even at `room == 0` (montgomery's `x`/`y`
+    /// `SmallVec` fields feed selects and bounds before the first inner
+    /// multiply loop; `z`/`m` fields and the flag cross one).
+    #[test]
+    fn innerpress_free_when_not_live_across_inner() {
+        let build = |crossing: bool| {
+            let mut sig = Signature::new(CallConv::Fast);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+            let b0 = func.dfg.make_block();
+            let h = func.dfg.make_block();
+            let before = func.dfg.make_block();
+            let alt = func.dfg.make_block();
+            let inner = func.dfg.make_block();
+            let post = func.dfg.make_block();
+            let latch = func.dfg.make_block();
+            let done = func.dfg.make_block();
+            for b in [b0, h, before, alt, inner, post, latch, done] {
+                func.layout.append_block(b);
+            }
+            let v0 = func.dfg.append_block_param(b0, types::I64);
+            let v1 = func.dfg.append_block_param(b0, types::I64);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let c0 = cur.ins().iconst(types::I64, 0);
+            cur.ins().jump(h, &[c0.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let iv = cur.func.dfg.append_block_param(h, types::I64);
+            let c10 = cur.ins().iconst(types::I64, 10);
+            let cond = cur.ins().icmp(IntCC::UnsignedLessThan, iv, c10);
+            cur.ins().brif(cond, before, &[], done, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(before);
+            let a = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), v0, 8);
+            let b = cur
+                .ins()
+                .load(types::I64, MemFlagsData::new().with_notrap(), v1, 16);
+            // `a` and `b` both get an upstream use; `b` gets a second
+            // one past the inner loop when `crossing`.
+            let r1 = cur.ins().icmp(IntCC::UnsignedLessThan, a, c10);
+            let r2 = cur.ins().icmp(IntCC::UnsignedLessThan, b, c10);
+            let r = cur.ins().band(r1, r2);
+            cur.ins().brif(r, inner, &[c0.into()], alt, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(alt);
+            cur.ins().jump(inner, &[c0.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(inner);
+            let j = cur.func.dfg.append_block_param(inner, types::I64);
+            let j1 = cur.ins().iadd_imm(j, 1);
+            let cj = cur.ins().icmp_imm(IntCC::UnsignedLessThan, j1, 3);
+            cur.ins().brif(cj, inner, &[j1.into()], post, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(post);
+            let _d = if crossing {
+                cur.ins().iadd(b, j1)
+            } else {
+                cur.ins().iadd(j1, j1)
+            };
+            cur.ins().jump(latch, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+            let iv1 = cur.ins().iadd_imm(iv, 1);
+            cur.ins().jump(h, &[iv1.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+            cur.ins().return_(&[]);
+
+            let mut deref = FxHashMap::default();
+            deref.insert(v0, (64, true));
+            deref.insert(v1, (64, true));
+            let na: FxHashSet<Value> = [v0, v1].into_iter().collect();
+            let mut an = crate::pipeline::Analysis::default();
+            // Budget 0 => `room` 0 regardless of inner-loop pressure.
+            an.regs = Some((2, 0));
+            run(
+                &mut func,
+                &mut an,
+                &na,
+                &FxHashSet::default(),
+                &deref,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &pliron::cols::ColMap::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                true,
+                false,
+            );
+            let block_of = |func: &Function, v: Value| {
+                func.layout
+                    .inst_block(func.dfg.value_def(v).inst().unwrap())
+                    .unwrap()
+            };
+            (block_of(&func, a) == b0, block_of(&func, b) == b0)
+        };
+        assert_eq!(
+            build(false),
+            (true, true),
+            "upstream-only loads hoist free at room 0"
+        );
+        assert_eq!(
+            build(true),
+            (true, false),
+            "a result used past the inner loop stays charged"
         );
     }
 }
