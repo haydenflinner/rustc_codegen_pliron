@@ -2539,6 +2539,21 @@ impl<I: VCodeInst> VCode<I> {
         let mut exit_flags =
             vec![None::<(Option<(u64, PReg, PReg)>, Option<FlagBranch>)>; self.num_blocks()];
         let mut fx_prev: Option<BlockIndex> = None;
+        // PLIRON TAILDUP (`PLIRON_TAILDUP=N`, default 0 = off): post-RA
+        // tail duplication at emit time, like LLVM's `TailDuplicator`.
+        // When an emitted block ends `b T` and T is a small
+        // jump-terminated block (at most N insts before its `b`, no
+        // calls/traps/safepoints/params), the `b T` is replaced by a
+        // replay of T's own instruction/edit stream, so the path runs
+        // T's insts then T's `b head` — one taken branch instead of
+        // two. T's own copy still emits for its other preds; N counts
+        // the insts before the terminator (`=1` takes the default 3,
+        // covering the `ldr xA; ldr xB; ldr xC; b head` restart/relay
+        // blocks; `=N` sets it directly).
+        let taildup = match pliron_mode("PLIRON_TAILDUP", 0) {
+            1 => 3,
+            n => n,
+        };
         let mut order_pos = vec![usize::MAX; self.num_blocks()];
         for (i, &b) in final_order.iter().enumerate() {
             order_pos[b.index()] = i;
@@ -2601,6 +2616,11 @@ impl<I: VCodeInst> VCode<I> {
                 }
                 if b == self.entry {
                     bytes += prologue;
+                }
+                // PLIRON TAILDUP: a spliced body can add up to N+1 insts
+                // at this block's tail — keep the bound sound.
+                if taildup > 0 {
+                    bytes += (u64::from(taildup) + 1) * per_inst;
                 }
                 suffix[oi] = suffix[oi + 1] + bytes;
             }
@@ -2831,6 +2851,95 @@ impl<I: VCodeInst> VCode<I> {
                 }
             }
         }
+
+        // PLIRON TAILDUP: collect the duplicable bodies (see the knob
+        // above). T qualifies when its own emission is not special —
+        // the save block (its `gen_prologue_body` runs before its items,
+        // outside the stream a copy replays), a `noret_dead` block (its
+        // site emits nothing, so its stream is NOT what a `b T` runs),
+        // the entry (prologue), an indirect-branch target (jump tables
+        // name its label) — and it is `body*; term` with every body
+        // inst plain: no nested terminator, call (return-address
+        // metadata), trap (a duplicated trap site is a second record
+        // for the same inst), safepoint (a stack map is consumed once),
+        // args pseudo, or flag-setting compare (a `Cmp` copy would seed
+        // T's own FLAGX entry state with post-body flags). The
+        // terminator is an unconditional `b` or a two-target `b.cc`
+        // whose CFG succs match its labels; the copy then carries the
+        // edge itself. The stream must end with the terminator: a
+        // trailing edit is an out-edge move that cannot be replayed
+        // ahead of it. `merged`/`canon_dups` status is irrelevant: the
+        // copy replays T's stream, which is exactly what reaching its
+        // label runs (an EDGEMERGE canon's equal twin, a BJALIAS
+        // bare-jump's final target).
+        let td_items: Vec<Option<SmallVec<[InstOrEdit<'_>; 8]>>> = if taildup == 0
+            || flags.machine_code_cfg_info()
+        {
+            Vec::new()
+        } else {
+            let mut v = Vec::with_capacity(self.num_blocks());
+            for b in 0..self.num_blocks() {
+                let t = BlockIndex::new(b);
+                let r = self.block_ranges.get(b);
+                let body_ok = r.len() >= 1
+                    && r.len() <= usize::from(taildup) + 1
+                    && !noret_dead.as_ref().is_some_and(|d| d[b])
+                    && sw_block != Some(t)
+                    && t != self.entry
+                    && !self.block_order.is_indirect_branch_target(t);
+                let ok = if body_ok {
+                    (|| {
+                        let last = r.end - 1;
+                        let lasti = &self.insts[last];
+                        if lasti.is_term() != MachTerminator::Branch {
+                            return None;
+                        }
+                        // PLIRON TAILDUP: unconditional `b` targets only.
+                        // A two-target `b.cc`'s not-taken edge is an
+                        // implicit fallthrough (or an emit-appended
+                        // `b nt` that is NOT in T's item stream) — it
+                        // only works at T's original emission position;
+                        // spliced into a pred it would land on whatever
+                        // follows the pred in `final_order`.
+                        let succs = self.block_succs(t);
+                        let term_ok = lasti
+                            .uncond_br_target()
+                            .is_some_and(|tl| {
+                                succs.len() == 1 && tl == MachLabel::from_block(succs[0])
+                            });
+                        if !term_ok {
+                            return None;
+                        }
+                        for i in r.start..last {
+                            let inst = &self.insts[i];
+                            if inst.is_term() != MachTerminator::None
+                                || inst.is_trap()
+                                || inst.call_type() != CallType::None
+                                || inst.trap_code().is_some()
+                                || inst.is_safepoint()
+                                || inst.is_args()
+                                || matches!(inst.flag_kind(), FlagKind::Cmp { .. })
+                            {
+                                return None;
+                            }
+                        }
+                        let its: SmallVec<[InstOrEdit; 8]> =
+                            regalloc.block_insts_and_edits(&self, t).collect();
+                        match its.last() {
+                            Some(&InstOrEdit::Inst(iix)) if iix.index() == last => Some(its),
+                            _ => None,
+                        }
+                    })()
+                } else {
+                    None
+                };
+                v.push(ok);
+            }
+            v
+        };
+        let mut td_count = 0usize;
+        let mut tdp = 0usize;
+        let tda = td_items.iter().flatten().count();
 
         // PLIRON: `PLIRON_EPIMERGE` emits the epilogue once per function and
         // every later `return` jumps to it, for epilogues of 3+ insts. `=1`
@@ -4084,6 +4193,69 @@ impl<I: VCodeInst> VCode<I> {
                     }
                 }
             }
+            // PLIRON TAILDUP: this block ends `b T` with T a duplicable
+            // body — drop the jump and replay T's items inline; the
+            // copy's own `b` then carries the edge. `td_copy_start`
+            // marks the tail of `items` as copies so `inst_offsets`
+            // keeps recording T's insts at T's own site (they emit
+            // there for T's other preds). Skipped for cold blocks —
+            // duplicating into a cold path is size for nothing — and
+            // for a `b` to the next block in emission order, which
+            // MachBuffer already folds for free.
+            let mut td_copy_start = usize::MAX;
+            if !td_items.is_empty() && !self.block_order.is_cold(block) {
+                let dbg = std::env::var_os("PLIRON_TAILDUP_DBG").is_some();
+                if let Some(&InstOrEdit::Inst(jix)) = items.last() {
+                    if let Some(tl) = self.insts[jix.index()].uncond_br_target() {
+                        let succs = self.block_succs(block);
+                        if succs.len() == 1 && tl == MachLabel::from_block(succs[0]) {
+                            tdp += 1;
+                            let t = succs[0].index();
+                            if dbg && t < td_items.len() {
+                                let r = self.block_ranges.get(t);
+                                eprintln!(
+                                    "TD b{} -> b{}: next={:?} len={} term={:?} succs={} merged={} cdup={} ok={} [{}]",
+                                    block.index(),
+                                    t,
+                                    final_order.get(oi + 1),
+                                    r.len(),
+                                    if r.len() > 0 {
+                                        self.insts[r.end - 1].is_term()
+                                    } else {
+                                        MachTerminator::None
+                                    },
+                                    self.block_succs(succs[0]).len(),
+                                    merged[t],
+                                    canon_dups[t].len(),
+                                    td_items[t].is_some(),
+                                    crate::PLIRON_FN_NAME.with(|s| s.borrow().clone())
+                                );
+                            }
+                        }
+                    }
+                }
+                let copy = if let Some(&InstOrEdit::Inst(jix)) = items.last() {
+                    self.insts[jix.index()].uncond_br_target().and_then(|tl| {
+                        let succs = self.block_succs(block);
+                        (succs.len() == 1
+                            && tl == MachLabel::from_block(succs[0])
+                            && succs[0].index() < td_items.len()
+                            && succs[0] != block
+                            && final_order.get(oi + 1) != Some(&succs[0]))
+                        .then(|| td_items[succs[0].index()].clone())
+                        .flatten()
+                    })
+                } else {
+                    None
+                };
+                if let Some(tits) = copy {
+                    items.pop();
+                    td_copy_start = items.len();
+                    items.extend(tits.iter().cloned());
+                    td_count += 1;
+                }
+            }
+
             let code_follows = oi + 1 < final_order.len();
             let brange = self.block_ranges.get(block.index());
             let mut k = 0usize;
@@ -4136,7 +4308,10 @@ impl<I: VCodeInst> VCode<I> {
                             // their offsets here. Value-label range
                             // generation below will skip empty ranges
                             // and ranges with to-offsets of zero.
-                            if !self.block_order.is_cold(block) {
+                            // PLIRON TAILDUP: a spliced copy
+                            // (`k >= td_copy_start`) is not the inst's
+                            // canonical site — T's own block records it.
+                            if !self.block_order.is_cold(block) && k < td_copy_start {
                                 inst_offsets[iix.index()] = buffer.cur_offset();
                             }
                         }
@@ -4824,7 +4999,7 @@ impl<I: VCodeInst> VCode<I> {
         }
         if eprof {
             eprintln!(
-                "eprof frame={t_frame:?} loop={t_loop:?} items={t_items:?} apply={t_apply:?} fuse={t_fuse:?} inst={t_inst:?} allocs={t_allocs:?} island={t_island:?}({n_islands}) obr={t_obr:?} fin={t_fin:?} ep={ep_mem}/{ep_next}/{ep_dir}/{ep_fused} r2r={ep_r2r} mcp={mcp_dead}"
+                "eprof frame={t_frame:?} loop={t_loop:?} items={t_items:?} apply={t_apply:?} fuse={t_fuse:?} inst={t_inst:?} allocs={t_allocs:?} island={t_island:?}({n_islands}) obr={t_obr:?} fin={t_fin:?} ep={ep_mem}/{ep_next}/{ep_dir}/{ep_fused} r2r={ep_r2r} mcp={mcp_dead} td={td_count} tdp={tdp} tda={tda}"
             );
         }
 

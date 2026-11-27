@@ -2573,6 +2573,12 @@
 (decl zero_reg () Reg)
 (extern constructor zero_reg zero_reg)
 
+;; PLIRON: `put_in_reg`, except an `iconst 0` rides `xzr` — for operand
+;; positions where the zero register is legal (e.g. `stp` data fields).
+(decl put_in_reg_or_zr (Value) Reg)
+(rule 0 (put_in_reg_or_zr v) (put_in_reg v))
+(rule 1 (put_in_reg_or_zr (iconst _ (u64_from_imm64 0))) (zero_reg))
+
 (decl fp_reg () Reg)
 (extern constructor fp_reg fp_reg)
 
@@ -2599,6 +2605,15 @@
 (rule (movz imm size)
       (let ((dst WritableReg (temp_writable_reg $I64))
             (_ Unit (emit (MInst.MovWide (MoveWideOp.MovZ) dst imm size))))
+        dst))
+
+;; PLIRON: helper for emitting `orr rd, xzr, xzr` (`mov rd, xzr`) — a zero
+;; materialization as a register move (`PLIRON_ZRMOV`). `AluRRR` rather
+;; than `MInst.Mov`: regalloc asserts a preg can't be a `Mov` source.
+(decl mov_zr (OperandSize) Reg)
+(rule (mov_zr size)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.AluRRR (ALUOp.Orr) size dst (zero_reg) (zero_reg)))))
         dst))
 
 ;; Helper for emitting `MInst.MovN` instructions.
@@ -3900,6 +3915,14 @@
 (attr imm (veri chain))
 (decl imm (Type ImmExtend u64) Reg)
 
+;; PLIRON (`PLIRON_ZRMOV`, opt-in): a zero constant rides the register-move
+;; form `mov rd, xzr` (ORR with xzr) instead of `movz` — LLVM's spelling;
+;; see the flag's comment for why.
+(rule 4 (imm (and (integral_ty ty) (fits_in_64 _)) _ n)
+      (if-let true (u64_eq n 0))
+      (if-let true (pliron_zrmov))
+      (mov_zr (operand_size ty)))
+
 ;; Move wide immediate instructions; to simplify, we only match when we
 ;; are zero-extending the value.
 (rule 3 (imm (integral_ty ty) (ImmExtend.Zero) k)
@@ -4115,6 +4138,19 @@
 (rule 1 (trap_if_zero_divisor reg _)
       (if-let true (pliron_unchecked_div))
       reg)
+
+;; PLIRON (`PLIRON_ZRMOV=1`, opt-in): materialize `iconst 0` as
+;; `mov wN/xN, wzr/xzr` (ORR with the zero register, `MInst.Mov`) — LLVM's
+;; spelling. Same instruction count as `movz`, but the register-move form
+;; is a move-elimination candidate on Apple cores where `movz` executes on
+;; an ALU. (protobuf: ~561k executed `mov #0` vs LLVM's ~13k `mov #0` +
+;; ~483k `mov wN, wzr`.)
+(decl pure pliron_zrmov () bool)
+(extern constructor pliron_zrmov pliron_zrmov)
+;; PLIRON (`PLIRON_ZRSTP=1`, opt-in): `stp` of an `iconcat` with an
+;; `iconst 0` half stores `xzr` for that half.
+(decl pure pliron_zrstp () bool)
+(extern constructor pliron_zrstp pliron_zrstp)
 
 (spec (size_from_ty ty)
       (provide

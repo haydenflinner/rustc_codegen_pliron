@@ -852,7 +852,7 @@ is local, else through the PLT) instead of a GOT load plus `call *reg`.
     changes no code. On regex-syntax, `=1` removes 1,291 `b`s and 14.7 KB
     of `__text`, and `=2` removes 1,716 `b`s and 20.4 KB
     (docs/history/2026-10-27-branches.md).
-67. Shared epilogue, `PLIRON_EPIMERGE=1|2|3|4|5` (default mode `2`, `=0` off;
+67. Shared epilogue, `PLIRON_EPIMERGE=1|2|3|4|5` (default mode `4`, `=0` off;
     `src/machinst/vcode.rs`). The first `return` that merges binds a label
     in front of its epilogue. Each later merging `return` jumps to that
     label in place of its own copy. `=2` merges every epilogue of 2 or more
@@ -2640,3 +2640,35 @@ dominates every `/`/`%` with its own `Assert` that calls
 duplicate LLVM doesn't have (`h % sparse.len()` in regex's c_utf8_seq runs
 it ~29k times). Off by default: a CLIF producer that relies on the CLIF
 trap semantics (e.g. a fuzzer feeding bare `urem x, 0`) keeps them.
+
+## taildup: post-RA tail duplication (`PLIRON_TAILDUP`, opt-in `=N`, `=1` means 3)
+
+`src/machinst/vcode.rs` (`emit`): when an emitted block ends `b T` and T
+is a small jump-terminated block (at most N insts before its terminator;
+no calls, traps, safepoints, `args` pseudos, flag-setting compares, or
+trailing edits; not the shrinkwrap save block, `noret_dead`, entry, or
+an indirect-branch target), the `b T` is replaced by a replay of T's own
+inst/edit stream so the path runs T's insts then T's `b` — one taken
+branch instead of two. Unconditional-`b` terminators only: a two-target
+`b.cc`'s not-taken edge is an implicit fallthrough at T's own emission
+position and cannot be replayed elsewhere (the first version allowed it
+and miscompiled cmp3/lto — the fallthrough landed on whatever followed
+the pred in `final_order`). Cold preds are skipped (size for nothing)
+and `b T` where T is the next block in emission order (MachBuffer folds
+it anyway). Spliced copies do not update `inst_offsets` (T's own site
+keeps the canonical record). LLVM's analog is `TailDuplicator`; unlike
+it this has no per-function duplication budget, which is why the flip
+is held: at `=6` protobuf −10.7k / pulldown −49.2k executed insts for
++0.6% / +2.1% `.text`. Gate 139 green under `PLIRON_TAILDUP=6`.
+
+## zrmov / zrstp: `iconst 0` rides the zero register (`PLIRON_ZRMOV` / `PLIRON_ZRSTP`, opt-in `=1`)
+
+`src/isa/aarch64/inst.isle` + `lower.isle` (externs `pliron_zrmov` /
+`pliron_zrstp` in `lower/isle.rs`): `PLIRON_ZRMOV` materializes `iconst 0`
+as `mov rd, xzr` (ORR with the zero register — LLVM's spelling and a
+move-elimination candidate on Apple cores, where `movz` executes on an
+ALU; instruction-count neutral). `PLIRON_ZRSTP` stores an `iconcat` with
+an `iconst 0` half via `stp xzr` through `put_in_reg_or_zr`. protobuf
+executed `mov xN,#0` is ~561k vs LLVM's ~13k `movz` + ~483k `mov wN,wzr`;
+the remaining delta is folding `zr` into `str`/`csel`/`csinc`/`cmp`
+operand positions — not yet implemented.

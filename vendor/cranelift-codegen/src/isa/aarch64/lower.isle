@@ -3711,6 +3711,26 @@
                          (value_regs_get value 0)
                          (value_regs_get value 1))))
 
+;; PLIRON (`PLIRON_ZRSTP`, opt-in): an `iconst 0` half of an `iconcat`
+;; stored via `stp` rides `xzr` instead of a `mov xN, #0` materialization
+;; (`stp xzr, xN` / `stp xzr, xzr`; the `0`/`x` order is `iconcat`'s
+;; little-endian lane order — `lo` lands in the lower-address slot).
+;; `put_in_reg_or_zr` keeps the `iconcat 0, 0` case free of both moves.
+(rule 2 (lower
+       (store (little_or_native_endian flags)
+              (iconcat _ lo (iconst _ (u64_from_imm64 0))) address offset))
+      (if-let true (pliron_zrstp))
+      (side_effect
+       (aarch64_storep64 (pair_amode address offset) flags
+                         (put_in_reg_or_zr lo) (zero_reg))))
+(rule 1 (lower
+       (store (little_or_native_endian flags)
+              (iconcat _ (iconst _ (u64_from_imm64 0)) hi) address offset))
+      (if-let true (pliron_zrstp))
+      (side_effect
+       (aarch64_storep64 (pair_amode address offset) flags
+                         (zero_reg) (put_in_reg_or_zr hi))))
+
 (rule -1 (lower
        (store (little_or_native_endian flags) value @ (value_type (ty_float_or_vec (ty_16 _))) address offset))
       (side_effect
