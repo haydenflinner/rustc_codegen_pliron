@@ -2845,7 +2845,7 @@ impl<I: VCodeInst> VCode<I> {
         // copy — a hot exit never pays a taken `b` — and `=5` still
         // always merges epilogues of 5+ insts like `=1`.
         static EPIMERGE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let epimerge = *EPIMERGE.get_or_init(|| pliron_mode("PLIRON_EPIMERGE", 2));
+        let epimerge = *EPIMERGE.get_or_init(|| pliron_mode("PLIRON_EPIMERGE", 4));
         // PLIRON: `=3` host selection — the `Ret` block in `final_order`
         // with the highest `block_freq` that would take the shared
         // epilogue (not a frame-only return, a merged block or a
