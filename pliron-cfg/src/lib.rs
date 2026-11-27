@@ -37,6 +37,13 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // 2026-11-27: aarch64 emit_icmp spells the unsigned checked_add
+    // carry check `icmp ult (a+b), a` as `cmn a,b` (hs/lo remaps), so
+    // post-RA flag_twin merges it with the sum's add -> adds; the madd
+    // twin covers mul+madd+cmn. Worst case count-neutral. protobuf
+    // -63.6k executed; gate 138/139 under the knob (debuginfo fails at
+    // clean HEAD too — lldb env). `PLIRON_CARRYCMP=0` off.
+    "PLIRON_CARRYCMP",
     // 2026-11-26: the inliner's free-bonus may land in self-recursive
     // callers (MaybeInst::fill -> Compiler::fill: 10,644 out-of-line
     // calls folded; merged frame 208B is smaller than LLVM's own 288B
