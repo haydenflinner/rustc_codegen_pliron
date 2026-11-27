@@ -1163,6 +1163,33 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    copies. Open env issue: `debuginfo` gate stanza needs user-run
    `DevToolsSecurity -enable` (lldb can't attach since the OrbStack
    restart).
+   2026-11-27 montgomery deep-dive (blind-sig +1.07M, 63% of the
+   program gap): the `add_mul_vvw` inner loops are at parity —
+   11 vs 11 insts (`ldr x/mul/umulh/adds/cinc|adc/adds/str/subs/b`).
+   The gap is per-outer-iteration and per-swap-element SmallVec
+   header reloads: `ldr [z,#0x28]` (len) + `cmp len,5` (spilled) +
+   ptr select run ~4x per outer iter (`z.data[i..n+i]` x2, `z.data[i]`,
+   `z.data[n+i]`) and between every element of the inlined
+   `swap_with_slice` ladder (smallvec lib.rs:509/755/784/1018 ≈
+   +0.9M executed). CLIF: `v4538 = v0+8` (union/ptr field),
+   `v4540 = v0+40` (len); block params merge the v0-derived inline
+   base with the loaded heap ptr into one root, so stores through
+   the merged root carry v0's taint bit and `clobbers` keeps the
+   reloads. LLVM hoists them: `noalias` &mut means stores through
+   non-v0-derived pointers can't write *v0 (the loaded heap ptr is
+   not v0-based), and `inbounds`-GEP bounds the inline arm's stores
+   to z[8..40), disjoint from len at +40 — neither fact reaches our
+   `concrete`/`clobbers` (single (Root,i64) constant offsets, no
+   root-sets, no inbounds extent). The fix is byte-precise
+   provenance: root-set union params + bounded offset ranges
+   (arm-disjoint check: inline arm [8,40) vs len 40) — the queued
+   multi-day item, now with the concrete site mapped. Misc found
+   on the way: the visible `udiv x,8` in the binary is folded by
+   `divconst` when the divisor is an iconst at step time (svtest
+   repro confirms; real montgomery's one `udiv` survives via a
+   non-iconst divisor path, ~noise). `PLIRON_RA2_COLDSPLIT=1`
+   measured on html: 92.42M x1.077 — regressed, exec unchanged,
+   do not retry.
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
