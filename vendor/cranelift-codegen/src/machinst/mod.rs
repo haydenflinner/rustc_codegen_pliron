@@ -778,6 +778,27 @@ pub trait MachInstEmit: MachInst {
         None
     }
 
+    /// PLIRON: if this instruction is `madd rd, a, b, c` (the
+    /// `iadd (imul a, b), c` fusion), return `(a, b, c)` — the
+    /// multiplicands and the addend — for the madd+carry twin.
+    fn madd_mul_operands(&self) -> Option<(Reg, Reg, Reg)> {
+        None
+    }
+
+    /// PLIRON: if this instruction is `mul rd, a, b` with `{a, b} ==
+    /// {rn, rm}` (either order), return `rd` — for the madd+carry twin.
+    fn mul_def_with_operands(&self, _rn: Reg, _rm: Reg) -> Option<Reg> {
+        None
+    }
+
+    /// PLIRON: this is `madd rd, a, b, c` and `later` is
+    /// `cmn {mulres, c}` where `mulres`'s def is a `mul` on the same
+    /// multiplicands (the caller proves both): `adds rd, mulres, c`
+    /// computes the same sum and the same flags the `cmn` set.
+    fn flag_twin_madd(&self, _later: &Self, _mulres: Reg) -> Option<Self> {
+        None
+    }
+
     /// PLIRON: this instruction neither reads nor writes the condition
     /// flags, and has no control flow (conservative: `false`).
     fn nzcv_free(&self) -> bool {

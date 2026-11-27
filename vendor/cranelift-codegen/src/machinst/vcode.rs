@@ -3788,7 +3788,50 @@ impl<I: VCodeInst> VCode<I> {
                     continue;
                 }
                 let (au, ad) = preg_ops[iix.index()].clone();
-                if ad.iter().any(|r| au.contains(r)) {
+                // PLIRON: a `madd rd, a, b, c` candidate twins with a later
+                // `cmn {mulres, c}` — `mulres`'s def must be `mul` on the
+                // same multiplicands, and the value must still be live
+                // here. Scan back for the def; the fused `adds rd,
+                // mulres, c` reads `(mulres, c)` instead of `(a, b, c)`.
+                let madd = self.insts[iix.index()].madd_mul_operands().and_then(|(rn, rm, ra)| {
+                    let mut back = k;
+                    while back > 0 {
+                        back -= 1;
+                        let InstOrEdit::Inst(bix) = items[back] else {
+                            break;
+                        };
+                        if squashed[bix.index()] {
+                            break;
+                        }
+                        if let Some(mrd) = self.insts[bix.index()].mul_def_with_operands(rn, rm) {
+                            // Between the mul and the madd nothing may
+                            // redefine the product or the inputs.
+                            let clean = items[back + 1..k].iter().all(|it| {
+                                let InstOrEdit::Inst(gix) = it else { return false };
+                                !preg_ops[gix.index()]
+                                    .1
+                                    .iter()
+                                    .any(|r| r == &mrd || r == &rn || r == &rm || r == &ra)
+                            });
+                            return clean.then_some((mrd, ra));
+                        }
+                        // A redefine of a multiplicand means an earlier
+                        // `mul` can no longer be the product's def.
+                        let (_, bd) = &preg_ops[bix.index()];
+                        if bd.iter().any(|r| r == &rn || r == &rm) {
+                            break;
+                        }
+                    }
+                    None
+                });
+                // The regs the fused inst reads — the gap to the flag
+                // user must not redefine them, and `rd` must not be one
+                // (the flag-setting form's compare reads it otherwise).
+                let gap_uses: SmallVec<[Reg; 4]> = match madd {
+                    Some((mulres, ra)) => smallvec![mulres, ra],
+                    None => au.clone(),
+                };
+                if ad.iter().any(|r| gap_uses.contains(r)) {
                     continue;
                 }
                 for j in k + 1..(k + 16).min(items.len()) {
@@ -3798,16 +3841,21 @@ impl<I: VCodeInst> VCode<I> {
                     if squashed[nix.index()] {
                         break;
                     }
-                    if let Some(fused) =
-                        self.insts[iix.index()].flag_twin(&self.insts[nix.index()])
-                    {
+                    let fused = match madd {
+                        Some((mulres, _)) => self.insts[iix.index()]
+                            .flag_twin_madd(&self.insts[nix.index()], mulres),
+                        None => self.insts[iix.index()].flag_twin(&self.insts[nix.index()]),
+                    };
+                    if let Some(fused) = fused {
                         self.insts[iix.index()] = fused;
                         self.insts[nix.index()] = I::gen_nop(0);
                         squashed[nix.index()] = true;
                         break;
                     }
                     let (_, gd) = &preg_ops[nix.index()];
-                    if !self.insts[nix.index()].nzcv_free() || gd.iter().any(|r| au.contains(r)) {
+                    if !self.insts[nix.index()].nzcv_free()
+                        || gd.iter().any(|r| gap_uses.contains(r))
+                    {
                         break;
                     }
                 }

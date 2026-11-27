@@ -4529,9 +4529,8 @@ impl MachInstEmit for Inst {
     fn flag_twin_candidate(&self) -> bool {
         match self {
             Inst::AluRRR { alu_op: ALUOp::Add | ALUOp::Sub, rd, .. }
-            | Inst::AluRRImm12 { alu_op: ALUOp::Add | ALUOp::Sub, rd, .. } => {
-                rd.to_reg() != zero_reg()
-            }
+            | Inst::AluRRImm12 { alu_op: ALUOp::Add | ALUOp::Sub, rd, .. }
+            | Inst::AluRRRR { alu_op: ALUOp3::MAdd, rd, .. } => rd.to_reg() != zero_reg(),
             _ => false,
         }
     }
@@ -4562,6 +4561,44 @@ impl MachInstEmit for Inst {
                 && Some(op2) == flags_op(alu_op) =>
             {
                 Some(Inst::AluRRImm12 { alu_op: op2, size, rd, rn, imm12 })
+            }
+            _ => None,
+        }
+    }
+
+    fn madd_mul_operands(&self) -> Option<(Reg, Reg, Reg)> {
+        match self {
+            &Inst::AluRRRR { alu_op: ALUOp3::MAdd, rd, rn, rm, ra, .. }
+                if rd.to_reg() != zero_reg() =>
+            {
+                Some((rn, rm, ra))
+            }
+            _ => None,
+        }
+    }
+
+    fn mul_def_with_operands(&self, rn: Reg, rm: Reg) -> Option<Reg> {
+        match self {
+            // A scalar `imul` lowers as `madd rd, a, b, xzr` (printed `mul`).
+            &Inst::AluRRRR { alu_op: ALUOp3::MAdd, rd, rn: mrn, rm: mrm, ra, .. }
+                if ra == zero_reg() && ((mrn, mrm) == (rn, rm) || (mrn, mrm) == (rm, rn)) =>
+            {
+                Some(rd.to_reg())
+            }
+            _ => None,
+        }
+    }
+
+    fn flag_twin_madd(&self, later: &Self, mulres: Reg) -> Option<Self> {
+        match (self, later) {
+            (
+                &Inst::AluRRRR { alu_op: ALUOp3::MAdd, size, rd, ra, .. },
+                &Inst::AluRRR { alu_op: ALUOp::AddS, size: size2, rd: rd2, rn: x, rm: y },
+            ) if rd2.to_reg() == zero_reg()
+                && size2 == size
+                && ((x == mulres && y == ra) || (y == mulres && x == ra)) =>
+            {
+                Some(Inst::AluRRR { alu_op: ALUOp::AddS, size, rd, rn: mulres, rm: ra })
             }
             _ => None,
         }

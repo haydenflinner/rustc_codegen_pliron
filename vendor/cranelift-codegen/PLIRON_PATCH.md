@@ -2681,8 +2681,18 @@ operand positions — not yet implemented.
 of `a+b` — emit `cmn a,b` with the remapped cond (`hs`/`lo`) instead of
 `subs sum,a`. The `cmn`'s operands are the iadd's own, so vcode's
 flag_twin merges it with the sum's `add` into one `adds` — LLVM's
-`adds; b.hs` shape. Count-neutral when the twin doesn't reach (madd-
-fused sums — `mul;madd;cmn;b.lo` — and iadds in different blocks).
-protobuf −63.6k executed. Residual: the madd shape needs a def-tracking
-twin variant (`madd`+`cmn` → `adds`), the `uge`/`ule` forms a flag-negated
-consumer.
+`adds; b.hs` shape. Count-neutral when the twin doesn't reach (iadds in
+different blocks). protobuf −63.6k executed.
+
+flag_twin's madd variant (machinst/vcode.rs twin loop +
+`MachInst::madd_mul_operands`/`mul_def_with_operands`/`flag_twin_madd`
+hooks, aarch64 impls in emit.rs) covers the madd-fused shape
+`mul m,a,b; madd d,a,b,c; cmn {m,c}`: the backward scan proves `m`'s def
+is `mul`/`madd ,,,xzr` on the same multiplicands with no redefinition
+between, the forward twin replaces the madd with `adds d,m,c` (same
+flags as the cmn — no cond remap). The `rd ∉ uses` veto applies to the
+fused inst's uses `{m,c}`, so `madd` with `rd` aliasing a multiplicand
+still fuses. Fires whenever a `cmn` sits adjacent — practical trigger is
+the carrycmp emit path. protobuf +1 net site (its checked_add sites are
+mostly not this shape); digit-accumulation loops (the /tmp/cadd repro)
+fuse every iteration.
