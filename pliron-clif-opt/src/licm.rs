@@ -327,71 +327,97 @@ fn clobbers(
             let l = i128::from(cloc.1);
             let lhi = l + i128::from(cloc.2.bytes());
             let res = arms.iter().any(|&(r2, alo, ahi)| {
-                // The arm's store covers bytes `[alo+imm, ahi+imm+ty)`.
-                let lo = i128::from(alo) + i128::from(imm);
-                let hi = i128::from(ahi) + i128::from(imm) + i128::from(ty.bytes());
-                // A loc on a rustc-`noalias` entry param can be written
-                // only through addresses derived from that param (LLVM
-                // arg-`noalias`: accessing the pointee through a
-                // non-derived pointer during the call is UB).
-                // `provescapes` tracks that provenance precisely: for a
-                // `live` root — no escape the loop can observe — only a
-                // store through a still-`rv`-based address (`taint`)
-                // can clobber; loaded pointers and unrelated roots
-                // can't be `rv`-based (`&mut self` field loads hoist
-                // past stores through pointers loaded from it,
-                // `compress_inner`). Without shelter a store is still
-                // safe when `not_derived` proves its address `rv`-free.
-                // The entry-param `noalias` set only: a scoped claim
-                // holds inside its clone's region, not function-wide.
-                // Applies per arm: the heap-pointer arm of a merged
-                // address is `rv`-free even when a sibling arm is not.
-                let shel_ans = (|| {
-                    let s = shel?;
-                    let Root::V(rv) = cloc.0 else { return None };
-                    if !noalias.contains(&rv) || scoped_na.contains(&rv) || r2 == cloc.0 {
-                        return None;
-                    }
-                    if let Some(&bit) = s.live.get(&rv) {
-                        return Some(match r2 {
-                            Root::V(x) => {
-                                let x = func.dfg.resolve_aliases(x);
-                                match s.pe.taint.get(&x) {
-                                    Some(&m) => m & bit != 0,
-                                    // Untainted inst results are clean:
-                                    // in-loop derivation is tracked and under
-                                    // shelter no `rv` was planted in memory.
-                                    // A param's provenance is caller-chosen —
-                                    // it may be `rv`-based (`&mut s.field`
-                                    // beside `&mut s`) — so absence from
-                                    // `taint` proves nothing.
-                                    None => func.dfg.value_def(x).inst().is_none(),
-                                }
-                            }
-                            _ => false,
-                        });
-                    }
-                    if let Root::V(x) = r2 {
-                        return Some(!not_derived(func, x, noalias, scoped_na, rv));
-                    }
-                    None
-                })();
-                let ans = if let Some(ans) = shel_ans {
-                    ans
-                } else {
-                    // `overlap_keeps`'s keep-rule with the arm's byte
-                    // span in place of the exact offset.
-                    !(match (cloc.0, r2) {
-                        _ if r2 == cloc.0 => l >= hi || lo >= lhi,
-                        (Root::S(_), Root::S(_)) => true,
-                        _ => {
-                            iso.contains(&cloc.0)
-                                || iso.contains(&r2)
-                                || slots_apart(func, cloc.0, r2)
+                // The arm's store covers bytes `[alo+imm, ahi+imm+ty)`,
+                // intersected with the arm root's dereferenceable
+                // extent: a store can't write outside its root's object
+                // (LLVM's `inbounds`-GEP analog — past `dereferenceable`
+                // bytes / the slot's size the write is UB), so `[elo,
+                // ehi)` bounds the span and an empty remainder means the
+                // arm can't write at all. `V`: `deref_fact`'s `[-k,
+                // bytes-k)` relative to the root — `k` keeps interior
+                // roots' writes into earlier fields legal; `bytes == 0`
+                // is "no extent claim" (a nullable `noalias` param), not
+                // a zero-size object. `S`: the slot's declared size.
+                // A `!writable` fact still clamps: a store through a
+                // `readonly` root is UB outright, so intersecting is the
+                // conservative half of that fact.
+                let (elo, ehi) = match r2 {
+                    Root::V(x) => match deref_fact(func, ps, deref, x) {
+                        Some((bytes, _, k)) if bytes > 0 => {
+                            (-i128::from(k), i128::from(bytes) - i128::from(k))
                         }
-                    })
+                        _ => (i128::MIN, i128::MAX),
+                    },
+                    Root::S(ss) => (0, i128::from(func.sized_stack_slots[ss].size)),
                 };
-                ans
+                let lo = (i128::from(alo) + i128::from(imm)).max(elo);
+                let hi = (i128::from(ahi) + i128::from(imm) + i128::from(ty.bytes())).min(ehi);
+                if lo >= hi {
+                    false
+                } else {
+                    // A loc on a rustc-`noalias` entry param can be written
+                    // only through addresses derived from that param (LLVM
+                    // arg-`noalias`: accessing the pointee through a
+                    // non-derived pointer during the call is UB).
+                    // `provescapes` tracks that provenance precisely: for a
+                    // `live` root — no escape the loop can observe — only a
+                    // store through a still-`rv`-based address (`taint`)
+                    // can clobber; loaded pointers and unrelated roots
+                    // can't be `rv`-based (`&mut self` field loads hoist
+                    // past stores through pointers loaded from it,
+                    // `compress_inner`). Without shelter a store is still
+                    // safe when `not_derived` proves its address `rv`-free.
+                    // The entry-param `noalias` set only: a scoped claim
+                    // holds inside its clone's region, not function-wide.
+                    // Applies per arm: the heap-pointer arm of a merged
+                    // address is `rv`-free even when a sibling arm is not.
+                    let shel_ans = (|| {
+                        let s = shel?;
+                        let Root::V(rv) = cloc.0 else { return None };
+                        if !noalias.contains(&rv) || scoped_na.contains(&rv) || r2 == cloc.0 {
+                            return None;
+                        }
+                        if let Some(&bit) = s.live.get(&rv) {
+                            return Some(match r2 {
+                                Root::V(x) => {
+                                    let x = func.dfg.resolve_aliases(x);
+                                    match s.pe.taint.get(&x) {
+                                        Some(&m) => m & bit != 0,
+                                        // Untainted inst results are clean:
+                                        // in-loop derivation is tracked and under
+                                        // shelter no `rv` was planted in memory.
+                                        // A param's provenance is caller-chosen —
+                                        // it may be `rv`-based (`&mut s.field`
+                                        // beside `&mut s`) — so absence from
+                                        // `taint` proves nothing.
+                                        None => func.dfg.value_def(x).inst().is_none(),
+                                    }
+                                }
+                                _ => false,
+                            });
+                        }
+                        if let Root::V(x) = r2 {
+                            return Some(!not_derived(func, x, noalias, scoped_na, rv));
+                        }
+                        None
+                    })();
+                    let ans = if let Some(ans) = shel_ans {
+                        ans
+                    } else {
+                        // `overlap_keeps`'s keep-rule with the arm's byte
+                        // span in place of the exact offset.
+                        !(match (cloc.0, r2) {
+                            _ if r2 == cloc.0 => l >= hi || lo >= lhi,
+                            (Root::S(_), Root::S(_)) => true,
+                            _ => {
+                                iso.contains(&cloc.0)
+                                    || iso.contains(&r2)
+                                    || slots_apart(func, cloc.0, r2)
+                            }
+                        })
+                    };
+                    ans
+                }
             });
             res
         }
@@ -3142,5 +3168,108 @@ mod tests {
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("licm produced invalid IR: {e}\n{}", func.display());
         }
+    }
+
+    /// `merged_param_store_arms_clear_sibling_field` without the `band`
+    /// index bound: the `v0` arm is near-wild `[8, 512)` and only the
+    /// arm root's `deref` extent bounds it. In a 40-byte object the arm
+    /// clamps to `[8,40)` — disjoint from the `+40` load (outside the
+    /// object, `gte`-safe), which hoists. In a 48-byte object `+40` is
+    /// writable tail — the clamp must not shave the object's last bytes,
+    /// so the load stays; `0` bytes is "no extent claim", no clamp.
+    #[test]
+    fn merged_param_store_arms_clamp_to_deref_extent() {
+        let build = |extent: u64| {
+            let mut sig = Signature::new(CallConv::Fast);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+            let b0 = func.dfg.make_block();
+            let h = func.dfg.make_block();
+            let out = func.dfg.make_block();
+            for b in [b0, h, out] {
+                func.layout.append_block(b);
+            }
+            let v0 = func.dfg.append_block_param(b0, types::I64);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let c0 = cur.ins().iconst(types::I8, 0);
+            let zero = cur.ins().iconst(types::I64, 0);
+            let three = cur.ins().iconst(types::I64, 3);
+            let inline = cur.ins().iadd_imm(v0, 8);
+            let len_addr = cur.ins().iadd_imm(v0, 40);
+            let heap = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), v0, 16);
+            let sel = cur.ins().select(c0, inline, heap);
+            cur.ins().jump(h, &[sel.into(), zero.into(), three.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let vp = cur.func.dfg.append_block_param(h, types::I64);
+            let vi = cur.func.dfg.append_block_param(h, types::I64);
+            let v3 = cur.func.dfg.append_block_param(h, types::I64);
+            let len = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), len_addr, 0);
+            let _ = len;
+            let idx = cur.ins().ishl(vi, v3);
+            let addr = cur.ins().iadd(vp, idx);
+            let seven = cur.ins().iconst(types::I64, 7);
+            cur.ins().store(MemFlagsData::new().with_notrap(), seven, addr, 0);
+            let next = cur.ins().iadd_imm(vi, 8);
+            let cnd = cur.ins().icmp_imm(IntCC::UnsignedLessThan, next, 64);
+            cur.ins().brif(cnd, h, &[vp.into(), next.into(), v3.into()], out, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(out);
+            let z = cur.ins().iconst(types::I64, 0);
+            cur.ins().return_(&[z]);
+
+            let mut noalias = FxHashSet::default();
+            noalias.insert(v0);
+            let mut deref = FxHashMap::default();
+            deref.insert(v0, (extent, true));
+            run(
+                &mut func,
+                &mut crate::pipeline::Analysis::default(),
+                &noalias,
+                &FxHashSet::default(),
+                &deref,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &pliron::cols::ColMap::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                true,
+                LicmOpts {
+                    gte: true,
+                    ..Default::default()
+                },
+            );
+            let n = func
+                .layout
+                .block_insts(h)
+                .filter(|&i| matches!(func.dfg.insts[i], InstructionData::Load { .. }))
+                .count();
+            let flags =
+                cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+            if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+                panic!("licm produced invalid IR: {e}\n{}", func.display());
+            }
+            n
+        };
+        assert_eq!(
+            build(40),
+            0,
+            "arm clamped to the 40-byte extent should clear the +40 load"
+        );
+        assert_eq!(
+            build(48),
+            1,
+            "the object's last 8 bytes are still writable: +40 stays clobbered"
+        );
+        assert_eq!(
+            build(0),
+            1,
+            "bytes == 0 is no extent claim: the wild arm keeps the load"
+        );
     }
 }
