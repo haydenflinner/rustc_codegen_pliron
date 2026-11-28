@@ -4073,6 +4073,17 @@ fn s_brbits(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_switchadapt(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::switchadapt::run_with(&mut p.clctx.func, p.target.cheap_br_table());
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("switchadapt");
+        }
+    }
+    k
+}
+
 fn s_eqtree(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::eqtree::run(&mut p.clctx.func);
     if k > 0 {
@@ -5468,6 +5479,11 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // tests (LLVM's bit test clusters). Ahead of licm, which hoists the
         // masks out of a byte loop. Opt-in: `PLIRON_BRBITS=1`.
         step("brbits", "brbits", Gate::OptIn("PLIRON_BRBITS"), s_brbits),
+        // Sparse grouped destinations as equality/range/bitmask tests (the
+        // lexer-switch shape). Same pre-licm position: the case sets still
+        // share destinations here, before edge duplication. Opt-in.
+        step("switchadapt", "switchadapt", Gate::OptIn("PLIRON_SWITCHADAPT"), s_switchadapt)
+            .needs(shape::SWITCH),
         cstep("licm", "licm", Gate::Flag(FlagId::Licm), s_licm)
             .needs(shape::LOOPS)
             .creates_all(),

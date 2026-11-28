@@ -32,6 +32,7 @@ pub mod memcmpk;
 pub mod mintrip;
 pub mod bytescan;
 pub mod brchain;
+pub mod switchadapt;
 pub mod celim;
 pub mod dbglabel;
 pub mod cicm;
