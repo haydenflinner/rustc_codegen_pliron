@@ -2612,6 +2612,21 @@ removed the same pads but cost +0.8% cycles from the lost alignment,
 so `=1` is kept only as a diagnostic. pulldown-cmark and blake3-scalar
 within noise.
 
+## `PLIRON_PADJUMP` (default `2` since 2026-11-27; `=0` off): cover large pads with a jump
+
+`src/machinst/vcode.rs` (`VCode::emit`), same site as `PLIRON_ALIGNFT`.
+A pad of `n` or more instructions ahead of any non-entry block starts
+with a `b` to the block it pads: the NOPs keep the head's alignment but
+stop executing on the fallthrough entry, one executed instruction
+replacing the pad's. Count-safe by construction — an executed pad loses
+at least one instruction, a dead one is unchanged. Where `ALIGNFT=2`
+covers only pads whose fallthrough entry is inside a loop span (per-trip
+hot), this covers the rest: loop heads entered hot from outside the loop
+(state-machine inner loops re-entered per token) and every other large
+pad. Exact counts (aarch64-linux callgrind): rust-html-rewriter -164k
+executed instructions (nops 297k -> 99k, x1.072 -> x1.070), rust-json
+-126k, regex and blind-sig flat.
+
 ## xreduce: `ireduce` of packed-field deposits (`PLIRON_XREDUCE`, opt-in `=1`)
 
 `src/opts/pliron.isle`, `src/opts.rs` (`pliron_xreduce_on`,

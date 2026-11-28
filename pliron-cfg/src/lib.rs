@@ -652,6 +652,14 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // 2026-11-27: a pad of 2+ instructions ahead of a block starts with a
+    // jump over it (vendored vcode.rs): the nops keep the head's alignment
+    // but stop executing on the fallthrough entry. Count-safe by
+    // construction — an executed pad loses at least one instruction, a
+    // dead one is unchanged. Exact counts: html -164k insts executed
+    // (nops 297k -> 99k, x1.072 -> x1.070), rust-json -126k, regex flat
+    // to better, blind-sig flat. `=0` off.
+    ("PLIRON_PADJUMP", "2"),
     // 2026-11-22: one `symbol_value` per global within a block (foldhash's
     // seed address loaded five times in `reserve_rehash`). Exact counts:
     // html -0.149%, the rest flat. `=1` also across dominator scopes,

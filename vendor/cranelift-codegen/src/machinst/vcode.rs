@@ -3178,18 +3178,19 @@ impl<I: VCodeInst> VCode<I> {
                     }
                 }
             }
-            // PLIRON (`PLIRON_PADJUMP=<n>`, opt-in, default `0` = off; not
-            // measured yet, see the handoff notes in
-            // docs/history/2026-11-13-six-features.md): a pad of
-            // `n` or more instructions starts with a jump to the block it
-            // pads. The pad sits on the fallthrough path into a loop
-            // head, and the 64-byte rule above pads up to 15 `nop`s:
-            // pulldown-cmark executed 510k of them (LLVM's code 3.6k),
-            // 1% of its instructions, 99k on one path of
-            // `FirstPass::parse_block`.
+            // PLIRON (`PLIRON_PADJUMP=<n>`, default `2` since 2026-11-27,
+            // `0` = off): a pad of `n` or more instructions starts with a
+            // jump to the block it pads. The pad sits on the fallthrough
+            // path into a loop head, and the 64-byte rule above pads up to
+            // 15 `nop`s: pulldown-cmark executed 510k of them (LLVM's code
+            // 3.6k), 1% of its instructions, 99k on one path of
+            // `FirstPass::parse_block`. Count-safe by construction — an
+            // executed pad loses at least one instruction, a dead one is
+            // unchanged. Exact counts: html -164k insts executed (nops
+            // 297k -> 99k), rust-json -126k, regex and blind-sig flat.
             static PADJUMP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
             let padjump = *PADJUMP.get_or_init(|| {
-                std::env::var("PLIRON_PADJUMP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+                std::env::var("PLIRON_PADJUMP").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
             });
             let pad_starts_jump = match I::fixed_inst_size() {
                 // `PLIRON_ALIGNFT=2`: a pad on a hot fallthrough entry is
