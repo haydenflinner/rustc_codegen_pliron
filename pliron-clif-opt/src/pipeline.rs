@@ -12,7 +12,7 @@ use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::flowgraph::ControlFlowGraph;
-use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, StackSlot, Value, ValueDef};
+use cranelift_codegen::ir::{Block, FuncRef, Function, Inst, InstructionData, Opcode, StackSlot, Value, ValueDef};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
 use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_module::FuncId;
@@ -3892,6 +3892,67 @@ fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+/// Does `func` store a vector into an explicit stack slot and later load
+/// a vector from the same slot? This is the memory round-trip LLVM's
+/// memcpyopt removes in the NEON memchr fast paths: the early loadfwd
+/// rounds run while the scan's dispatch shape still hides the dominating
+/// store, so one narrow late rerun is worthwhile only for functions with
+/// this exact shape. The scan is deliberately syntactic — it is a cheap
+/// admission test for `loadfwd`, not the transform itself.
+fn vecslot_roundtrip(func: &Function) -> bool {
+    let mut stored = FxHashSet::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            match func.dfg.insts[i] {
+                InstructionData::Store { args, .. } => {
+                    if !func.dfg.value_type(func.dfg.resolve_aliases(args[0])).is_vector() {
+                        continue;
+                    }
+                    if let ValueDef::Result(di, _) = func.dfg.value_def(args[1])
+                        && let InstructionData::StackAddr { opcode: Opcode::StackAddr, stack_slot, .. } = func.dfg.insts[di]
+                    {
+                        stored.insert(stack_slot);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if stored.is_empty() {
+        return false;
+    }
+    func.layout.blocks().flat_map(|b| func.layout.block_insts(b)).any(|i| {
+        if let InstructionData::Load { arg, .. } = func.dfg.insts[i]
+            && func.dfg.value_type(func.dfg.first_result(i)).is_vector()
+            && let ValueDef::Result(di, _) = func.dfg.value_def(arg)
+            && let InstructionData::StackAddr { opcode: Opcode::StackAddr, stack_slot, .. } = func.dfg.insts[di]
+        {
+            stored.contains(&stack_slot)
+        } else {
+            false
+        }
+    })
+}
+
+/// Late load forwarding admission-gated to vector stack-slot round-trips
+/// (`PLIRON_VECSLOTFWD=1`): serde_json's NEON memchr path materializes
+/// the two byte splats through a 48-byte slot in a cold arm. Once the
+/// late threading has simplified that arm, `loadfwd` forwards the splats
+/// and the fixed frame for the whole `skip_to_escape` function disappears
+/// — two stack-pointer instructions on every hot scalar call. A general
+/// late loadfwd round is a measured regression (regex), so this reruns it
+/// only where the vector-slot shape exists.
+fn s_vecslotfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if !vecslot_roundtrip(&p.clctx.func) {
+        return 0;
+    }
+    let k = s_loadfwd2(p, an);
+    if k > 0 && p.dump {
+        p.dump("vecslotfwd");
+    }
+    k
+}
+
 // `PLIRON_SCOPED_NOALIAS=1`: `loadfwd` on the function as lowered, while
 // the inlined callees' `&mut` params are still their clones' entry params
 // (`loadfwd::scoped_any`). Functions without a candidate skip it.
@@ -6286,6 +6347,13 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // (post-index), so the block carries one cursor. After every
         // sink: `edgesink` would push the edge's add onto a split edge.
         step("bumpedge", "", Gate::Env("PLIRON_BUMPEDGE"), s_bumpedge).needs(shape::BPARAM),
+        // Vector constants parked in an explicit slot (the NEON memchr
+        // fast paths) become forwardable only after the late threading
+        // simplifies the scan arms. Reuse loadfwd under a narrow
+        // vector-roundtrip admission gate, then let deadslot drop the
+        // frame bytes. Opt-in: `PLIRON_VECSLOTFWD=1`.
+        step("vecslotfwd", "loadfwd2", Gate::OptIn("PLIRON_VECSLOTFWD"), s_vecslotfwd)
+            .needs(shape::LOAD | shape::STORE),
         // A slot whose last store `dse3` deleted (after `slotmerge`)
         // still has its size, and the function a frame for it.
         step("deadslot", "deadslot", Gate::Env("PLIRON_DEADSLOT"), s_deadslot).needs(shape::SLOT),

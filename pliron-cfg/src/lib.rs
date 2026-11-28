@@ -660,6 +660,17 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // (nops 297k -> 99k, x1.072 -> x1.070), rust-json -126k, regex flat
     // to better, blind-sig flat. `=0` off.
     ("PLIRON_PADJUMP", "2"),
+    // 2026-11-27: br_table indexed by the raw value with `s` copies of the
+    // default target padding the table front (vendored aarch64 lower.isle)
+    // — no subtraction, bytes above the highest case escape in `cmp; b.hs`.
+    // Exact counts: html -166k (x1.070 -> x1.068), regex flat, blind-sig
+    // +13k (net suite win). The vendored crate reads the env directly;
+    // this entry documents the default. `=0` off.
+    ("PLIRON_SWITCH_PRETEST", "1"),
+    // 2026-11-27: narrow late loadfwd round admission-gated to vector
+    // stack-slot round-trips (serde_json NEON memchr splats). Exact counts:
+    // rust-json -39k (x1.012 -> x1.011). `=0` off.
+    ("PLIRON_VECSLOTFWD", "1"),
     // 2026-11-22: one `symbol_value` per global within a block (foldhash's
     // seed address loaded five times in `reserve_rehash`). Exact counts:
     // html -0.149%, the rest flat. `=1` also across dominator scopes,

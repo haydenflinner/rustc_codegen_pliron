@@ -639,6 +639,25 @@ pub struct ExtendedValue {
     extend: ExtendOp,
 }
 
+/// PLIRON: shared modular arithmetic of `btsub_imm`/`btsub_pre` (see
+/// `btsub_imm`).
+fn btsub_imm_inner(op: u64, ty: Type, j: u64, n: u64) -> Option<u64> {
+    if ty.bits() > 16 {
+        return None;
+    }
+    let w = 1u64 << ty.bits();
+    let j = j & (w - 1);
+    let s = match op {
+        0 => j,
+        1 if j >= w / 2 => w - j,
+        _ => return None,
+    };
+    if s == 0 || s > 0xfff || s + n > w {
+        return None;
+    }
+    Some(s)
+}
+
 impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     isle_lower_prelude_methods!();
 
@@ -1786,20 +1805,55 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     /// back below `N` and cannot fold. Returns `s`, or none when the
     /// bound fails, `s` overflows imm12, or `s` is 0 (`iadd c, 0`).
     fn btsub_imm(&mut self, op: u64, ty: Type, j: u64, n: u64) -> Option<u64> {
-        if !narrowext_part(1024) || ty.bits() > 16 {
+        if !narrowext_part(1024) {
             return None;
         }
-        let w = 1u64 << ty.bits();
-        let j = j & (w - 1);
-        let s = match op {
-            0 => j,
-            1 if j >= w / 2 => w - j,
-            _ => return None,
-        };
-        if s == 0 || s > 0xfff || s + n > w {
+        btsub_imm_inner(op, ty, j, n)
+    }
+
+    /// PLIRON (`PLIRON_SWITCH_PRETEST`, default on since 2026-11-27,
+    /// `=0` off): the same `br_table`
+    /// index shape as `btsub_imm`, but instead of subtracting the lowest
+    /// case value, the table gains `s` copies of the default target in
+    /// front and is indexed by the raw value: the bounds check becomes
+    /// `cmp x, #(s+n); b.hs default` with no subtraction anywhere —
+    /// one instruction less for every byte above the highest case (the
+    /// dominant default arm of lol_html's state machines, where letters
+    /// sit above the dense `0x9..0x3e` range) and one less for every
+    /// in-range byte, at the cost of `s` table bytes and a full table
+    /// trip (instead of the short bounds branch) for values below the
+    /// lowest case. That last case is why the padding is capped small:
+    /// `PLIRON_SWITCH_PRETEST_PAD` (default 64). Values below the lowest
+    /// case of a byte switch in practice are control characters, which
+    /// the parsed formats exclude. Returns `s` (the padding count).
+    fn btsub_pre(&mut self, op: u64, ty: Type, j: u64, n: u64) -> Option<u64> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_SWITCH_PRETEST").as_deref() != Ok("0")) {
             return None;
         }
-        Some(s)
+        static PAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let pad = *PAD.get_or_init(|| {
+            std::env::var("PLIRON_SWITCH_PRETEST_PAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64)
+        });
+        let s = btsub_imm_inner(op, ty, j, n)?;
+        (s <= pad).then_some(s)
+    }
+
+    /// PLIRON: `pad` copies of `default` in front of the jump table
+    /// entries, for `btsub_pre`.
+    fn jt_pad_targets(
+        &mut self,
+        default: MachLabel,
+        targets: &BoxVecMachLabel,
+        pad: u64,
+    ) -> BoxVecMachLabel {
+        let mut v = Vec::with_capacity(targets.len() + pad as usize);
+        v.extend(std::iter::repeat(default).take(pad as usize));
+        v.extend(targets.iter().copied());
+        Box::new(v)
     }
 
     /// PLIRON (`PLIRON_NARROWEXT` bit 8): the mask for a `tst` of a

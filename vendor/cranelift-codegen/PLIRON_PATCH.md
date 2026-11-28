@@ -2735,3 +2735,30 @@ ISel shape. The direct `cset; cbz/cbnz` arm rewrites the branch in
 place (no flag writer between). Gaps allow only `nzcv_free` insts and
 flag-free regalloc edge moves; `rd`'s def-scan runs ≤15 items back.
 Gate clean under the knob; protobuf −61k executed.
+
+## switchpretest: padded `br_table` indexed by the raw value (`PLIRON_SWITCH_PRETEST`, default on since 2026-11-27, `=0` off)
+
+`src/isa/aarch64/lower.isle` (three rules mirroring the `btsub_imm` forms
+at priorities 4/4/5) + `btsub_pre`/`jt_pad_targets` in `lower/isle.rs`: a
+`br_table` on a narrow `(c - s) mod W` index (`uextend (isub c, j)` /
+`uextend (iadd c, -j)`, the `btsub_imm` match) normally folds the
+subtraction into the bounds compare. With the knob on and `s` at most
+`PLIRON_SWITCH_PRETEST_PAD` (default 64), the table instead gains `s`
+copies of the default target in front and is indexed by the raw value:
+the bounds check is `cmp x, #(s+n); b.hs default` with no subtraction
+anywhere — one instruction less per dispatch for bytes above the highest
+case (the dominant default arm of lol_html's state machines: letters sit
+above the dense `0x9..0x3e` range) and one less for in-range bytes.
+Values below the lowest case take the full table trip through a padding
+entry instead of the short bounds branch (+4), which is why the padding
+is capped small: they are control characters the parsed formats exclude.
+Exact equivalence for every `x` in `[0, W)`: `[s, s+n)` hits the same
+entry, `[0, s)` wraps to `>= n` in the subtracted form and lands on a
+default padding entry in the padded form, `[s+n, W)` fails both bounds
+checks.
+
+Exact instructions, html (the target): 91,876,434 -> 91,705,997
+(-170k; one per dispatch iteration across the lexer/tag_scanner state
+machines, no symbol regressed). Regression tests:
+`pliron-clif-opt/tests/jt_pretest.rs` (runs every byte value, decodes the
+padding; red without the rules).
