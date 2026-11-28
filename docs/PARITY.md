@@ -240,20 +240,23 @@ found and what moved the numbers.
 
 SPD is measured on the kernels above, which the backend has been tuned
 against for weeks. On real programs it was never tuned on, native code is
-**1.054x slower** than LLVM (geomean of 8; 2026-11-13, 5 interleaved
-rounds, `bench/heldout/run.py`, AC power; was 1.076x on 11-11 and
-1.054x on 11-10 — within day-to-day machine drift):
+**1.013x slower** than LLVM (geomean of 8; 2026-11-28, 5 interleaved
+rounds, `bench/heldout/run.py`, AC power, Low Power Mode on both sides;
+was 1.054x on 11-13 and 1.076x on 11-11). Three programs are faster
+than LLVM; exact-count/wall-clock divergences cut both ways (html
+executes 6% more instructions yet runs at wall-clock parity, regex the
+inverse) — memory placement, not instruction count:
 
 | program (sightglass) | LLVM | pliron | pliron/LLVM |
 |---|---|---|---|
-| blake3-scalar | 4.32 ms | 4.05 ms | 0.939 |
-| blind-sig | 1.36 ms | 1.50 ms | 1.096 |
-| pulldown-cmark | 4.81 ms | 5.51 ms | 1.147 |
-| rust-compression | 3.65 ms | 3.32 ms | 0.910 |
-| rust-html-rewriter | 5.69 ms | 7.36 ms | 1.293 |
-| regex | 3.42 ms | 4.13 ms | 1.209 |
-| rust-json | 3.60 ms | 3.85 ms | 1.068 |
-| rust-protobuf | 8.23 ms | 7.00 ms | 0.851 |
+| blake3-scalar | 4.08 ms | 4.27 ms | 1.045 |
+| blind-sig | 1.85 ms | 1.89 ms | 1.026 |
+| pulldown-cmark | 4.98 ms | 5.13 ms | 1.031 |
+| rust-compression | 3.08 ms | 3.37 ms | 1.093 |
+| rust-html-rewriter | 7.12 ms | 7.07 ms | 0.993 |
+| regex | 3.78 ms | 3.93 ms | 1.039 |
+| rust-json | 4.05 ms | 3.91 ms | 0.965 |
+| rust-protobuf | 6.94 ms | 6.39 ms | 0.921 |
 
 Since the 11-09 measurement `PLIRON_BJALIAS` (default on, afcc31b) removed ~600 dead
 `b .+4` fallthrough branches per binary — eager aliasing of bare-jump
