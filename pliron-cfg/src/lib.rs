@@ -790,6 +790,13 @@ pub const DEFAULT_VALUES: &[(&str, &str)] = &[
     // the rest within noise, no codegen-time delta; needed the loopidiom
     // forwarder-param escape fix for the wasm leg). `=0` off.
     ("PLIRON_XCGU_INLINED", "1"),
+    // 2026-11-27: admit whole copy closures four items past the CGU cap.
+    // The cap's admission order otherwise filled blind-sig's hottest CGU
+    // exactly before one-item `mac_digit`, leaving copied multiply loops
+    // with an import. Exact callgrind: blind-sig x1.017 -> x1.016
+    // (+0.54M -> +0.49M); rust-json x1.012, regex x0.990 and html x1.072
+    // unchanged. `=0` restores the hard cap.
+    ("PLIRON_XCGU_SLACK", "4"),
     // 2026-11-18: leaf callees (calls only cold / intrinsics / other small
     // leaves) copyable up to 100 MIR stmts, with LASTCALL=20 so a single-
     // user dep over that size stays Internal and is not promoted (the

@@ -1099,6 +1099,14 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     let tiny_max = crate::env_get("PLIRON_XCGU_TINY")
         .and_then(|s| s.parse().ok())
         .unwrap_or(8usize);
+    // `PLIRON_XCGU_SLACK=<n>` (opt-in, `0` off): let whole closures overrun
+    // the cap by at most this many items. The cap's order is arbitrary, and
+    // blind-sig's hottest CGU filled it exactly before the one-item copy of
+    // `mac_digit` that the copied `long` multiply loop needed, leaving that
+    // loop with an import where every other CGU had the body.
+    let slack = crate::env_get("PLIRON_XCGU_SLACK")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0usize);
     let mut charged = 0usize;
     for &c in &candidates {
         let m = MonoItem::Fn(c);
@@ -1150,7 +1158,7 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                 MonoItem::Fn(inst) => tcx.size_estimate(*inst) <= tiny_max,
                 _ => false,
             });
-        if coverable && (tiny || charged + cost <= cap) {
+        if coverable && (tiny || charged + cost <= cap.saturating_add(slack)) {
             if let Some(w) = &why
                 && with_no_trimmed_paths!(c.to_string()).contains(*w)
                 && pliron_cfg::tracing_on()
