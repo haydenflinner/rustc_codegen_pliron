@@ -1207,6 +1207,40 @@ cross-check (the LLVM side must be built from the same dsa HEAD:
    everywhere — left opt-in. `set_digit`/`div_rem_digit` at
    straight-line sites, `mac3`, `mul3` and the monty.rs header
    reloads are the remaining gap.
+   2026-11-28 overnight: montgomery's +1.06M SmallVec residual
+   closed to -64k (AHEAD of LLVM) in three steps: licm store arms
+   intersect their root's dereferenceable extent (`inbounds`-analog
+   clamp; `861e4ba7`), then `PLIRON_LICM_INNERPRESS=2`'s pressure
+   gate was found to charge hoists whose results are not live across
+   any inner loop — and finally deleted outright, since every `=2`
+   candidate is a `notrap` load whose worst case is today's cost
+   (`3c30c95d`, `15d1f025`). `lower.rs`'s `dyn_index` records NUW
+   facts for `gep nuw` operands and `lcse_facts` folds
+   `(x*2^k)>>k`/`(x*C)/C` -> x under nuw or a proven vmax bound.
+   Bounds-check dedup in montgomery is genuinely blocked: the len
+   operand is a block-param phi merging loads from two dispatch
+   arms, unfixable without load PRE at joins (already exists —
+   blocked by clobber proofs) or edge mutual exclusion (LLVM does
+   not have it either; the one real montgomery case is `len` at
+   byte 40 of the 48-byte union object, overlapping the inline arm
+   in principle). blind-sig stands at ~x1.017, montgomery itself
+   ahead. html x1.072 -> x1.068: `PLIRON_PADJUMP=2` (a jump over
+   2+-instruction alignment pads; count-safe by construction,
+   -164k html, -126k rust-json) and `PLIRON_SWITCH_PRETEST`
+   (br_table padded with copies of the default target, indexed by
+   the raw value — no subtraction, bytes above the highest case
+   escape in `cmp; b.hs`; -166k html, regex flat, blind-sig +13k).
+   `PLIRON_VECSLOTFWD` forwards vector stack-slot round-trips
+   (serde_json NEON memchr splats), rust-json -39k. Correctness:
+   an 11-hour rafuzz campaign (~13.9M seeds, 422 ra2 + 140 clif
+   legs) found one real bug — MINCLUS cluster spans double-covered
+   spill ranges, overlapping pieces of one vreg in a single spill
+   bundle (baf2dbd3: cluster spans now cut out of coverage at
+   creation). Negative results: the br_table double byte-load fix
+   was shape-correct but worth only -17k html at +120k regex
+   collateral and 617ms compile time — reverted; `PLIRON_XCGU_SLACK=4` lets copy
+   closures overrun the CGU cap by 4 items (blind-sig +0.54M ->
+   +0.49M, `b3e49c42`).
    (1.189x LLVM's executed instructions, then pulldown-cmark 1.156x,
    rust-json 1.130x, compression 1.113x, regex 1.100x, protobuf 1.075x,
    blake3 1.052x; exact callgrind counts 2026-11-17 after item 9 and
