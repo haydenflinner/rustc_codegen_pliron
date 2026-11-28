@@ -651,6 +651,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // -60k exact (x1.039 -> x1.038); regex +289 / rust-json +397, inside
     // the noise floor. `PLIRON_DEMSHIFT=0` off.
     "PLIRON_DEMSHIFT",
+    // 2026-11-28: edgesel equality-edge inverse evaluation folds the
+    // select-hidden copy-count cancellation ((x+c)-x) that miniz's
+    // slice::range validation leaves behind — rust-compression -189k
+    // exact (x1.038 -> x1.033); regex +21 / json +15 / html -40, corpus
+    // 7322 functions 0 mismatch. `PLIRON_EDGESEL_REL=0` off.
+    "PLIRON_EDGESEL_REL",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
