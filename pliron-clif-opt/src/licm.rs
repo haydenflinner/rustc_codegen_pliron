@@ -3166,6 +3166,194 @@ mod tests {
         );
     }
 
+    /// Montgomery's merged store address: the heap arm's root is the
+    /// load result `heap = load(v0+8)` — a pointer loaded out of `v0`'s
+    /// own object. Under shelter (no `v0` provenance planted in memory
+    /// the loop observes) that arm is provably not `v0`-based, so the
+    /// store can write memory reachable from `*v0` but never the
+    /// `v0`-rooted header fields themselves: `load v0+0` / `load v0+40`
+    /// hoist. When a `v0`-derived value IS planted in memory ahead of
+    /// the loop, the loaded heap pointer could be a replanted
+    /// `v0`-derived copy — every arm is suspect and the loads stay.
+    /// (The escape must be a plain memory store: `provescapes` treats
+    /// operand-0 stores as the planting site.)
+    #[test]
+    fn merged_store_loaded_ptr_arm_clears_when_sheltered() {
+        let build = |plant: bool| {
+            let mut sig = Signature::new(CallConv::Fast);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+            let b0 = func.dfg.make_block();
+            let h = func.dfg.make_block();
+            let out = func.dfg.make_block();
+            for b in [b0, h, out] {
+                func.layout.append_block(b);
+            }
+            let v0 = func.dfg.append_block_param(b0, types::I64);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let c0 = cur.ins().iconst(types::I8, 0);
+            let zero = cur.ins().iconst(types::I64, 0);
+            let inline = cur.ins().iadd_imm(v0, 8);
+            if plant {
+                // A `v0`-derived pointer externalizes into memory the
+                // heap load can observe: shelter is gone, and the heap
+                // pointer below can genuinely be the replanted copy.
+                cur.ins().store(MemFlagsData::new().with_notrap(), inline, v0, 8);
+            }
+            let heap = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), v0, 8);
+            let sel = cur.ins().select(c0, inline, heap);
+            cur.ins().jump(h, &[sel.into(), zero.into()]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let vp = cur.func.dfg.append_block_param(h, types::I64);
+            let vi = cur.func.dfg.append_block_param(h, types::I64);
+            let cap = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), v0, 0);
+            let len = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), v0, 40);
+            let idx = cur.ins().band_imm(vi, 3);
+            let idx8 = cur.ins().ishl_imm(idx, 3);
+            let addr = cur.ins().iadd(vp, idx8);
+            let seven = cur.ins().iconst(types::I64, 7);
+            cur.ins().store(MemFlagsData::new().with_notrap(), seven, addr, 0);
+            let s = cur.ins().iadd(cap, len);
+            let next = cur.ins().iadd(vi, s);
+            let cnd = cur.ins().icmp_imm(IntCC::UnsignedLessThan, next, 64);
+            cur.ins().brif(cnd, h, &[vp.into(), next.into()], out, &[]);
+
+            let mut cur = FuncCursor::new(&mut func).at_bottom(out);
+            let z = cur.ins().iconst(types::I64, 0);
+            cur.ins().return_(&[z]);
+
+            let mut noalias = FxHashSet::default();
+            noalias.insert(v0);
+            let mut deref = FxHashMap::default();
+            deref.insert(v0, (48, true));
+            run(
+                &mut func,
+                &mut crate::pipeline::Analysis::default(),
+                &noalias,
+                &FxHashSet::default(),
+                &deref,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &pliron::cols::ColMap::default(),
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                true,
+                false,
+            );
+            let n = func
+                .layout
+                .block_insts(h)
+                .filter(|&i| matches!(func.dfg.insts[i], InstructionData::Load { .. }))
+                .count();
+            let flags =
+                cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+            if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+                panic!("licm produced invalid IR: {e}\n{}", func.display());
+            }
+            n
+        };
+        assert_eq!(
+            build(false),
+            0,
+            "sheltered: the loaded-ptr arm is provably not v0-based, header loads hoist"
+        );
+        assert_eq!(
+            build(true),
+            2,
+            "a planted v0-derived pointer breaks shelter: the heap arm is suspect again"
+        );
+    }
+
+    /// The same merged store, but the heap alternative of the merge is a
+    /// second entry param, not a load result: a caller can hand in a
+    /// `v0`-based pointer (`&mut s.field` beside `&mut s`) with no
+    /// in-function derivation `taint` could track, so even under shelter
+    /// the param arm is suspect and the header loads stay.
+    #[test]
+    fn merged_store_entry_param_arm_stays() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let out = func.dfg.make_block();
+        for b in [b0, h, out] {
+            func.layout.append_block(b);
+        }
+        let v0 = func.dfg.append_block_param(b0, types::I64);
+        let w = func.dfg.append_block_param(b0, types::I64);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let c0 = cur.ins().iconst(types::I8, 0);
+        let zero = cur.ins().iconst(types::I64, 0);
+        let inline = cur.ins().iadd_imm(v0, 8);
+        let sel = cur.ins().select(c0, inline, w);
+        cur.ins().jump(h, &[sel.into(), zero.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let vp = cur.func.dfg.append_block_param(h, types::I64);
+        let vi = cur.func.dfg.append_block_param(h, types::I64);
+        let cap = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), v0, 0);
+        let len = cur.ins().load(types::I64, MemFlagsData::new().with_notrap(), v0, 40);
+        let idx = cur.ins().band_imm(vi, 3);
+        let idx8 = cur.ins().ishl_imm(idx, 3);
+        let addr = cur.ins().iadd(vp, idx8);
+        let seven = cur.ins().iconst(types::I64, 7);
+        cur.ins().store(MemFlagsData::new().with_notrap(), seven, addr, 0);
+        let s = cur.ins().iadd(cap, len);
+        let next = cur.ins().iadd(vi, s);
+        let cnd = cur.ins().icmp_imm(IntCC::UnsignedLessThan, next, 64);
+        cur.ins().brif(cnd, h, &[vp.into(), next.into()], out, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(out);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        let mut noalias = FxHashSet::default();
+        noalias.insert(v0);
+        let mut deref = FxHashMap::default();
+        deref.insert(v0, (48, true));
+        run(
+            &mut func,
+            &mut crate::pipeline::Analysis::default(),
+            &noalias,
+            &FxHashSet::default(),
+            &deref,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            &pliron::cols::ColMap::default(),
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+            true,
+            false,
+        );
+        let loads_in_loop = func
+            .layout
+            .block_insts(h)
+            .filter(|&i| matches!(func.dfg.insts[i], InstructionData::Load { .. }))
+            .count();
+        assert_eq!(
+            loads_in_loop, 2,
+            "an entry-param arm stays suspect even under shelter:\n{}",
+            func.display()
+        );
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("licm produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
     /// Under `PLIRON_LICM_INNERPRESS=2` a `notrap` load hoists free
     /// whether or not its result lives across an inner loop: regalloc2
     /// cannot rematerialize a load, so the spill it risks is a reload
