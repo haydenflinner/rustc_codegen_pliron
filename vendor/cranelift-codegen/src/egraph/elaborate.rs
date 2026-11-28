@@ -81,6 +81,53 @@ pub(crate) fn elab_keep_on() -> bool {
     *ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP").as_deref() != Ok("0"))
 }
 
+/// PLIRON (`PLIRON_ELABKEEP_C2`, opt-in): an `iconst` that needs two or
+/// more instructions to materialize keeps the hoist the pipeline gave it
+/// even when its uses sit inside the loop. `ELABKEEP`'s operand rule
+/// never holds for a constant (no operands), and the wide-const rule
+/// only covers three/four-instruction constants whose uses are all
+/// outside the loop, so a two-instruction bit-test mask licm hoisted was
+/// rematerialized per iteration: lol_html's lexer paid `movz`+`movk` per
+/// byte dispatched. A one-instruction constant is a genuinely free remat
+/// and keeps sinking; two or more instructions cost more per iteration
+/// than the spill/reload a kept register would ever pay.
+pub(crate) fn elab_keep_c2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP_C2").as_deref() == Ok("1"))
+}
+
+/// Materialization cost of an `iconst` in aarch64 instructions (0 for a
+/// non-constant): one for the movz/movn single-slice forms and logical
+/// immediates, otherwise the movz/movn + movk chain length. Mirrors the
+/// `one_inst` rule of `const_sink` in context.rs.
+pub(crate) fn const_cost(func: &Function, inst: Inst) -> usize {
+    let crate::ir::InstructionData::UnaryImm { opcode: crate::ir::Opcode::Iconst, imm } = func.dfg.insts[inst] else {
+        return 0;
+    };
+    let ty = func.dfg.ctrl_typevar(inst);
+    let bits = ty.bits();
+    if bits > 64 {
+        return 4;
+    }
+    let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let v = imm.bits() as u64 & m;
+    #[cfg(feature = "arm64")]
+    let bitmask = crate::isa::aarch64::inst::ImmLogic::maybe_from_u64(
+        v,
+        if bits > 32 { crate::ir::types::I64 } else { crate::ir::types::I32 },
+    )
+    .is_some();
+    #[cfg(not(feature = "arm64"))]
+    let bitmask = false;
+    let chunks = |x: u64| (0..4).filter(|i| (x >> (16 * i)) & 0xffff != 0).count();
+    let n = chunks(v).min(chunks(!v & m));
+    if n <= 1 || bitmask {
+        1
+    } else {
+        n
+    }
+}
+
 /// PLIRON (`PLIRON_ELABKEEP`): the blocks that use a value in the
 /// function the egraph pass was given, up to three.
 #[derive(Clone, Copy, Default)]
@@ -417,6 +464,7 @@ impl<'a> Elaborator<'a> {
         insert_block: Block,
         args: &[ElaboratedValue],
         wide: Option<Value>,
+        keep_const: bool,
     ) -> Option<LoopStackEntry> {
         let (orig, ops) = orig_block.get(&inst)?;
         let mut best = None;
@@ -425,6 +473,14 @@ impl<'a> Elaborator<'a> {
             if loop_analysis.is_in_loop(*orig, l)
                 || args.iter().any(|a| loop_analysis.is_in_loop(a.in_block, l))
                 || match wide {
+                    _ if keep_const => {
+                        // PLIRON_ELABKEEP_C2: a constant whose
+                        // materialization is two or more instructions is
+                        // not a free remat — uses inside the loop do not
+                        // sink it (only the def/arg placement rules above
+                        // can).
+                        false
+                    }
                     // A wide constant keeps its hoist only where the
                     // incoming function used it outside the loop alone
                     // (its users were hoisted with it).
@@ -778,9 +834,22 @@ impl<'a> Elaborator<'a> {
             // PLIRON_REMATCALL=1: both loop rules give way when the use's
             // loop contains a call — an extra cheap op per iteration next
             // to a call beats the value's trip across it.
-            let callful = loop_analysis
-                .innermost_loop(insert_block)
-                .is_some_and(|l| call_loops.contains(&l));
+            //
+            // PLIRON_ELABKEEP_C2: the exception prices a one-instruction
+            // remat against a one-instruction reload. A constant needing
+            // two or more instructions (a bit-test mask's `movz`+`movk`)
+            // costs more per iteration rematerialized than reloaded, so
+            // the loop rules apply to it even in a calling loop.
+            let expensive_const = elab_keep_c2_on()
+                && func
+                    .dfg
+                    .value_def(arg.value)
+                    .inst()
+                    .is_some_and(|d| const_cost(func, d) >= 2);
+            let callful = !expensive_const
+                && loop_analysis
+                    .innermost_loop(insert_block)
+                    .is_some_and(|l| call_loops.contains(&l));
             if !callful
                 && loop_analysis.loop_level(insert_block).level()
                     > loop_analysis.loop_level(arg.in_block).level()
@@ -1054,6 +1123,7 @@ impl<'a> Elaborator<'a> {
                         insert_block,
                         arg_values,
                         wide_const(self.func, inst).then(|| self.func.dfg.first_result(inst)),
+                        elab_keep_c2_on() && const_cost(self.func, inst) >= 2,
                     ) {
                         Some(e) => {
                             self.stats.elaborate_licm_hoist += 1;

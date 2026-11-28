@@ -1555,6 +1555,53 @@ t_immsynth() {
   fi
 }
 
+# r[verify clif.lower.elabkeepc2]
+t_elabkeepc2() {
+  # PLIRON_ELABKEEP_C2: a constant needing two+ aarch64 instructions keeps
+  # its licm hoist instead of being rematerialized inside the loop. Pin:
+  # the masklex mask (movz+movk) must sit outside the backward-branch span
+  # of the byte loop. Runs on aarch64 only; correctness everywhere.
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/elabkeepc2/main.rs -o $out/elabkeepc2$exe &&
+      $out/elabkeepc2$exe > /dev/null || return 1
+  if [[ -x "$llvmod" && "$(uname -m)" == arm64 ]]; then
+    PLIRON_ELABKEEP_C2=1 rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/elabkeepc2/main.rs -o $out/ekc2.o || return 1
+    "$llvmod" -d --no-show-raw-insn $out/ekc2.o | awk '/masklex.*>:$/{p=1;next} /^$/{p=0} p' > $out/ekc2.dis
+    python3 - "$out/ekc2.dis" <<'PYEOF' || return 1
+import sys, re
+lines = open(sys.argv[1]).read().splitlines()
+insts = []
+for l in lines:
+    m = re.match(r"^\s*([0-9a-f]+):\s+(\S+)", l)
+    if m:
+        insts.append((int(m.group(1), 16), m.group(2), l))
+if not insts:
+    print("elabkeepc2: no instructions parsed", file=sys.stderr)
+    sys.exit(1)
+# backward branches define loop spans; the branch target is the LAST hex
+# in the disassembly line (tbz/cbz carry bit numbers as earlier hexes).
+spans = []
+for a, op, l in insts:
+    if op.startswith("b") or op.startswith("tb") or op.startswith("cb"):
+        # immediate bit-numbers are `#0xN`; the branch target is the first
+        # bare `0xN` (the trailing `<sym+0xN>` relocation print is ignored).
+        hexes = re.findall(r"(?<!#)0x([0-9a-f]+)", l.split("<")[0])
+        if hexes:
+            t = int(hexes[0], 16)
+            if t < a:
+                spans.append((t, a))
+inside = lambda a: any(lo <= a <= hi for lo, hi in spans)
+if not spans:
+    print("elabkeepc2: no loop found in masklex", file=sys.stderr); sys.exit(1)
+# movk is the discriminator: single-instruction constants (free remats)
+# never need one; only a two-plus-instruction constant like the mask does.
+movks = [a for a, op, _ in insts if op.startswith("movk")]
+bad = [hex(a) for a in movks if inside(a)]
+if bad:
+    print(f"elabkeepc2: mask materialized inside loop at {bad} (spans {[hex(lo)+'-'+hex(hi) for lo,hi in spans]})", file=sys.stderr); sys.exit(1)
+PYEOF
+  fi
+}
+
 # r[verify iropt.constload.copy]
 t_constcopy() {
   # PLIRON_CONSTCOPY (default on) replaces an alloca copied from a constant global with
@@ -1879,6 +1926,7 @@ want willret && t_willret
 want constcopy && t_constcopy
 want shift128k && t_shift128k
 want immsynth && t_immsynth
+want elabkeepc2 && t_elabkeepc2
 want simdshift && t_simdshift
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR

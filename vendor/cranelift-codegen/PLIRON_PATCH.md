@@ -2835,3 +2835,23 @@ blinding factor makes montgomery's data-dependent paths vary +-25-90k
 between two runs of one binary). Regression test: `test.sh` stanza
 `immsynth` — 472 generated constants bit-exact at runtime on both knob
 settings, plus disassembly pinning of the three serde forms.
+
+## Cost-2 constants keep their hoist (`PLIRON_ELABKEEP_C2`, opt-in `=1`)
+
+`src/egraph/elaborate.rs` (`elab_keep_c2_on`, `const_cost`, a `keep_const`
+argument to `keep_out_of_loop`; `maybe_remat_arg` prices the REMATCALL
+exception), `src/egraph/mod.rs` (`orig_block` records such a constant):
+an `iconst` needing two or more instructions on aarch64 (a bit-test
+mask's `movz`+`movk`, neither a logical immediate nor a single-chunk
+constant) keeps the position the pipeline gave it. `ELABKEEP`'s rule
+breaks on a constant's empty operand list at the innermost loop, so
+elaboration re-materialized switchadapt's 64-bit bit-test mask inside
+lol_html's `tag_name_state` byte loop — two extra instructions per byte,
+erasing the switch transform's gain. `ELABKEEP_WIDE` (three-plus
+instructions) does not cover it and deliberately narrows to constants
+whose uses are all outside the loop; the use here is in the loop, which
+is exactly what licm hoisted the constant out of. One-instruction
+constants stay free remats, so the exception in `maybe_remat_arg` for
+loops containing a call (the clone costs one instruction, a reload of
+the spilled vreg costs one too) now also compares materialization cost
+against the one-instruction reload.

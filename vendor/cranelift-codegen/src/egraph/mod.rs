@@ -1059,7 +1059,12 @@ impl<'a> EgraphPass<'a> {
                     // PLIRON: remember where the pipeline had it.
                     // `PLIRON_ELABKEEP_WIDE`: a wide constant has no
                     // operands, but its hoist is kept too.
-                    if !kept_ops.is_empty() || elaborate::wide_const(ctx.func, inst) {
+                    // `PLIRON_ELABKEEP_C2`: so is a two-plus-instruction
+                    // constant's (a bit-test mask licm hoisted).
+                    if !kept_ops.is_empty()
+                        || elaborate::wide_const(ctx.func, inst)
+                        || (elaborate::elab_keep_c2_on() && elaborate::const_cost(ctx.func, inst) >= 2)
+                    {
                         self.orig_block.insert(inst, (block, kept_ops));
                     }
                     // Insert into GVN map and optimize any new nodes
