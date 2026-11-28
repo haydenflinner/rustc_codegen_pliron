@@ -1520,6 +1520,41 @@ t_shift128k() {
   fi
 }
 
+# r[verify clif.lower.immsynth]
+t_immsynth() {
+  # PLIRON_IMMSYNTH (default on): logical-immediate-aware constant synthesis.
+  # 472 generated constants (byte replications, deviations, masks, runs,
+  # random u64s) must materialize bit-exactly — the golden file is
+  # compiler-independent — and the PLIRON_IMMSYNTH=0 movz/movn/movk-only path
+  # must agree. On aarch64 the disassembly pins LLVM's shapes: each of the
+  # serde_json SWAR constants in at most two instructions, a random u64 in
+  # the four-instruction slice form.
+  rustc $BE --edition 2021 -O -C codegen-units=1 tests/immsynth/main.rs -o $out/immsynth$exe &&
+      $out/immsynth$exe > $out/immsynth.out &&
+      diff -q tests/immsynth/golden.txt $out/immsynth.out >/dev/null &&
+  PLIRON_IMMSYNTH=0 rustc $BE --edition 2021 -O -C codegen-units=1 tests/immsynth/main.rs -o $out/immsynth0$exe &&
+      $out/immsynth0$exe > $out/immsynth0.out &&
+      diff -q tests/immsynth/golden.txt $out/immsynth0.out >/dev/null || return 1
+  if [[ -x "$llvmod" && "$(uname -m)" == arm64 ]]; then
+    rustc $BE --emit obj --edition 2021 -O -C codegen-units=1 tests/immsynth/pin.rs -o $out/immsynthpin.o
+    "$llvmod" -d --no-show-raw-insn $out/immsynthpin.o > $out/immsynthpin.dis
+    local fn n
+    for fn in serde_backslash serde_himask serde_lomask; do
+      awk "/${fn}.*>:\$/{p=1;next} /^\$/{p=0} p" $out/immsynthpin.dis > $out/immsynthpin.$fn
+      n=$(grep -cE "^\s*[0-9a-f]+:" $out/immsynthpin.$fn)
+      # 2 materialization instructions + ret = 3 lines.
+      [[ -n "$n" && "$n" -le 3 ]] || { echo "immsynth: $fn materializes in more than 2 instructions ($n)" >&2; return 1; }
+    done
+    awk '/random_u64.*>:$/{p=1;next} /^$/{p=0} p' $out/immsynthpin.dis > $out/immsynthpin.random
+    n=$(grep -cE "^\s*[0-9a-f]+:" $out/immsynthpin.random)
+    # 4 slice instructions + ret = 5 lines; the invariant is it never gets LONGER.
+    [[ -n "$n" && "$n" -le 5 ]] || { echo "immsynth: random u64 regressed past 4 instructions ($n)" >&2; return 1; }
+    awk '/exact_mask.*>:$/{p=1;next} /^$/{p=0} p' $out/immsynthpin.dis > $out/immsynthpin.mask
+    n=$(grep -cE "^\s*[0-9a-f]+:" $out/immsynthpin.mask)
+    [[ -n "$n" && "$n" -le 2 ]] || { echo "immsynth: exact logical immediate not a single orr ($n)" >&2; return 1; }
+  fi
+}
+
 # r[verify iropt.constload.copy]
 t_constcopy() {
   # PLIRON_CONSTCOPY (default on) replaces an alloca copied from a constant global with
@@ -1843,6 +1878,7 @@ want retattr && t_retattr
 want willret && t_willret
 want constcopy && t_constcopy
 want shift128k && t_shift128k
+want immsynth && t_immsynth
 want simdshift && t_simdshift
 want invokeblk && t_invokeblk
 # resumehoist looks for inlined `_Unwind_Resume` invokes; on Windows MIR

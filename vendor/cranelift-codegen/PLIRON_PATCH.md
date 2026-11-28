@@ -2796,3 +2796,42 @@ build, included in the net). Collateral exact totals for `=3` vs `=0`:
 regex 45,522,742 -> 45,473,341 (-49,401), blind-sig 32,054,866 ->
 32,006,847 (-48,019). A native `dtoa-short` cargo smoke test covers the
 critical-edge form that initially exposed the edge-block flush bug.
+
+## `PLIRON_IMMSYNTH` (default on since 2026-11-28; `=0` off): logical-immediate constant synthesis
+
+`src/isa/aarch64/lower/isle.rs` (`load_constant_full`, module-level
+`synth_plan` and the `*_plan` candidate builders). Upstream materialized
+integer constants only as movz/movn/movk 16-bit slices. The value (or a
+nearby reconstruction of it) is often a valid aarch64 bitmask immediate,
+and then `orr`/`and`/`eor` immediate forms materialize it in fewer
+instructions. This is a port of the candidate set of LLVM's
+`AArch64ExpandImm.cpp`, driven strictly by instruction count — a
+candidate replaces the slice sequence only when strictly shorter, so the
+transform can never lengthen a materialization:
+
+- the exact logical immediate (already mostly caught by the ISLE rules
+  for zero-extended values; this also covers sign-extended narrow ones);
+- `orr xzr` base + one `movk` patch, with the patched chunk reconstructed
+  three ways (zeroed, all-ones, copied from the opposite half — the last
+  is what covers replicated-pattern constants with one deviating chunk,
+  serde_json's `0xfefefefefefefeff`);
+- `orr` of two logical immediates (repeated bytes with two runs per
+  element, serde_json's `0x5c5c5c5c5c5c5c5c = 0x1c1c.. | 0x4444..`);
+- `orr`+`and` (De Morgan on the inverse) and `orr`+`eor` decompositions;
+- a replicated 16-bit chunk + `movk` patches;
+- a contiguous run of ones interrupted by one or two chunks;
+- identical 32-bit halves: movz/movk of the low half, then
+  `orr xd, xd, xd, lsl #32`.
+
+Every plan is checked bit-exactly against the target value by a
+reference evaluator in debug builds (`debug_assert` in
+`load_constant_full`). Exact counts (same-dylib A/B against
+`PLIRON_IMMSYNTH=0`, aarch64-linux callgrind): rust-json -331k
+instructions (x1.012 -> x1.004; the three SWAR constants of
+`skip_to_escape` now materialize in the same two instructions LLVM
+uses), rust-html-rewriter -66k, regex and blind-sig neutral
+(blind-sig's exact counts are not deterministic at all: the random RSA
+blinding factor makes montgomery's data-dependent paths vary +-25-90k
+between two runs of one binary). Regression test: `test.sh` stanza
+`immsynth` — 472 generated constants bit-exact at runtime on both knob
+settings, plus disassembly pinning of the three serde forms.

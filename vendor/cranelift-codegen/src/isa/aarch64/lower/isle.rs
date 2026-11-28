@@ -658,6 +658,584 @@ fn btsub_imm_inner(op: u64, ty: Type, j: u64, n: u64) -> Option<u64> {
     Some(s)
 }
 
+// PLIRON (`PLIRON_IMMSYNTH`, default on; `=0` off): logical-immediate-aware
+// constant synthesis. The upstream `load_constant_full` models constants
+// only as movz/movn/movk 16-bit slices; LLVM additionally uses the bitmask
+// ("logical") immediates of `orr`/`and`/`eor` — both as exact one-instruction
+// forms and as bases or patches combined with `movk` — plus a shifted-orr
+// replication trick for constants whose two 32-bit halves are identical.
+// This is a port of the candidate set of LLVM's AArch64ExpandImm.cpp, driven
+// strictly by instruction count: a candidate replaces the movz/movn/movk
+// sequence only when it is strictly shorter, so the transform can never
+// lengthen a materialization.
+fn pliron_immsynth_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_IMMSYNTH").as_deref() != Ok("0"))
+}
+
+/// One instruction of a constant-materialization plan. `slice` is the 16-bit
+/// slice index (0 = bits 15..0); `bits` is the slice value as it should appear
+/// in the final constant for `MovZ`/`MovK` (the inversion needed by the `movn`
+/// encoding happens at emission, as in the original code).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SynthStep {
+    MovZ { bits: u16, slice: u8, size: OperandSize },
+    MovN { bits: u16, slice: u8, size: OperandSize },
+    MovK { bits: u16, slice: u8, size: OperandSize },
+    /// `orr` with a logical immediate; `orr rd, xzr, #imm` as the first step
+    /// of a plan, `orr rd, rd, #imm` afterwards.
+    OrrImm { imml: ImmLogic, size: OperandSize },
+    /// `and` with a logical immediate; only valid as a non-first step.
+    AndImm { imml: ImmLogic, size: OperandSize },
+    /// `eor` with a logical immediate; only valid as a non-first step.
+    EorImm { imml: ImmLogic, size: OperandSize },
+    /// `orr xd, xd, xd, lsl #32`: replicate the low 32 bits into the high
+    /// half. Only valid as a non-first step of a 64-bit plan.
+    OrrSelfLsl32,
+}
+
+/// The 16-bit slice of `value` at slice index `shift`.
+fn synth_get(value: u64, shift: u8) -> u16 {
+    (value >> (shift * 16)) as u16
+}
+
+/// The movz/movn + movk plan: the same sequence the upstream code emitted,
+/// expressed as steps. `value` must already be normalized to fit in `size`.
+fn movwide_plan(value: u64, size: OperandSize) -> Vec<SynthStep> {
+    fn replace(mut old: u64, new: u16, shift: u8) -> u64 {
+        let offset = shift * 16;
+        old &= !(0xffff << offset);
+        old |= u64::from(new) << offset;
+        old
+    }
+
+    let (mut running_value, op, first) =
+        [(MoveWideOp::MovZ, 0), (MoveWideOp::MovN, size.max_value())]
+            .into_iter()
+            .map(|(op, base)| {
+                let first = (0..(size.bits() / 16))
+                    .find(|&i| synth_get(base ^ value, i) != 0)
+                    .unwrap_or(0);
+                (replace(base, synth_get(value, first), first), op, first)
+            })
+            .min_by_key(|(base, ..)| {
+                (0..4)
+                    .filter(|&i| synth_get(base ^ value, i) != 0)
+                    .count()
+            })
+            .unwrap();
+
+    let mut steps = Vec::with_capacity(4);
+    match op {
+        MoveWideOp::MovZ => steps.push(SynthStep::MovZ {
+            bits: synth_get(value, first),
+            slice: first,
+            size,
+        }),
+        MoveWideOp::MovN => steps.push(SynthStep::MovN {
+            bits: synth_get(value, first),
+            slice: first,
+            size,
+        }),
+    }
+
+    for shift in (first + 1)..(size.bits() / 16) {
+        let bits = synth_get(value, shift);
+        if bits != synth_get(running_value, shift) {
+            steps.push(SynthStep::MovK {
+                bits,
+                slice: shift,
+                size,
+            });
+            running_value = replace(running_value, bits, shift);
+        }
+    }
+    let _ = running_value;
+    steps
+}
+
+/// A single `orr rd, xzr, #imm` when `value` itself is a logical immediate.
+fn exact_logic_plan(value: u64, size: OperandSize) -> Option<Vec<SynthStep>> {
+    let imml = ImmLogic::maybe_from_u64(value, size.to_ty())?;
+    Some(alloc::vec![SynthStep::OrrImm { imml, size }])
+}
+
+/// `orr rd, xzr, #imm` plus a single `movk` patching one 16-bit slice. The
+/// logical-immediate base only has to match `value` outside the patched
+/// slice; following LLVM, three reconstructions of the missing slice are
+/// tried per position: zeroed, all-ones, and copied from the opposite 32-bit
+/// half (which is what covers replicated-byte-pattern constants with one
+/// deviating slice, e.g. SWAR masks like 0xfefefefefefefeff).
+fn orr_movk_plan(value: u64) -> Option<Vec<SynthStep>> {
+    for slice in 0..4u8 {
+        let mask = 0xffffu64 << (slice * 16);
+        let zero_chunk = value & !mask;
+        let one_chunk = value | mask;
+        let rot = value.rotate_left(32);
+        let replicate_chunk = zero_chunk | (rot & mask);
+        for cand in [zero_chunk, one_chunk, replicate_chunk] {
+            if let Some(imml) = ImmLogic::maybe_from_u64(cand, I64) {
+                return Some(alloc::vec![
+                    SynthStep::OrrImm {
+                        imml,
+                        size: OperandSize::Size64,
+                    },
+                    SynthStep::MovK {
+                        bits: synth_get(value, slice),
+                        slice,
+                        size: OperandSize::Size64,
+                    },
+                ]);
+            }
+        }
+    }
+    None
+}
+
+// --- Helpers for the decomposition of a constant into the orr/and/eor of a
+// --- pair of logical immediates, ported from LLVM's AArch64ExpandImm.cpp.
+
+fn run_of_ones_starting_at(v: u64, pos: u32) -> u64 {
+    let num = (v >> pos).trailing_ones();
+    let unshifted = if num == 64 { u64::MAX } else { (1u64 << num) - 1 };
+    unshifted << pos
+}
+
+fn maximally_replicate_sub_imm(v: u64, subset: u64) -> u64 {
+    let mut result = subset;
+    for i in 0..6u32 {
+        let rotation = 1u32 << (6 - i);
+        let closure = result | result.rotate_left(rotation);
+        if closure != (closure & v) {
+            break;
+        }
+        result = closure;
+    }
+    result
+}
+
+/// Find the logical immediate covering the most bits of `remaining`, allowing
+/// extra bits only where they are also set in `original`.
+fn maximal_logical_imm_within(remaining: u64, original: u64) -> u64 {
+    let pos = remaining.trailing_zeros();
+    let first_run = run_of_ones_starting_at(original, pos);
+    maximally_replicate_sub_imm(original, first_run)
+}
+
+/// Decompose `uimm` into `(a, b)` with `uimm == a | b` where both are logical
+/// immediates-by-construction (encodability is checked by the caller).
+fn decompose_into_orr_of_logical_immediates(uimm: u64) -> Option<(u64, u64)> {
+    if uimm == 0 || uimm == u64::MAX {
+        return None;
+    }
+    // Avoid a run of ones split around the rotation boundary.
+    let initial_trailing_ones = uimm.trailing_ones();
+    let rotated = uimm.rotate_right(initial_trailing_ones);
+
+    let m1 = maximal_logical_imm_within(rotated, rotated);
+    let remaining = rotated & !m1;
+    if remaining == 0 {
+        // `rotated` is a single repeating run — already covered by the exact
+        // logical-immediate case.
+        return None;
+    }
+    let m2 = maximal_logical_imm_within(remaining, rotated);
+    if remaining & !m2 != 0 {
+        return None;
+    }
+    Some((
+        m1.rotate_left(initial_trailing_ones),
+        m2.rotate_left(initial_trailing_ones),
+    ))
+}
+
+/// `orr` of two logical immediates (e.g. 0x5c5c5c5c5c5c5c5c, a repeated byte
+/// with two runs of ones per element, = 0x1c1c.. | 0x4444..).
+fn orr_orr_plan(value: u64) -> Option<Vec<SynthStep>> {
+    let (i1, i2) = decompose_into_orr_of_logical_immediates(value)?;
+    let l1 = ImmLogic::maybe_from_u64(i1, I64)?;
+    let l2 = ImmLogic::maybe_from_u64(i2, I64)?;
+    Some(alloc::vec![
+        SynthStep::OrrImm {
+            imml: l1,
+            size: OperandSize::Size64,
+        },
+        SynthStep::OrrImm {
+            imml: l2,
+            size: OperandSize::Size64,
+        },
+    ])
+}
+
+/// `orr` then `and` of logical immediates, via De Morgan on the inverse.
+fn orr_and_plan(value: u64) -> Option<Vec<SynthStep>> {
+    let (i1, i2) = decompose_into_orr_of_logical_immediates(!value)?;
+    let l1 = ImmLogic::maybe_from_u64(!i1, I64)?;
+    let l2 = ImmLogic::maybe_from_u64(!i2, I64)?;
+    Some(alloc::vec![
+        SynthStep::OrrImm {
+            imml: l1,
+            size: OperandSize::Size64,
+        },
+        SynthStep::AndImm {
+            imml: l2,
+            size: OperandSize::Size64,
+        },
+    ])
+}
+
+/// `orr` then `eor` of logical immediates; covers the remaining repeated
+/// byte/halfword patterns and some irregular bitmasks.
+fn orr_eor_plan(value: u64) -> Option<Vec<SynthStep>> {
+    // Determine the larger repetition size of the two possible logical
+    // immediates, by finding the repetition size of `value`.
+    let mut big_size = 64u32;
+    loop {
+        big_size /= 2;
+        let mask = (1u64 << big_size) - 1;
+        if (value & mask) != ((value >> big_size) & mask) {
+            big_size *= 2;
+            break;
+        }
+        if big_size <= 2 {
+            break;
+        }
+    }
+
+    let big_mask = u64::MAX >> (64 - big_size);
+    // The last bit of each run of ones, circularly.
+    let run_starts = value & !value.rotate_left(1);
+    let runs_per_big_chunk = (run_starts & big_mask).count_ones() as usize;
+
+    const BIG_TO_SMALL_SIZE_TABLE: [i32; 32] = [
+        -1, -1, 0, 1, 2, 2, -1, 3, 3, 3, -1, -1, -1, -1, -1, 4, 4, 4, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, 5,
+    ];
+    if runs_per_big_chunk >= BIG_TO_SMALL_SIZE_TABLE.len() {
+        return None;
+    }
+    let big_to_small_shift = BIG_TO_SMALL_SIZE_TABLE[runs_per_big_chunk];
+    if big_to_small_shift == -1 {
+        return None;
+    }
+    let small_size = big_size >> big_to_small_shift;
+
+    // 64-bit values with a bit set every (1 << index) bits.
+    const REPEATED_ONES_TABLE: [u64; 7] = [
+        0xffffffffffffffff,
+        0x5555555555555555,
+        0x1111111111111111,
+        0x0101010101010101,
+        0x0001000100010001,
+        0x0000000100000001,
+        0x0000000000000001,
+    ];
+    let small_ones = REPEATED_ONES_TABLE[small_size.trailing_zeros() as usize];
+
+    // Try to find the number of ones in each of the smaller repetitions by
+    // looking at runs of ones in `value`; up to three attempts, as the eor
+    // may have changed the length of the first two runs we find.
+    let mut rotation = run_starts.trailing_zeros();
+    let mut rotated_imm = value.rotate_right(rotation);
+    for _attempt in 0..3 {
+        let run_length = rotated_imm.trailing_ones();
+
+        let small_imm = (small_ones
+            .wrapping_shl(run_length)
+            .wrapping_sub(small_ones))
+        .rotate_left(rotation);
+        let big_imm = value ^ small_imm;
+
+        if let (Some(big_imml), Some(small_imml)) = (
+            ImmLogic::maybe_from_u64(big_imm, I64),
+            ImmLogic::maybe_from_u64(small_imm, I64),
+        ) {
+            return Some(alloc::vec![
+                SynthStep::OrrImm {
+                    imml: small_imml,
+                    size: OperandSize::Size64,
+                },
+                SynthStep::EorImm {
+                    imml: big_imml,
+                    size: OperandSize::Size64,
+                },
+            ]);
+        }
+
+        // Rotate to the next run of ones.
+        rotation = rotation.wrapping_add(
+            (run_starts.rotate_right(rotation) & !1).trailing_zeros(),
+        );
+        rotated_imm = value.rotate_right(rotation);
+    }
+    None
+}
+
+/// A 16-bit chunk occurring two or three times whose 4x replication is a
+/// logical immediate: materialize the replication with one `orr` and patch
+/// the deviating chunks with `movk` (e.g. |A|B|A|A| or |A|B|C|A|).
+fn replicate_chunks_plan(value: u64) -> Option<Vec<SynthStep>> {
+    let chunks = [
+        synth_get(value, 0),
+        synth_get(value, 1),
+        synth_get(value, 2),
+        synth_get(value, 3),
+    ];
+    for &cand in chunks.iter() {
+        let count = chunks.iter().filter(|&&c| c == cand).count();
+        if count != 2 && count != 3 {
+            continue;
+        }
+        let c = u64::from(cand);
+        let rep = (c << 48) | (c << 32) | (c << 16) | c;
+        if let Some(imml) = ImmLogic::maybe_from_u64(rep, I64) {
+            let mut steps = alloc::vec![SynthStep::OrrImm {
+                imml,
+                size: OperandSize::Size64,
+            }];
+            for slice in 0..4u8 {
+                if chunks[slice as usize] != cand {
+                    steps.push(SynthStep::MovK {
+                        bits: chunks[slice as usize],
+                        slice,
+                        size: OperandSize::Size64,
+                    });
+                }
+            }
+            return Some(steps);
+        }
+    }
+    None
+}
+
+/// `isMask_64` from LLVM: ones contiguous from bit 0 upwards.
+fn synth_is_mask(x: u64) -> bool {
+    (x & x.wrapping_add(1)) == 0
+}
+
+/// A contiguous sequence of ones interrupted by one or two chunks: the run is
+/// materialized with one `orr`, the interrupting/outside chunks with `movk`.
+fn sequence_of_ones_plan(value: u64) -> Option<Vec<SynthStep>> {
+    let not_set = -1i32;
+    let mut start_idx = not_set;
+    let mut end_idx = not_set;
+    for idx in 0..4i32 {
+        // Sign-extend the 16-bit chunk to 64 bits.
+        let chunk = ((synth_get(value, idx as u8) as i64) << 48) >> 48;
+        let chunk = chunk as u64;
+        let is_start = chunk != 0 && chunk != u64::MAX && synth_is_mask(!chunk);
+        let is_end = chunk != 0 && chunk != u64::MAX && synth_is_mask(chunk);
+        if is_start {
+            start_idx = idx;
+        } else if is_end {
+            end_idx = idx;
+        }
+    }
+    if start_idx == not_set || end_idx == not_set {
+        return None;
+    }
+
+    let mut outside = 0u64;
+    let mut inside = 0xffffu64;
+    let (mut start_idx, mut end_idx) = (start_idx, end_idx);
+    if start_idx > end_idx {
+        // The sequence of ones wraps around the MSB into the LSB; swap and
+        // pretend we are materializing zeros surrounded by ones.
+        core::mem::swap(&mut start_idx, &mut end_idx);
+        core::mem::swap(&mut outside, &mut inside);
+    }
+
+    let mut orr_imm = value;
+    let mut movks: Vec<u8> = Vec::new();
+    for idx in 0..4i32 {
+        let chunk = u64::from(synth_get(value, idx as u8));
+        if (idx < start_idx || idx > end_idx) && chunk != outside {
+            // A chunk outside the contiguous sequence of ones.
+            if outside == 0 {
+                orr_imm &= !(0xffffu64 << (idx * 16));
+            } else {
+                orr_imm |= 0xffffu64 << (idx * 16);
+            }
+            movks.push(idx as u8);
+        } else if idx > start_idx && idx < end_idx && chunk != inside {
+            // A chunk interrupting the sequence of ones.
+            if inside != 0xffff {
+                orr_imm &= !(0xffffu64 << (idx * 16));
+            } else {
+                orr_imm |= 0xffffu64 << (idx * 16);
+            }
+            movks.push(idx as u8);
+        }
+    }
+    if movks.is_empty() || movks.len() > 2 {
+        return None;
+    }
+    let imml = ImmLogic::maybe_from_u64(orr_imm, I64)?;
+    let mut steps = alloc::vec![SynthStep::OrrImm {
+        imml,
+        size: OperandSize::Size64,
+    }];
+    for slice in movks {
+        steps.push(SynthStep::MovK {
+            bits: synth_get(value, slice),
+            slice,
+            size: OperandSize::Size64,
+        });
+    }
+    Some(steps)
+}
+
+/// Identical 32-bit halves: build the low half with movz/movn/movk in 32-bit
+/// form (which zeroes the top), then replicate it upward with
+/// `orr xd, xd, xd, lsl #32`.
+fn half_replication_plan(value: u64) -> Option<Vec<SynthStep>> {
+    let low = value & 0xffff_ffff;
+    if (value >> 32) != low || low == 0 {
+        return None;
+    }
+    let mut steps = movwide_plan(low, OperandSize::Size32);
+    if steps.len() > 2 {
+        return None;
+    }
+    steps.push(SynthStep::OrrSelfLsl32);
+    Some(steps)
+}
+
+/// Evaluate the full candidate set for a normalized `value` of the given
+/// size and return the shortest plan. Ties keep the movz/movn/movk plan.
+fn synth_plan(value: u64, size: OperandSize) -> Vec<SynthStep> {
+    let mut best = movwide_plan(value, size);
+
+    if !pliron_immsynth_enabled() || best.len() <= 1 {
+        return best;
+    }
+
+    // A single `orr` with a logical immediate beats any multi-instruction
+    // sequence. (For zero-extended constants the ISLE rules ahead of
+    // `load_constant_full` catch most of these already, but not the
+    // sign-extended narrow forms nor inverted-encodable values.)
+    if let Some(plan) = exact_logic_plan(value, size) {
+        if plan.len() < best.len() {
+            best = plan;
+        }
+    }
+
+    // Everything below is only profitable for 64-bit constants: 32-bit ones
+    // always fit in movz/movn + at most one movk, so no 2+-instruction
+    // logical sequence can be strictly shorter than the baseline except the
+    // exact form handled above.
+    if size != OperandSize::Size64 {
+        return best;
+    }
+
+    if best.len() > 2 {
+        // Two- and three-instruction candidates; a candidate wins only when
+        // strictly shorter than the best plan so far.
+        for plan in [
+            orr_movk_plan(value),
+            orr_orr_plan(value),
+            orr_and_plan(value),
+            orr_eor_plan(value),
+            replicate_chunks_plan(value),
+            sequence_of_ones_plan(value),
+            half_replication_plan(value),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if plan.len() < best.len() {
+                best = plan;
+            }
+        }
+    }
+
+    best
+}
+
+/// Bit-level reference evaluation of a plan, used to check correctness in
+/// debug builds and tests: returns the final register value. `movn`'s bits
+/// are the un-inverted slice value of the target (the encoding inversion is
+/// accounted for here). Always compiled: `debug_assert!` still name-resolves
+/// its arguments when the assertions themselves are compiled out.
+#[allow(dead_code)]
+fn eval_synth_steps(steps: &[SynthStep]) -> u64 {
+    let mut reg: u64 = 0;
+    for (i, step) in steps.iter().enumerate() {
+        match *step {
+            SynthStep::MovZ { bits, slice, size } => {
+                debug_assert!(i == 0, "movz must be the first step");
+                reg = u64::from(bits) << (slice * 16);
+                if size == OperandSize::Size32 {
+                    reg &= u64::from(u32::MAX);
+                }
+            }
+            SynthStep::MovN { bits, slice, size } => {
+                debug_assert!(i == 0, "movn must be the first step");
+                let width = u64::from(size.bits());
+                let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+                // movn encodes the inverse of the slice; the net effect is
+                // all-ones within the width except `bits` in the slice.
+                reg = mask & !(0xffffu64 << (slice * 16));
+                reg |= u64::from(bits) << (slice * 16);
+                reg &= mask;
+            }
+            SynthStep::MovK { bits, slice, size } => {
+                debug_assert!(i != 0, "movk cannot be the first step");
+                let width = u64::from(size.bits());
+                let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+                reg &= mask & !(0xffffu64 << (slice * 16));
+                reg |= u64::from(bits) << (slice * 16);
+                reg &= mask;
+            }
+            SynthStep::OrrImm { imml, size } => {
+                let mask = if size == OperandSize::Size64 {
+                    u64::MAX
+                } else {
+                    u64::from(u32::MAX)
+                };
+                if i == 0 {
+                    reg = imml.value() & mask;
+                } else {
+                    reg |= imml.value() & mask;
+                }
+                if size == OperandSize::Size32 {
+                    reg &= u64::from(u32::MAX);
+                }
+            }
+            SynthStep::AndImm { imml, size } => {
+                debug_assert!(i != 0, "and cannot be the first step");
+                let mask = if size == OperandSize::Size64 {
+                    u64::MAX
+                } else {
+                    u64::from(u32::MAX)
+                };
+                reg &= imml.value() & mask;
+                if size == OperandSize::Size32 {
+                    reg &= u64::from(u32::MAX);
+                }
+            }
+            SynthStep::EorImm { imml, size } => {
+                debug_assert!(i != 0, "eor cannot be the first step");
+                let mask = if size == OperandSize::Size64 {
+                    u64::MAX
+                } else {
+                    u64::from(u32::MAX)
+                };
+                reg ^= imml.value() & mask;
+                if size == OperandSize::Size32 {
+                    reg &= u64::from(u32::MAX);
+                }
+            }
+            SynthStep::OrrSelfLsl32 => {
+                debug_assert!(i != 0, "orr-shift cannot be the first step");
+                reg &= u64::from(u32::MAX);
+                reg |= reg << 32;
+            }
+        }
+    }
+    reg
+}
+
 impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     isle_lower_prelude_methods!();
 
@@ -1006,18 +1584,6 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             _ => value,
         };
 
-        // Divide the value into 16-bit slices that we can manipulate using
-        // `movz`, `movn`, and `movk`.
-        fn get(value: u64, shift: u8) -> u16 {
-            (value >> (shift * 16)) as u16
-        }
-        fn replace(mut old: u64, new: u16, shift: u8) -> u64 {
-            let offset = shift * 16;
-            old &= !(0xffff << offset);
-            old |= u64::from(new) << offset;
-            old
-        }
-
         // The 32-bit versions of `movz`/`movn`/`movk` will clear the upper 32
         // bits, so if that's the outcome we want we might as well use them. For
         // simplicity and ease of reading the disassembly, we use the same size
@@ -1028,69 +1594,100 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             OperandSize::Size64
         };
 
-        // The `movz` instruction initially sets all bits to zero, while `movn`
-        // initially sets all bits to one. A good choice of initial value can
-        // reduce the number of `movk` instructions we need afterward, so we
-        // check both variants to determine which is closest to the constant
-        // we actually wanted. In case they're equally good, we prefer `movz`
-        // because the assembly listings are generally harder to read when the
-        // operands are negated.
-        let (mut running_value, op, first) =
-            [(MoveWideOp::MovZ, 0), (MoveWideOp::MovN, size.max_value())]
-                .into_iter()
-                .map(|(op, base)| {
-                    // Both `movz` and `movn` can overwrite one slice after setting
-                    // the initial value; we get to pick which one. 32-bit variants
-                    // can only modify the lower two slices.
-                    let first = (0..(size.bits() / 16))
-                        // Pick one slice that's different from the initial value
-                        .find(|&i| get(base ^ value, i) != 0)
-                        // If none are different, we still have to pick one
-                        .unwrap_or(0);
-                    // Compute the value we'll get from this `movz`/`movn`
-                    (replace(base, get(value, first), first), op, first)
-                })
-                // Count how many `movk` instructions we'll need.
-                .min_by_key(|(base, ..)| (0..4).filter(|&i| get(base ^ value, i) != 0).count())
-                // `variants` isn't empty so `min_by_key` always returns something.
-                .unwrap();
+        // PLIRON (`PLIRON_IMMSYNTH`): pick the shortest materialization out
+        // of the movz/movn/movk slice sequence and the logical-immediate
+        // candidates; see `synth_plan`. The movz/movn/movk-only plan is what
+        // upstream emitted, and no candidate is ever longer than it.
+        let steps = synth_plan(value, size);
+        debug_assert_eq!(
+            value,
+            eval_synth_steps(&steps),
+            "constant synthesis of {value:#x} must reproduce the value"
+        );
 
-        // Build the initial instruction we chose above, putting the result
-        // into a new temporary virtual register. Note that the encoding for the
-        // immediate operand is bitwise-inverted for `movn`.
-        let mut rd = self.temp_writable_reg(I64);
-        self.lower_ctx.emit(MInst::MovWide {
-            op,
-            rd,
-            imm: MoveWideConst {
-                bits: match op {
-                    MoveWideOp::MovZ => get(value, first),
-                    MoveWideOp::MovN => !get(value, first),
-                },
-                shift: first,
-            },
-            size,
-        });
-
-        // Emit a `movk` instruction for each remaining slice of the desired
-        // constant that does not match the initial value constructed above.
-        for shift in (first + 1)..(size.bits() / 16) {
-            let bits = get(value, shift);
-            if bits != get(running_value, shift) {
-                let rn = rd.to_reg();
-                rd = self.temp_writable_reg(I64);
-                self.lower_ctx.emit(MInst::MovK {
-                    rd,
-                    rn,
-                    imm: MoveWideConst { bits, shift },
-                    size,
-                });
-                running_value = replace(running_value, bits, shift);
+        // Emit the plan, chaining each instruction through a fresh temporary
+        // (vcode wants one def per virtual register).
+        let mut rn: Option<Reg> = None;
+        for (i, step) in steps.iter().enumerate() {
+            let rd = self.temp_writable_reg(I64);
+            match *step {
+                SynthStep::MovZ { bits, slice, size } | SynthStep::MovK { bits, slice, size } => {
+                    if i == 0 {
+                        self.lower_ctx.emit(MInst::MovWide {
+                            op: MoveWideOp::MovZ,
+                            rd,
+                            imm: MoveWideConst { bits, shift: slice },
+                            size,
+                        });
+                    } else {
+                        self.lower_ctx.emit(MInst::MovK {
+                            rd,
+                            rn: rn.expect("movk cannot be the first step"),
+                            imm: MoveWideConst { bits, shift: slice },
+                            size,
+                        });
+                    }
+                }
+                SynthStep::MovN { bits, slice, size } => {
+                    debug_assert_eq!(i, 0, "movn must be the first step");
+                    // The encoding for the immediate operand is
+                    // bitwise-inverted for `movn`.
+                    self.lower_ctx.emit(MInst::MovWide {
+                        op: MoveWideOp::MovN,
+                        rd,
+                        imm: MoveWideConst {
+                            bits: !bits,
+                            shift: slice,
+                        },
+                        size,
+                    });
+                }
+                SynthStep::OrrImm { imml, size } => {
+                    self.lower_ctx.emit(MInst::AluRRImmLogic {
+                        alu_op: ALUOp::Orr,
+                        size,
+                        rd,
+                        rn: rn.unwrap_or_else(zero_reg),
+                        imml,
+                    });
+                }
+                SynthStep::AndImm { imml, size } => {
+                    self.lower_ctx.emit(MInst::AluRRImmLogic {
+                        alu_op: ALUOp::And,
+                        size,
+                        rd,
+                        rn: rn.expect("and cannot be the first step"),
+                        imml,
+                    });
+                }
+                SynthStep::EorImm { imml, size } => {
+                    self.lower_ctx.emit(MInst::AluRRImmLogic {
+                        alu_op: ALUOp::Eor,
+                        size,
+                        rd,
+                        rn: rn.expect("eor cannot be the first step"),
+                        imml,
+                    });
+                }
+                SynthStep::OrrSelfLsl32 => {
+                    let rm = rn.expect("orr-shift cannot be the first step");
+                    self.lower_ctx.emit(MInst::AluRRRShift {
+                        alu_op: ALUOp::Orr,
+                        size: OperandSize::Size64,
+                        rd,
+                        rn: rm,
+                        rm,
+                        shiftop: ShiftOpAndAmt::new(
+                            ShiftOp::LSL,
+                            ShiftOpShiftImm::maybe_from_shift(32).unwrap(),
+                        ),
+                    });
+                }
             }
+            rn = Some(rd.to_reg());
         }
 
-        debug_assert_eq!(value, running_value);
-        return rd.to_reg();
+        return rn.expect("a synthesis plan is never empty");
     }
 
     fn zero_reg(&mut self) -> Reg {
@@ -2122,5 +2719,218 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
 
     fn is_pic(&mut self) -> bool {
         self.backend.flags.is_pic()
+    }
+}
+
+#[cfg(test)]
+mod immsynth_tests {
+    use super::*;
+
+    /// The movz/movn/movk baseline length for a normalized value, with
+    /// logical-immediate synthesis disabled: what upstream cranelift would
+    /// have emitted. The invariant of the whole transform is that no plan is
+    /// ever longer than this.
+    fn baseline_len(value: u64, size: OperandSize) -> usize {
+        movwide_plan(value, size).len()
+    }
+
+    fn check(value: u64, size: OperandSize) -> Vec<SynthStep> {
+        let plan = synth_plan(value, size);
+        assert!(
+            !plan.is_empty(),
+            "empty plan for {value:#x} ({size:?})"
+        );
+        assert_eq!(
+            value,
+            eval_synth_steps(&plan),
+            "plan for {value:#018x} ({size:?}) does not reproduce the value: {plan:?}"
+        );
+        assert!(
+            plan.len() <= baseline_len(value, size),
+            "plan for {value:#018x} ({size:?}) is longer than the movz/movn/movk baseline: {plan:?}"
+        );
+        plan
+    }
+
+    #[test]
+    fn serde_json_swar_constants() {
+        // The three constants of serde_json's skip_to_escape: LLVM
+        // materializes each in two instructions.
+        for value in [
+            0x5c5c5c5c5c5c5c5cu64,
+            0xfefefefefefefeffu64,
+            0xdfdfdfdfdfdfdfe0u64,
+        ] {
+            let plan = check(value, OperandSize::Size64);
+            assert!(
+                plan.len() <= 2,
+                "serde constant {value:#018x} should materialize in <= 2 instructions, got {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_constants() {
+        // (value, maximum acceptable plan length)
+        let cases: &[(u64, usize)] = &[
+            // Exact logical immediates: one instruction.
+            (0x0101010101010101, 1),
+            (0x8080808080808080, 1),
+            (0x7f7f7f7f7f7f7f7f, 1),
+            (0x2222222222222222, 1),
+            (0xfefefefefefefefe, 1),
+            (0xdfdfdfdfdfdfdfdf, 1),
+            (0xfffffffffffffffe, 1),
+            (0x00000000ffffffff, 1),
+            // Two-instruction forms.
+            (0x5c5c5c5c5c5c5c5c, 2), // orr | orr
+            (0xfefefefefefefeff, 2), // orr + movk
+            (0xdfdfdfdfdfdfdfe0, 2), // orr + movk
+            // Repeated byte/halfword/deviating patterns must beat the
+            // four-instruction slice sequence.
+            (0x01010101010101ff, 2),
+            (0xdeadbeefdeadbeef, 3), // identical halves: movz/movk + orr-shift
+        ];
+        for &(value, max_len) in cases {
+            let plan = check(value, OperandSize::Size64);
+            assert!(
+                plan.len() <= max_len,
+                "{value:#018x}: expected <= {max_len} instructions, got {}: {plan:?}",
+                plan.len()
+            );
+        }
+    }
+
+    #[test]
+    fn small_constants_unaffected() {
+        for value in [
+            0u64,
+            1,
+            42,
+            0xffff,
+            0x10000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_0000_0000,
+        ] {
+            let size = if value >> 32 == 0 {
+                OperandSize::Size32
+            } else {
+                OperandSize::Size64
+            };
+            let plan = check(value, size);
+            assert_eq!(
+                plan.len(),
+                baseline_len(value, size),
+                "small constant {value:#x} should keep the baseline sequence: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn random_u64_correctness_and_never_regress() {
+        // xorshift64* PRNG, deterministic seed.
+        let mut state = 0x243f6a8885a308d3u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545f4914f6cdd1d)
+        };
+        let mut improved = 0usize;
+        let mut total = 0usize;
+        for _ in 0..200_000 {
+            let value = next();
+            let size = if value >> 32 == 0 {
+                OperandSize::Size32
+            } else {
+                OperandSize::Size64
+            };
+            let plan = check(value, size);
+            total += 1;
+            if plan.len() < baseline_len(value, size) {
+                improved += 1;
+            }
+        }
+        // Random u64s almost never benefit; this is a regression-tripwire
+        // for pathological behavior rather than a target. It is fine for
+        // this to be zero.
+        let _ = improved;
+        let _ = total;
+    }
+
+    #[test]
+    fn structured_u64_correctness() {
+        // Patterned values: repeated bytes with deviations, runs, masks.
+        let mut tested = 0usize;
+        for byte in 0..=255u64 {
+            let rep = byte
+                .wrapping_mul(0x0101010101010101);
+            // The plain repetition.
+            if rep >> 32 != 0 {
+                check(rep, OperandSize::Size64);
+            } else {
+                check(rep, OperandSize::Size32);
+            }
+            tested += 1;
+            // Deviations in each byte position.
+            for pos in 0..8u32 {
+                let dev = rep ^ (0x5au64 << (pos * 8));
+                check(dev, OperandSize::Size64);
+                tested += 1;
+            }
+        }
+        // Contiguous runs of ones at every position and length.
+        for len in 1..64u32 {
+            for pos in 0..=(64 - len) {
+                let mask = if len == 64 {
+                    u64::MAX
+                } else {
+                    ((1u64 << len) - 1) << pos
+                };
+                check(mask, OperandSize::Size64);
+                check(!mask, OperandSize::Size64);
+                tested += 2;
+            }
+        }
+        // Random 32-bit values.
+        let mut state = 0xdeadbeefu64;
+        for _ in 0..20_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let value = state >> 32;
+            check(value, OperandSize::Size32);
+            tested += 1;
+        }
+        let _ = tested;
+    }
+
+    #[test]
+    fn exact_logical_immediates_single_instruction() {
+        // A selection of valid logical immediates of assorted element sizes:
+        // each must materialize in exactly one instruction.
+        for value in [
+            0xffu64,
+            0xff00,
+            0xffff,
+            0xffff0000ffff,
+            0x1111111111111111,
+            0x5555555555555555,
+            0x3333333333333333,
+            0xf0f0f0f0f0f0f0f0,
+            0xff000000000000ff,
+            0x8000000000000001,
+        ] {
+            let size = if value >> 32 == 0 {
+                OperandSize::Size32
+            } else {
+                OperandSize::Size64
+            };
+            let plan = check(value, size);
+            assert_eq!(
+                plan.len(),
+                1,
+                "logical immediate {value:#018x} should be one instruction: {plan:?}"
+            );
+        }
     }
 }
