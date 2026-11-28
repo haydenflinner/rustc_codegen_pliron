@@ -1328,6 +1328,23 @@ impl MachInst for Inst {
         }
     }
 
+    fn gen_zero(ty: Type, dst: Writable<Reg>) -> Option<Inst> {
+        // PLIRON: use ORR of the architectural zero register with
+        // itself. This encodes as the usual `mov rd, xzr` alias but,
+        // unlike the canonical move pseudo-inst, is legal in vcode: a
+        // real register may not be the source of a coalescable move.
+        if !ty.is_int() || ty.bits() > 64 {
+            return None;
+        }
+        Some(Inst::AluRRR {
+            alu_op: ALUOp::Orr,
+            size: OperandSize::from_bits(ty.bits() as usize),
+            rd: dst,
+            rn: zero_reg(),
+            rm: zero_reg(),
+        })
+    }
+
     fn fixed_inst_size() -> Option<CodeOffset> {
         Some(4)
     }

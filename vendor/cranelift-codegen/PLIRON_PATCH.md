@@ -2762,3 +2762,37 @@ Exact instructions, html (the target): 91,876,434 -> 91,705,997
 machines, no symbol regressed). Regression tests:
 `pliron-clif-opt/tests/jt_pretest.rs` (runs every byte value, decodes the
 padding; red without the rules).
+
+## zfresh: edge-local `iconst 0` vregs (`PLIRON_ZFRESH`, default 3, `=0` off)
+
+`src/machinst/lower.rs`, `src/machinst/isle.rs`, `src/machinst/mod.rs` and
+`src/isa/aarch64/inst/mod.rs`: an `iconst 0` used as a branch/blockparam
+argument (bit 0) or call argument (bit 1) is materialized into a fresh vreg
+at the use edge instead of reading the constant's shared, often long-lived
+vreg. `MachInst::gen_zero` is the backend hook; aarch64 implements it as
+`orr rd, xzr, xzr` (the `mov rd, xzr` alias). The ORR form is deliberate:
+vcode rightly rejects the architectural zero register as the source of its
+coalescable `Mov` pseudo-instruction. Because regalloc block arguments
+cannot name a pinned nonallocatable register at all, the zero still has to
+be materialized for phi edges; the win is that the fresh short-range vreg
+coalesces with the edge/argument register instead of forcing
+`mov shared, xzr; mov arg, shared` (and sometimes spilling the shared zero
+across a loop or call).
+
+Edge materializations are emitted while collecting successor arguments,
+after the branch in the backwards vcode builder and flushed before the
+block boundary, so they land before the branch in final order; synthetic
+critical-edge blocks flush them separately. Constants are pure and the
+original `iconst` simply goes dead when all of its uses are rewritten.
+
+Exact executed instructions, rust-html-rewriter, same release dylib:
+`PLIRON_ZFRESH=0` 91,705,965; both bits (`=3`, the default)
+91,404,860 (-301,105). Bit ablation on the equivalent pre-cleanup implementation gave
+branch-only (`=1`) 91,408,380 (about -297.6k) and call-only (`=2`)
+91,702,558 (about -3.4k).
+The branch bit removes about 160k executed `mov xN, xzr` plus copies and
+zero-live-range spill traffic (it adds about 39k placement nops in that
+build, included in the net). Collateral exact totals for `=3` vs `=0`:
+regex 45,522,742 -> 45,473,341 (-49,401), blind-sig 32,054,866 ->
+32,006,847 (-48,019). A native `dtoa-short` cargo smoke test covers the
+critical-edge form that initially exposed the edge-block flush bug.

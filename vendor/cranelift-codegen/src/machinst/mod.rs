@@ -424,6 +424,15 @@ pub trait MachInst: Clone + Debug {
     /// control flow.
     fn gen_jump(target: MachLabel) -> Self;
 
+    /// PLIRON: materialize integer zero in one register with the
+    /// backend's preferred single-instruction zero idiom. This is used
+    /// to re-materialize zero block/call operands close to their use
+    /// rather than forcing one shared zero vreg through regalloc copies.
+    /// Backends without such a form return `None`.
+    fn gen_zero(_ty: Type, _dst: Writable<Reg>) -> Option<Self> {
+        None
+    }
+
     /// Generate a store of an immediate 64-bit integer to a register. Used by
     /// the control plane to generate random instructions.
     fn gen_imm_u64(_value: u64, _dst: Writable<Reg>) -> Option<Self> {

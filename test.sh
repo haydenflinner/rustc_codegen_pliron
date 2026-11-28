@@ -430,7 +430,11 @@ t_slotpromlt() {
   # `PLIRON_RA2_REGION` / `PLIRON_RA2_SPILLHOIST` (default on since
   # 2026-11-18): region splitting plus a store at the definition also
   # remove the traffic XBLOCK was measured on (1500 -> 1500 with them).
-  local _ra_off="PLIRON_RA2_REGION=0 PLIRON_RA2_SPILLHOIST=0 PLIRON_RA2_POSTOPT=0 PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0"
+  # And `PLIRON_ZFRESH` (default 3 since 2026-11-28): the fresh zero
+  # materializations at edges replace exactly the zero-copy moves XBLOCK
+  # eliminated here — 1459 -> 1457 with either one alone, no further
+  # drop combined.
+  local _ra_off="PLIRON_RA2_REGION=0 PLIRON_RA2_SPILLHOIST=0 PLIRON_RA2_POSTOPT=0 PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_ZFRESH=0"
   env $_ra_off PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
   env $_ra_off PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
   env $_ra_off PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o

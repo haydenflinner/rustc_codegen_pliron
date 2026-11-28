@@ -153,7 +153,16 @@ macro_rules! isle_lower_prelude_methods {
             (off..list.len(&self.lower_ctx.dfg().value_lists))
                 .map(|ix| {
                     let val = list.get(ix, &self.lower_ctx.dfg().value_lists).unwrap();
-                    self.put_in_regs(val)
+                    // PLIRON (`PLIRON_ZFRESH` bit 1): this conversion is
+                    // used for call arguments; give an `iconst 0` its own
+                    // short-range vreg so the fixed-argument-register
+                    // constraint does not copy out of a long-lived shared
+                    // zero producer.
+                    if let Some(regs) = self.lower_ctx.fresh_zero_in_regs(val, 2) {
+                        regs
+                    } else {
+                        self.put_in_regs(val)
+                    }
                 })
                 .collect()
         }

@@ -888,6 +888,55 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         any.then_some(out)
     }
 
+    /// PLIRON: the type of `val` when it is an integer `iconst 0` of at
+    /// most 64 bits.
+    fn zero_iconst_type(&self, val: Value) -> Option<Type> {
+        let val = self.f.dfg.resolve_aliases(val);
+        let ValueDef::Result(inst, 0) = self.f.dfg.value_def(val) else {
+            return None;
+        };
+        let InstructionData::UnaryImm { opcode, imm } = &self.f.dfg.insts[inst] else {
+            return None;
+        };
+        if *opcode != crate::ir::Opcode::Iconst || imm.bits() != 0 {
+            return None;
+        }
+        let ty = self.f.dfg.value_type(val);
+        (ty.is_int() && ty.bits() <= 64).then_some(ty)
+    }
+
+    /// PLIRON (`PLIRON_ZFRESH`): if `val` is an integer `iconst 0`,
+    /// materialize a fresh zero in a new vreg at the current lowering
+    /// point instead of reading the value's shared vreg. `bitmask`
+    /// selects the use class: bit 0 is branch/blockparam arguments and
+    /// bit 1 is call arguments. Constants are pure, so this is always
+    /// semantics-preserving; whether it is profitable depends on whether
+    /// the shared vreg would otherwise be copied into a fixed or phi
+    /// register. The default is 3 (both classes); `PLIRON_ZFRESH=0`
+    /// disables it.
+    pub(crate) fn fresh_zero_in_regs(
+        &mut self,
+        val: Value,
+        bitmask: u64,
+    ) -> Option<ValueRegs<Reg>> {
+        static MODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let mode = *MODE.get_or_init(|| {
+            std::env::var("PLIRON_ZFRESH")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(3)
+        });
+        if mode & bitmask == 0 {
+            return None;
+        }
+
+        let ty = self.zero_iconst_type(val)?;
+        let dst = self.alloc_tmp(ty).only_reg()?;
+        let mi = I::gen_zero(ty, dst)?;
+        self.emit(mi);
+        Some(ValueRegs::one(dst.to_reg()))
+    }
+
     /// PLIRON: copy `regs` into fresh vregs, emitting the moves. Gives
     /// `ret_detach`d return operands a minimal-range vreg so the
     /// fixed-return-reg constraint stays local to the copy.
@@ -1449,6 +1498,12 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.finish_ir_inst(loc);
         // Add block param outputs for current block.
         self.lower_branch_blockparam_args(bindex);
+        // PLIRON (`PLIRON_ZFRESH` bit 0): fresh zero materializations
+        // emitted while collecting edge arguments were pushed after the
+        // branch in the backwards builder, so they land before the branch
+        // in final forward order. Flush them separately rather than
+        // mixing them into the branch's own emission group.
+        self.finish_ir_inst(loc);
         Ok(())
     }
 
@@ -1536,7 +1591,11 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             match arg {
                 BlockArg::Value(arg) => {
                     debug_assert!(self.f.dfg.value_is_real(arg));
-                    let regs = self.put_value_in_regs(arg);
+                    let regs = if let Some(regs) = self.fresh_zero_in_regs(arg, 1) {
+                        regs
+                    } else {
+                        self.put_value_in_regs(arg)
+                    };
                     buffer.extend_from_slice(regs.regs());
                 }
                 BlockArg::TryCallRet(i) => {
@@ -1621,6 +1680,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 self.emit(I::gen_jump(MachLabel::from_block(succ)));
                 self.finish_ir_inst(Default::default());
                 self.lower_branch_blockparam_args(bindex);
+                // PLIRON: as in `lower_clif_branch`, flush any fresh-zero
+                // materializations emitted while collecting this edge's
+                // block arguments before the block boundary.
+                self.finish_ir_inst(Default::default());
             }
 
             // Original block body.
