@@ -4971,8 +4971,9 @@ fn s_demand(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
-fn s_demanded(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = crate::demanded::run(&mut p.clctx.func, &p.target);
+fn s_demanded(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let la = an.cfg_dt_la(&p.clctx.func).la;
+    let k = crate::demanded::run_with(&mut p.clctx.func, &p.target, la);
     if k > 0 {
         p.dump("demanded");
     }

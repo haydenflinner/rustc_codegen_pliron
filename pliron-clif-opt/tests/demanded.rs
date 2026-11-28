@@ -3,7 +3,7 @@
 //! Every shape runs through the differential checker; the ones that must
 //! change assert the change, so `PLIRON_DEMANDED=0` fails them.
 
-use cranelift_codegen::ir::{Function, Opcode};
+use cranelift_codegen::ir::{Function, Opcode, types};
 use pliron_cfg::target::Target;
 use pliron_clif_opt::demanded::run;
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
@@ -327,6 +327,46 @@ block2(v10: i8):
     assert_eq!(n, 1, "{f}");
     assert_eq!(count(&f, Opcode::Ireduce), 0, "{f}");
     assert_eq!(count(&f, Opcode::Istore8), 1, "{f}");
+}
+
+
+/// miniz_oxide's dictionary fill loop: the byte entering the hash chain is
+/// an in-loop `ireduce.i16` of an i32, the hash is loop-carried, and every
+/// extended bit is masked off at the roots. The conversion the widening
+/// removes executes per trip; the one it adds for the entry seed executes
+/// once, so loop depth breaks their static-cost tie.
+#[test]
+fn loop_carried_hash_chain_widens() {
+    let (f, n) = go(
+        "function %f(i16, i32, i32) -> i64 {
+block0(v0: i16, v1: i32, v2: i32):
+    jump block1(v0, v1, v2)
+block1(v3: i16, v4: i32, v5: i32):
+    v6 = ireduce.i16 v4
+    v7 = bxor v3, v6
+    v8 = iconst.i16 0x7fff
+    v9 = band v7, v8
+    v10 = uextend.i64 v7
+    v11 = iconst.i64 0x7fff
+    v12 = band v10, v11
+    v13 = iconst.i16 5
+    v14 = ishl v9, v13
+    v15 = iconst.i32 1
+    v16 = iadd v4, v15
+    v17 = iconst.i32 0xffff
+    v18 = band v16, v17
+    v19 = isub v5, v15
+    brif v19, block1(v14, v18, v19), block2(v9)
+block2(v20: i16):
+    v21 = uextend.i64 v20
+    return v21
+}",
+        &Target::host(),
+    );
+    assert!(n >= 1, "{f}");
+    assert_eq!(count(&f, Opcode::Ireduce), 0, "{f}");
+    let b1 = f.layout.blocks().nth(1).unwrap();
+    assert_eq!(f.dfg.value_type(f.dfg.block_params(b1)[0]), types::I32, "{f}");
 }
 
 /// A web member with a use outside the web (a compare) keeps the whole web

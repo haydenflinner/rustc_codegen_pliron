@@ -38,14 +38,18 @@
 //!   on wasm the `& 255`/`& 65535` the emitter puts after every narrow
 //!   add, subtract, multiply and shift. A rewrite is taken only when a
 //!   per-target count of the extensions and masks it removes beats the
-//!   count it adds (`Cost`).
+//!   count it adds (`Cost`), with loop depth weighting conversions that
+//!   execute per trip against those the rewrite leaves outside the loop.
 //!
 //! `PLIRON_WASM_MASKELIM` is the dual on wasm: it drops a mask whose
 //! input already fits (known bits); this drops the work whose output bits
 //! nobody reads (demanded bits).
 
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::SecondaryMap;
+use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_codegen::ir::{
     types, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value, ValueDef,
 };
@@ -497,16 +501,33 @@ fn find(up: &mut SecondaryMap<Value, Value>, v: Value) -> Value {
     r
 }
 
-/// Run the analysis and its rewrites on `func`.
-pub fn run(func: &mut Function, target: &Target) -> usize {
+fn enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| pliron_cfg::env_is("PLIRON_DEMANDED", "1"));
-    if !*ON {
+    *ON
+}
+
+/// Run the analysis and its rewrites on `func`.
+pub fn run(func: &mut Function, target: &Target) -> usize {
+    if !enabled() {
+        return 0;
+    }
+    let cfg = ControlFlowGraph::with_function(func);
+    let dt = DominatorTree::with_function(func, &cfg);
+    let mut la = LoopAnalysis::new();
+    la.compute(func, &cfg, &dt);
+    run_with(func, target, &la)
+}
+
+/// `run` with the pipeline's cached loop analysis. The widening cost of a
+/// conversion in a loop is the conversion each trip, not once.
+pub fn run_with(func: &mut Function, target: &Target, la: &LoopAnalysis) -> usize {
+    if !enabled() {
         return 0;
     }
     let Some(dm) = analyze(func) else { return 0 };
     let mut k = drop_masks(func, &dm);
-    k += widen(func, &dm, target);
+    k += widen(func, &dm, target, la);
     k
 }
 
@@ -581,6 +602,24 @@ fn drop_masks(func: &mut Function, dm: &Demanded) -> usize {
     k
 }
 
+/// Cost weight for an instruction in `b`: a loop trip count proxy, the same
+/// geometric weighting `slotprom` uses (1, 8, 64, 512 by nest depth).
+fn block_weight(la: &LoopAnalysis, b: cranelift_codegen::ir::Block) -> u32 {
+    1u32 << (3 * la.loop_level(b).level().min(3))
+}
+
+fn inst_weight(func: &Function, la: &LoopAnalysis, i: Inst) -> u32 {
+    func.layout.inst_block(i).map_or(1, |b| block_weight(la, b))
+}
+
+fn value_weight(func: &Function, la: &LoopAnalysis, v: Value) -> u32 {
+    match func.dfg.value_def(func.dfg.resolve_aliases(v)) {
+        ValueDef::Result(i, _) => inst_weight(func, la, i),
+        ValueDef::Param(b, _) => block_weight(la, b),
+        _ => 1,
+    }
+}
+
 /// Narrow webs rebuilt wide. A web is a set of `i8`/`i16` values — results
 /// of widenable ops and block parameters — whose every use is another
 /// member (a value operand of a member op, an edge argument of a member
@@ -590,7 +629,7 @@ fn drop_masks(func: &mut Function, dm: &Demanded) -> usize {
 /// it pays: member parameters change type, member ops get wide twins,
 /// leaves (operands from outside) convert, and the roots read the wide
 /// value (a zero extension whose bits are demanded keeps a mask).
-fn widen(func: &mut Function, dm: &Demanded, target: &Target) -> usize {
+fn widen(func: &mut Function, dm: &Demanded, target: &Target, la: &LoopAnalysis) -> usize {
     let masked = target.narrow_masked();
     let word = Type::int((target.word_bytes() * 8) as u16).expect("word is an integer type");
     let cost = Cost { masked, word: word.bits() };
@@ -764,6 +803,8 @@ fn widen(func: &mut Function, dm: &Demanded, target: &Target) -> usize {
         new: u32,
         /// Widest extension root (0: stores only).
         widest: u32,
+        /// Widest source of an `ireduce` leaf (the narrow width otherwise).
+        leafwidest: u32,
         members: Vec<Value>,
     }
     let mut webs: rustc_hash::FxHashMap<Value, Web> = Default::default();
@@ -773,12 +814,12 @@ fn widen(func: &mut Function, dm: &Demanded, target: &Target) -> usize {
     for &v in &members {
         let root = find(&mut up, v);
         let n = func.dfg.value_type(v);
-        let w = webs.entry(root).or_insert(Web { old: 0, new: 0, widest: 0, members: Vec::new() });
+        let w = webs.entry(root).or_insert(Web { old: 0, new: 0, widest: 0, leafwidest: 0, members: Vec::new() });
         w.members.push(v);
         // The member's own cost, and its leaves.
         let leaves: smallvec::SmallVec<[Value; 4]> = match func.dfg.value_def(v) {
             ValueDef::Result(i, _) => {
-                w.old += cost.node(func.dfg.insts[i].opcode());
+                w.old += cost.node(func.dfg.insts[i].opcode()) * inst_weight(func, la, i);
                 value_operands(func, i).into_iter().map(|a| func.dfg.resolve_aliases(a)).filter(|&a| !cand[a]).collect()
             }
             ValueDef::Param(b, k) => {
@@ -801,19 +842,23 @@ fn widen(func: &mut Function, dm: &Demanded, target: &Target) -> usize {
             _ => smallvec::SmallVec::new(),
         };
         for l in leaves {
-            if let Some(InstructionData::Unary { opcode: Opcode::Ireduce, arg }) =
-                func.dfg.value_def(l).inst().map(|d| &func.dfg.insts[d])
-            {
+            let lsrc = func.dfg.value_def(l).inst().and_then(|d| match &func.dfg.insts[d] {
+                InstructionData::Unary { opcode: Opcode::Ireduce, arg } => Some(*arg),
+                _ => None,
+            });
+            w.leafwidest = w.leafwidest.max(lsrc.map_or_else(|| func.dfg.value_type(l).bits(), |a| func.dfg.value_type(a).bits()));
+            let lwt = value_weight(func, la, l);
+            if let Some(a) = lsrc {
                 let c = red.entry((root, l)).or_insert(0);
                 *c += 1;
                 if *c == nuses[l] {
-                    w.old += cost.ireduce_leaf(func, *arg, n);
+                    w.old += cost.ireduce_leaf(func, a, n) * lwt;
                 }
             }
             // The leaf's new conversion; its type is not known until every
-            // root is seen, so count it at the word (a narrower `w` only
-            // makes `ireduce` leaves cheaper).
-            w.new += cost.leaf(func, l, if masked { word } else { types::I32 });
+            // leaf is seen, so count it at i32 (the width narrow webs prefer
+            // when no wider leaf already gives the wide value a home).
+            w.new += cost.leaf(func, l, if masked { word } else { types::I32 }) * lwt;
         }
         // Roots.
         for &u in &uses[v] {
@@ -832,8 +877,9 @@ fn widen(func: &mut Function, dm: &Demanded, target: &Target) -> usize {
                         u32::from(!fused && !(opcode == Opcode::Uextend && clean))
                     };
                     let new = u32::from(!undemanded) + u32::from(masked && m.bits() > word.bits());
-                    w.old += old;
-                    w.new += new;
+                    let rwt = inst_weight(func, la, i);
+                    w.old += old * rwt;
+                    w.new += new * rwt;
                 }
                 _ => {}
             }
@@ -852,9 +898,14 @@ fn widen(func: &mut Function, dm: &Demanded, target: &Target) -> usize {
         if !pliron_cfg::bisect("demanded") {
             continue;
         }
-        // The widest root's type (32 bits for stores alone); where narrow
-        // arithmetic is masked, the word, extended once at wider roots.
-        let w = if masked { word } else { Type::int(web.widest.max(32) as u16).expect("int type") };
+        // The widest leaf source, at least 32 bits and no wider than the
+        // word: root extensions can always start at the width chosen here,
+        // while an `ireduce` leaf's source already occupies its own width.
+        // Where narrow arithmetic is masked the word is the only profitable
+        // width (and on wasm32 it is i32 already).
+        let rootw = web.widest.max(32);
+        let leafw = web.leafwidest.min(rootw).clamp(32, word.bits());
+        let w = if masked { word } else { Type::int(leafw as u16).expect("int type") };
         rewrite(func, &web.members, &uses, &preds, w, dm);
         dead = true;
         k += 1;
