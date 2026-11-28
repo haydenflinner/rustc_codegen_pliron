@@ -975,14 +975,37 @@ impl<'a, F: Function> Env<'a, F> {
         vreg: VRegIndex,
         spillset: SpillSetIndex,
         clus: &mut SmallVec<[Use; 8]>,
+        holes: &mut SmallVec<[CodeRange; 4]>,
+        entry_to: ProgPoint,
         new_lrs: &mut SmallVec<[(VRegIndex, LiveRangeIndex); 16]>,
         new_bundles: &mut SmallVec<[LiveBundleIndex; 16]>,
     ) {
         if clus.len() >= 2 {
+            let last = minimal_range_for_use(clus.last().unwrap());
+            // End at a Before point: an early use's minimal range ends
+            // at After, but the coverage cut around this span (see
+            // `split_into_minimal_bundles`) resumes there, and a range
+            // may not start at an After point (the move insertion in
+            // `moves.rs` cannot connect one). The span's uses are never
+            // defs, so the start is a Before point already. The extra
+            // half-instruction is dead space the conflict split's trim
+            // reclaims as usual. Never past the end of the range being
+            // split: nothing resumes there, so the round-up is not
+            // needed and the piece would reach beyond the vreg's live
+            // range.
+            let mut to = last.to;
+            if to.pos() != InstPosition::Before {
+                to = core::cmp::min(ProgPoint::before(to.inst().next()), entry_to);
+            }
             let cr = CodeRange {
                 from: minimal_range_for_use(&clus[0]).from,
-                to: minimal_range_for_use(clus.last().unwrap()).to,
+                to,
             };
+            // The span belongs to the cluster bundle, so the spill
+            // coverage of this range is cut around it (see
+            // `split_into_minimal_bundles`); ordered and disjoint, as
+            // the uses are.
+            holes.push(cr);
             let lr = self.ctx.ranges.add(cr, self.ctx.scratch_bump.clone());
             new_lrs.push((vreg, lr));
             self.ctx.ranges[lr].vreg = vreg;
@@ -1054,9 +1077,21 @@ impl<'a, F: Function> Env<'a, F> {
             // PLIRON (`PLIRON_RA2_MINCLUS`): register-uses that sit close
             // together in one block gather in `clus` and become one
             // bundle covering the whole cluster (see `minclus_flush`);
-            // every other use keeps the per-use path.
+            // every other use keeps the per-use path. An entry with an
+            // `any`-constrained use is not clustered: such uses migrate
+            // into the spill coverage's use list, and the coverage is
+            // cut around the cluster spans (below), which is only sound
+            // when its use list stays empty.
+            let uses = core::mem::replace(&mut self.ctx.ranges[entry.index].uses, empty_vec);
+            let entry_minclus = minclus
+                && !uses
+                    .iter()
+                    .any(|u| u.operand.constraint() == OperandConstraint::Any);
             let mut clus: SmallVec<[Use; 8]> = smallvec![];
-            for u in core::mem::replace(&mut self.ctx.ranges[entry.index].uses, empty_vec) {
+            // The spans the clusters of this entry own, in order (see
+            // `minclus_flush`): the spill coverage is cut around them.
+            let mut holes: SmallVec<[CodeRange; 4]> = smallvec![];
+            for u in uses {
                 trace!("   -> use {:?}", u);
 
                 let is_def = u.operand.kind() == OperandKind::Def;
@@ -1067,7 +1102,7 @@ impl<'a, F: Function> Env<'a, F> {
                 // could create unnecessary conflicts with existing bundles that need to fit in a
                 // register, more strict requirements, so we delay them eagerly.
                 if u.operand.constraint() == OperandConstraint::Any {
-                    self.minclus_flush(vreg, spillset, &mut clus, &mut new_lrs, &mut new_bundles);
+                    self.minclus_flush(vreg, spillset, &mut clus, &mut holes, entry.range.to, &mut new_lrs, &mut new_bundles);
                     trace!("    -> migrating this any-constrained use to the spill range");
                     spill_uses.push(u);
 
@@ -1093,7 +1128,7 @@ impl<'a, F: Function> Env<'a, F> {
                 // anything else breaks the cluster and keeps the per-use
                 // minimal bundle (a def writes a new value, a fixed or
                 // tied operand needs a particular register anyway).
-                if minclus && !is_def && u.operand.constraint() == OperandConstraint::Reg {
+                if entry_minclus && !is_def && u.operand.constraint() == OperandConstraint::Reg {
                     if !clus.is_empty() {
                         let same_block = self.ctx.cfginfo.insn_block[u.pos.inst().index()]
                             == self.ctx.cfginfo.insn_block[clus[0].pos.inst().index()];
@@ -1108,6 +1143,8 @@ impl<'a, F: Function> Env<'a, F> {
                                 vreg,
                                 spillset,
                                 &mut clus,
+                                &mut holes,
+                                entry.range.to,
                                 &mut new_lrs,
                                 &mut new_bundles,
                             );
@@ -1116,39 +1153,78 @@ impl<'a, F: Function> Env<'a, F> {
                     clus.push(u);
                     continue;
                 }
-                self.minclus_flush(vreg, spillset, &mut clus, &mut new_lrs, &mut new_bundles);
+                self.minclus_flush(vreg, spillset, &mut clus, &mut holes, entry.range.to, &mut new_lrs, &mut new_bundles);
                 self.push_minimal_bundle(u, vreg, spillset, &mut new_lrs, &mut new_bundles);
             }
-            self.minclus_flush(vreg, spillset, &mut clus, &mut new_lrs, &mut new_bundles);
+            self.minclus_flush(vreg, spillset, &mut clus, &mut holes, entry.range.to, &mut new_lrs, &mut new_bundles);
 
             if !spill_range.is_empty() {
-                // Make one entry in the spill bundle that covers the whole range.
+                // Make one entry in the spill bundle that covers the whole
+                // range, or one per piece around the cluster spans.
                 // TODO: it might be worth tracking enough state to only create this LR when there is
                 // open space in the original LR.
-                let spill_lr = self
-                    .ctx
-                    .ranges
-                    .add(spill_range, self.ctx.scratch_bump.clone());
-                self.ctx.ranges[spill_lr].vreg = vreg;
-                self.ctx.ranges[spill_lr].bundle = spill;
-                self.ctx.ranges[spill_lr].uses.extend(spill_uses.drain(..));
-                new_lrs.push((vreg, spill_lr));
-
-                if spill_starts_def {
-                    self.ctx.ranges[spill_lr].set_flag(LiveRangeFlag::StartsAtDef);
+                //
+                // PLIRON (`PLIRON_RA2_MINCLUS`): a cluster bundle owns its
+                // whole span as a live range of this vreg, so the coverage
+                // is cut around it. Were the span covered here as well, a
+                // cluster piece that later cannot keep a register would
+                // migrate into this same spill bundle (the re-split's own
+                // coverage, a trimmed end) and overlap the range already
+                // there — two overlapping ranges of one bundle, which the
+                // allocation btree forbids (fuzz seed 23300). With the
+                // holes, every later piece fills only its own part.
+                // `entry_minclus` guarantees nothing migrated into
+                // `spill_uses` when holes are present, so the uses and the
+                // def flag can go on the first piece as before.
+                debug_assert!(holes.is_empty() || spill_uses.is_empty());
+                let mut spans: SmallVec<[CodeRange; 5]> = smallvec![];
+                let mut at = spill_range.from;
+                for &h in holes.iter() {
+                    let hf = core::cmp::max(h.from, at);
+                    let ht = core::cmp::min(h.to, spill_range.to);
+                    if hf >= ht {
+                        continue;
+                    }
+                    if hf > at {
+                        spans.push(CodeRange { from: at, to: hf });
+                    }
+                    at = ht;
+                }
+                if at < spill_range.to {
+                    spans.push(CodeRange {
+                        from: at,
+                        to: spill_range.to,
+                    });
                 }
 
-                self.ctx.bundles[spill].ranges.push(LiveRangeListEntry {
-                    range: spill_range,
-                    index: spill_lr,
-                });
-                self.ctx.ranges[spill_lr].bundle = spill;
-                trace!(
-                    "  -> added spill range {:?} in new LR {:?} in spill bundle {:?}",
-                    spill_range,
-                    spill_lr,
-                    spill
-                );
+                let mut first = true;
+                for span in spans {
+                    let spill_lr = self
+                        .ctx
+                        .ranges
+                        .add(span, self.ctx.scratch_bump.clone());
+                    self.ctx.ranges[spill_lr].vreg = vreg;
+                    self.ctx.ranges[spill_lr].bundle = spill;
+                    if first {
+                        self.ctx.ranges[spill_lr].uses.extend(spill_uses.drain(..));
+                        if spill_starts_def {
+                            self.ctx.ranges[spill_lr].set_flag(LiveRangeFlag::StartsAtDef);
+                        }
+                        first = false;
+                    }
+                    new_lrs.push((vreg, spill_lr));
+
+                    self.ctx.bundles[spill].ranges.push(LiveRangeListEntry {
+                        range: span,
+                        index: spill_lr,
+                    });
+                    trace!(
+                        "  -> added spill range {:?} in new LR {:?} in spill bundle {:?}",
+                        span,
+                        spill_lr,
+                        spill
+                    );
+                }
             } else {
                 assert!(spill_uses.is_empty());
             }

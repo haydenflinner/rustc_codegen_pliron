@@ -117,7 +117,7 @@ SOURCES = ["vendor/regalloc2/src", "vendor/cranelift-codegen/src/machinst"]
 # Seeds that once failed (ra2 leg), replayed by `quick` under every quick combination.
 # 82467, 93016: PLIRON_RA2_RELOADCOPY retargeted a reload into a copy's
 # destination that was a fixed stack slot posing as a register.
-REGRESS = [82467, 93016]
+REGRESS = [82467, 93016, 11344, 23300]
 CLIF_CHECK_ENV = {"PLIRON_RA_CHECK": "1", "PLIRON_RELOADPRE_CHECK": "1"}
 # (corpus, every) for the loop's CLIF leg; `quick` uses smoke every 4.
 CLIF_SETS = [("std", 4), ("smoke", 2), ("clcg", 16), ("html", 8)]

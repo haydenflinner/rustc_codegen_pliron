@@ -182,6 +182,9 @@ fn run_case(c: &Case) -> Outcome {
     let Some(f) = generate(c) else {
         return Outcome::NoFunc;
     };
+    if std::env::var("RAFUZZ_EXPLAIN").is_ok() {
+        regalloc2::set_explain(true);
+    }
     let env = env_of(c);
     // PLIRON: honour `PLIRON_RA_ALGO=greedy|fast|ion` (harness/rafuzz.py).
     let ro = RegallocOptions {

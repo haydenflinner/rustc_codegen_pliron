@@ -758,3 +758,29 @@ failed as designed); pulldown-cmark 46,398,014 -> 46,378,507 (-19.5k,
 std corpus (4,979 fns) -745 weighted stack accesses, -448 weighted
 instructions, one addr2line regression (+306 weighted movs — a cluster
 register picked up copies).
+
+Fix (2026-11-27, rafuzz seeds 23300 and 11344, `assertion failed:
+res.is_none()` in `try_to_allocate_bundle_to_reg`): the spill coverage
+a minimal split adds to the spill bundle covers the whole split range
+— including the span of every cluster just created, since the cluster
+bundle is a live range of the same vreg inside it. Unlike a per-use
+minimal bundle, a cluster bundle is *non-minimal* and re-enters the
+splitting machinery when no register is free; its pieces then migrate
+into the same spill bundle a second time (the re-split's own
+whole-range coverage, a trimmed end) and overlapped the coverage
+already there — two overlapping ranges in one bundle, which the
+allocation btree forbids. The coverage is now cut around the cluster
+spans (one spill range per piece instead of one for the whole range):
+the span is owned by the cluster bundle alone, and every piece of it
+that later lands in the spill bundle fills only its own part of the
+hole, so the pieces stay disjoint. The invariant this restores is
+upstream's: ranges migrate into a spill bundle only as freshly carved,
+disjoint pieces. One move is new when a cluster keeps its register:
+the slot no longer carries the value across the span, so the boundary
+at the cluster's end inserts a store back into it (the reload at its
+first use is unchanged) — needed because spill-slot sharing
+(`PLIRON_RA2_SLOTLIVE`) may give the slot to another value across the
+hole. Because `any`-constrained uses migrate into the coverage's use
+list (and a use must attach to the one piece covering it), an entry
+that has one is no longer clustered at all; such uses break clusters
+anyway, so this only widens the break distance.
