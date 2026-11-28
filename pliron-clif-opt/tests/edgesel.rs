@@ -128,3 +128,141 @@ fn both_arms_same_target_keeps_select() {
     assert!(s.contains("select"), "{s}");
     dcheck(&before, &after);
 }
+
+#[test]
+fn equality_edge_cancels_select_hidden_sub() {
+    // Reduced `slice::range` validation: success on `tag == 2` proves both
+    // validation selects took their false arms, so the copy count is
+    // `(x + 4) - x` even though armmerge hid the endpoints behind selects.
+    let before = parse(
+        "function %f(i64) -> i64 {
+        block0(v0: i64):
+            v1 = iconst.i64 3
+            v2 = iadd v0, v1
+            v3 = icmp uge v2, v0
+            v4 = iconst.i64 4
+            v5 = iadd v0, v4
+            v6 = icmp ugt v0, v5
+            v7 = iconst.i64 1
+            v8 = iconst.i64 2
+            v9 = select.i64 v6, v7, v8
+            v10 = iconst.i64 0
+            v11 = select.i64 v3, v10, v9
+            v12 = select.i64 v3, v2, v0
+            v13 = select.i64 v3, v10, v5
+            jump block1(v11, v12, v13)
+
+        block1(v20: i64, v21: i64, v22: i64):
+            v23 = iconst.i64 2
+            v24 = icmp eq v20, v23
+            brif v24, block2, block3
+
+        block2:
+            v25 = isub v22, v21
+            return v25
+
+        block3:
+            v26 = iconst.i64 0
+            return v26
+        }",
+    );
+    let mut after = before.clone();
+    let n = pliron_clif_opt::edgesel::edge_rel(&mut after);
+    assert_eq!(n, 1);
+    let s = after.to_string();
+    assert!(s.contains("v25 = iconst.i64 4"), "{s}");
+    assert!(!s.contains("isub"), "{s}");
+    dcheck(&before, &after);
+}
+
+#[test]
+fn loop_reentry_rejects_select_hidden_sub() {
+    // The soundness gate is the unique incoming edge: a success block that
+    // can re-enter itself without passing through the equality edge must not
+    // use the edge-proof endpoints.
+    let before = parse(
+        "function %f(i64, i8) -> i64 {
+        block0(v0: i64, v30: i8):
+            v4 = iconst.i64 4
+            v5 = iadd v0, v4
+            v7 = iconst.i64 1
+            v8 = iconst.i64 2
+            v9 = select.i64 v30, v7, v8
+            v10 = iconst.i64 0
+            v11 = select.i64 v30, v10, v9
+            v12 = select.i64 v30, v5, v0
+            jump block1(v11, v0, v12)
+
+        block1(v20: i64, v21: i64, v22: i64):
+            v23 = iconst.i64 2
+            v24 = icmp eq v20, v23
+            brif v24, block2, block3
+
+        block2:
+            v25 = isub v22, v21
+            brif v30, block2, block3
+
+        block3:
+            v26 = iconst.i64 0
+            return v26
+        }",
+    );
+    let mut after = before.clone();
+    let n = pliron_clif_opt::edgesel::edge_rel(&mut after);
+    assert_eq!(n, 0);
+    assert!(after.to_string().contains("isub"));
+    dcheck(&before, &after);
+}
+
+#[test]
+fn narrow_delta_uses_in_bounds_iconst() {
+    // Cranelift's verifier requires a narrow `iconst` to be zero-extended:
+    // `(x - 1) - x` is `0xffffffff` in i32, not the sign-extended i64 -1.
+    let before = parse(
+        "function %f(i32, i8) -> i32 {
+        block0(v0: i32, v30: i8):
+            v4 = iconst.i32 -1
+            v5 = iadd v0, v4
+            v7 = iconst.i32 1
+            v8 = iconst.i32 2
+            v9 = select.i32 v30, v7, v8
+            v10 = iconst.i32 0
+            v11 = select.i32 v30, v10, v9
+            v12 = select.i32 v30, v0, v5
+            jump block1(v11, v0, v12)
+
+        block1(v20: i32, v21: i32, v22: i32):
+            v23 = iconst.i32 2
+            v24 = icmp eq v20, v23
+            brif v24, block2, block3
+
+        block2:
+            v25 = isub v22, v21
+            return v25
+
+        block3:
+            v26 = iconst.i32 0
+            return v26
+        }",
+    );
+    let mut after = before.clone();
+    let n = pliron_clif_opt::edgesel::edge_rel(&mut after);
+    assert_eq!(n, 1);
+    let inst = after
+        .dfg
+        .value_def(cranelift_codegen::ir::Value::from_u32(25))
+        .inst()
+        .expect("v25 is an instruction result");
+    let cranelift_codegen::ir::InstructionData::UnaryImm {
+        opcode: cranelift_codegen::ir::Opcode::Iconst,
+        imm,
+    } = after.dfg.insts[inst]
+    else {
+        panic!("v25 was not folded: {}", after.display())
+    };
+    let imm = imm.bits();
+    assert_eq!(imm, u32::MAX as i64, "{}", after.display());
+    let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+    cranelift_codegen::verify_function(&after, &flags).unwrap();
+    dcheck(&before, &after);
+}
