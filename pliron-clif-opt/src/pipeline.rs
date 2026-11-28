@@ -4980,6 +4980,20 @@ fn s_demanded(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_demshift(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    // The rewrite is a mask move unless the selector folds the new
+    // truncate-before-shift into the shift. aarch64 does (`ubfiz`);
+    // x64 and wasm would pay the same one mask instruction as before.
+    if !p.target.is_aarch64() {
+        return 0;
+    }
+    let k = crate::demanded::shiftxor(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("demshift");
+    }
+    k
+}
+
 fn s_memcmpk(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let little = p.isa.endianness() == cranelift_codegen::ir::Endianness::Little;
     let k = crate::memcmpk::run_with(&mut p.clctx.func, p.fn_names, p.fname, p.const_tables, little);
@@ -6338,6 +6352,14 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // That GVN is also what shows a rotated loop's guard to be the
         // test the block's only predecessor just made.
         step("retest", "edgeknown", Gate::Env("PLIRON_RETEST"), s_retest).needs(shape::CONDBR),
+        // Rotate `(h << k) ^ byte` hash recurrences so the shift input is
+        // truncated instead of every loop iteration masking the xor
+        // (`((h << 5) ^ b) & 0x7fff` in miniz). This must run late: the
+        // egraph/CSE rounds first coalesce the recurrence's several
+        // mask users into the single direct shape the proof expects.
+        // Opt-in: `PLIRON_DEMSHIFT=1`.
+        step("demshift", "demshift", Gate::OptIn("PLIRON_DEMSHIFT"), s_demshift)
+            .needs(shape::BPARAM | shape::LOOPS),
         // Loop params in lockstep (`q = p + D`, D invariant: two pointers
         // of one zip, a duplicate the late GVN made) share one register;
         // `q`'s end test becomes `p`'s and folds. After the last GVN and

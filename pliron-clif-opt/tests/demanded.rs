@@ -3,9 +3,9 @@
 //! Every shape runs through the differential checker; the ones that must
 //! change assert the change, so `PLIRON_DEMANDED=0` fails them.
 
-use cranelift_codegen::ir::{Function, Opcode, types};
+use cranelift_codegen::ir::{Function, InstructionData, Opcode, types};
 use pliron_cfg::target::Target;
-use pliron_clif_opt::demanded::run;
+use pliron_clif_opt::demanded::{run, shiftxor};
 use pliron_clif_opt::diffcheck::{Config, Facts, check};
 
 fn knob() {
@@ -24,6 +24,27 @@ fn count(f: &Function, op: Opcode) -> usize {
         .flat_map(|b| f.layout.block_insts(b))
         .filter(|&i| f.dfg.insts[i].opcode() == op)
         .count()
+}
+
+fn iconst(f: &Function, v: cranelift_codegen::ir::Value) -> Option<u64> {
+    let i = f.dfg.value_def(f.dfg.resolve_aliases(v)).inst()?;
+    let InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } = f.dfg.insts[i] else {
+        return None;
+    };
+    Some(imm.bits() as u64)
+}
+
+fn band_consts(f: &Function) -> Vec<u64> {
+    f.layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .filter_map(|i| {
+            let InstructionData::Binary { opcode: Opcode::Band, args } = f.dfg.insts[i] else {
+                return None;
+            };
+            args.iter().find_map(|&a| iconst(f, a))
+        })
+        .collect()
 }
 
 /// Run the step for `target`, check it against the original, return the
@@ -367,6 +388,48 @@ block2(v20: i16):
     assert_eq!(count(&f, Opcode::Ireduce), 0, "{f}");
     let b1 = f.layout.blocks().nth(1).unwrap();
     assert_eq!(f.dfg.value_type(f.dfg.block_params(b1)[0]), types::I32, "{f}");
+}
+
+/// The widened form of miniz's hash recurrence carries `(h << 5)` and
+/// masks the xor every trip. Truncating both shift inputs to the ten bits
+/// that can survive the shift makes the xor itself fit in 15 bits, so the
+/// per-trip `0x7fff` mask is exact identity and disappears.
+#[test]
+fn shiftxor_loop_recurrence_rotates_mask() {
+    let before = parse(
+        "function %f(i32, i32, i32) -> i32 {
+block0(v0: i32, v1: i32, v2: i32):
+    v10 = iconst.i32 5
+    v11 = ishl v0, v10
+    v12 = iconst.i32 255
+    v13 = band v1, v12
+    jump block1(v11, v13, v1, v2)
+block1(v3: i32, v4: i32, v5: i32, v6: i32):
+    v7 = bxor v3, v4
+    v8 = iconst.i32 0x7fff
+    v9 = band v7, v8
+    v14 = ishl v9, v10
+    v15 = iconst.i32 1
+    v16 = iadd v5, v15
+    v17 = band v16, v12
+    v18 = isub v6, v15
+    brif v18, block1(v14, v17, v16, v18), block2(v9)
+block2(v20: i32):
+    return v20
+}",
+    );
+    let mut after = before.clone();
+    let n = shiftxor(&mut after);
+    cranelift_codegen::verifier::verify_function(&after, &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
+        .unwrap_or_else(|e| panic!("verifier: {e}\n{after}"));
+    let s = check(&before, &after, &Facts::default(), &Config { trials: 256, ..Config::default() })
+        .unwrap_or_else(|m| panic!("shiftxor changed behaviour: {m:?}\n{after}"));
+    assert!(s.compared > 0, "no trial compared: {:?}", s.why);
+    assert!(n > 0, "{after}");
+    let masks = band_consts(&after);
+    assert!(!masks.contains(&0x7fff), "{masks:?}\n{after}");
+    assert_eq!(masks.iter().filter(|&&c| c == 1023).count(), 2, "{masks:?}\n{after}");
+    assert_eq!(masks.iter().filter(|&&c| c == 255).count(), 2, "{masks:?}\n{after}");
 }
 
 /// A web member with a use outside the web (a compare) keeps the whole web

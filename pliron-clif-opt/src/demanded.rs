@@ -51,7 +51,7 @@ use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::loop_analysis::LoopAnalysis;
 use cranelift_codegen::ir::{
-    types, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value, ValueDef,
+    types, Block, BlockArg, Function, Inst, InstBuilder, InstructionData, Opcode, Type, Value, ValueDef,
 };
 use pliron_cfg::target::Target;
 
@@ -932,6 +932,390 @@ fn widen(func: &mut Function, dm: &Demanded, target: &Target, la: &LoopAnalysis)
         });
     }
     k
+}
+
+/// Uses of every value, split into ordinary instruction operands and
+/// edge arguments, plus the incoming values of every block parameter.
+/// `demanded` does not keep use lists; the shift/xor rewrite below needs
+/// them to know whether canonicalizing a shift's high bits is observable.
+struct UseTabs {
+    inst: SecondaryMap<Value, smallvec::SmallVec<[Inst; 2]>>,
+    edge: SecondaryMap<Value, smallvec::SmallVec<[EdgeUse; 2]>>,
+    /// `(param index, edge value)` for every edge into a block.
+    into: SecondaryMap<Block, Vec<(usize, Value)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EdgeUse {
+    target: Block,
+    index: usize,
+}
+
+fn use_tabs(func: &Function) -> UseTabs {
+    let mut t = UseTabs {
+        inst: SecondaryMap::default(),
+        edge: SecondaryMap::default(),
+        into: SecondaryMap::default(),
+    };
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let data = &func.dfg.insts[i];
+            let dests = data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            // For a branch, `inst_args` may include the variadic edge
+            // values; its fixed args are the condition/indirect target,
+            // which are ordinary uses. Edge values are recorded by target
+            // and parameter index below.
+            let fixed = if dests.is_empty() { func.dfg.inst_args(i) } else { func.dfg.inst_fixed_args(i) };
+            for &a in fixed {
+                t.inst[func.dfg.resolve_aliases(a)].push(i);
+            }
+            for bc in dests {
+                let target = bc.block(&func.dfg.value_lists);
+                for (index, arg) in bc.args(&func.dfg.value_lists).enumerate() {
+                    if let BlockArg::Value(v) = arg {
+                        let v = func.dfg.resolve_aliases(v);
+                        t.edge[v].push(EdgeUse { target, index });
+                        t.into[target].push((index, v));
+                    }
+                }
+            }
+        }
+    }
+    t
+}
+
+/// `c` as a contiguous low mask: return `(mask, width)` for `2^width-1`.
+fn lowmask(c: u64, ty: Type) -> Option<(u64, u32)> {
+    let c = c & tymask(ty);
+    if c == 0 || c & c.wrapping_add(1) != 0 {
+        return None;
+    }
+    let n = c.trailing_ones();
+    (n < ty.bits()).then_some((c, n))
+}
+
+/// `v` is zero outside the low `bits` bits, structurally. Block parameters
+/// are true when every incoming edge value is; cycles are refused rather
+/// than solved (the rotation shape this targets is acyclic below the
+/// parameter).
+fn fits_low_bits(
+    func: &Function,
+    tabs: &UseTabs,
+    v: Value,
+    bits: u32,
+    seen: &mut rustc_hash::FxHashSet<Value>,
+    memo: &mut rustc_hash::FxHashMap<(Value, u32), bool>,
+) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    let key = (v, bits);
+    if let Some(&r) = memo.get(&key) {
+        return r;
+    }
+    let ty = func.dfg.value_type(v);
+    if ty.is_int() && ty.bits() <= bits {
+        memo.insert(key, true);
+        return true;
+    }
+    if iconst(func, v).is_some_and(|c| c & !lowfill((1u64 << bits) - 1) == 0) {
+        memo.insert(key, true);
+        return true;
+    }
+    let r = match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => match func.dfg.insts[i] {
+            InstructionData::Load { opcode, .. } => match opcode {
+                Opcode::Uload8 => bits >= 8,
+                Opcode::Uload16 => bits >= 16,
+                Opcode::Uload32 => bits >= 32,
+                _ => false,
+            },
+            InstructionData::Unary { opcode: Opcode::Uextend, arg } => func.dfg.value_type(arg).bits() <= bits,
+            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
+                (imm.bits() as u64) & !((1u64 << bits) - 1) == 0
+            }
+            InstructionData::Binary { opcode, args: [a, b] } => match opcode {
+                Opcode::Band => {
+                    let subset = iconst(func, a).or_else(|| iconst(func, b)).is_some_and(|c| c & !((1u64 << bits) - 1) == 0);
+                    subset
+                        || (fits_low_bits(func, tabs, a, bits, seen, memo) && fits_low_bits(func, tabs, b, bits, seen, memo))
+                }
+                Opcode::Ishl => {
+                    // A left shift is inside the low `bits` when its input
+                    // is inside the low `bits-k` bits. (The k >= bits case
+                    // would require a zero input; nothing here needs it.)
+                    iconst(func, b).is_some_and(|k| {
+                        let k = (k & u64::from(func.dfg.value_type(func.dfg.first_result(i)).bits() - 1)) as u32;
+                        k < bits && {
+                            let mut seen2 = seen.clone();
+                            fits_low_bits(func, tabs, a, bits - k, &mut seen2, memo)
+                        }
+                    })
+                }
+                Opcode::Bor | Opcode::Bxor => {
+                    let mut seena = seen.clone();
+                    let mut seenb = seen.clone();
+                    fits_low_bits(func, tabs, a, bits, &mut seena, memo)
+                        && fits_low_bits(func, tabs, b, bits, &mut seenb, memo)
+                }
+                _ => false,
+            },
+            _ => false,
+        },
+        ValueDef::Param(b, index) => {
+            if !seen.insert(v) {
+                return false;
+            }
+            let mut any = false;
+            let mut fits = true;
+            for &(ix, a) in &tabs.into[b] {
+                if ix != index {
+                    continue;
+                }
+                any = true;
+                if !fits_low_bits(func, tabs, a, bits, seen, memo) {
+                    fits = false;
+                    break;
+                }
+            }
+            any && fits
+        }
+        _ => false,
+    };
+    memo.insert(key, r);
+    r
+}
+
+/// A constant `ishl` whose high bits the rewrite may canonicalize: the
+/// result is used only by `xor` directly, or only as an edge value for the
+/// block parameter the shift collector is currently expanding.
+fn shift_def(func: &Function, v: Value) -> Option<(Inst, Value, u32)> {
+    let i = func.dfg.value_def(func.dfg.resolve_aliases(v)).inst()?;
+    let InstructionData::Binary { opcode: Opcode::Ishl, args: [x, kk] } = func.dfg.insts[i] else {
+        return None;
+    };
+    let ty = func.dfg.value_type(func.dfg.first_result(i));
+    let k = (iconst(func, kk)? & u64::from(ty.bits() - 1)) as u32;
+    Some((i, func.dfg.resolve_aliases(x), k))
+}
+
+fn sole_xor_use(func: &Function, tabs: &UseTabs, v: Value, xor: Inst) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    tabs.edge[v].is_empty() && tabs.inst[v].len() == 1 && tabs.inst[v][0] == xor
+}
+
+fn only_edge_use(tabs: &UseTabs, v: Value, target: Block, index: usize) -> bool {
+    let v = tabs_edge_key(v);
+    !tabs.edge[v].is_empty()
+        && tabs.inst[v].is_empty()
+        && tabs.edge[v].iter().all(|&u| u.target == target && u.index == index)
+}
+
+/// `UseTabs` keys are already resolved; keep one place for the resolution
+/// so a future alias represented in the scan cannot split the two sides of
+/// a comparison.
+fn tabs_edge_key(v: Value) -> Value {
+    v
+}
+
+/// Collect the shift instructions that can feed `v` in the rotated shape
+/// `xor (shift ...), byte`: either `v` is the shift result itself, or it
+/// is a block parameter whose every incoming value is such a shift. The
+/// use checks are deliberately narrow: mutating a shift canonicalizes the
+/// undemanded high bits of its result, so no other instruction may read
+/// that result, and the parameter itself may only feed the xor.
+fn collect_shifts(
+    func: &Function,
+    tabs: &UseTabs,
+    v: Value,
+    bits: u32,
+    xor: Inst,
+    out: &mut Vec<(Inst, Value, u32)>,
+) -> bool {
+    let v = func.dfg.resolve_aliases(v);
+    if let Some((si, x, k)) = shift_def(func, v) {
+        return k > 0 && k < bits && sole_xor_use(func, tabs, v, xor) && {
+            out.push((si, x, k));
+            true
+        };
+    }
+    let ValueDef::Param(b, index) = func.dfg.value_def(v) else { return false };
+    if !sole_xor_use(func, tabs, v, xor) {
+        return false;
+    }
+    let mut any = false;
+    for &(ix, a) in &tabs.into[b] {
+        if ix != index {
+            continue;
+        }
+        any = true;
+        let Some((si, x, k)) = shift_def(func, a) else { return false };
+        if k == 0 || k >= bits || !only_edge_use(tabs, a, b, index) {
+            return false;
+        }
+        out.push((si, x, k));
+    }
+    any
+}
+
+/// Remove every low-mask band of `x` at least as wide as `bits`. A
+/// shiftxor plan has just canonicalized `x` itself into the low `bits`
+/// bits, so all of these are exact identities. This covers the duplicate
+/// and nested masks widening materializes for the several roots of one
+/// hash recurrence in a single sweep.
+fn drop_wide_bands_of_xor(
+    func: &mut Function,
+    x: Value,
+    bits: u32,
+    candidates: &[(Inst, Value, u32)],
+) -> usize {
+    let mut n = 0;
+    for &(bandi, bandr, width) in candidates {
+        if width < bits || func.layout.inst_block(bandi).is_none() {
+            continue;
+        }
+        func.layout.remove_inst(bandi);
+        func.dfg.clear_results(bandi);
+        func.dfg.change_to_alias(bandr, x);
+        n += 1;
+    }
+    n
+}
+
+struct ShiftXorPlan {
+    bandi: Inst,
+    bandr: Value,
+    xorv: Value,
+    shifts: Vec<(Inst, Value, u32)>,
+    mask: u64,
+}
+
+/// Canonicalize `band (bxor (a << k), byte), (1<<bits)-1` recurrences.
+///
+/// Feeding `(a & (mask >> k))` to the shift is invisible in the masked low
+/// bits and makes the shift result zero outside the mask. When the xor's
+/// other operand is structurally inside the mask too (a byte load or a
+/// zero extension), the xor itself is already inside the mask and the
+/// outer `band` can go. On aarch64 the new mask folds into the shift as
+/// `ubfiz #k,#bits-k`, so the rewrite removes the recurrence's explicit
+/// mask instruction rather than moving it. The use checks in
+/// `collect_shifts` are what license changing the shift result's high
+/// bits; the band replacement itself is exact once both xor operands fit.
+pub fn shiftxor(func: &mut Function) -> usize {
+    // Cheap shape test before building the use tables.
+    let mut shaped = false;
+    'outer: for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let InstructionData::Binary { opcode: Opcode::Band, args } = func.dfg.insts[i] else { continue };
+            for a in args {
+                if let Some(xi) = func.dfg.value_def(func.dfg.resolve_aliases(a)).inst()
+                    && matches!(func.dfg.insts[xi], InstructionData::Binary { opcode: Opcode::Bxor, .. })
+                {
+                    shaped = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if !shaped {
+        return 0;
+    }
+    let tabs = use_tabs(func);
+    let mut plans: Vec<ShiftXorPlan> = Vec::new();
+    let mut mask_users: rustc_hash::FxHashMap<Value, Vec<(Inst, Value, u32)>> = Default::default();
+    let mut seen_candidates: rustc_hash::FxHashSet<(Value, u32)> = Default::default();
+    let mut fitmemo: rustc_hash::FxHashMap<(Value, u32), bool> = Default::default();
+    for b in func.layout.blocks() {
+        for bandi in func.layout.block_insts(b) {
+            let InstructionData::Binary { opcode: Opcode::Band, args: [ba, bb] } = func.dfg.insts[bandi] else {
+                continue;
+            };
+            let bandr = func.dfg.first_result(bandi);
+            let ty = func.dfg.value_type(bandr);
+            if !tracked(ty) {
+                continue;
+            }
+            let (x, c) = match (iconst(func, ba), iconst(func, bb)) {
+                (_, Some(c)) => (ba, c),
+                (Some(c), None) => (bb, c),
+                _ => continue,
+            };
+            let Some((mask, bits)) = lowmask(c, ty) else { continue };
+            let x = func.dfg.resolve_aliases(x);
+            let Some(xi) = func.dfg.value_def(x).inst() else { continue };
+            let InstructionData::Binary { opcode: Opcode::Bxor, args: [xa, xb] } = func.dfg.insts[xi] else {
+                continue;
+            };
+            mask_users.entry(x).or_default().push((bandi, bandr, bits));
+            // Duplicate masks of one xor at one width need only one proof;
+            // different widths are bounded by the scalar integer widths.
+            if !seen_candidates.insert((x, bits)) {
+                continue;
+            }
+            for (s, y) in [(xa, xb), (xb, xa)] {
+                let mut shifts = Vec::new();
+                let mut seen = Default::default();
+                let cs = collect_shifts(func, &tabs, s, bits, xi, &mut shifts);
+                let fb = cs && fits_low_bits(func, &tabs, y, bits, &mut seen, &mut fitmemo);
+                if cs && fb {
+                    plans.push(ShiftXorPlan { bandi, bandr, xorv: x, shifts, mask });
+                    break;
+                }
+            }
+        }
+    }
+    if plans.is_empty() {
+        return 0;
+    }
+
+    let mut n = 0;
+    for p in plans {
+        if func.layout.inst_block(p.bandi).is_none() || !pliron_cfg::bisect("demshift") {
+            continue;
+        }
+        for &(si, x, k) in &p.shifts {
+            if func.layout.inst_block(si).is_none() {
+                continue;
+            }
+            let smask = p.mask >> k;
+            let ty = func.dfg.value_type(x);
+            if smask == 0 || smask == tymask(ty) {
+                continue;
+            }
+            // Re-scan the current input: an earlier duplicate mask in the
+            // same recurrence may already have canonicalized this shift.
+            let curx = match func.dfg.insts[si] {
+                InstructionData::Binary { opcode: Opcode::Ishl, args: [x, _] } => func.dfg.resolve_aliases(x),
+                _ => continue,
+            };
+            let already = func.dfg.value_def(curx).inst().is_some_and(|d| {
+                matches!(
+                    func.dfg.insts[d],
+                    InstructionData::Binary { opcode: Opcode::Band, args: [aa, bb] }
+                        if (iconst(func, aa).or_else(|| iconst(func, bb))).is_some_and(|c| c & !smask == 0)
+                )
+            });
+            if already {
+                continue;
+            }
+            let masked = {
+                let mut cur = FuncCursor::new(func).at_inst(si);
+                let c = cur.ins().iconst(ty, smask as i64);
+                cur.ins().band(curx, c)
+            };
+            if let InstructionData::Binary { args, .. } = &mut func.dfg.insts[si] {
+                args[0] = masked;
+            }
+        }
+        if func.layout.inst_block(p.bandi).is_some() {
+            func.layout.remove_inst(p.bandi);
+            func.dfg.clear_results(p.bandi);
+            func.dfg.change_to_alias(p.bandr, p.xorv);
+            n += 1;
+        }
+        if let Some(candidates) = mask_users.get(&p.xorv) {
+            n += drop_wide_bands_of_xor(func, p.xorv, p.mask.trailing_ones(), candidates);
+        }
+    }
+    n
 }
 
 /// A member whose register aarch64 already holds zero-extended (a `band`
