@@ -644,6 +644,13 @@ pub const DEFAULT_ON: &[&str] = &[
     // gate + FNMAX=512 keep montgomery out (was +2.9% blind-sig). Callgrind
     // non-nop: html −0.043%, blind-sig −0.12%, no program worse. `=0` off.
     "PLIRON_WIDE128",
+    // 2026-11-28: demshift rotates the mask of `band(bxor(h<<k, byte),
+    // (1<<bits)-1)` shift-xor recurrences into the shift inputs (ubfiz
+    // folds it on aarch64), dropping the recurrence's explicit mask.
+    // miniz compress_inner 8 -> 7 insts/hash-trip: rust-compression
+    // -60k exact (x1.039 -> x1.038); regex +289 / rust-json +397, inside
+    // the noise floor. `PLIRON_DEMSHIFT=0` off.
+    "PLIRON_DEMSHIFT",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
